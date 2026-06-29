@@ -1,13 +1,15 @@
 //! Frame extraction: the only place that talks to ffmpeg for decoding.
 //!
-//! ffmpeg samples frames at a fixed fps and writes a raw PPM stream to stdout;
-//! we parse it incrementally. stderr is sent to `/dev/null` — we deliberately
-//! do *not* use the `showinfo` filter, which would force a second pipe and risk
-//! a deadlock when its buffer fills. Timestamps are derived as `index / fps`.
+//! ffmpeg samples frames at a fixed fps and pre-scales each one (via swscale,
+//! its optimized C path) down to the size we actually need before writing a raw
+//! PPM stream to stdout — so the pipe carries small frames, not full-resolution
+//! ones, and Rust does almost no resizing. We parse the stream incrementally;
+//! stderr is sent to `/dev/null`, and we deliberately do *not* use the
+//! `showinfo` filter, which would force a second pipe and risk a deadlock when
+//! its buffer fills. Timestamps are derived as `index / fps`.
 //!
-//! Each decoded frame is immediately downscaled into a small grayscale image
-//! (for scoring) and a small RGB image (for composition); the full-resolution
-//! buffer is dropped right away to keep peak memory bounded.
+//! Grayscale derivation (one per frame, for scoring) is independent across
+//! frames, so it runs in parallel after the frames are read off the pipe.
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -15,7 +17,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use image::imageops::FilterType;
-use image::{DynamicImage, GrayImage, RgbImage};
+use image::{GrayImage, RgbImage};
+use rayon::prelude::*;
 
 use crate::types::{RawScores, ScoredFrame};
 
@@ -62,6 +65,13 @@ fn extract_inner(
     range: Option<(f32, f32)>,
 ) -> Result<ExtractResult> {
     let rgb_edge = cell_min_edge.max(1);
+    // ffmpeg pre-scales the shorter edge down to this in its optimized C
+    // (swscale) before the PPM hits the pipe — far cheaper than shipping
+    // full-resolution frames and resizing them in Rust, and it shrinks pipe
+    // bandwidth. `rgb_edge >= SCORE_EDGE` always (the smallest cell is 256),
+    // so the piped frame already serves as the composition RGB as-is; only the
+    // grayscale needs a further (cheap) downscale.
+    let pipe_edge = rgb_edge.max(SCORE_EDGE);
 
     let mut cmd = Command::new("ffmpeg");
     // Seek before -i for speed; -t bounds the duration read.
@@ -69,11 +79,16 @@ fn extract_inner(
         cmd.args(["-ss", &start.to_string()]);
         cmd.args(["-t", &(end - start).max(0.0).to_string()]);
     }
+    // `force_original_aspect_ratio=increase` scales so the shorter edge lands
+    // exactly on `pipe_edge`, preserving aspect.
+    let vf = format!(
+        "fps={fps},scale={pipe_edge}:{pipe_edge}:force_original_aspect_ratio=increase"
+    );
     let mut child = cmd
         .arg("-i")
         .arg(input)
         .arg("-vf")
-        .arg(format!("fps={fps}"))
+        .arg(vf)
         .args(["-f", "image2pipe", "-vcodec", "ppm", "pipe:1"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -83,59 +98,50 @@ fn extract_inner(
     let stdout = child.stdout.take().expect("stdout was piped");
     let mut reader = BufReader::new(stdout);
 
-    let mut frames = Vec::new();
+    // Read the (already small) RGB frames sequentially off the pipe; deriving
+    // each grayscale is independent per frame, so that runs in parallel after.
+    let mut rgbs: Vec<RgbImage> = Vec::new();
     let mut aspect = 1.0_f32;
-    let mut idx = 0u32;
-    let start_offset = range.map(|(s, _)| s).unwrap_or(0.0);
-
-    while let Some(full) = read_ppm(&mut reader)? {
-        if idx == 0 {
-            let (w, h) = full.dimensions();
+    while let Some(frame) = read_ppm(&mut reader)? {
+        if rgbs.is_empty() {
+            let (w, h) = frame.dimensions();
             aspect = w as f32 / h as f32;
         }
-        let gray = resize_gray(&full, SCORE_EDGE);
-        let rgb = resize_min_edge(&full, rgb_edge);
-        drop(full); // release the full-resolution buffer immediately
-
-        frames.push(ScoredFrame {
-            ts: start_offset + idx as f32 / fps,
-            gray,
-            rgb,
-            raw: RawScores::default(),
-            score: 0.0,
-        });
-        idx += 1;
+        rgbs.push(frame);
     }
 
     let status = child.wait().context("waiting for ffmpeg")?;
-    if !status.success() && frames.is_empty() {
+    if !status.success() && rgbs.is_empty() {
         bail!("ffmpeg exited with {status} and produced no frames");
     }
+
+    let start_offset = range.map(|(s, _)| s).unwrap_or(0.0);
+    let frames: Vec<ScoredFrame> = rgbs
+        .into_par_iter()
+        .enumerate()
+        .map(|(idx, rgb)| ScoredFrame {
+            ts: start_offset + idx as f32 / fps,
+            gray: to_gray(&rgb, SCORE_EDGE),
+            rgb,
+            raw: RawScores::default(),
+            score: 0.0,
+        })
+        .collect();
 
     Ok(ExtractResult { aspect, frames })
 }
 
-/// Downscale to a grayscale image whose shorter edge is `min_edge`.
-/// Never upscales beyond the source.
-fn resize_gray(img: &RgbImage, min_edge: u32) -> GrayImage {
-    let gray = DynamicImage::ImageRgb8(img.clone()).into_luma8();
+/// Derive a grayscale image (shorter edge `min_edge`) from an already-small RGB
+/// frame. Converts in place (no full-image clone) and only resizes when the
+/// source is larger than the target.
+fn to_gray(img: &RgbImage, min_edge: u32) -> GrayImage {
+    let gray = image::imageops::grayscale(img);
     let (w, h) = gray.dimensions();
     let (nw, nh) = target_dims(w, h, min_edge);
     if (nw, nh) == (w, h) {
         gray
     } else {
         image::imageops::resize(&gray, nw, nh, FilterType::Triangle)
-    }
-}
-
-/// Downscale an RGB image so its shorter edge is `min_edge`. Never upscales.
-fn resize_min_edge(img: &RgbImage, min_edge: u32) -> RgbImage {
-    let (w, h) = img.dimensions();
-    let (nw, nh) = target_dims(w, h, min_edge);
-    if (nw, nh) == (w, h) {
-        img.clone()
-    } else {
-        image::imageops::resize(img, nw, nh, FilterType::Triangle)
     }
 }
 

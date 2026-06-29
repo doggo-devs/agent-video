@@ -34,16 +34,6 @@ pub fn render(frames: &[ScoredFrame], layout: &Layout, hero_idx: &[usize]) -> Re
         Rgb([16, 16, 16]),
     );
 
-    let is_hero: Vec<bool> = {
-        let mut v = vec![false; frames.len()];
-        for &h in hero_idx {
-            if h < frames.len() {
-                v[h] = true;
-            }
-        }
-        v
-    };
-
     for (i, frame) in frames.iter().enumerate() {
         let rect = layout.rects[i];
         if rect.w == 0 || rect.h == 0 {
@@ -52,7 +42,9 @@ pub fn render(frames: &[ScoredFrame], layout: &Layout, hero_idx: &[usize]) -> Re
         let cell = image::imageops::resize(&frame.rgb, rect.w, rect.h, FilterType::Triangle);
         image::imageops::overlay(&mut canvas, &cell, rect.x as i64, rect.y as i64);
 
-        if is_hero[i] {
+        // hero_idx holds at most 3 entries, so a linear check is cheaper than
+        // allocating an n-sized lookup table.
+        if hero_idx.contains(&i) {
             draw_border(&mut canvas, rect.x, rect.y, rect.w, rect.h, HERO_BORDER, HERO_BORDER_PX);
         }
         draw_timestamp(&mut canvas, &font, rect.x, rect.y, frame.ts);
@@ -93,17 +85,16 @@ fn draw_timestamp(img: &mut RgbImage, font: &FontRef, x: u32, y: u32, ts: f32) {
     let label = format_ts(ts);
     let scale = PxScale::from(20.0);
 
-    // Translucent dark backing strip for legibility.
+    // Translucent dark backing strip for legibility. get_pixel_mut darkens in
+    // place — one bounds check per pixel instead of two.
     let strip_w = (label.len() as u32 * 12 + 8).min(img.width().saturating_sub(x));
     let strip_h = 24.min(img.height().saturating_sub(y));
     for py in y..(y + strip_h) {
         for px in x..(x + strip_w) {
-            let p = img.get_pixel(px, py);
-            img.put_pixel(
-                px,
-                py,
-                Rgb([p.0[0] / 3, p.0[1] / 3, p.0[2] / 3]),
-            );
+            let p = img.get_pixel_mut(px, py);
+            p.0[0] /= 3;
+            p.0[1] /= 3;
+            p.0[2] /= 3;
         }
     }
     drawing::draw_text_mut(

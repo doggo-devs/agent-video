@@ -30,31 +30,64 @@ const W_EDGE: f32 = 0.25;
 /// Convolves with the 3×3 kernel `[[0,1,0],[1,-4,1],[0,1,0]]` (edges clamped)
 /// and returns the variance of the response. A blurred frame has a low-variance
 /// (flat) Laplacian; a sharp one has a spiky response.
+///
+/// The interior (every pixel with all four neighbours in bounds) is walked with
+/// direct slice indexing — no per-pixel clamp or bounds check — so LLVM can
+/// vectorize it. The one-pixel border falls back to a clamped path, keeping the
+/// result identical to a naive clamped convolution.
 pub fn clarity(gray: &GrayImage) -> f32 {
     let (w, h) = gray.dimensions();
     if w == 0 || h == 0 {
         return 0.0;
     }
-    let at = |x: i64, y: i64| -> f32 {
-        let xc = x.clamp(0, w as i64 - 1) as u32;
-        let yc = y.clamp(0, h as i64 - 1) as u32;
-        gray.get_pixel(xc, yc).0[0] as f32
-    };
-
+    let (wu, hu) = (w as usize, h as usize);
+    let buf = gray.as_raw();
+    let n = (w as f64) * (h as f64);
     let mut sum = 0.0_f64;
     let mut sum_sq = 0.0_f64;
-    let n = (w as f64) * (h as f64);
-    for y in 0..h as i64 {
-        for x in 0..w as i64 {
-            let lap = at(x, y - 1)
-                + at(x - 1, y)
-                + at(x + 1, y)
-                + at(x, y + 1)
-                - 4.0 * at(x, y);
-            sum += lap as f64;
-            sum_sq += (lap as f64) * (lap as f64);
+
+    let mut accumulate = |lap: f32| {
+        sum += lap as f64;
+        sum_sq += (lap as f64) * (lap as f64);
+    };
+
+    // Interior: all neighbours in bounds, plain indexing.
+    if wu >= 3 && hu >= 3 {
+        for y in 1..hu - 1 {
+            let row = y * wu;
+            let up = row - wu;
+            let down = row + wu;
+            for x in 1..wu - 1 {
+                let c = buf[row + x] as f32;
+                let lap = buf[up + x] as f32
+                    + buf[row + x - 1] as f32
+                    + buf[row + x + 1] as f32
+                    + buf[down + x] as f32
+                    - 4.0 * c;
+                accumulate(lap);
+            }
         }
     }
+
+    // Border: clamped reads, identical to the naive path.
+    let at = |x: i64, y: i64| -> f32 {
+        let xc = x.clamp(0, w as i64 - 1) as usize;
+        let yc = y.clamp(0, h as i64 - 1) as usize;
+        buf[yc * wu + xc] as f32
+    };
+    let is_interior = |x: usize, y: usize| x >= 1 && y >= 1 && x + 1 < wu && y + 1 < hu;
+    for y in 0..hu {
+        for x in 0..wu {
+            if wu >= 3 && hu >= 3 && is_interior(x, y) {
+                continue;
+            }
+            let (xi, yi) = (x as i64, y as i64);
+            let lap = at(xi, yi - 1) + at(xi - 1, yi) + at(xi + 1, yi) + at(xi, yi + 1)
+                - 4.0 * at(xi, yi);
+            accumulate(lap);
+        }
+    }
+
     let mean = sum / n;
     (sum_sq / n - mean * mean) as f32
 }
@@ -63,31 +96,66 @@ pub fn clarity(gray: &GrayImage) -> f32 {
 ///
 /// Applies horizontal and vertical Sobel kernels, takes the gradient magnitude
 /// `sqrt(gx² + gy²)` per pixel, and returns the mean (edges clamped).
+///
+/// Same interior/border split as [`clarity`]: the interior uses direct indexing
+/// for vectorization, the one-pixel border uses clamped reads.
 pub fn edge_density(gray: &GrayImage) -> f32 {
     let (w, h) = gray.dimensions();
     if w == 0 || h == 0 {
         return 0.0;
     }
-    let at = |x: i64, y: i64| -> f32 {
-        let xc = x.clamp(0, w as i64 - 1) as u32;
-        let yc = y.clamp(0, h as i64 - 1) as u32;
-        gray.get_pixel(xc, yc).0[0] as f32
-    };
-
+    let (wu, hu) = (w as usize, h as usize);
+    let buf = gray.as_raw();
     let mut total = 0.0_f64;
-    for y in 0..h as i64 {
-        for x in 0..w as i64 {
-            let gx = -at(x - 1, y - 1) + at(x + 1, y - 1) - 2.0 * at(x - 1, y)
-                + 2.0 * at(x + 1, y)
-                - at(x - 1, y + 1)
-                + at(x + 1, y + 1);
-            let gy = -at(x - 1, y - 1) - 2.0 * at(x, y - 1) - at(x + 1, y - 1)
-                + at(x - 1, y + 1)
-                + 2.0 * at(x, y + 1)
-                + at(x + 1, y + 1);
+
+    if wu >= 3 && hu >= 3 {
+        for y in 1..hu - 1 {
+            let row = y * wu;
+            let up = row - wu;
+            let down = row + wu;
+            for x in 1..wu - 1 {
+                let (ul, uc, ur) = (
+                    buf[up + x - 1] as f32,
+                    buf[up + x] as f32,
+                    buf[up + x + 1] as f32,
+                );
+                let (l, r) = (buf[row + x - 1] as f32, buf[row + x + 1] as f32);
+                let (dl, dc, dr) = (
+                    buf[down + x - 1] as f32,
+                    buf[down + x] as f32,
+                    buf[down + x + 1] as f32,
+                );
+                let gx = -ul + ur - 2.0 * l + 2.0 * r - dl + dr;
+                let gy = -ul - 2.0 * uc - ur + dl + 2.0 * dc + dr;
+                total += (gx * gx + gy * gy).sqrt() as f64;
+            }
+        }
+    }
+
+    let at = |x: i64, y: i64| -> f32 {
+        let xc = x.clamp(0, w as i64 - 1) as usize;
+        let yc = y.clamp(0, h as i64 - 1) as usize;
+        buf[yc * wu + xc] as f32
+    };
+    let is_interior = |x: usize, y: usize| x >= 1 && y >= 1 && x + 1 < wu && y + 1 < hu;
+    for y in 0..hu {
+        for x in 0..wu {
+            if wu >= 3 && hu >= 3 && is_interior(x, y) {
+                continue;
+            }
+            let (xi, yi) = (x as i64, y as i64);
+            let gx = -at(xi - 1, yi - 1) + at(xi + 1, yi - 1) - 2.0 * at(xi - 1, yi)
+                + 2.0 * at(xi + 1, yi)
+                - at(xi - 1, yi + 1)
+                + at(xi + 1, yi + 1);
+            let gy = -at(xi - 1, yi - 1) - 2.0 * at(xi, yi - 1) - at(xi + 1, yi - 1)
+                + at(xi - 1, yi + 1)
+                + 2.0 * at(xi, yi + 1)
+                + at(xi + 1, yi + 1);
             total += (gx * gx + gy * gy).sqrt() as f64;
         }
     }
+
     (total / ((w as f64) * (h as f64))) as f32
 }
 
@@ -107,7 +175,7 @@ pub fn frame_diff(a: &GrayImage, b: &GrayImage) -> f32 {
         .as_raw()
         .iter()
         .zip(b.as_raw().iter())
-        .map(|(&x, &y)| (x as i32 - y as i32).unsigned_abs() as u64)
+        .map(|(&x, &y)| x.abs_diff(y) as u64)
         .sum();
     total as f32 / n as f32
 }
@@ -169,11 +237,11 @@ pub fn rank_normalize_and_score(frames: &mut [ScoredFrame]) {
 fn rank_to_percentile(frames: &[ScoredFrame], key: impl Fn(&ScoredFrame) -> f32) -> Vec<f32> {
     let n = frames.len();
     let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| {
-        key(&frames[a])
-            .partial_cmp(&key(&frames[b]))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Stable sort with total_cmp: total_cmp matches partial_cmp ordering for
+    // finite values (so output is unchanged) but is faster and NaN-safe.
+    // Stability is load-bearing — tied raw values must map to deterministic
+    // percentiles, or selection becomes non-reproducible across runs.
+    idx.sort_by(|&a, &b| key(&frames[a]).total_cmp(&key(&frames[b])));
 
     let mut out = vec![0.0_f32; n];
     let denom = (n - 1) as f32;
@@ -195,12 +263,7 @@ pub fn select_top_k(frames: &[ScoredFrame], k: usize, min_gap: f32) -> Vec<usize
         return Vec::new();
     }
     let mut order: Vec<usize> = (0..frames.len()).collect();
-    order.sort_by(|&a, &b| {
-        frames[b]
-            .score
-            .partial_cmp(&frames[a].score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    order.sort_by(|&a, &b| frames[b].score.total_cmp(&frames[a].score));
 
     let mut chosen: Vec<usize> = Vec::with_capacity(k);
     for &i in &order {
@@ -214,12 +277,7 @@ pub fn select_top_k(frames: &[ScoredFrame], k: usize, min_gap: f32) -> Vec<usize
             chosen.push(i);
         }
     }
-    chosen.sort_by(|&a, &b| {
-        frames[a]
-            .ts
-            .partial_cmp(&frames[b].ts)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    chosen.sort_by(|&a, &b| frames[a].ts.total_cmp(&frames[b].ts));
     chosen
 }
 
@@ -245,12 +303,7 @@ pub fn pick_heroes(selected: &[ScoredFrame]) -> Vec<usize> {
     let threshold = mean + std;
 
     let mut heroes: Vec<usize> = (0..n).filter(|&i| selected[i].score >= threshold).collect();
-    heroes.sort_by(|&a, &b| {
-        selected[b]
-            .score
-            .partial_cmp(&selected[a].score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    heroes.sort_by(|&a, &b| selected[b].score.total_cmp(&selected[a].score));
     heroes.truncate(3);
     heroes
 }
@@ -300,6 +353,42 @@ mod tests {
         let black = GrayImage::from_pixel(8, 8, Luma([0]));
         let white = GrayImage::from_pixel(8, 8, Luma([255]));
         assert_eq!(frame_diff(&black, &white), 255.0);
+    }
+
+    /// Naive fully-clamped Laplacian variance — the reference the optimized
+    /// interior/border split must match exactly.
+    fn clarity_naive(g: &GrayImage) -> f32 {
+        let (w, h) = g.dimensions();
+        let at = |x: i64, y: i64| {
+            let xc = x.clamp(0, w as i64 - 1) as u32;
+            let yc = y.clamp(0, h as i64 - 1) as u32;
+            g.get_pixel(xc, yc).0[0] as f32
+        };
+        let (mut sum, mut sq) = (0.0_f64, 0.0_f64);
+        for y in 0..h as i64 {
+            for x in 0..w as i64 {
+                let lap = at(x, y - 1) + at(x - 1, y) + at(x + 1, y) + at(x, y + 1)
+                    - 4.0 * at(x, y);
+                sum += lap as f64;
+                sq += (lap as f64) * (lap as f64);
+            }
+        }
+        let n = (w as f64) * (h as f64);
+        let mean = sum / n;
+        (sq / n - mean * mean) as f32
+    }
+
+    #[test]
+    fn fast_clarity_matches_naive_clamped() {
+        // A varied gradient+checker pattern exercises interior and border alike.
+        let mut g = GrayImage::new(13, 9);
+        for y in 0..9u32 {
+            for x in 0..13u32 {
+                let v = ((x * 17 + y * 31 + (x ^ y) * 5) % 256) as u8;
+                g.put_pixel(x, y, Luma([v]));
+            }
+        }
+        assert_eq!(clarity(&g), clarity_naive(&g), "interior path must match");
     }
 
     #[test]

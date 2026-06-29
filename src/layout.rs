@@ -59,16 +59,16 @@ pub fn compute(n: usize, heroes: &[usize], aspect: f32, preset: &Preset) -> Layo
         return Layout { rects: Vec::new(), canvas_w: 0, canvas_h: 0, template: "UNIFORM" };
     }
 
-    let hero_set: Vec<bool> = {
-        let mut v = vec![false; n];
-        for &h in heroes {
-            if h < n {
-                v[h] = true;
-            }
+    // Mark hero frames, deduplicating and counting in a single pass: a caller
+    // may pass the same index twice, which must not place two 2×2 blocks.
+    let mut hero_set = vec![false; n];
+    let mut hero_count = 0;
+    for &h in heroes {
+        if h < n && !hero_set[h] {
+            hero_set[h] = true;
+            hero_count += 1;
         }
-        v
-    };
-    let hero_count = hero_set.iter().filter(|&&b| b).count();
+    }
 
     // Weighted cell demand: a hero needs 4 cells, a normal 1.
     let weighted = (n - hero_count) + 4 * hero_count;
@@ -82,7 +82,8 @@ pub fn compute(n: usize, heroes: &[usize], aspect: f32, preset: &Preset) -> Layo
     let mut grid_cells: Vec<Option<(usize, usize, usize, usize)>> = vec![None; n];
 
     for &h in heroes {
-        if h >= n {
+        // Skip out-of-range and already-placed duplicates.
+        if h >= n || grid_cells[h].is_some() {
             continue;
         }
         if let Some((gx, gy)) = find_block(&occupied, cols, rows, 2, 2, landscape) {
@@ -260,6 +261,17 @@ mod tests {
         let hero = l.rects[0];
         let normal = l.rects[1];
         assert!(hero.w > normal.w && hero.h > normal.h, "hero must be bigger");
+    }
+
+    #[test]
+    fn deduplicates_repeated_hero_index() {
+        // A repeated index must place one 2×2 block, not two, and leave a valid
+        // grid. HERO_LEFT (single hero) is the correct template.
+        let l = compute(10, &[0, 0], 16.0 / 9.0, &preset());
+        assert_eq!(l.template, "HERO_LEFT");
+        assert_valid(&l);
+        let placed = l.rects.iter().filter(|r| r.w > 0 && r.h > 0).count();
+        assert_eq!(placed, 10, "all frames placed exactly once");
     }
 
     #[test]

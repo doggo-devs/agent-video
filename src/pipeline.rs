@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 
 use crate::types::{
     GridMeta, KeyFrameMeta, Metadata, Preset, ScoredFrame, Settings,
@@ -40,33 +41,42 @@ pub fn process(
     let chunks = chunk_by_seconds(deduped, CHUNK_SECONDS);
     let capacity = layout::grid_capacity(preset, aspect);
 
-    let mut grid_metas = Vec::new();
-    for (ci, mut chunk) in chunks.into_iter().enumerate() {
-        if chunk.is_empty() {
-            continue;
-        }
-        // Score within the chunk.
-        score::compute_raw(&mut chunk);
-        score::rank_normalize_and_score(&mut chunk);
+    // Each chunk is independent: score → select → layout → render → write JPEG.
+    // JPEG encoding dominates and parallelizes cleanly. Carry the chunk index
+    // through so grid numbering and metadata order stay deterministic regardless
+    // of completion order.
+    let mut grid_metas: Vec<(usize, GridMeta)> = chunks
+        .into_par_iter()
+        .enumerate()
+        .filter(|(_, chunk)| !chunk.is_empty())
+        .map(|(ci, mut chunk)| -> Result<(usize, GridMeta)> {
+            // Score within the chunk.
+            score::compute_raw(&mut chunk);
+            score::rank_normalize_and_score(&mut chunk);
 
-        // Select top-k with temporal NMS.
-        let span = chunk_span(&chunk);
-        let min_gap = (0.5 * span / capacity.max(1) as f32).max(MIN_GAP_FLOOR);
-        let selected = score::select_top_k(&chunk, capacity, min_gap);
-        let picked: Vec<ScoredFrame> = selected.iter().map(|&i| chunk[i].clone()).collect();
+            // Select top-k with temporal NMS.
+            let span = chunk_span(&chunk);
+            let min_gap = (0.5 * span / capacity.max(1) as f32).max(MIN_GAP_FLOOR);
+            let selected = score::select_top_k(&chunk, capacity, min_gap);
+            let picked: Vec<ScoredFrame> = selected.iter().map(|&i| chunk[i].clone()).collect();
 
-        // Heroes drive the layout template.
-        let heroes = score::pick_heroes(&picked);
-        let lay = layout::compute(picked.len(), &heroes, aspect, preset);
+            // Heroes drive the layout template.
+            let heroes = score::pick_heroes(&picked);
+            let lay = layout::compute(picked.len(), &heroes, aspect, preset);
 
-        // Compose and write.
-        let jpeg = compose::render(&picked, &lay, &heroes)?;
-        let file = format!("grid_{:03}.jpg", ci + 1);
-        fs::write(out_dir.join(&file), &jpeg)
-            .with_context(|| format!("writing {file}"))?;
+            // Compose and write.
+            let jpeg = compose::render(&picked, &lay, &heroes)?;
+            let file = format!("grid_{:03}.jpg", ci + 1);
+            fs::write(out_dir.join(&file), &jpeg)
+                .with_context(|| format!("writing {file}"))?;
 
-        grid_metas.push(build_grid_meta(&file, &picked, &heroes, lay.template));
-    }
+            Ok((ci, build_grid_meta(&file, &picked, &heroes, lay.template)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Restore chunk order lost to parallel completion.
+    grid_metas.sort_by_key(|(ci, _)| *ci);
+    let grid_metas: Vec<GridMeta> = grid_metas.into_iter().map(|(_, m)| m).collect();
 
     // Subtitles (optional).
     if let Some(text) = subtitle::extract(input).ok().flatten() {

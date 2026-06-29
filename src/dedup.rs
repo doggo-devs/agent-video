@@ -7,7 +7,10 @@
 //! is distinct from the temporal NMS in [`crate::score`], which spreads the
 //! finally-selected frames across the timeline.
 
+use std::collections::VecDeque;
+
 use image_hasher::{HasherConfig, ImageHash};
+use rayon::prelude::*;
 
 use crate::types::ScoredFrame;
 
@@ -20,27 +23,37 @@ const WINDOW: usize = 8;
 ///
 /// Consumes the input and returns the kept frames in order. The first frame is
 /// always kept. Comparison uses pHash (DCT-based) Hamming distance.
+///
+/// Hashing is the expensive part (scale + grayscale + DCT) and is independent
+/// per frame, so every hash is computed up front in parallel. The keep/drop
+/// decision is inherently sequential — whether a frame survives depends on which
+/// earlier frames were kept — so it runs serially over the precomputed hashes,
+/// doing only cheap integer Hamming comparisons.
 pub fn deduplicate(frames: Vec<ScoredFrame>, hash_threshold: u32) -> Vec<ScoredFrame> {
     let hasher = HasherConfig::new().to_hasher();
-    let mut window: Vec<ImageHash> = Vec::with_capacity(WINDOW);
+
+    // Phase 1 (parallel): hash every frame. The scoring grayscale is hashed
+    // directly by reference — `image_hasher`'s `Image for GrayImage` borrows it,
+    // so there is no clone.
+    let hashes: Vec<ImageHash> = frames
+        .par_iter()
+        .map(|frame| hasher.hash_image(&frame.gray))
+        .collect();
+
+    // Phase 2 (sequential): sliding-window keep/drop over the precomputed
+    // hashes. `VecDeque` evicts the oldest hash in O(1).
+    let mut window: VecDeque<&ImageHash> = VecDeque::with_capacity(WINDOW);
     let mut kept: Vec<ScoredFrame> = Vec::with_capacity(frames.len());
 
-    for frame in frames {
-        // The scoring grayscale is what we hash — small and already uniform.
-        let dyn_img = image::DynamicImage::ImageLuma8(frame.gray.clone());
-        let hash = hasher.hash_image(&dyn_img);
-
-        let is_dup = window
-            .iter()
-            .any(|h| h.dist(&hash) <= hash_threshold);
+    for (frame, hash) in frames.into_iter().zip(&hashes) {
+        let is_dup = window.iter().any(|h| h.dist(hash) <= hash_threshold);
         if is_dup {
             continue;
         }
-
         if window.len() == WINDOW {
-            window.remove(0);
+            window.pop_front();
         }
-        window.push(hash);
+        window.push_back(hash);
         kept.push(frame);
     }
 
