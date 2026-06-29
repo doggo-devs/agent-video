@@ -11,34 +11,29 @@ use serde::Serialize;
 
 /// Raw per-dimension scores, in their natural (incomparable) units.
 ///
-/// These are absolute values: `clarity` is a Laplacian variance (hundreds to
-/// tens of thousands), `edge_density` a Sobel energy mean, `scene_diff` a mean
-/// absolute pixel difference (0-255). They are only meaningful *after*
-/// per-chunk rank normalization — see [`crate::score`].
+/// Only meaningful after per-chunk rank normalization — see [`crate::score`].
+/// `clarity` is a Laplacian variance, `edge_density` a Sobel energy mean,
+/// `scene_diff` a mean absolute pixel difference (0-255).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RawScores {
-    /// Laplacian variance. Higher is sharper.
     pub clarity: f32,
-    /// Sobel energy mean. Higher means richer edge content.
     pub edge_density: f32,
     /// Mean absolute grayscale difference from the previous kept frame.
     pub scene_diff: f32,
 }
 
 /// A single sampled frame carrying everything the pipeline needs downstream.
-///
-/// Holds only the downscaled derivatives, never the source-resolution buffer.
+/// Holds only downscaled derivatives, never the source-resolution buffer.
 #[derive(Debug, Clone)]
 pub struct ScoredFrame {
-    /// Presentation timestamp in seconds, derived as `frame_index / fps`.
+    /// Presentation timestamp in seconds.
     pub ts: f32,
-    /// Small grayscale image used for all scoring convolutions.
+    /// Small grayscale image used for scoring convolutions.
     pub gray: GrayImage,
-    /// Small RGB image (cell-sized) pasted onto the grid during composition.
+    /// Small RGB image pasted onto the grid during composition.
     pub rgb: RgbImage,
-    /// Absolute per-dimension scores.
     pub raw: RawScores,
-    /// Final weighted score in `0..=100`, filled in after rank normalization.
+    /// Final weighted score in `0..=100`, filled after rank normalization.
     pub score: f32,
 }
 
@@ -72,6 +67,17 @@ pub enum Quality {
     High,
 }
 
+impl Quality {
+    /// Lowercase tier name as written into `metadata.json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Quality::Low => "low",
+            Quality::Medium => "medium",
+            Quality::High => "high",
+        }
+    }
+}
+
 /// Detail tier: controls sampling fps, dedup strictness, and clarity filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detail {
@@ -80,18 +86,28 @@ pub enum Detail {
     Fine,
 }
 
+impl Detail {
+    /// Lowercase tier name as written into `metadata.json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Detail::Coarse => "coarse",
+            Detail::Standard => "standard",
+            Detail::Fine => "fine",
+        }
+    }
+}
+
 /// Fully resolved processing parameters, merged from model preset + quality +
-/// detail tiers. The whole layout engine derives from `max_pixels`, `aspect`
-/// is supplied separately at layout time.
+/// detail tiers. `aspect` is supplied separately at layout time.
 #[derive(Debug, Clone, Copy)]
 pub struct Preset {
-    /// Canvas area budget in pixels. Constrains total area, not edge length.
+    /// Canvas area budget (pixel edge length, not area).
     pub max_pixels: u32,
     /// Minimum readable edge length for a single frame cell, in pixels.
     pub min_frame_size: u32,
     /// Canvas scale multiplier from the quality tier (0.5 / 0.75 / 1.0).
     pub canvas_scale: f32,
-    /// Base sampling frames-per-second before the dynamic governor adjusts it.
+    /// Base sampling fps before any dynamic governor adjustments.
     pub base_fps: f32,
     /// pHash Hamming distance threshold; frames closer than this are dropped.
     pub hash_threshold: u32,
@@ -100,11 +116,14 @@ pub struct Preset {
 /// Metadata for one rendered grid image.
 #[derive(Debug, Clone, Serialize)]
 pub struct GridMeta {
-    pub file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
     pub time_range: String,
     pub total_frames: usize,
     pub key_frames: Vec<KeyFrameMeta>,
     pub layout: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base64: Option<String>,
 }
 
 /// Metadata for a single key (hero) frame inside a grid.

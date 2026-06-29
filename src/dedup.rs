@@ -17,54 +17,71 @@ use crate::types::ScoredFrame;
 /// How many recently-kept hashes to compare against. A short window catches
 /// repeats across brief dips without letting slow drift accumulate into a
 /// missed duplicate.
-const WINDOW: usize = 8;
+const DEFAULT_WINDOW: usize = 8;
 
-/// Drop frames that are perceptually within `hash_threshold` of a recent frame.
+/// Streaming perceptual-hash deduplicator.
 ///
-/// Consumes the input and returns the kept frames in order. The first frame is
-/// always kept. Comparison uses pHash (DCT-based) Hamming distance.
-///
-/// Hashing is the expensive part (scale + grayscale + DCT) and is independent
-/// per frame, so every hash is computed up front in parallel. The keep/drop
-/// decision is inherently sequential — whether a frame survives depends on which
-/// earlier frames were kept — so it runs serially over the precomputed hashes,
-/// doing only cheap integer Hamming comparisons.
-pub fn deduplicate(frames: Vec<ScoredFrame>, hash_threshold: u32) -> Vec<ScoredFrame> {
-    let hasher = HasherConfig::new().to_hasher();
+/// Retains only the hashes of recently-kept frames so duplicates are dropped
+/// before they reach the scoring buffer.
+pub struct Deduper {
+    hasher: image_hasher::Hasher,
+    recent: VecDeque<ImageHash>,
+    hash_threshold: u32,
+    window_size: usize,
+}
 
-    // Phase 1 (parallel): hash every frame. The scoring grayscale is hashed
-    // directly by reference — `image_hasher`'s `Image for GrayImage` borrows it,
-    // so there is no clone.
-    let hashes: Vec<ImageHash> = frames
-        .par_iter()
-        .map(|frame| hasher.hash_image(&frame.gray))
-        .collect();
-
-    // Phase 2 (sequential): sliding-window keep/drop over the precomputed
-    // hashes. `VecDeque` evicts the oldest hash in O(1).
-    let mut window: VecDeque<&ImageHash> = VecDeque::with_capacity(WINDOW);
-    let mut kept: Vec<ScoredFrame> = Vec::with_capacity(frames.len());
-
-    for (frame, hash) in frames.into_iter().zip(&hashes) {
-        let is_dup = window.iter().any(|h| h.dist(hash) <= hash_threshold);
-        if is_dup {
-            continue;
+impl Deduper {
+    pub fn new(hash_threshold: u32, window: usize) -> Self {
+        let window_size = if window == 0 { DEFAULT_WINDOW } else { window };
+        Self {
+            hasher: HasherConfig::new().to_hasher(),
+            recent: VecDeque::with_capacity(window_size),
+            hash_threshold,
+            window_size,
         }
-        if window.len() == WINDOW {
-            window.pop_front();
-        }
-        window.push_back(hash);
-        kept.push(frame);
     }
 
-    kept
+    /// Drop duplicates from a bounded batch while preserving frame order.
+    ///
+    /// Hashing within the batch runs in parallel; the keep/drop decisions remain
+    /// sequential so results match the streaming single-frame path.
+    pub fn filter(&mut self, frames: Vec<ScoredFrame>) -> Vec<ScoredFrame> {
+        let hashes: Vec<ImageHash> = frames
+            .par_iter()
+            .map(|frame| self.hasher.hash_image(&frame.gray))
+            .collect();
+
+        let mut kept = Vec::with_capacity(frames.len());
+        for (frame, hash) in frames.into_iter().zip(hashes) {
+            if self.accepts_hash(hash) {
+                kept.push(frame);
+            }
+        }
+        kept
+    }
+
+    fn accepts_hash(&mut self, hash: ImageHash) -> bool {
+        let is_dup = self
+            .recent
+            .iter()
+            .any(|recent| recent.dist(&hash) <= self.hash_threshold);
+        if is_dup {
+            return false;
+        }
+
+        if self.recent.len() == self.window_size {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(hash);
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{GrayImage, RgbImage};
     use crate::types::RawScores;
+    use image::{GrayImage, RgbImage};
 
     /// Build a frame whose grayscale is a flat fill of `level`.
     fn flat_frame(ts: f32, level: u8) -> ScoredFrame {
@@ -77,9 +94,13 @@ mod tests {
         }
     }
 
+    fn dedup(frames: Vec<ScoredFrame>, threshold: u32, window: usize) -> Vec<ScoredFrame> {
+        Deduper::new(threshold, window).filter(frames)
+    }
+
     #[test]
     fn keeps_first_frame_always() {
-        let kept = deduplicate(vec![flat_frame(0.0, 128)], 8);
+        let kept = dedup(vec![flat_frame(0.0, 128)], 8, 8);
         assert_eq!(kept.len(), 1);
     }
 
@@ -90,7 +111,7 @@ mod tests {
             flat_frame(1.0, 100),
             flat_frame(2.0, 100),
         ];
-        let kept = deduplicate(frames, 8);
+        let kept = dedup(frames, 8, 8);
         assert_eq!(kept.len(), 1, "identical frames collapse to one");
     }
 
@@ -113,7 +134,7 @@ mod tests {
             raw: RawScores::default(),
             score: 0.0,
         };
-        let kept = deduplicate(vec![mk(0.0, a), mk(1.0, b)], 8);
+        let kept = dedup(vec![mk(0.0, a), mk(1.0, b)], 8, 8);
         assert_eq!(kept.len(), 2, "distinct frames are both kept");
     }
 }

@@ -39,7 +39,6 @@ pub fn grid_capacity(preset: &Preset, aspect: f32) -> usize {
     ((edge * edge) / cell_area).floor().max(1.0) as usize
 }
 
-/// Template name for a hero count.
 fn template_name(hero_count: usize) -> &'static str {
     match hero_count {
         0 => "UNIFORM",
@@ -56,7 +55,12 @@ fn template_name(hero_count: usize) -> &'static str {
 /// `rects` are aligned with the input frame order.
 pub fn compute(n: usize, heroes: &[usize], aspect: f32, preset: &Preset) -> Layout {
     if n == 0 {
-        return Layout { rects: Vec::new(), canvas_w: 0, canvas_h: 0, template: "UNIFORM" };
+        return Layout {
+            rects: Vec::new(),
+            canvas_w: 0,
+            canvas_h: 0,
+            template: "UNIFORM",
+        };
     }
 
     // Mark hero frames, deduplicating and counting in a single pass: a caller
@@ -82,7 +86,6 @@ pub fn compute(n: usize, heroes: &[usize], aspect: f32, preset: &Preset) -> Layo
     let mut grid_cells: Vec<Option<(usize, usize, usize, usize)>> = vec![None; n];
 
     for &h in heroes {
-        // Skip out-of-range and already-placed duplicates.
         if h >= n || grid_cells[h].is_some() {
             continue;
         }
@@ -101,9 +104,8 @@ pub fn compute(n: usize, heroes: &[usize], aspect: f32, preset: &Preset) -> Layo
         }
     }
 
-    // Pixel sizing: keep cell aspect = aspect, cap the longer canvas edge.
+    // Pixel sizing: keep cell aspect = source aspect, cap the longer canvas edge.
     let max_edge = preset.max_pixels as f32 * preset.canvas_scale;
-    // longer edge = cell_h × max(cols·aspect, rows)
     let cell_h = max_edge / (cols as f32 * aspect).max(rows as f32);
     let cell_w = cell_h * aspect;
 
@@ -117,17 +119,32 @@ pub fn compute(n: usize, heroes: &[usize], aspect: f32, preset: &Preset) -> Layo
                 let y0 = (*gy as f32 * cell_h).round() as u32;
                 let x1 = ((*gx + *gw) as f32 * cell_w).round() as u32;
                 let y1 = ((*gy + *gh) as f32 * cell_h).round() as u32;
-                Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+                Rect {
+                    x: x0,
+                    y: y0,
+                    w: x1 - x0,
+                    h: y1 - y0,
+                }
             }
             // Unplaced (packer ran out of room) — zero-size, skipped by compose.
-            None => Rect { x: 0, y: 0, w: 0, h: 0 },
+            None => Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
         })
         .collect();
 
     let canvas_w = (cols as f32 * cell_w).round() as u32;
     let canvas_h = (rows as f32 * cell_h).round() as u32;
 
-    Layout { rects, canvas_w, canvas_h, template: template_name(hero_count) }
+    Layout {
+        rects,
+        canvas_w,
+        canvas_h,
+        template: template_name(hero_count),
+    }
 }
 
 /// Choose `(cols, rows)` so `cols × rows ≥ weighted` and the canvas (cells
@@ -193,7 +210,6 @@ fn find_block(
     None
 }
 
-/// Mark a `bw × bh` block as occupied.
 fn mark(occupied: &mut [bool], cols: usize, gx: usize, gy: usize, bw: usize, bh: usize) {
     for dy in 0..bh {
         for dx in 0..bw {
@@ -211,7 +227,6 @@ mod tests {
         crate::preset::resolve_preset(8000, Quality::High, Detail::Standard)
     }
 
-    /// No rectangle overlaps another, and all sit within the canvas.
     fn assert_valid(layout: &Layout) {
         let rs: Vec<_> = layout.rects.iter().filter(|r| r.w > 0 && r.h > 0).collect();
         for r in &rs {
@@ -224,7 +239,12 @@ mod tests {
         }
         for i in 0..rs.len() {
             for j in (i + 1)..rs.len() {
-                assert!(!rs[i].overlaps(rs[j]), "overlap: {:?} vs {:?}", rs[i], rs[j]);
+                assert!(
+                    !rs[i].overlaps(rs[j]),
+                    "overlap: {:?} vs {:?}",
+                    rs[i],
+                    rs[j]
+                );
             }
         }
     }
@@ -260,7 +280,10 @@ mod tests {
         assert_valid(&l);
         let hero = l.rects[0];
         let normal = l.rects[1];
-        assert!(hero.w > normal.w && hero.h > normal.h, "hero must be bigger");
+        assert!(
+            hero.w > normal.w && hero.h > normal.h,
+            "hero must be bigger"
+        );
     }
 
     #[test]
@@ -299,11 +322,14 @@ mod tests {
 
     #[test]
     fn capacity_is_larger_for_lower_quality_canvas() {
-        let hi = grid_capacity(&crate::preset::resolve_preset(8000, Quality::High, Detail::Standard), 1.0);
-        let lo = grid_capacity(&crate::preset::resolve_preset(8000, Quality::Low, Detail::Standard), 1.0);
-        // Low quality: smaller min frame (256 vs 512) but half canvas scale.
-        // Net: 256²·... vs 512²·... with 0.5 edge → low fits same order; just
-        // assert both are positive and finite.
+        let hi = grid_capacity(
+            &crate::preset::resolve_preset(8000, Quality::High, Detail::Standard),
+            1.0,
+        );
+        let lo = grid_capacity(
+            &crate::preset::resolve_preset(8000, Quality::Low, Detail::Standard),
+            1.0,
+        );
         assert!(hi >= 1 && lo >= 1);
     }
 

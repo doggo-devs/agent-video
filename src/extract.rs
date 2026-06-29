@@ -8,12 +8,13 @@
 //! `showinfo` filter, which would force a second pipe and risk a deadlock when
 //! its buffer fills. Timestamps are derived as `index / fps`.
 //!
-//! Grayscale derivation (one per frame, for scoring) is independent across
-//! frames, so it runs in parallel after the frames are read off the pipe.
+//! Grayscale derivation (one per frame, for scoring) is independent across a
+//! caller-sized batch, so it can run in parallel without retaining the whole
+//! video in memory.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use image::imageops::FilterType;
@@ -22,56 +23,146 @@ use rayon::prelude::*;
 
 use crate::types::{RawScores, ScoredFrame};
 
-/// Fixed minimum edge for the grayscale scoring image. Scoring on a uniform
-/// scale keeps Laplacian variance / Sobel energy comparable across frames
-/// regardless of source resolution.
-const SCORE_EDGE: u32 = 256;
+/// Default edge length for the grayscale scoring image.
+const DEFAULT_SCORE_EDGE: u32 = 256;
 
-/// Result of sampling a video: the frames plus the source aspect ratio the
-/// layout engine needs.
-pub struct ExtractResult {
-    /// Source frame aspect ratio `width / height`. Constant for the whole clip.
-    pub aspect: f32,
-    pub frames: Vec<ScoredFrame>,
-}
-
-/// Sample `input` at `fps`, returning downscaled frames.
+/// One sampled RGB frame from ffmpeg, already downscaled for composition.
 ///
-/// `cell_min_edge` is the layout's minimum cell edge; the composition RGB is
-/// kept at that edge. Hero cells (up to 2×2) upscale modestly from it — an
-/// acceptable trade for bounded memory, since every extracted frame is held in
-/// RAM before dedup/selection runs. Raw scores are left at their defaults —
-/// [`crate::score`] fills them per chunk.
-pub fn extract_frames(input: &Path, fps: f32, cell_min_edge: u32) -> Result<ExtractResult> {
-    extract_inner(input, fps, cell_min_edge, None)
+/// The frame owns its pixel buffer. Call [`scored_frames_from_rgbs`] on a small
+/// batch to derive scoring grayscale images while keeping memory bounded by the
+/// batch size rather than by the full video.
+#[derive(Debug)]
+pub struct RgbFrame {
+    /// Presentation timestamp in seconds.
+    pub ts: f32,
+    /// Downscaled RGB image used later by composition.
+    pub rgb: RgbImage,
 }
 
-/// Like [`extract_frames`] but restricted to the time window `[start, end)`
-/// seconds. Timestamps in the result are absolute (offset by `start`).
-pub fn extract_range(
+/// Streaming reader over ffmpeg's PPM image pipe.
+///
+/// Frames are pulled one by one with [`FrameStream::next_frame`]. The stream
+/// waits for ffmpeg at EOF and reports a decoding failure if ffmpeg produced no
+/// frames. Dropping the stream early leaves child cleanup to the OS; callers in
+/// this crate consume it to EOF.
+pub struct FrameStream {
+    child: Child,
+    reader: BufReader<ChildStdout>,
+    tok: Vec<u8>,
+    fps: f32,
+    start_offset: f32,
+    idx: usize,
+    aspect: Option<f32>,
+    eof: bool,
+}
+
+impl FrameStream {
+    /// Return the source frame aspect ratio once at least one frame was read.
+    pub fn aspect(&self) -> Option<f32> {
+        self.aspect
+    }
+
+    /// Read the next sampled frame, or `None` after a clean EOF.
+    ///
+    /// The timestamp is derived as `start + index / fps`. On EOF this method
+    /// waits for ffmpeg and surfaces a non-zero exit status if no frame was
+    /// decoded.
+    pub fn next_frame(&mut self) -> Result<Option<RgbFrame>> {
+        if self.eof {
+            return Ok(None);
+        }
+
+        let Some(rgb) = read_ppm(&mut self.reader, &mut self.tok)? else {
+            self.eof = true;
+            let status = self.child.wait().context("waiting for ffmpeg")?;
+            if !status.success() && self.idx == 0 {
+                bail!("ffmpeg exited with {status} and produced no frames");
+            }
+            return Ok(None);
+        };
+
+        if self.aspect.is_none() {
+            let (w, h) = rgb.dimensions();
+            self.aspect = Some(w as f32 / h as f32);
+        }
+
+        let ts = self.start_offset + self.idx as f32 / self.fps;
+        self.idx += 1;
+        Ok(Some(RgbFrame { ts, rgb }))
+    }
+}
+
+/// Open a streaming extractor for the whole video.
+pub fn stream_frames(
     input: &Path,
     fps: f32,
     cell_min_edge: u32,
+    score_edge: u32,
+) -> Result<FrameStream> {
+    stream_inner(input, fps, cell_min_edge, score_edge, None)
+}
+
+/// Open a streaming extractor for `[start, end)` seconds.
+///
+/// Timestamps produced by [`FrameStream::next_frame`] are absolute, offset by
+/// `start`.
+pub fn stream_range(
+    input: &Path,
+    fps: f32,
+    cell_min_edge: u32,
+    score_edge: u32,
     start: f32,
     end: f32,
-) -> Result<ExtractResult> {
-    extract_inner(input, fps, cell_min_edge, Some((start, end)))
+) -> Result<FrameStream> {
+    stream_inner(input, fps, cell_min_edge, score_edge, Some((start, end)))
 }
 
-fn extract_inner(
+/// Convert a bounded RGB batch to [`ScoredFrame`]s, deriving grayscale in parallel.
+pub fn scored_frames_from_rgbs(frames: Vec<RgbFrame>, score_edge: u32) -> Vec<ScoredFrame> {
+    let score_edge = if score_edge == 0 {
+        DEFAULT_SCORE_EDGE
+    } else {
+        score_edge
+    };
+    frames
+        .into_par_iter()
+        .map(|frame| scored_frame_from_rgb(frame, score_edge))
+        .collect()
+}
+
+/// Convert a single RGB frame to a [`ScoredFrame`] with grayscale for scoring.
+pub fn scored_frame_from_rgb(frame: RgbFrame, score_edge: u32) -> ScoredFrame {
+    let score_edge = if score_edge == 0 {
+        DEFAULT_SCORE_EDGE
+    } else {
+        score_edge
+    };
+    ScoredFrame {
+        ts: frame.ts,
+        gray: to_gray(&frame.rgb, score_edge),
+        rgb: frame.rgb,
+        raw: RawScores::default(),
+        score: 0.0,
+    }
+}
+
+fn stream_inner(
     input: &Path,
     fps: f32,
     cell_min_edge: u32,
+    score_edge: u32,
     range: Option<(f32, f32)>,
-) -> Result<ExtractResult> {
+) -> Result<FrameStream> {
     let rgb_edge = cell_min_edge.max(1);
-    // ffmpeg pre-scales the shorter edge down to this in its optimized C
-    // (swscale) before the PPM hits the pipe — far cheaper than shipping
-    // full-resolution frames and resizing them in Rust, and it shrinks pipe
-    // bandwidth. `rgb_edge >= SCORE_EDGE` always (the smallest cell is 256),
-    // so the piped frame already serves as the composition RGB as-is; only the
-    // grayscale needs a further (cheap) downscale.
-    let pipe_edge = rgb_edge.max(SCORE_EDGE);
+    let score_edge = if score_edge == 0 {
+        DEFAULT_SCORE_EDGE
+    } else {
+        score_edge
+    };
+    // The piped frame doubles as the composition RGB, so pre-scale to the larger
+    // edge; `rgb_edge >= score_edge` typically, so only the grayscale downscales
+    // further.
+    let pipe_edge = rgb_edge.max(score_edge);
 
     let mut cmd = Command::new("ffmpeg");
     // Seek before -i for speed; -t bounds the duration read.
@@ -81,9 +172,8 @@ fn extract_inner(
     }
     // `force_original_aspect_ratio=increase` scales so the shorter edge lands
     // exactly on `pipe_edge`, preserving aspect.
-    let vf = format!(
-        "fps={fps},scale={pipe_edge}:{pipe_edge}:force_original_aspect_ratio=increase"
-    );
+    let vf =
+        format!("fps={fps},scale={pipe_edge}:{pipe_edge}:force_original_aspect_ratio=increase");
     let mut child = cmd
         .arg("-i")
         .arg(input)
@@ -96,44 +186,19 @@ fn extract_inner(
         .context("failed to spawn ffmpeg (is it on PATH?)")?;
 
     let stdout = child.stdout.take().expect("stdout was piped");
-    let mut reader = BufReader::new(stdout);
-
-    // Read the (already small) RGB frames sequentially off the pipe; deriving
-    // each grayscale is independent per frame, so that runs in parallel after.
-    let mut rgbs: Vec<RgbImage> = Vec::new();
-    let mut aspect = 1.0_f32;
-    while let Some(frame) = read_ppm(&mut reader)? {
-        if rgbs.is_empty() {
-            let (w, h) = frame.dimensions();
-            aspect = w as f32 / h as f32;
-        }
-        rgbs.push(frame);
-    }
-
-    let status = child.wait().context("waiting for ffmpeg")?;
-    if !status.success() && rgbs.is_empty() {
-        bail!("ffmpeg exited with {status} and produced no frames");
-    }
-
-    let start_offset = range.map(|(s, _)| s).unwrap_or(0.0);
-    let frames: Vec<ScoredFrame> = rgbs
-        .into_par_iter()
-        .enumerate()
-        .map(|(idx, rgb)| ScoredFrame {
-            ts: start_offset + idx as f32 / fps,
-            gray: to_gray(&rgb, SCORE_EDGE),
-            rgb,
-            raw: RawScores::default(),
-            score: 0.0,
-        })
-        .collect();
-
-    Ok(ExtractResult { aspect, frames })
+    Ok(FrameStream {
+        child,
+        reader: BufReader::new(stdout),
+        tok: Vec::new(),
+        fps,
+        start_offset: range.map(|(s, _)| s).unwrap_or(0.0),
+        idx: 0,
+        aspect: None,
+        eof: false,
+    })
 }
 
-/// Derive a grayscale image (shorter edge `min_edge`) from an already-small RGB
-/// frame. Converts in place (no full-image clone) and only resizes when the
-/// source is larger than the target.
+/// Downscale RGB to grayscale with shorter edge `min_edge`; no-op if already smaller.
 fn to_gray(img: &RgbImage, min_edge: u32) -> GrayImage {
     let gray = image::imageops::grayscale(img);
     let (w, h) = gray.dimensions();
@@ -159,72 +224,91 @@ fn target_dims(w: u32, h: u32, min_edge: u32) -> (u32, u32) {
 }
 
 /// Read one PPM (P6) image from a buffered reader, or `None` at clean EOF.
-fn read_ppm<R: BufRead>(r: &mut R) -> Result<Option<RgbImage>> {
-    let magic = match read_token(r)? {
-        None => return Ok(None),
-        Some(m) => m,
-    };
-    if magic != "P6" {
-        bail!("unexpected PPM magic: {magic:?}");
+/// `tok` is a scratch buffer reused across calls so header parsing allocates
+/// nothing per frame.
+fn read_ppm<R: BufRead>(r: &mut R, tok: &mut Vec<u8>) -> Result<Option<RgbImage>> {
+    if !read_token(r, tok)? {
+        return Ok(None);
     }
-    let w: u32 = read_token(r)?.context("eof in PPM header")?.parse()?;
-    let h: u32 = read_token(r)?.context("eof in PPM header")?.parse()?;
-    let maxval: u32 = read_token(r)?.context("eof in PPM header")?.parse()?;
+    if tok.as_slice() != b"P6" {
+        bail!("unexpected PPM magic: {:?}", String::from_utf8_lossy(tok));
+    }
+    let w = read_header_u32(r, tok)?;
+    let h = read_header_u32(r, tok)?;
+    let maxval = read_header_u32(r, tok)?;
     if maxval != 255 {
         bail!("unsupported PPM maxval {maxval} (expected 255)");
     }
 
-    let mut data = vec![0u8; (w as usize) * (h as usize) * 3];
-    r.read_exact(&mut data).context("eof in PPM pixel data")?;
+    // Avoid pre-zeroing: `vec![0u8; n]` would memset a frame that the read then
+    // fully overwrites. `take` + `read_to_end` fills uninitialised spare capacity
+    // directly (std's BorrowedBuf path) — no memset, no unsafe.
+    let n = (w as usize) * (h as usize) * 3;
+    let mut data = Vec::with_capacity(n);
+    (&mut *r)
+        .take(n as u64)
+        .read_to_end(&mut data)
+        .context("reading PPM pixel data")?;
+    if data.len() != n {
+        bail!("eof in PPM pixel data");
+    }
 
     RgbImage::from_raw(w, h, data)
         .map(Some)
         .context("PPM dimensions do not match pixel data")
 }
 
-/// Read one whitespace-delimited token from a PPM header, skipping leading
-/// whitespace and `#` comment lines. Consumes exactly one trailing whitespace
-/// byte as the terminator, so binary pixel data following `maxval` is untouched.
-/// Returns `None` at EOF before any token byte.
-fn read_token<R: BufRead>(r: &mut R) -> Result<Option<String>> {
-    let mut buf = Vec::new();
-    // Skip leading whitespace and comment lines.
+/// Read a numeric PPM-header token into `tok` and parse it, erroring on EOF.
+fn read_header_u32<R: BufRead>(r: &mut R, tok: &mut Vec<u8>) -> Result<u32> {
+    if !read_token(r, tok)? {
+        bail!("eof in PPM header");
+    }
+    let s = std::str::from_utf8(tok).context("non-utf8 in PPM header")?;
+    s.parse()
+        .with_context(|| format!("invalid PPM header number: {s:?}"))
+}
+
+/// Read one whitespace-delimited PPM-header token into `buf` (cleared first),
+/// skipping leading whitespace and `#` comment lines and consuming exactly one
+/// trailing whitespace byte, so the binary pixel data after `maxval` stays
+/// intact. Reuses `buf` across calls (no per-token allocation). Returns `false`
+/// at EOF before any token byte.
+fn read_token<R: BufRead>(r: &mut R, buf: &mut Vec<u8>) -> Result<bool> {
+    buf.clear();
+    let (mut in_comment, mut in_token) = (false, false);
     loop {
-        let mut b = [0u8; 1];
-        if r.read(&mut b)? == 0 {
-            return Ok(None);
+        let chunk = r.fill_buf()?;
+        if chunk.is_empty() {
+            // EOF finishes a token already being accumulated; otherwise none.
+            return Ok(in_token);
         }
-        let c = b[0];
-        if c == b'#' {
-            loop {
-                let mut d = [0u8; 1];
-                if r.read(&mut d)? == 0 {
-                    return Ok(None);
+        let mut consumed = chunk.len();
+        let mut done = false;
+        for (i, &c) in chunk.iter().enumerate() {
+            if in_comment {
+                if c == b'\n' {
+                    in_comment = false;
                 }
-                if d[0] == b'\n' {
-                    break;
+            } else if !in_token {
+                if c == b'#' {
+                    in_comment = true;
+                } else if !c.is_ascii_whitespace() {
+                    in_token = true;
+                    buf.push(c);
                 }
+            } else if c.is_ascii_whitespace() {
+                consumed = i + 1; // consume through the terminator
+                done = true;
+                break;
+            } else {
+                buf.push(c);
             }
-            continue;
         }
-        if c.is_ascii_whitespace() {
-            continue;
+        r.consume(consumed); // chunk borrow ends here, so consume is allowed
+        if done {
+            return Ok(true);
         }
-        buf.push(c);
-        break;
     }
-    // Accumulate until the terminating whitespace byte.
-    loop {
-        let mut b = [0u8; 1];
-        if r.read(&mut b)? == 0 {
-            break;
-        }
-        if b[0].is_ascii_whitespace() {
-            break;
-        }
-        buf.push(b[0]);
-    }
-    Ok(Some(String::from_utf8(buf)?))
 }
 
 #[cfg(test)]
@@ -237,7 +321,9 @@ mod tests {
         // 2x1 image: red, green pixels.
         let bytes = b"P6\n2 1\n255\n\xff\x00\x00\x00\xff\x00";
         let mut r = Cursor::new(&bytes[..]);
-        let img = read_ppm(&mut r).expect("parse ok").expect("one frame");
+        let img = read_ppm(&mut r, &mut Vec::new())
+            .expect("parse ok")
+            .expect("one frame");
         assert_eq!(img.dimensions(), (2, 1));
         assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0]);
         assert_eq!(img.get_pixel(1, 0).0, [0, 255, 0]);
@@ -246,7 +332,7 @@ mod tests {
     #[test]
     fn returns_none_at_clean_eof() {
         let mut r = Cursor::new(&b""[..]);
-        assert!(read_ppm(&mut r).expect("ok").is_none());
+        assert!(read_ppm(&mut r, &mut Vec::new()).expect("ok").is_none());
     }
 
     #[test]
@@ -256,17 +342,33 @@ mod tests {
         bytes.extend_from_slice(one);
         bytes.extend_from_slice(one);
         let mut r = Cursor::new(bytes);
-        assert!(read_ppm(&mut r).expect("ok").is_some());
-        assert!(read_ppm(&mut r).expect("ok").is_some());
-        assert!(read_ppm(&mut r).expect("ok").is_none());
+        let mut tok = Vec::new();
+        assert!(read_ppm(&mut r, &mut tok).expect("ok").is_some());
+        assert!(read_ppm(&mut r, &mut tok).expect("ok").is_some());
+        assert!(read_ppm(&mut r, &mut tok).expect("ok").is_none());
     }
 
     #[test]
     fn skips_comment_in_header() {
         let bytes = b"P6\n# generated by test\n1 1\n255\n\xaa\xbb\xcc";
         let mut r = Cursor::new(&bytes[..]);
-        let img = read_ppm(&mut r).expect("ok").expect("frame");
+        let img = read_ppm(&mut r, &mut Vec::new())
+            .expect("ok")
+            .expect("frame");
         assert_eq!(img.get_pixel(0, 0).0, [0xaa, 0xbb, 0xcc]);
+    }
+
+    #[test]
+    fn parses_header_split_across_buffer_refills() {
+        // Capacity-1 BufReader makes fill_buf yield one byte at a time, so the
+        // token state machine must survive a refill mid-token and mid-comment.
+        let bytes = b"P6\n# split header\n2 1\n255\n\xff\x00\x00\x00\xff\x00";
+        let mut r = BufReader::with_capacity(1, Cursor::new(&bytes[..]));
+        let img = read_ppm(&mut r, &mut Vec::new())
+            .expect("ok")
+            .expect("frame");
+        assert_eq!(img.dimensions(), (2, 1));
+        assert_eq!(img.get_pixel(1, 0).0, [0, 255, 0]);
     }
 
     #[test]

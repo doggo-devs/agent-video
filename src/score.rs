@@ -18,22 +18,19 @@ use rayon::prelude::*;
 
 use crate::types::{RawScores, ScoredFrame};
 
-/// Weight of the scene-change dimension in the final score.
-const W_SCENE: f32 = 0.40;
-/// Weight of the clarity dimension.
-const W_CLARITY: f32 = 0.35;
-/// Weight of the edge-density dimension.
-const W_EDGE: f32 = 0.25;
+/// Scoring dimension weights, passed from the profile.
+#[derive(Debug, Clone, Copy)]
+pub struct Weights {
+    pub scene: f32,
+    pub clarity: f32,
+    pub edge: f32,
+}
 
 /// Laplacian variance: a focus/sharpness measure. Higher is sharper.
 ///
-/// Convolves with the 3×3 kernel `[[0,1,0],[1,-4,1],[0,1,0]]` (edges clamped)
-/// and returns the variance of the response. A blurred frame has a low-variance
-/// (flat) Laplacian; a sharp one has a spiky response.
-///
-/// The interior (every pixel with all four neighbours in bounds) is walked with
-/// direct slice indexing — no per-pixel clamp or bounds check — so LLVM can
-/// vectorize it. The one-pixel border falls back to a clamped path, keeping the
+/// Convolves with `[[0,1,0],[1,-4,1],[0,1,0]]` (edges clamped) and returns the
+/// response variance. The interior uses plain slice indexing so LLVM can
+/// vectorize it; the one-pixel border falls back to clamped reads, keeping the
 /// result identical to a naive clamped convolution.
 pub fn clarity(gray: &GrayImage) -> f32 {
     let (w, h) = gray.dimensions();
@@ -51,7 +48,7 @@ pub fn clarity(gray: &GrayImage) -> f32 {
         sum_sq += (lap as f64) * (lap as f64);
     };
 
-    // Interior: all neighbours in bounds, plain indexing.
+    // Interior: all neighbours in bounds — plain indexing.
     if wu >= 3 && hu >= 3 {
         for y in 1..hu - 1 {
             let row = y * wu;
@@ -69,7 +66,7 @@ pub fn clarity(gray: &GrayImage) -> f32 {
         }
     }
 
-    // Border: clamped reads, identical to the naive path.
+    // Border: clamped reads.
     let at = |x: i64, y: i64| -> f32 {
         let xc = x.clamp(0, w as i64 - 1) as usize;
         let yc = y.clamp(0, h as i64 - 1) as usize;
@@ -94,11 +91,8 @@ pub fn clarity(gray: &GrayImage) -> f32 {
 
 /// Sobel energy mean: a content-richness measure.
 ///
-/// Applies horizontal and vertical Sobel kernels, takes the gradient magnitude
-/// `sqrt(gx² + gy²)` per pixel, and returns the mean (edges clamped).
-///
-/// Same interior/border split as [`clarity`]: the interior uses direct indexing
-/// for vectorization, the one-pixel border uses clamped reads.
+/// Applies horizontal and vertical Sobel kernels, takes `sqrt(gx² + gy²)` per
+/// pixel, and returns the mean. Same interior/border split as [`clarity`].
 pub fn edge_density(gray: &GrayImage) -> f32 {
     let (w, h) = gray.dimensions();
     if w == 0 || h == 0 {
@@ -213,7 +207,7 @@ pub fn compute_raw(frames: &mut [ScoredFrame]) {
 /// gets 100, and the rest interpolate linearly by rank position. Ties share the
 /// rank of their first occurrence. With fewer than two frames every score is
 /// 100 (a single frame is trivially the best of its chunk).
-pub fn rank_normalize_and_score(frames: &mut [ScoredFrame]) {
+pub fn rank_normalize_and_score(frames: &mut [ScoredFrame], weights: &Weights) {
     let n = frames.len();
     if n == 0 {
         return;
@@ -227,9 +221,12 @@ pub fn rank_normalize_and_score(frames: &mut [ScoredFrame]) {
     let edge_rank = rank_to_percentile(frames, |f| f.raw.edge_density);
     let scene_rank = rank_to_percentile(frames, |f| f.raw.scene_diff);
 
-    for i in 0..n {
-        frames[i].score =
-            W_SCENE * scene_rank[i] + W_CLARITY * clarity_rank[i] + W_EDGE * edge_rank[i];
+    for ((frame, &scene), (&clarity, &edge)) in frames
+        .iter_mut()
+        .zip(&scene_rank)
+        .zip(clarity_rank.iter().zip(&edge_rank))
+    {
+        frame.score = weights.scene * scene + weights.clarity * clarity + weights.edge * edge;
     }
 }
 
@@ -237,15 +234,13 @@ pub fn rank_normalize_and_score(frames: &mut [ScoredFrame]) {
 fn rank_to_percentile(frames: &[ScoredFrame], key: impl Fn(&ScoredFrame) -> f32) -> Vec<f32> {
     let n = frames.len();
     let mut idx: Vec<usize> = (0..n).collect();
-    // Stable sort with total_cmp: total_cmp matches partial_cmp ordering for
-    // finite values (so output is unchanged) but is faster and NaN-safe.
-    // Stability is load-bearing — tied raw values must map to deterministic
-    // percentiles, or selection becomes non-reproducible across runs.
+    // Stable sort is load-bearing: tied raw values must map to deterministic
+    // percentiles, or selection stops being reproducible across runs. total_cmp
+    // matches partial_cmp for finite values but is faster and NaN-safe.
     idx.sort_by(|&a, &b| key(&frames[a]).total_cmp(&key(&frames[b])));
 
     let mut out = vec![0.0_f32; n];
     let denom = (n - 1) as f32;
-    // `idx` is ascending: position 0 is the smallest (percentile 0).
     for (rank, &frame_i) in idx.iter().enumerate() {
         out[frame_i] = 100.0 * rank as f32 / denom;
     }
@@ -293,8 +288,11 @@ pub fn pick_heroes(selected: &[ScoredFrame]) -> Vec<usize> {
         return Vec::new();
     }
     let mean: f32 = selected.iter().map(|f| f.score).sum::<f32>() / n as f32;
-    let var: f32 =
-        selected.iter().map(|f| (f.score - mean).powi(2)).sum::<f32>() / n as f32;
+    let var: f32 = selected
+        .iter()
+        .map(|f| (f.score - mean).powi(2))
+        .sum::<f32>()
+        / n as f32;
     let std = var.sqrt();
     // No spread means no frame stands out — a uniform grid.
     if std < f32::EPSILON {
@@ -319,7 +317,11 @@ mod tests {
             ts,
             gray: GrayImage::new(1, 1),
             rgb: RgbImage::new(1, 1),
-            raw: RawScores { clarity, edge_density: edge, scene_diff: scene },
+            raw: RawScores {
+                clarity,
+                edge_density: edge,
+                scene_diff: scene,
+            },
             score: 0.0,
         }
     }
@@ -367,8 +369,8 @@ mod tests {
         let (mut sum, mut sq) = (0.0_f64, 0.0_f64);
         for y in 0..h as i64 {
             for x in 0..w as i64 {
-                let lap = at(x, y - 1) + at(x - 1, y) + at(x + 1, y) + at(x, y + 1)
-                    - 4.0 * at(x, y);
+                let lap =
+                    at(x, y - 1) + at(x - 1, y) + at(x + 1, y) + at(x, y + 1) - 4.0 * at(x, y);
                 sum += lap as f64;
                 sq += (lap as f64) * (lap as f64);
             }
@@ -400,7 +402,12 @@ mod tests {
             frame(1.0, 2.0, 2.0, 2.0),
             frame(2.0, 3.0, 3.0, 3.0),
         ];
-        rank_normalize_and_score(&mut fs);
+        let weights = Weights {
+            scene: 0.40,
+            clarity: 0.35,
+            edge: 0.25,
+        };
+        rank_normalize_and_score(&mut fs, &weights);
         assert!((fs[0].score - 0.0).abs() < 1e-3);
         assert!((fs[1].score - 50.0).abs() < 1e-3);
         assert!((fs[2].score - 100.0).abs() < 1e-3);
@@ -409,7 +416,12 @@ mod tests {
     #[test]
     fn single_frame_scores_full() {
         let mut fs = vec![frame(0.0, 9.0, 9.0, 9.0)];
-        rank_normalize_and_score(&mut fs);
+        let weights = Weights {
+            scene: 0.40,
+            clarity: 0.35,
+            edge: 0.25,
+        };
+        rank_normalize_and_score(&mut fs, &weights);
         assert_eq!(fs[0].score, 100.0);
     }
 

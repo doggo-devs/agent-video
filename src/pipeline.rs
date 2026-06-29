@@ -5,150 +5,439 @@
 //! meaningful relative to the frames they compete with, and a "minute" is the
 //! v1 unit of competition.
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::mem;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
-use anyhow::{Context, Result};
-use rayon::prelude::*;
+use anyhow::{Context, Result, anyhow};
 
-use crate::types::{
-    GridMeta, KeyFrameMeta, Metadata, Preset, ScoredFrame, Settings,
-};
+use crate::config::Config;
+use crate::types::{GridMeta, KeyFrameMeta, Metadata, ScoredFrame, Settings};
 use crate::{compose, dedup, extract, layout, score, subtitle};
 
-/// Seconds per grid chunk (the v1 "minute" unit).
-const CHUNK_SECONDS: f32 = 60.0;
+/// Lower bound for an extraction batch.
+///
+/// Very low sampling rates can produce tiny chunks. Keeping at least this many
+/// frames per batch amortizes rayon scheduling and pHash setup without moving
+/// the memory bound materially.
+const MIN_EXTRACT_BATCH_FRAMES: usize = 32;
 
-/// Floor on the temporal NMS gap so selection never collapses to one moment.
-const MIN_GAP_FLOOR: f32 = 0.5;
+/// Upper bound for an extraction batch.
+///
+/// This caps transient RGB+gray memory for high-fps profiles. The exact chunk
+/// boundary is still timestamp-driven after dedup, so this bound only controls
+/// conversion/dedup batching.
+const MAX_EXTRACT_BATCH_FRAMES: usize = 240;
 
-/// Run the full `process` pipeline and write all outputs into `out_dir`.
+/// Default max in-flight chunks (running + queued results awaiting emit).
+///
+/// Two is enough to overlap ffmpeg extraction with chunk scoring/encoding.
+/// Users can raise this with `-j` for more throughput at the cost of memory.
+pub const DEFAULT_IN_FLIGHT: usize = 2;
+
+/// Output mode: write files or JSON to stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    /// Write grid images and metadata.json to disk.
+    Files,
+    /// Output JSON with embedded base64 images to stdout.
+    Json,
+}
+
+/// Run the full `process` pipeline.
+///
+/// `threads` controls Rayon worker count (0 = Rayon default, i.e. CPU cores).
+/// `max_in_flight` bounds how many chunks can be processing/queued at once.
 pub fn process(
     input: &Path,
     out_dir: &Path,
-    preset: &Preset,
-    quality_label: &str,
-    detail_label: &str,
+    cfg: &Config,
+    mode: OutputMode,
+    threads: usize,
+    max_in_flight: usize,
 ) -> Result<()> {
-    fs::create_dir_all(out_dir)
-        .with_context(|| format!("creating output dir {}", out_dir.display()))?;
+    // Build a dedicated thread pool so -j controls actual parallelism.
+    let mut builder = rayon::ThreadPoolBuilder::new();
+    if threads > 0 {
+        builder = builder.num_threads(threads);
+    }
+    let pool = builder
+        .thread_name(|i| format!("vidgrid-{i}"))
+        .build()
+        .context("building rayon thread pool")?;
 
-    let res = extract::extract_frames(input, preset.base_fps, preset.min_frame_size)?;
-    let aspect = res.aspect;
-    let deduped = dedup::deduplicate(res.frames, preset.hash_threshold);
+    pool.install(|| process_inner(input, out_dir, cfg, mode, max_in_flight))
+}
 
-    let duration = deduped.last().map(|f| f.ts + 1.0 / preset.base_fps).unwrap_or(0.0);
-    let chunks = chunk_by_seconds(deduped, CHUNK_SECONDS);
-    let capacity = layout::grid_capacity(preset, aspect);
+fn process_inner(
+    input: &Path,
+    out_dir: &Path,
+    cfg: &Config,
+    mode: OutputMode,
+    max_in_flight: usize,
+) -> Result<()> {
+    if mode == OutputMode::Files {
+        fs::create_dir_all(out_dir)
+            .with_context(|| format!("creating output dir {}", out_dir.display()))?;
+    }
 
-    // Each chunk is independent: score → select → layout → render → write JPEG.
-    // JPEG encoding dominates and parallelizes cleanly. Carry the chunk index
-    // through so grid numbering and metadata order stay deterministic regardless
-    // of completion order.
-    let mut grid_metas: Vec<(usize, GridMeta)> = chunks
-        .into_par_iter()
-        .enumerate()
-        .filter(|(_, chunk)| !chunk.is_empty())
-        .map(|(ci, mut chunk)| -> Result<(usize, GridMeta)> {
-            // Score within the chunk.
-            score::compute_raw(&mut chunk);
-            score::rank_normalize_and_score(&mut chunk);
+    let write_files = mode == OutputMode::Files;
+    let mut stream =
+        extract::stream_frames(input, cfg.base_fps, cfg.min_frame_size, cfg.score_edge)?;
+    let mut state = ProcessState::new(cfg, write_files, max_in_flight);
 
-            // Select top-k with temporal NMS.
-            let span = chunk_span(&chunk);
-            let min_gap = (0.5 * span / capacity.max(1) as f32).max(MIN_GAP_FLOOR);
-            let selected = score::select_top_k(&chunk, capacity, min_gap);
-            let picked: Vec<ScoredFrame> = selected.iter().map(|&i| chunk[i].clone()).collect();
+    while let Some(frame) = stream.next_frame()? {
+        if let Some(aspect) = stream.aspect() {
+            state.set_aspect(aspect);
+        }
+        state.push_rgb(frame, out_dir)?;
+    }
+    let (duration, grid_metas) = state.finish(out_dir)?;
 
-            // Heroes drive the layout template.
-            let heroes = score::pick_heroes(&picked);
-            let lay = layout::compute(picked.len(), &heroes, aspect, preset);
-
-            // Compose and write.
-            let jpeg = compose::render(&picked, &lay, &heroes)?;
-            let file = format!("grid_{:03}.jpg", ci + 1);
-            fs::write(out_dir.join(&file), &jpeg)
-                .with_context(|| format!("writing {file}"))?;
-
-            Ok((ci, build_grid_meta(&file, &picked, &heroes, lay.template)))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    // Restore chunk order lost to parallel completion.
-    grid_metas.sort_by_key(|(ci, _)| *ci);
-    let grid_metas: Vec<GridMeta> = grid_metas.into_iter().map(|(_, m)| m).collect();
-
-    // Subtitles (optional).
-    if let Some(text) = subtitle::extract(input).ok().flatten() {
+    if write_files && let Some(text) = subtitle::extract(input).ok().flatten() {
         fs::write(out_dir.join("subtitles.txt"), text).context("writing subtitles.txt")?;
     }
 
-    // Metadata.
     let meta = Metadata {
         source: input.display().to_string(),
         duration,
         settings: Settings {
-            max_pixels: preset.max_pixels,
-            quality: quality_label.to_string(),
-            detail: detail_label.to_string(),
+            max_pixels: cfg.max_pixels,
+            quality: cfg.quality_label.to_string(),
+            detail: cfg.detail_label.to_string(),
         },
         grids: grid_metas,
     };
-    let json = serde_json::to_string_pretty(&meta).context("serializing metadata")?;
-    fs::write(out_dir.join("metadata.json"), json).context("writing metadata.json")?;
 
-    println!("wrote {} grid(s) to {}", meta.grids.len(), out_dir.display());
+    if write_files {
+        let json = serde_json::to_string_pretty(&meta).context("serializing metadata")?;
+        fs::write(out_dir.join("metadata.json"), json).context("writing metadata.json")?;
+        eprintln!(
+            "wrote {} grid(s) to {}",
+            meta.grids.len(),
+            out_dir.display()
+        );
+    } else {
+        let json = serde_json::to_string_pretty(&meta).context("serializing metadata")?;
+        println!("{json}");
+    }
+
     Ok(())
 }
 
+#[derive(Debug)]
+struct GridResult {
+    ci: usize,
+    jpeg: Vec<u8>,
+    meta: GridMeta,
+}
+
+#[derive(Clone, Copy)]
+struct ProcessChunkEnv {
+    preset: crate::types::Preset,
+    aspect: f32,
+    capacity: usize,
+    weights: score::Weights,
+    write_files: bool,
+    min_gap_floor: f32,
+    jpeg_quality: u8,
+    hero_border_px: u32,
+}
+
+struct ProcessState<'a> {
+    cfg: &'a Config,
+    env: ProcessChunkEnv,
+    deduper: dedup::Deduper,
+    rgb_batch: Vec<extract::RgbFrame>,
+    batch_frames: usize,
+    max_in_flight: usize,
+    current_chunk: Vec<ScoredFrame>,
+    current_key: Option<usize>,
+    next_chunk_ci: usize,
+    tx: Option<Sender<ChunkMsg>>,
+    rx: Receiver<ChunkMsg>,
+    ready: BTreeMap<usize, Result<GridResult>>,
+    outstanding: usize,
+    next_emit: usize,
+    duration: f32,
+    grid_metas: Vec<GridMeta>,
+}
+
+impl<'a> ProcessState<'a> {
+    fn new(cfg: &'a Config, write_files: bool, parallelism: usize) -> Self {
+        let preset = cfg.as_preset();
+        let (tx, rx) = mpsc::channel();
+        Self {
+            cfg,
+            env: ProcessChunkEnv {
+                preset,
+                aspect: 1.0,
+                capacity: layout::grid_capacity(&preset, 1.0),
+                weights: cfg.weights(),
+                write_files,
+                min_gap_floor: cfg.min_gap,
+                jpeg_quality: cfg.jpeg_quality,
+                hero_border_px: cfg.hero_border_px,
+            },
+            deduper: dedup::Deduper::new(cfg.hash_threshold, cfg.dedup_window),
+            rgb_batch: Vec::with_capacity(extract_batch_frames(cfg)),
+            batch_frames: extract_batch_frames(cfg),
+            max_in_flight: parallelism.max(1),
+            current_chunk: Vec::new(),
+            current_key: None,
+            next_chunk_ci: 0,
+            tx: Some(tx),
+            rx,
+            ready: BTreeMap::new(),
+            outstanding: 0,
+            next_emit: 0,
+            duration: 0.0,
+            grid_metas: Vec::new(),
+        }
+    }
+
+    fn set_aspect(&mut self, aspect: f32) {
+        self.env.aspect = aspect;
+        self.env.capacity = layout::grid_capacity(&self.env.preset, aspect);
+    }
+
+    fn push_rgb(&mut self, frame: extract::RgbFrame, out_dir: &Path) -> Result<()> {
+        self.rgb_batch.push(frame);
+        if self.rgb_batch.len() == self.batch_frames {
+            self.flush_extract_batch();
+            self.drain_results(out_dir, Some(self.max_in_flight))?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, out_dir: &Path) -> Result<(f32, Vec<GridMeta>)> {
+        self.flush_extract_batch();
+        self.flush_current_chunk();
+        self.tx = None;
+        self.drain_results(out_dir, Some(0))?;
+        Ok((self.duration, self.grid_metas))
+    }
+
+    fn flush_extract_batch(&mut self) {
+        if self.rgb_batch.is_empty() {
+            return;
+        }
+
+        let frames =
+            extract::scored_frames_from_rgbs(mem::take(&mut self.rgb_batch), self.cfg.score_edge);
+        for frame in self.deduper.filter(frames) {
+            self.duration = frame.ts + 1.0 / self.cfg.base_fps;
+            self.push_chunked_frame(frame);
+        }
+    }
+
+    fn push_chunked_frame(&mut self, frame: ScoredFrame) {
+        let key = (frame.ts / self.cfg.chunk_seconds).floor() as usize;
+        match self.current_key {
+            None => self.current_key = Some(key),
+            Some(cur) if cur != key => {
+                self.flush_current_chunk();
+                self.current_key = Some(key);
+            }
+            Some(_) => {}
+        }
+        self.current_chunk.push(frame);
+    }
+
+    fn flush_current_chunk(&mut self) {
+        if self.current_chunk.is_empty() {
+            return;
+        }
+        let ci = self.next_chunk_ci;
+        self.next_chunk_ci += 1;
+        let chunk = mem::take(&mut self.current_chunk);
+        self.spawn_chunk(ci, chunk);
+    }
+
+    fn spawn_chunk(&mut self, ci: usize, chunk: Vec<ScoredFrame>) {
+        self.outstanding += 1;
+        let tx = self.tx.as_ref().expect("sender lives until finish").clone();
+        let env = self.env;
+        rayon::spawn_fifo(move || {
+            // Catch panics so we always send a result — otherwise outstanding
+            // never decrements and the main thread blocks forever on recv().
+            let result = panic::catch_unwind(AssertUnwindSafe(|| process_chunk(ci, chunk, env)))
+                .unwrap_or_else(|panic| Err(panic_to_anyhow(panic)));
+            let _ = tx.send((ci, result));
+        });
+    }
+
+    fn drain_results(&mut self, out_dir: &Path, max_in_flight: Option<usize>) -> Result<()> {
+        loop {
+            // Backpressure: count both outstanding jobs AND queued results awaiting emit.
+            let buffered = self.outstanding + self.ready.len();
+            if max_in_flight.is_some_and(|max| buffered > max) {
+                let (ci, result) = self.rx.recv().context("receiving grid result")?;
+                self.outstanding -= 1;
+                self.ready.insert(ci, result);
+            } else {
+                loop {
+                    match self.rx.try_recv() {
+                        Ok((ci, result)) => {
+                            self.outstanding -= 1;
+                            self.ready.insert(ci, result);
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+            }
+
+            while let Some(result) = self.ready.remove(&self.next_emit) {
+                let result = result?;
+                debug_assert_eq!(result.ci, self.next_emit);
+                if self.env.write_files {
+                    let file = format!("grid_{:03}.jpg", result.ci + 1);
+                    fs::write(out_dir.join(&file), &result.jpeg)
+                        .with_context(|| format!("writing {file}"))?;
+                }
+                self.grid_metas.push(result.meta);
+                self.next_emit += 1;
+            }
+
+            let buffered = self.outstanding + self.ready.len();
+            if max_in_flight.is_none_or(|max| buffered <= max) {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn extract_batch_frames(cfg: &Config) -> usize {
+    ((cfg.base_fps * cfg.chunk_seconds).round().max(1.0) as usize)
+        .clamp(MIN_EXTRACT_BATCH_FRAMES, MAX_EXTRACT_BATCH_FRAMES)
+}
+
+type ChunkMsg = (usize, Result<GridResult>);
+
+fn process_chunk(
+    ci: usize,
+    mut chunk: Vec<ScoredFrame>,
+    env: ProcessChunkEnv,
+) -> Result<GridResult> {
+    score::compute_raw(&mut chunk);
+    score::rank_normalize_and_score(&mut chunk, &env.weights);
+
+    let span = chunk_span(&chunk);
+    let min_gap = (0.5 * span / env.capacity.max(1) as f32).max(env.min_gap_floor);
+    let selected = score::select_top_k(&chunk, env.capacity, min_gap);
+    let picked: Vec<ScoredFrame> = selected.iter().map(|&i| chunk[i].clone()).collect();
+
+    let heroes = score::pick_heroes(&picked);
+    let lay = layout::compute(picked.len(), &heroes, env.aspect, &env.preset);
+
+    let jpeg = compose::render(&picked, &lay, &heroes, env.jpeg_quality, env.hero_border_px)?;
+    let file = format!("grid_{:03}.jpg", ci + 1);
+
+    let meta = build_grid_meta(
+        if env.write_files {
+            Some(file.as_str())
+        } else {
+            None
+        },
+        if env.write_files { None } else { Some(&jpeg) },
+        &picked,
+        &heroes,
+        lay.template,
+    );
+
+    Ok(GridResult { ci, jpeg, meta })
+}
+
 /// Run the `extract` pipeline: high-density sampling of `[start, end)` into a
-/// single equal-cell grid, frames in time order (no hero emphasis), then write
-/// `grid_extract.jpg` and `metadata.json`.
+/// single equal-cell grid, frames in time order (no hero emphasis).
 pub fn extract_range(
     input: &Path,
     out_dir: &Path,
-    preset: &Preset,
-    quality_label: &str,
-    detail_label: &str,
+    cfg: &Config,
     start: f32,
     end: f32,
+    mode: OutputMode,
 ) -> Result<()> {
-    fs::create_dir_all(out_dir)
-        .with_context(|| format!("creating output dir {}", out_dir.display()))?;
+    let write_files = mode == OutputMode::Files;
+    if write_files {
+        fs::create_dir_all(out_dir)
+            .with_context(|| format!("creating output dir {}", out_dir.display()))?;
+    }
 
     // Triple the base fps for dense sampling within the window.
-    let fps = preset.base_fps * 3.0;
-    let res = extract::extract_range(input, fps, preset.min_frame_size, start, end)?;
-    let aspect = res.aspect;
-    let mut frames = dedup::deduplicate(res.frames, preset.hash_threshold);
+    let fps = cfg.base_fps * 3.0;
+    let mut stream =
+        extract::stream_range(input, fps, cfg.min_frame_size, cfg.score_edge, start, end)?;
 
+    let batch_size = extract_batch_frames(cfg);
+    let mut deduper = dedup::Deduper::new(cfg.hash_threshold, cfg.dedup_window);
+    let mut rgb_batch = Vec::with_capacity(batch_size);
+    let mut frames = Vec::new();
+    let mut aspect = 1.0_f32;
+
+    while let Some(rgb) = stream.next_frame()? {
+        if let Some(a) = stream.aspect() {
+            aspect = a;
+        }
+        rgb_batch.push(rgb);
+        if rgb_batch.len() == batch_size {
+            let scored =
+                extract::scored_frames_from_rgbs(mem::take(&mut rgb_batch), cfg.score_edge);
+            frames.extend(deduper.filter(scored));
+        }
+    }
+    if !rgb_batch.is_empty() {
+        let scored = extract::scored_frames_from_rgbs(rgb_batch, cfg.score_edge);
+        frames.extend(deduper.filter(scored));
+    }
+
+    let weights = cfg.weights();
     score::compute_raw(&mut frames);
-    score::rank_normalize_and_score(&mut frames);
+    score::rank_normalize_and_score(&mut frames, &weights);
 
-    let capacity = layout::grid_capacity(preset, aspect);
-    // Equal layout, time order, no heroes: take the top-k then sort by time.
-    let selected = score::select_top_k(&frames, capacity, MIN_GAP_FLOOR);
+    let preset = cfg.as_preset();
+    let capacity = layout::grid_capacity(&preset, aspect);
+    let selected = score::select_top_k(&frames, capacity, cfg.min_gap);
     let picked: Vec<ScoredFrame> = selected.iter().map(|&i| frames[i].clone()).collect();
 
-    let lay = layout::compute(picked.len(), &[], aspect, preset);
-    let jpeg = compose::render(&picked, &lay, &[])?;
+    let lay = layout::compute(picked.len(), &[], aspect, &preset);
+    let jpeg = compose::render(&picked, &lay, &[], cfg.jpeg_quality, cfg.hero_border_px)?;
+
     let file = "grid_extract.jpg";
-    fs::write(out_dir.join(file), &jpeg).context("writing grid_extract.jpg")?;
+    let grid_meta = build_grid_meta(
+        if write_files { Some(file) } else { None },
+        if write_files { None } else { Some(&jpeg) },
+        &picked,
+        &[],
+        lay.template,
+    );
 
     let meta = Metadata {
         source: input.display().to_string(),
         duration: end - start,
         settings: Settings {
-            max_pixels: preset.max_pixels,
-            quality: quality_label.to_string(),
-            detail: detail_label.to_string(),
+            max_pixels: cfg.max_pixels,
+            quality: cfg.quality_label.to_string(),
+            detail: cfg.detail_label.to_string(),
         },
-        grids: vec![build_grid_meta(file, &picked, &[], lay.template)],
+        grids: vec![grid_meta],
     };
-    let json = serde_json::to_string_pretty(&meta).context("serializing metadata")?;
-    fs::write(out_dir.join("metadata.json"), json).context("writing metadata.json")?;
 
-    println!("wrote {} to {}", file, out_dir.display());
+    if write_files {
+        fs::write(out_dir.join(file), &jpeg).context("writing grid_extract.jpg")?;
+        let json = serde_json::to_string_pretty(&meta).context("serializing metadata")?;
+        fs::write(out_dir.join("metadata.json"), json).context("writing metadata.json")?;
+        eprintln!("wrote {} to {}", file, out_dir.display());
+    } else {
+        let json = serde_json::to_string_pretty(&meta).context("serializing metadata")?;
+        println!("{json}");
+    }
+
     Ok(())
 }
 
@@ -179,11 +468,14 @@ fn parse_clock(s: &str) -> Result<f32> {
 
 /// Build the metadata record for one rendered grid.
 fn build_grid_meta(
-    file: &str,
+    file: Option<&str>,
+    jpeg: Option<&[u8]>,
     picked: &[ScoredFrame],
     heroes: &[usize],
     template: &'static str,
 ) -> GridMeta {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
     let (first, last) = (
         picked.first().map(|f| f.ts).unwrap_or(0.0),
         picked.last().map(|f| f.ts).unwrap_or(0.0),
@@ -197,11 +489,12 @@ fn build_grid_meta(
         })
         .collect();
     GridMeta {
-        file: file.to_string(),
+        file: file.map(str::to_string),
         time_range: format!("{}-{}", compose::format_ts(first), compose::format_ts(last)),
         total_frames: picked.len(),
         key_frames,
         layout: template.to_string(),
+        base64: jpeg.map(|b| STANDARD.encode(b)),
     }
 }
 
@@ -215,6 +508,7 @@ fn chunk_span(chunk: &[ScoredFrame]) -> f32 {
 
 /// Partition frames (assumed time-ordered) into chunks of `seconds` each, keyed
 /// by `floor(ts / seconds)`. Empty chunks are not emitted.
+#[cfg(test)]
 fn chunk_by_seconds(frames: Vec<ScoredFrame>, seconds: f32) -> Vec<Vec<ScoredFrame>> {
     let mut chunks: Vec<Vec<ScoredFrame>> = Vec::new();
     let mut cur_key = usize::MAX;
@@ -227,6 +521,17 @@ fn chunk_by_seconds(frames: Vec<ScoredFrame>, seconds: f32) -> Vec<Vec<ScoredFra
         chunks.last_mut().expect("just pushed").push(f);
     }
     chunks
+}
+
+/// Convert a panic payload to an anyhow error.
+fn panic_to_anyhow(payload: Box<dyn std::any::Any + Send>) -> anyhow::Error {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        anyhow!("worker panic: {s}")
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        anyhow!("worker panic: {s}")
+    } else {
+        anyhow!("worker panic (unknown payload)")
+    }
 }
 
 #[cfg(test)]
@@ -247,7 +552,13 @@ mod tests {
 
     #[test]
     fn splits_frames_at_minute_boundaries() {
-        let frames = vec![frame(0.0), frame(30.0), frame(59.9), frame(60.1), frame(125.0)];
+        let frames = vec![
+            frame(0.0),
+            frame(30.0),
+            frame(59.9),
+            frame(60.1),
+            frame(125.0),
+        ];
         let chunks = chunk_by_seconds(frames, 60.0);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].len(), 3);
