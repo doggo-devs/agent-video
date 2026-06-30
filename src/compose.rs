@@ -86,7 +86,7 @@ fn draw_border(img: &mut RgbImage, x: u32, y: u32, w: u32, h: u32, color: Rgb<u8
 
 /// Draw an `MM:SS` timestamp at the cell's top-left over a translucent strip.
 fn draw_timestamp(img: &mut RgbImage, font: &FontRef, x: u32, y: u32, ts: f32) {
-    let label = format_ts(ts);
+    let label = crate::types::format_ts(ts);
     let scale = PxScale::from(20.0);
 
     // get_pixel_mut darkens in place — one bounds check per pixel instead of two.
@@ -109,11 +109,6 @@ fn draw_timestamp(img: &mut RgbImage, font: &FontRef, x: u32, y: u32, ts: f32) {
         font,
         &label,
     );
-}
-
-pub fn format_ts(ts: f32) -> String {
-    let total = ts.max(0.0).round() as u32;
-    format!("{:02}:{:02}", total / 60, total % 60)
 }
 
 fn encode_jpeg(img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
@@ -140,21 +135,13 @@ mod tests {
     }
 
     #[test]
-    fn formats_timestamp_as_mmss() {
-        assert_eq!(format_ts(0.0), "00:00");
-        assert_eq!(format_ts(83.0), "01:23");
-        assert_eq!(format_ts(605.4), "10:05");
-    }
-
-    #[test]
     fn renders_nonempty_jpeg() {
-        let preset = crate::preset::resolve_preset(
-            2048,
-            crate::types::Quality::Low,
-            crate::types::Detail::Standard,
-        );
+        let spec = crate::types::CanvasSpec {
+            edge: 1024,
+            min_cell_edge: 256,
+        };
         let frames: Vec<_> = (0..4).map(|i| frame(i as f32)).collect();
-        let layout = crate::layout::compute(4, &[], 16.0 / 9.0, &preset);
+        let layout = crate::layout::compute(4, &[], 16.0 / 9.0, &spec);
         let bytes = render(&frames, &layout, &[], 92, 4).expect("render ok");
         assert!(bytes.len() > 100, "JPEG should have real content");
         assert_eq!(&bytes[0..2], &[0xff, 0xd8]);

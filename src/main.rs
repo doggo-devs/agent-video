@@ -2,30 +2,29 @@
 //!
 //! Two subcommands: `process` (smart frame selection + grid composition for
 //! short/medium videos) and `extract` (high-density sampling of a time range).
-//! This module only parses arguments, resolves a [`Preset`], and dispatches.
 
+mod child;
 mod compose;
 mod config;
 mod dedup;
+mod error;
 mod extract;
 mod layout;
 mod pipeline;
-mod preset;
 mod probe;
-mod profile;
 mod score;
 mod subtitle;
 mod types;
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 
-use crate::config::{Config, StrategyOpts};
+use crate::config::{Config, Overrides, StrategyOpts};
+use crate::error::Error;
 use crate::pipeline::parse_range;
-use crate::preset::resolve_preset;
 use crate::probe::SampleStrategy;
-use crate::profile::ProfileOverrides;
 use crate::types::{Detail, Quality};
 
 #[derive(Parser)]
@@ -199,17 +198,31 @@ impl From<DetailArg> for Detail {
     }
 }
 
-impl From<StrategyArg> for SampleStrategy {
+impl From<StrategyArg> for crate::probe::SampleStrategy {
     fn from(s: StrategyArg) -> Self {
         match s {
-            StrategyArg::FixedFps => SampleStrategy::FixedFps,
-            StrategyArg::Keyframes => SampleStrategy::Keyframes,
-            StrategyArg::Adaptive => SampleStrategy::Adaptive,
+            StrategyArg::FixedFps => Self::FixedFps,
+            StrategyArg::Keyframes => Self::Keyframes,
+            StrategyArg::Adaptive => Self::Adaptive,
         }
     }
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let code = e
+                .downcast_ref::<Error>()
+                .map(|e| e.code.exit_code())
+                .unwrap_or(1);
+            eprintln!("error: {e:#}");
+            ExitCode::from(code as u8)
+        }
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let (io, opts) = match &cli.command {
@@ -217,13 +230,10 @@ fn main() -> anyhow::Result<()> {
         Command::Extract { io, opts, .. } => (io, opts),
     };
 
-    let max_edge = opts.max_edge;
-
     let quality = Quality::from(opts.quality);
     let detail = Detail::from(opts.detail);
-    let preset = resolve_preset(max_edge, quality, detail);
 
-    let overrides = ProfileOverrides {
+    let overrides = Overrides {
         w_scene: opts.w_scene,
         w_clarity: opts.w_clarity,
         w_edge: opts.w_edge,
@@ -236,7 +246,6 @@ fn main() -> anyhow::Result<()> {
         jpeg_quality: opts.jpeg_quality,
         hero_border_px: opts.hero_border_px,
     };
-    let prof = profile::resolve(opts.profile.as_deref(), &overrides)?;
 
     let strategy_opts = StrategyOpts {
         strategy: SampleStrategy::from(opts.strategy),
@@ -244,7 +253,15 @@ fn main() -> anyhow::Result<()> {
         min_keyframes: opts.min_keyframes,
         force: opts.force,
     };
-    let cfg = Config::new(preset, prof, quality, detail, strategy_opts);
+
+    let cfg = Config::new(
+        opts.max_edge,
+        quality,
+        detail,
+        opts.profile.as_deref(),
+        &overrides,
+        strategy_opts,
+    )?;
 
     let mode = if opts.json {
         pipeline::OutputMode::Json
@@ -261,7 +278,7 @@ fn main() -> anyhow::Result<()> {
         Command::Process {
             threads, in_flight, ..
         } => {
-            let threads = threads.unwrap_or(0); // 0 = rayon default (CPU cores)
+            let threads = threads.unwrap_or(0);
             let in_flight = in_flight.unwrap_or(pipeline::DEFAULT_IN_FLIGHT);
             pipeline::process(&io.input, &io.output, &cfg, mode, threads, in_flight, subs)
         }

@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, ErrorCode, ErrorContext, Result};
 
 /// Sampling strategy for frame extraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -99,18 +99,33 @@ pub fn probe_duration(input: &Path) -> Result<f32> {
         ])
         .arg(input)
         .output()
-        .context("ffprobe not found on PATH")?;
+        .map_err(|e| {
+            Error::new(ErrorCode::FfprobeNotFound, "ffprobe not found on PATH")
+                .with_source(e)
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("ffprobe failed: {}", stderr.trim());
+        return Err(Error::new(
+            ErrorCode::FfprobeFailed,
+            format!("ffprobe failed: {}", stderr.trim()),
+        )
+        .with_context(
+            ErrorContext::default()
+                .with_input(input)
+                .with_exit_status(output.status)
+                .with_stderr(stderr.to_string()),
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .trim()
-        .parse::<f32>()
-        .context("failed to parse duration from ffprobe")
+    stdout.trim().parse::<f32>().map_err(|e| {
+        Error::new(
+            ErrorCode::FfprobeFailed,
+            format!("failed to parse duration from ffprobe: {}", stdout.trim()),
+        )
+        .with_source(e)
+    })
 }
 
 /// Probe a video for I-frame timestamps and duration.
@@ -139,20 +154,55 @@ fn probe_iframe_timestamps(input: &Path) -> Result<Vec<f32>> {
         ])
         .arg(input)
         .output()
-        .context("ffprobe not found on PATH")?;
+        .map_err(|e| {
+            Error::new(ErrorCode::FfprobeNotFound, "ffprobe not found on PATH")
+                .with_source(e)
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("ffprobe I-frame scan failed: {}", stderr.trim());
+        return Err(Error::new(
+            ErrorCode::FfprobeFailed,
+            format!("ffprobe I-frame scan failed: {}", stderr.trim()),
+        )
+        .with_context(
+            ErrorContext::default()
+                .with_input(input)
+                .with_exit_status(output.status)
+                .with_stderr(stderr.to_string()),
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut timestamps: Vec<f32> = stdout
-        .lines()
-        .filter_map(|line| line.trim().parse::<f32>().ok())
-        .collect();
-    timestamps.sort_by(|a, b| a.total_cmp(b));
+    let mut timestamps: Vec<f32> = Vec::new();
+    let mut parse_errors: Vec<(usize, String)> = Vec::new();
 
+    for (line_num, line) in stdout.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match trimmed.parse::<f32>() {
+            Ok(ts) => timestamps.push(ts),
+            Err(_) => parse_errors.push((line_num + 1, trimmed.to_string())),
+        }
+    }
+
+    // Warn about parse failures but don't fail entirely if we got some timestamps
+    if !parse_errors.is_empty() {
+        let count = parse_errors.len();
+        eprintln!(
+            "warning: skipped {count} unparseable pts_time lines from ffprobe"
+        );
+        for (line_num, content) in parse_errors.iter().take(3) {
+            eprintln!("  line {line_num}: {content:?}");
+        }
+        if count > 3 {
+            eprintln!("  ... and {} more", count - 3);
+        }
+    }
+
+    timestamps.sort_by(|a, b| a.total_cmp(b));
     Ok(timestamps)
 }
 

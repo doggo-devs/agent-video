@@ -155,9 +155,14 @@ pub fn edge_density(gray: &GrayImage) -> f32 {
 
 /// Mean absolute grayscale difference between two equally-sized frames.
 ///
-/// Returns 0.0 if dimensions differ (cannot compare). Used as the scene-change
-/// signal: how much this frame differs from the previous kept frame.
+/// Used as the scene-change signal: how much this frame differs from the
+/// previous kept frame. Dimensions must match (debug-asserted).
 pub fn frame_diff(a: &GrayImage, b: &GrayImage) -> f32 {
+    debug_assert_eq!(
+        a.dimensions(),
+        b.dimensions(),
+        "frame_diff: dimension mismatch"
+    );
     if a.dimensions() != b.dimensions() {
         return 0.0;
     }

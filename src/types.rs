@@ -60,57 +60,32 @@ impl Rect {
 }
 
 /// Resolution tier: controls minimum readable frame size and canvas scale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Quality {
     Low,
     Medium,
     High,
 }
 
-impl Quality {
-    /// Lowercase tier name as written into `metadata.json`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Quality::Low => "low",
-            Quality::Medium => "medium",
-            Quality::High => "high",
-        }
-    }
-}
-
 /// Detail tier: controls sampling fps, dedup strictness, and clarity filtering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Detail {
     Coarse,
     Standard,
     Fine,
 }
 
-impl Detail {
-    /// Lowercase tier name as written into `metadata.json`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Detail::Coarse => "coarse",
-            Detail::Standard => "standard",
-            Detail::Fine => "fine",
-        }
-    }
-}
-
-/// Fully resolved processing parameters, merged from quality + detail tiers.
-/// `aspect` is supplied separately at layout time.
+/// Resolved canvas geometry for layout; the quality scale is already applied.
 #[derive(Debug, Clone, Copy)]
-pub struct Preset {
-    /// Canvas edge length in pixels.
-    pub max_edge: u32,
-    /// Minimum readable edge length for a single frame cell, in pixels.
-    pub min_frame_size: u32,
-    /// Canvas scale multiplier from the quality tier (0.5 / 0.75 / 1.0).
-    pub canvas_scale: f32,
-    /// Base sampling fps before any dynamic governor adjustments.
-    pub base_fps: f32,
-    /// pHash Hamming distance threshold; frames closer than this are dropped.
-    pub hash_threshold: u32,
+pub struct CanvasSpec {
+    /// Longer canvas edge in pixels.
+    pub edge: u32,
+    /// Target shorter edge of a single cell, in pixels. A soft lower bound:
+    /// capacity planning treats the canvas as square while the packed canvas is
+    /// only roughly square, so cells can land slightly below it.
+    pub min_cell_edge: u32,
 }
 
 /// Metadata for one rendered grid image.
@@ -118,7 +93,9 @@ pub struct Preset {
 pub struct GridMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    pub time_range: String,
+    /// Time range as "MM:SS-MM:SS" for JSON output.
+    #[serde(serialize_with = "serialize_time_range")]
+    pub time_range: (f32, f32),
     pub total_frames: usize,
     pub key_frames: Vec<KeyFrameMeta>,
     pub layout: String,
@@ -126,6 +103,17 @@ pub struct GridMeta {
     pub base64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitles: Option<String>,
+}
+
+fn serialize_time_range<S: serde::Serializer>(range: &(f32, f32), s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&format!("{}-{}", format_ts(range.0), format_ts(range.1)))
+}
+
+/// Format a timestamp as `MM:SS`, clamping negatives to zero and rounding to
+/// the nearest second.
+pub fn format_ts(ts: f32) -> String {
+    let total = ts.max(0.0).round() as u32;
+    format!("{:02}:{:02}", total / 60, total % 60)
 }
 
 /// Metadata for a single key (hero) frame inside a grid.
@@ -146,9 +134,21 @@ pub struct Metadata {
 }
 
 /// The resolved settings echoed back into `metadata.json`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct Settings {
     pub max_edge: u32,
-    pub quality: String,
-    pub detail: String,
+    pub quality: Quality,
+    pub detail: Detail,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_timestamp_as_mmss() {
+        assert_eq!(format_ts(0.0), "00:00");
+        assert_eq!(format_ts(83.0), "01:23");
+        assert_eq!(format_ts(605.4), "10:05");
+    }
 }

@@ -1,9 +1,10 @@
 //! Grid geometry. Pure calculation — no image operations.
 //!
 //! The layout is aspect-aware: cell aspect ratio follows the source frame, so
-//! landscape and portrait videos tile differently. `max_edge` caps the canvas
-//! **edge** (the longer side, in pixels); the grid is sized to keep the canvas
-//! roughly square, which maximizes the pixel budget a VLM actually sees.
+//! landscape and portrait videos tile differently. [`CanvasSpec::edge`] caps
+//! the canvas **edge** (the longer side, in pixels); the grid is sized to keep
+//! the canvas roughly square, which maximizes the pixel budget a VLM actually
+//! sees.
 //!
 //! Hero frames occupy 2×2 blocks; normal frames a single cell. Placement uses
 //! an occupancy packer rather than fixed-coordinate templates: it generalizes
@@ -13,7 +14,7 @@
 //! land top-left and read naturally (a top strip for landscape, a left column
 //! for portrait).
 
-use crate::types::{Preset, Rect};
+use crate::types::{CanvasSpec, Rect};
 
 /// A computed grid: one rectangle per frame (in input order) plus canvas size
 /// and the template name driven by hero count.
@@ -29,13 +30,14 @@ pub struct Layout {
 
 /// How many cells fit on the canvas at the minimum readable cell size.
 ///
-/// Treats the canvas as square with edge `max_edge × canvas_scale`. A cell's
-/// shorter edge is `min_frame_size`, so its area is `min_frame_size² ×
-/// max(aspect, 1/aspect)`. Returns at least 1.
-pub fn grid_capacity(preset: &Preset, aspect: f32) -> usize {
-    let edge = preset.max_edge as f32 * preset.canvas_scale;
+/// An estimate: treats the canvas as square with edge [`CanvasSpec::edge`],
+/// while [`compute`] only keeps it roughly square. A cell's shorter edge is
+/// `min_cell_edge`, so its area is `min_cell_edge² × max(aspect, 1/aspect)`.
+/// Returns at least 1.
+pub fn grid_capacity(spec: &CanvasSpec, aspect: f32) -> usize {
+    let edge = spec.edge as f32;
     let long_ratio = aspect.max(1.0 / aspect);
-    let cell_area = (preset.min_frame_size as f32).powi(2) * long_ratio;
+    let cell_area = (spec.min_cell_edge as f32).powi(2) * long_ratio;
     ((edge * edge) / cell_area).floor().max(1.0) as usize
 }
 
@@ -53,7 +55,7 @@ fn template_name(hero_count: usize) -> &'static str {
 ///
 /// Heroes occupy 2×2 cell blocks; all others a single cell. The returned
 /// `rects` are aligned with the input frame order.
-pub fn compute(n: usize, heroes: &[usize], aspect: f32, preset: &Preset) -> Layout {
+pub fn compute(n: usize, heroes: &[usize], aspect: f32, spec: &CanvasSpec) -> Layout {
     if n == 0 {
         return Layout {
             rects: Vec::new(),
@@ -105,8 +107,8 @@ pub fn compute(n: usize, heroes: &[usize], aspect: f32, preset: &Preset) -> Layo
     }
 
     // Pixel sizing: keep cell aspect = source aspect, cap the longer canvas edge.
-    let max_edge = preset.max_edge as f32 * preset.canvas_scale;
-    let cell_h = max_edge / (cols as f32 * aspect).max(rows as f32);
+    let edge = spec.edge as f32;
+    let cell_h = edge / (cols as f32 * aspect).max(rows as f32);
     let cell_w = cell_h * aspect;
 
     let rects = grid_cells
@@ -221,10 +223,12 @@ fn mark(occupied: &mut [bool], cols: usize, gx: usize, gy: usize, bw: usize, bh:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Detail, Quality};
 
-    fn preset() -> Preset {
-        crate::preset::resolve_preset(8000, Quality::High, Detail::Standard)
+    fn spec() -> CanvasSpec {
+        CanvasSpec {
+            edge: 8000,
+            min_cell_edge: 512,
+        }
     }
 
     fn assert_valid(layout: &Layout) {
@@ -251,7 +255,7 @@ mod tests {
 
     #[test]
     fn lays_out_uniform_landscape() {
-        let l = compute(12, &[], 16.0 / 9.0, &preset());
+        let l = compute(12, &[], 16.0 / 9.0, &spec());
         assert_eq!(l.template, "UNIFORM");
         assert_eq!(l.rects.len(), 12);
         assert_valid(&l);
@@ -259,7 +263,7 @@ mod tests {
 
     #[test]
     fn lays_out_uniform_portrait() {
-        let l = compute(12, &[], 9.0 / 16.0, &preset());
+        let l = compute(12, &[], 9.0 / 16.0, &spec());
         assert_valid(&l);
         // Portrait cells are taller than wide.
         let r = l.rects.iter().find(|r| r.w > 0).expect("a cell");
@@ -268,14 +272,14 @@ mod tests {
 
     #[test]
     fn landscape_cell_is_wider_than_tall() {
-        let l = compute(12, &[], 16.0 / 9.0, &preset());
+        let l = compute(12, &[], 16.0 / 9.0, &spec());
         let r = l.rects.iter().find(|r| r.w > 0).expect("a cell");
         assert!(r.w > r.h, "landscape cell should be wider than tall: {r:?}");
     }
 
     #[test]
     fn hero_block_is_larger_than_normal() {
-        let l = compute(10, &[0], 16.0 / 9.0, &preset());
+        let l = compute(10, &[0], 16.0 / 9.0, &spec());
         assert_eq!(l.template, "HERO_LEFT");
         assert_valid(&l);
         let hero = l.rects[0];
@@ -290,7 +294,7 @@ mod tests {
     fn deduplicates_repeated_hero_index() {
         // A repeated index must place one 2×2 block, not two, and leave a valid
         // grid. HERO_LEFT (single hero) is the correct template.
-        let l = compute(10, &[0, 0], 16.0 / 9.0, &preset());
+        let l = compute(10, &[0, 0], 16.0 / 9.0, &spec());
         assert_eq!(l.template, "HERO_LEFT");
         assert_valid(&l);
         let placed = l.rects.iter().filter(|r| r.w > 0 && r.h > 0).count();
@@ -299,21 +303,21 @@ mod tests {
 
     #[test]
     fn dual_hero_names_template() {
-        let l = compute(10, &[0, 1], 16.0 / 9.0, &preset());
+        let l = compute(10, &[0, 1], 16.0 / 9.0, &spec());
         assert_eq!(l.template, "DUAL_HERO");
         assert_valid(&l);
     }
 
     #[test]
     fn three_heroes_make_top_strip() {
-        let l = compute(12, &[0, 1, 2], 16.0 / 9.0, &preset());
+        let l = compute(12, &[0, 1, 2], 16.0 / 9.0, &spec());
         assert_eq!(l.template, "TOP_STRIP");
         assert_valid(&l);
     }
 
     #[test]
     fn portrait_hero_lays_out_valid() {
-        let l = compute(10, &[0], 9.0 / 16.0, &preset());
+        let l = compute(10, &[0], 9.0 / 16.0, &spec());
         assert_valid(&l);
         let hero = l.rects[0];
         // Hero anchors at the top-left for portrait (column-major scan).
@@ -321,21 +325,17 @@ mod tests {
     }
 
     #[test]
-    fn capacity_is_larger_for_lower_quality_canvas() {
-        let hi = grid_capacity(
-            &crate::preset::resolve_preset(8000, Quality::High, Detail::Standard),
-            1.0,
-        );
-        let lo = grid_capacity(
-            &crate::preset::resolve_preset(8000, Quality::Low, Detail::Standard),
-            1.0,
-        );
-        assert!(hi >= 1 && lo >= 1);
+    fn quality_tiers_preserve_capacity() {
+        // Quality changes pixel density, not layout structure: the canvas edge
+        // and min cell edge scale together, so capacity stays identical.
+        let hi = grid_capacity(&CanvasSpec { edge: 8000, min_cell_edge: 512 }, 1.0);
+        let lo = grid_capacity(&CanvasSpec { edge: 4000, min_cell_edge: 256 }, 1.0);
+        assert_eq!(hi, lo);
     }
 
     #[test]
     fn single_frame_fills_one_cell() {
-        let l = compute(1, &[], 1.0, &preset());
+        let l = compute(1, &[], 1.0, &spec());
         assert_eq!(l.rects.len(), 1);
         assert_valid(&l);
     }

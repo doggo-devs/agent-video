@@ -4,9 +4,8 @@
 //! its optimized C path) down to the size we actually need before writing a raw
 //! PPM stream to stdout — so the pipe carries small frames, not full-resolution
 //! ones, and Rust does almost no resizing. We parse the stream incrementally;
-//! stderr is sent to `/dev/null`, and we deliberately do *not* use the
-//! `showinfo` filter, which would force a second pipe and risk a deadlock when
-//! its buffer fills. Timestamps are derived as `index / fps`.
+//! stderr is captured and reported on failure. Timestamps are derived as
+//! `index / fps`.
 //!
 //! Grayscale derivation (one per frame, for scoring) is independent across a
 //! caller-sized batch, so it can run in parallel without retaining the whole
@@ -14,17 +13,16 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{ChildStdout, Command};
 
 use anyhow::{Context, Result, bail};
 use image::imageops::FilterType;
 use image::{GrayImage, RgbImage};
 use rayon::prelude::*;
 
+use crate::child::TrackedChild;
+use crate::error::ErrorCode;
 use crate::types::{RawScores, ScoredFrame};
-
-/// Default edge length for the grayscale scoring image.
-const DEFAULT_SCORE_EDGE: u32 = 256;
 
 /// One sampled RGB frame from ffmpeg, already downscaled for composition.
 ///
@@ -39,21 +37,48 @@ pub struct RgbFrame {
     pub rgb: RgbImage,
 }
 
+/// How a decoded frame's timestamp is derived.
+enum TsPolicy {
+    /// ts = start + idx / fps (fixed-rate sampling).
+    Fps { fps: f32, start: f32 },
+    /// ts from a pre-probed list, falling back to the index when exhausted.
+    List(Vec<f32>),
+}
+
+impl TsPolicy {
+    fn ts_at(&self, idx: usize) -> f32 {
+        match self {
+            TsPolicy::Fps { fps, start } => start + idx as f32 / fps,
+            TsPolicy::List(list) => list.get(idx).copied().unwrap_or(idx as f32),
+        }
+    }
+}
+
 /// Streaming reader over ffmpeg's PPM image pipe.
 ///
 /// Frames are pulled one by one with [`FrameStream::next_frame`]. The stream
-/// waits for ffmpeg at EOF and reports a decoding failure if ffmpeg produced no
-/// frames. Dropping the stream early leaves child cleanup to the OS; callers in
-/// this crate consume it to EOF.
+/// waits for ffmpeg at EOF and reports a decoding failure (with stderr) if
+/// ffmpeg produced no frames. A frame's timestamp is derived by the stream's
+/// [`TsPolicy`]: computed from a fixed fps, or read from a pre-probed keyframe
+/// list.
 pub struct FrameStream {
-    child: Child,
+    child: Option<TrackedChild>,
     reader: BufReader<ChildStdout>,
     tok: Vec<u8>,
-    fps: f32,
-    start_offset: f32,
+    ts: TsPolicy,
     idx: usize,
     aspect: Option<f32>,
     eof: bool,
+    /// Context string for ffmpeg wait errors, so messages stay mode-specific.
+    wait_context: &'static str,
+}
+
+impl Drop for FrameStream {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            child.kill_and_wait();
+        }
+    }
 }
 
 impl FrameStream {
@@ -64,9 +89,9 @@ impl FrameStream {
 
     /// Read the next sampled frame, or `None` after a clean EOF.
     ///
-    /// The timestamp is derived as `start + index / fps`. On EOF this method
-    /// waits for ffmpeg and surfaces a non-zero exit status if no frame was
-    /// decoded.
+    /// The timestamp is derived by the stream's [`TsPolicy`]. On EOF this method
+    /// waits for ffmpeg and surfaces a non-zero exit status with stderr if no
+    /// frame was decoded.
     pub fn next_frame(&mut self) -> Result<Option<RgbFrame>> {
         if self.eof {
             return Ok(None);
@@ -74,9 +99,15 @@ impl FrameStream {
 
         let Some(rgb) = read_ppm(&mut self.reader, &mut self.tok)? else {
             self.eof = true;
-            let status = self.child.wait().context("waiting for ffmpeg")?;
-            if !status.success() && self.idx == 0 {
-                bail!("ffmpeg exited with {status} and produced no frames");
+            if let Some(child) = self.child.take()
+                && let Err(e) = child.wait(self.wait_context)
+            {
+                if self.idx == 0 {
+                    let err = e.into_error(ErrorCode::NoFramesExtracted);
+                    bail!("{err}");
+                }
+                let err = e.into_error(ErrorCode::FfmpegFailed);
+                bail!("{err} after {} frames (possible truncation)", self.idx);
             }
             return Ok(None);
         };
@@ -86,61 +117,7 @@ impl FrameStream {
             self.aspect = Some(w as f32 / h as f32);
         }
 
-        let ts = self.start_offset + self.idx as f32 / self.fps;
-        self.idx += 1;
-        Ok(Some(RgbFrame { ts, rgb }))
-    }
-}
-
-/// Streaming reader over ffmpeg's keyframe-only PPM output.
-///
-/// Uses `-skip_frame nokey` to decode only I-frames. Timestamps come from a
-/// pre-probed list rather than computed from fps.
-pub struct KeyframeStream {
-    child: Child,
-    reader: BufReader<ChildStdout>,
-    tok: Vec<u8>,
-    timestamps: Vec<f32>,
-    idx: usize,
-    aspect: Option<f32>,
-    eof: bool,
-}
-
-impl KeyframeStream {
-    /// Return the source frame aspect ratio once at least one frame was read.
-    pub fn aspect(&self) -> Option<f32> {
-        self.aspect
-    }
-
-    /// Read the next keyframe, or `None` after a clean EOF.
-    ///
-    /// Timestamps are taken from the pre-probed list passed at construction;
-    /// if ffmpeg outputs more frames than expected, later frames get their
-    /// index as a fallback timestamp.
-    pub fn next_frame(&mut self) -> Result<Option<RgbFrame>> {
-        if self.eof {
-            return Ok(None);
-        }
-
-        let Some(rgb) = read_ppm(&mut self.reader, &mut self.tok)? else {
-            self.eof = true;
-            let status = self.child.wait().context("waiting for ffmpeg")?;
-            if !status.success() && self.idx == 0 {
-                bail!("ffmpeg exited with {status} and produced no frames");
-            }
-            return Ok(None);
-        };
-
-        if self.aspect.is_none() {
-            let (w, h) = rgb.dimensions();
-            self.aspect = Some(w as f32 / h as f32);
-        }
-
-        let ts = self
-            .timestamps
-            .get(self.idx)
-            .copied()
-            .unwrap_or(self.idx as f32);
+        let ts = self.ts.ts_at(self.idx);
         self.idx += 1;
         Ok(Some(RgbFrame { ts, rgb }))
     }
@@ -181,18 +158,13 @@ pub fn stream_keyframes(
     timestamps: Vec<f32>,
     cell_min_edge: u32,
     score_edge: u32,
-) -> Result<KeyframeStream> {
+) -> Result<FrameStream> {
     let rgb_edge = cell_min_edge.max(1);
-    let score_edge = if score_edge == 0 {
-        DEFAULT_SCORE_EDGE
-    } else {
-        score_edge
-    };
     let pipe_edge = rgb_edge.max(score_edge);
 
     let vf = format!("scale={pipe_edge}:{pipe_edge}:force_original_aspect_ratio=increase");
-    let mut child = Command::new("ffmpeg")
-        .arg("-skip_frame")
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-skip_frame")
         .arg("nokey")
         .arg("-i")
         .arg(input)
@@ -200,31 +172,28 @@ pub fn stream_keyframes(
         .arg(vf)
         .arg("-vsync")
         .arg("0")
-        .args(["-f", "image2pipe", "-vcodec", "ppm", "pipe:1"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to spawn ffmpeg for keyframe extraction")?;
+        .args(["-f", "image2pipe", "-vcodec", "ppm", "pipe:1"]);
 
-    let stdout = child.stdout.take().expect("stdout was piped");
-    Ok(KeyframeStream {
-        child,
+    let (child, stdout) = TrackedChild::spawn(
+        &mut cmd,
+        "ffmpeg for keyframe extraction",
+        ErrorCode::FfmpegNotFound,
+    )?;
+
+    Ok(FrameStream {
+        child: Some(child),
         reader: BufReader::new(stdout),
         tok: Vec::new(),
-        timestamps,
+        ts: TsPolicy::List(timestamps),
         idx: 0,
         aspect: None,
         eof: false,
+        wait_context: "ffmpeg keyframe extraction",
     })
 }
 
 /// Convert a bounded RGB batch to [`ScoredFrame`]s, deriving grayscale in parallel.
 pub fn scored_frames_from_rgbs(frames: Vec<RgbFrame>, score_edge: u32) -> Vec<ScoredFrame> {
-    let score_edge = if score_edge == 0 {
-        DEFAULT_SCORE_EDGE
-    } else {
-        score_edge
-    };
     frames
         .into_par_iter()
         .map(|frame| scored_frame_from_rgb(frame, score_edge))
@@ -232,12 +201,7 @@ pub fn scored_frames_from_rgbs(frames: Vec<RgbFrame>, score_edge: u32) -> Vec<Sc
 }
 
 /// Convert a single RGB frame to a [`ScoredFrame`] with grayscale for scoring.
-pub fn scored_frame_from_rgb(frame: RgbFrame, score_edge: u32) -> ScoredFrame {
-    let score_edge = if score_edge == 0 {
-        DEFAULT_SCORE_EDGE
-    } else {
-        score_edge
-    };
+fn scored_frame_from_rgb(frame: RgbFrame, score_edge: u32) -> ScoredFrame {
     ScoredFrame {
         ts: frame.ts,
         gray: to_gray(&frame.rgb, score_edge),
@@ -255,11 +219,6 @@ fn stream_inner(
     range: Option<(f32, f32)>,
 ) -> Result<FrameStream> {
     let rgb_edge = cell_min_edge.max(1);
-    let score_edge = if score_edge == 0 {
-        DEFAULT_SCORE_EDGE
-    } else {
-        score_edge
-    };
     // The piped frame doubles as the composition RGB, so pre-scale to the larger
     // edge; `rgb_edge >= score_edge` typically, so only the grayscale downscales
     // further.
@@ -275,27 +234,30 @@ fn stream_inner(
     // exactly on `pipe_edge`, preserving aspect.
     let vf =
         format!("fps={fps},scale={pipe_edge}:{pipe_edge}:force_original_aspect_ratio=increase");
-    let mut child = cmd
-        .arg("-i")
+    cmd.arg("-i")
         .arg(input)
         .arg("-vf")
         .arg(vf)
-        .args(["-f", "image2pipe", "-vcodec", "ppm", "pipe:1"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to spawn ffmpeg (is it on PATH?)")?;
+        .args(["-f", "image2pipe", "-vcodec", "ppm", "pipe:1"]);
 
-    let stdout = child.stdout.take().expect("stdout was piped");
+    let (child, stdout) = TrackedChild::spawn(
+        &mut cmd,
+        "ffmpeg (is it on PATH?)",
+        ErrorCode::FfmpegNotFound,
+    )?;
+
     Ok(FrameStream {
-        child,
+        child: Some(child),
         reader: BufReader::new(stdout),
         tok: Vec::new(),
-        fps,
-        start_offset: range.map(|(s, _)| s).unwrap_or(0.0),
+        ts: TsPolicy::Fps {
+            fps,
+            start: range.map(|(s, _)| s).unwrap_or(0.0),
+        },
         idx: 0,
         aspect: None,
         eof: false,
+        wait_context: "ffmpeg frame extraction",
     })
 }
 
