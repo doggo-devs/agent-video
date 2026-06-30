@@ -97,12 +97,12 @@ impl Detail {
     }
 }
 
-/// Fully resolved processing parameters, merged from model preset + quality +
-/// detail tiers. `aspect` is supplied separately at layout time.
+/// Fully resolved processing parameters, merged from quality + detail tiers.
+/// `aspect` is supplied separately at layout time.
 #[derive(Debug, Clone, Copy)]
 pub struct Preset {
-    /// Canvas area budget (pixel edge length, not area).
-    pub max_pixels: u32,
+    /// Canvas edge length in pixels.
+    pub max_edge: u32,
     /// Minimum readable edge length for a single frame cell, in pixels.
     pub min_frame_size: u32,
     /// Canvas scale multiplier from the quality tier (0.5 / 0.75 / 1.0).
@@ -124,6 +124,8 @@ pub struct GridMeta {
     pub layout: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitles: Option<String>,
 }
 
 /// Metadata for a single key (hero) frame inside a grid.
@@ -146,7 +148,7 @@ pub struct Metadata {
 /// The resolved settings echoed back into `metadata.json`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Settings {
-    pub max_pixels: u32,
+    pub max_edge: u32,
     pub quality: String,
     pub detail: String,
 }

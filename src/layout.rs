@@ -1,7 +1,7 @@
 //! Grid geometry. Pure calculation — no image operations.
 //!
 //! The layout is aspect-aware: cell aspect ratio follows the source frame, so
-//! landscape and portrait videos tile differently. `max_pixels` caps the canvas
+//! landscape and portrait videos tile differently. `max_edge` caps the canvas
 //! **edge** (the longer side, in pixels); the grid is sized to keep the canvas
 //! roughly square, which maximizes the pixel budget a VLM actually sees.
 //!
@@ -29,11 +29,11 @@ pub struct Layout {
 
 /// How many cells fit on the canvas at the minimum readable cell size.
 ///
-/// Treats the canvas as square with edge `max_pixels × canvas_scale`. A cell's
+/// Treats the canvas as square with edge `max_edge × canvas_scale`. A cell's
 /// shorter edge is `min_frame_size`, so its area is `min_frame_size² ×
 /// max(aspect, 1/aspect)`. Returns at least 1.
 pub fn grid_capacity(preset: &Preset, aspect: f32) -> usize {
-    let edge = preset.max_pixels as f32 * preset.canvas_scale;
+    let edge = preset.max_edge as f32 * preset.canvas_scale;
     let long_ratio = aspect.max(1.0 / aspect);
     let cell_area = (preset.min_frame_size as f32).powi(2) * long_ratio;
     ((edge * edge) / cell_area).floor().max(1.0) as usize
@@ -105,7 +105,7 @@ pub fn compute(n: usize, heroes: &[usize], aspect: f32, preset: &Preset) -> Layo
     }
 
     // Pixel sizing: keep cell aspect = source aspect, cap the longer canvas edge.
-    let max_edge = preset.max_pixels as f32 * preset.canvas_scale;
+    let max_edge = preset.max_edge as f32 * preset.canvas_scale;
     let cell_h = max_edge / (cols as f32 * aspect).max(rows as f32);
     let cell_w = cell_h * aspect;
 

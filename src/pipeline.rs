@@ -12,11 +12,21 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::Config;
+use crate::probe::{KeyframeInfo, SampleStrategy};
 use crate::types::{GridMeta, KeyFrameMeta, Metadata, ScoredFrame, Settings};
-use crate::{compose, dedup, extract, layout, score, subtitle};
+use crate::{compose, dedup, extract, layout, probe, score, subtitle};
+
+/// Subtitle extraction options.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubtitleOpts<'a> {
+    /// Explicit subtitle file path (highest priority).
+    pub path: Option<&'a Path>,
+    /// Embedded track index (used when path is None).
+    pub track: Option<usize>,
+}
 
 /// Lower bound for an extraction batch.
 ///
@@ -58,7 +68,12 @@ pub fn process(
     mode: OutputMode,
     threads: usize,
     max_in_flight: usize,
+    subs: SubtitleOpts<'_>,
 ) -> Result<()> {
+    // Probe if needed for strategy validation
+    let keyframe_info = probe_if_needed(input, cfg)?;
+    validate_strategy(cfg, keyframe_info.as_ref())?;
+
     // Build a dedicated thread pool so -j controls actual parallelism.
     let mut builder = rayon::ThreadPoolBuilder::new();
     if threads > 0 {
@@ -69,7 +84,79 @@ pub fn process(
         .build()
         .context("building rayon thread pool")?;
 
-    pool.install(|| process_inner(input, out_dir, cfg, mode, max_in_flight))
+    pool.install(|| match cfg.strategy {
+        SampleStrategy::FixedFps => {
+            process_inner(input, out_dir, cfg, mode, max_in_flight, subs)
+        }
+        SampleStrategy::Keyframes => {
+            let info = keyframe_info.expect("validated");
+            process_keyframes(input, out_dir, cfg, mode, max_in_flight, info, subs)
+        }
+        SampleStrategy::Adaptive => {
+            let info = keyframe_info.expect("validated");
+            process_adaptive(input, out_dir, cfg, mode, max_in_flight, info, subs)
+        }
+    })
+}
+
+/// Probe video metadata when the strategy requires it.
+fn probe_if_needed(input: &Path, cfg: &Config) -> Result<Option<KeyframeInfo>> {
+    match cfg.strategy {
+        SampleStrategy::FixedFps if cfg.force_long_video => Ok(None),
+        SampleStrategy::FixedFps => {
+            // Need duration check for the 1-hour limit
+            match probe::probe_duration(input) {
+                Ok(duration) => Ok(Some(KeyframeInfo {
+                    timestamps: Vec::new(),
+                    duration,
+                })),
+                Err(e) => {
+                    eprintln!("warning: ffprobe failed ({e}); duration check skipped");
+                    Ok(None)
+                }
+            }
+        }
+        SampleStrategy::Keyframes | SampleStrategy::Adaptive => {
+            if !probe::ffprobe_available() {
+                bail!(
+                    "--strategy {:?} requires ffprobe (not found on PATH)",
+                    cfg.strategy
+                );
+            }
+            Ok(Some(probe::probe_keyframes(input)?))
+        }
+    }
+}
+
+/// Validate strategy constraints against probed video info.
+fn validate_strategy(cfg: &Config, info: Option<&KeyframeInfo>) -> Result<()> {
+    use crate::config::StrategyOpts;
+
+    match cfg.strategy {
+        SampleStrategy::FixedFps => {
+            let dominated = info.is_some_and(|i| i.duration > StrategyOpts::MAX_DURATION_DEFAULT);
+            if dominated && !cfg.force_long_video {
+                let hours = info.unwrap().duration / 3600.0;
+                bail!(
+                    "video is {hours:.1}h (>{:.0}s limit for fixed-fps); \
+                     use --force or --strategy keyframes/adaptive",
+                    StrategyOpts::MAX_DURATION_DEFAULT
+                );
+            }
+        }
+        SampleStrategy::Keyframes | SampleStrategy::Adaptive => {
+            let i = info.expect("probe should succeed for keyframes/adaptive");
+            if i.count() < cfg.min_keyframes {
+                bail!(
+                    "video has only {} keyframes (<{} required); \
+                     lower --min-keyframes or use --strategy fixed-fps",
+                    i.count(),
+                    cfg.min_keyframes
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn process_inner(
@@ -78,6 +165,7 @@ fn process_inner(
     cfg: &Config,
     mode: OutputMode,
     max_in_flight: usize,
+    subs: SubtitleOpts<'_>,
 ) -> Result<()> {
     if mode == OutputMode::Files {
         fs::create_dir_all(out_dir)
@@ -97,15 +185,144 @@ fn process_inner(
     }
     let (duration, grid_metas) = state.finish(out_dir)?;
 
-    if write_files && let Some(text) = subtitle::extract(input).ok().flatten() {
-        fs::write(out_dir.join("subtitles.txt"), text).context("writing subtitles.txt")?;
+    write_outputs(input, out_dir, cfg, mode, duration, grid_metas, subs)
+}
+
+/// Process video using keyframes-only strategy.
+fn process_keyframes(
+    input: &Path,
+    out_dir: &Path,
+    cfg: &Config,
+    mode: OutputMode,
+    max_in_flight: usize,
+    info: KeyframeInfo,
+    subs: SubtitleOpts<'_>,
+) -> Result<()> {
+    if mode == OutputMode::Files {
+        fs::create_dir_all(out_dir)
+            .with_context(|| format!("creating output dir {}", out_dir.display()))?;
+    }
+
+    eprintln!(
+        "keyframes mode: {} I-frames over {:.1}s (mean gap {:.1}s, max {:.1}s)",
+        info.count(),
+        info.duration,
+        info.mean_gap(),
+        info.max_gap()
+    );
+
+    let write_files = mode == OutputMode::Files;
+    let mut stream =
+        extract::stream_keyframes(input, info.timestamps, cfg.min_frame_size, cfg.score_edge)?;
+    let mut state = ProcessState::new(cfg, write_files, max_in_flight);
+
+    while let Some(frame) = stream.next_frame()? {
+        if let Some(aspect) = stream.aspect() {
+            state.set_aspect(aspect);
+        }
+        state.push_rgb(frame, out_dir)?;
+    }
+    let (duration, grid_metas) = state.finish(out_dir)?;
+
+    write_outputs(input, out_dir, cfg, mode, duration, grid_metas, subs)
+}
+
+/// Process video using adaptive strategy: keyframes + sparse region fill.
+fn process_adaptive(
+    input: &Path,
+    out_dir: &Path,
+    cfg: &Config,
+    mode: OutputMode,
+    max_in_flight: usize,
+    info: KeyframeInfo,
+    subs: SubtitleOpts<'_>,
+) -> Result<()> {
+    if mode == OutputMode::Files {
+        fs::create_dir_all(out_dir)
+            .with_context(|| format!("creating output dir {}", out_dir.display()))?;
+    }
+
+    let sparse_regions = info.sparse_regions(cfg.gap_threshold);
+    eprintln!(
+        "adaptive mode: {} I-frames (max gap {:.1}s), {} sparse regions (threshold {:.1}s)",
+        info.count(),
+        info.max_gap(),
+        sparse_regions.len(),
+        cfg.gap_threshold
+    );
+
+    let write_files = mode == OutputMode::Files;
+    let mut state = ProcessState::new(cfg, write_files, max_in_flight);
+
+    // Phase 1: extract keyframes
+    let mut stream =
+        extract::stream_keyframes(input, info.timestamps, cfg.min_frame_size, cfg.score_edge)?;
+    while let Some(frame) = stream.next_frame()? {
+        if let Some(aspect) = stream.aspect() {
+            state.set_aspect(aspect);
+        }
+        state.push_rgb(frame, out_dir)?;
+    }
+
+    // Phase 2: fill sparse regions with fixed-fps samples
+    for (start, end) in sparse_regions {
+        eprintln!("  filling sparse region {:.1}s-{:.1}s", start, end);
+        let mut fill_stream = extract::stream_range(
+            input,
+            cfg.base_fps,
+            cfg.min_frame_size,
+            cfg.score_edge,
+            start,
+            end,
+        )?;
+        while let Some(frame) = fill_stream.next_frame()? {
+            if let Some(aspect) = fill_stream.aspect() {
+                state.set_aspect(aspect);
+            }
+            state.push_rgb(frame, out_dir)?;
+        }
+    }
+
+    let (duration, grid_metas) = state.finish(out_dir)?;
+
+    write_outputs(input, out_dir, cfg, mode, duration, grid_metas, subs)
+}
+
+/// Shared output writing for all strategies.
+fn write_outputs(
+    input: &Path,
+    out_dir: &Path,
+    cfg: &Config,
+    mode: OutputMode,
+    duration: f32,
+    mut grid_metas: Vec<GridMeta>,
+    subs: SubtitleOpts<'_>,
+) -> Result<()> {
+    let write_files = mode == OutputMode::Files;
+
+    // Extract subtitles: explicit path > explicit track > auto-detection
+    let srt_text = match (subs.path, subs.track) {
+        (Some(path), _) => Some(subtitle::extract_from_file(path)?),
+        (None, Some(track)) => Some(subtitle::extract_track(input, track)?),
+        (None, None) => subtitle::extract(input)?,
+    };
+    if let Some(ref text) = srt_text {
+        let cues = subtitle::parse_srt(text);
+        for grid in &mut grid_metas {
+            if let Ok((start, end)) = parse_range(&grid.time_range) {
+                grid.subtitles = subtitle::slice_for_range(&cues, start, end);
+            }
+        }
+        if write_files {
+            fs::write(out_dir.join("subtitles.txt"), text).context("writing subtitles.txt")?;
+        }
     }
 
     let meta = Metadata {
         source: input.display().to_string(),
         duration,
         settings: Settings {
-            max_pixels: cfg.max_pixels,
+            max_edge: cfg.max_edge,
             quality: cfg.quality_label.to_string(),
             detail: cfg.detail_label.to_string(),
         },
@@ -330,7 +547,7 @@ fn process_chunk(
     let span = chunk_span(&chunk);
     let min_gap = (0.5 * span / env.capacity.max(1) as f32).max(env.min_gap_floor);
     let selected = score::select_top_k(&chunk, env.capacity, min_gap);
-    let picked: Vec<ScoredFrame> = selected.iter().map(|&i| chunk[i].clone()).collect();
+    let picked = extract_selected(&mut chunk, selected);
 
     let heroes = score::pick_heroes(&picked);
     let lay = layout::compute(picked.len(), &heroes, env.aspect, &env.preset);
@@ -355,6 +572,9 @@ fn process_chunk(
 
 /// Run the `extract` pipeline: high-density sampling of `[start, end)` into a
 /// single equal-cell grid, frames in time order (no hero emphasis).
+///
+/// Uses streaming dedup + batched selection to bound memory: each batch is
+/// scored and reduced to `capacity` candidates before the next batch loads.
 pub fn extract_range(
     input: &Path,
     out_dir: &Path,
@@ -362,6 +582,7 @@ pub fn extract_range(
     start: f32,
     end: f32,
     mode: OutputMode,
+    subs: SubtitleOpts<'_>,
 ) -> Result<()> {
     let write_files = mode == OutputMode::Files;
     if write_files {
@@ -369,15 +590,19 @@ pub fn extract_range(
             .with_context(|| format!("creating output dir {}", out_dir.display()))?;
     }
 
-    // Triple the base fps for dense sampling within the window.
     let fps = cfg.base_fps * 3.0;
     let mut stream =
         extract::stream_range(input, fps, cfg.min_frame_size, cfg.score_edge, start, end)?;
 
-    let batch_size = extract_batch_frames(cfg);
+    let extract_batch = extract_batch_frames(cfg);
+    let select_batch = (cfg.base_fps * cfg.chunk_seconds).round().max(1.0) as usize;
     let mut deduper = dedup::Deduper::new(cfg.hash_threshold, cfg.dedup_window);
-    let mut rgb_batch = Vec::with_capacity(batch_size);
-    let mut frames = Vec::new();
+    let weights = cfg.weights();
+    let preset = cfg.as_preset();
+
+    let mut rgb_batch = Vec::with_capacity(extract_batch);
+    let mut scored_batch: Vec<ScoredFrame> = Vec::new();
+    let mut candidates: Vec<ScoredFrame> = Vec::new();
     let mut aspect = 1.0_f32;
 
     while let Some(rgb) = stream.next_frame()? {
@@ -385,31 +610,54 @@ pub fn extract_range(
             aspect = a;
         }
         rgb_batch.push(rgb);
-        if rgb_batch.len() == batch_size {
+        if rgb_batch.len() >= extract_batch {
             let scored =
                 extract::scored_frames_from_rgbs(mem::take(&mut rgb_batch), cfg.score_edge);
-            frames.extend(deduper.filter(scored));
+            scored_batch.extend(deduper.filter(scored));
+        }
+
+        if scored_batch.len() >= select_batch {
+            flush_batch_to_candidates(
+                &mut scored_batch,
+                &mut candidates,
+                &weights,
+                &preset,
+                aspect,
+                cfg.min_gap,
+            );
         }
     }
+
     if !rgb_batch.is_empty() {
         let scored = extract::scored_frames_from_rgbs(rgb_batch, cfg.score_edge);
-        frames.extend(deduper.filter(scored));
+        scored_batch.extend(deduper.filter(scored));
+    }
+    if !scored_batch.is_empty() {
+        flush_batch_to_candidates(
+            &mut scored_batch,
+            &mut candidates,
+            &weights,
+            &preset,
+            aspect,
+            cfg.min_gap,
+        );
     }
 
-    let weights = cfg.weights();
-    score::compute_raw(&mut frames);
-    score::rank_normalize_and_score(&mut frames, &weights);
-
-    let preset = cfg.as_preset();
     let capacity = layout::grid_capacity(&preset, aspect);
-    let selected = score::select_top_k(&frames, capacity, cfg.min_gap);
-    let picked: Vec<ScoredFrame> = selected.iter().map(|&i| frames[i].clone()).collect();
+    let picked = if candidates.len() <= capacity {
+        candidates
+    } else {
+        score::compute_raw(&mut candidates);
+        score::rank_normalize_and_score(&mut candidates, &weights);
+        let selected = score::select_top_k(&candidates, capacity, cfg.min_gap);
+        extract_selected(&mut candidates, selected)
+    };
 
     let lay = layout::compute(picked.len(), &[], aspect, &preset);
     let jpeg = compose::render(&picked, &lay, &[], cfg.jpeg_quality, cfg.hero_border_px)?;
 
     let file = "grid_extract.jpg";
-    let grid_meta = build_grid_meta(
+    let mut grid_meta = build_grid_meta(
         if write_files { Some(file) } else { None },
         if write_files { None } else { Some(&jpeg) },
         &picked,
@@ -417,11 +665,22 @@ pub fn extract_range(
         lay.template,
     );
 
+    // Extract subtitles for this range
+    let srt_text = match (subs.path, subs.track) {
+        (Some(path), _) => Some(subtitle::extract_from_file(path)?),
+        (None, Some(track)) => Some(subtitle::extract_track(input, track)?),
+        (None, None) => subtitle::extract(input)?,
+    };
+    if let Some(ref text) = srt_text {
+        let cues = subtitle::parse_srt(text);
+        grid_meta.subtitles = subtitle::slice_for_range(&cues, start, end);
+    }
+
     let meta = Metadata {
         source: input.display().to_string(),
         duration: end - start,
         settings: Settings {
-            max_pixels: cfg.max_pixels,
+            max_edge: cfg.max_edge,
             quality: cfg.quality_label.to_string(),
             detail: cfg.detail_label.to_string(),
         },
@@ -441,6 +700,25 @@ pub fn extract_range(
     Ok(())
 }
 
+fn flush_batch_to_candidates(
+    batch: &mut Vec<ScoredFrame>,
+    candidates: &mut Vec<ScoredFrame>,
+    weights: &score::Weights,
+    preset: &crate::types::Preset,
+    aspect: f32,
+    min_gap: f32,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    score::compute_raw(batch);
+    score::rank_normalize_and_score(batch, weights);
+    let capacity = layout::grid_capacity(preset, aspect);
+    let selected = score::select_top_k(batch, capacity, min_gap);
+    candidates.extend(extract_selected(batch, selected));
+    batch.clear();
+}
+
 /// Parse a `MM:SS-MM:SS` (or `SS-SS`) range into `(start, end)` seconds.
 pub fn parse_range(s: &str) -> Result<(f32, f32)> {
     let (a, b) = s
@@ -458,12 +736,28 @@ pub fn parse_range(s: &str) -> Result<(f32, f32)> {
 fn parse_clock(s: &str) -> Result<f32> {
     let parts: Vec<&str> = s.split(':').collect();
     let secs = match parts.as_slice() {
-        [s] => s.parse::<f32>()?,
-        [m, s] => m.parse::<f32>()? * 60.0 + s.parse::<f32>()?,
-        [h, m, s] => h.parse::<f32>()? * 3600.0 + m.parse::<f32>()? * 60.0 + s.parse::<f32>()?,
-        _ => anyhow::bail!("bad time '{s}'"),
+        [sec] => sec.parse::<f32>(),
+        [m, sec] => Ok(m.parse::<f32>()? * 60.0 + sec.parse::<f32>()?),
+        [h, m, sec] => {
+            Ok(h.parse::<f32>()? * 3600.0 + m.parse::<f32>()? * 60.0 + sec.parse::<f32>()?)
+        }
+        _ => anyhow::bail!("expected MM:SS or seconds, got '{s}'"),
     };
-    Ok(secs)
+    secs.with_context(|| format!("invalid time '{s}'"))
+}
+
+/// Extract frames at `indices` from `frames` without cloning.
+///
+/// Uses `swap_remove` so indices must be processed in descending order to avoid
+/// invalidation. The returned frames are sorted by timestamp.
+fn extract_selected(frames: &mut Vec<ScoredFrame>, mut indices: Vec<usize>) -> Vec<ScoredFrame> {
+    indices.sort_unstable_by(|a, b| b.cmp(a));
+    let mut picked = Vec::with_capacity(indices.len());
+    for i in indices {
+        picked.push(frames.swap_remove(i));
+    }
+    picked.sort_by(|a, b| a.ts.total_cmp(&b.ts));
+    picked
 }
 
 /// Build the metadata record for one rendered grid.
@@ -495,6 +789,7 @@ fn build_grid_meta(
         key_frames,
         layout: template.to_string(),
         base64: jpeg.map(|b| STANDARD.encode(b)),
+        subtitles: None,
     }
 }
 

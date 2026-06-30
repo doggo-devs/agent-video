@@ -1,23 +1,7 @@
-//! Preset resolution: merge a model preset, a quality tier, and a detail tier
-//! into a single [`Preset`]. The whole layout engine reads from `max_pixels`,
-//! so changing target model is a one-number change.
+//! Preset resolution: merge a quality tier and a detail tier into a single
+//! [`Preset`]. The layout engine reads from `max_pixels` (canvas edge length).
 
 use crate::types::{Detail, Preset, Quality};
-
-/// Model presets only seed the `max_pixels` default; `--max-pixels` overrides.
-///
-/// `max_pixels` is a canvas **area** budget. Returns `None` for an unknown name
-/// so the caller can surface a clear error.
-pub fn model_max_pixels(model: &str) -> Option<u32> {
-    let v = match model {
-        "qwen2.5vl" => 8000,
-        "gpt4o" => 2048,
-        "claude" => 2048,
-        "internvl" => 4096,
-        _ => return None,
-    };
-    Some(v)
-}
 
 /// Minimum readable frame edge and canvas scale for a quality tier.
 fn quality_params(q: Quality) -> (u32, f32) {
@@ -37,16 +21,16 @@ fn detail_params(d: Detail) -> (f32, u32) {
     }
 }
 
-/// Merge the three tiers into a resolved [`Preset`].
+/// Merge quality and detail tiers into a resolved [`Preset`].
 ///
-/// `max_pixels` is taken as-is (already resolved from `--max-pixels` or the
-/// model preset by the caller). `min_frame_size` and `canvas_scale` come from
-/// `quality`; `base_fps` and `hash_threshold` from `detail`.
-pub fn resolve_preset(max_pixels: u32, quality: Quality, detail: Detail) -> Preset {
+/// `max_edge` is taken as-is (canvas edge length). `min_frame_size` and
+/// `canvas_scale` come from `quality`; `base_fps` and `hash_threshold` from
+/// `detail`.
+pub fn resolve_preset(max_edge: u32, quality: Quality, detail: Detail) -> Preset {
     let (min_frame_size, canvas_scale) = quality_params(quality);
     let (base_fps, hash_threshold) = detail_params(detail);
     Preset {
-        max_pixels,
+        max_edge,
         min_frame_size,
         canvas_scale,
         base_fps,
@@ -57,16 +41,6 @@ pub fn resolve_preset(max_pixels: u32, quality: Quality, detail: Detail) -> Pres
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolves_qwen_default_pixels() {
-        assert_eq!(model_max_pixels("qwen2.5vl"), Some(8000));
-    }
-
-    #[test]
-    fn rejects_unknown_model() {
-        assert_eq!(model_max_pixels("nope"), None);
-    }
 
     #[test]
     fn merges_high_standard_tiers() {

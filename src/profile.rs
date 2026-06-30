@@ -126,7 +126,16 @@ fn load_user_profiles() -> HashMap<String, ProfileOverrides> {
         Some(d) => d.join("vidgrid").join("profiles.toml"),
         None => return HashMap::new(),
     };
-    load_profiles_from(&path).unwrap_or_default()
+    if !path.exists() {
+        return HashMap::new();
+    }
+    match load_profiles_from(&path) {
+        Ok(profiles) => profiles,
+        Err(e) => {
+            eprintln!("warning: {e:#}");
+            HashMap::new()
+        }
+    }
 }
 
 fn load_profiles_from(path: &PathBuf) -> Result<HashMap<String, ProfileOverrides>> {

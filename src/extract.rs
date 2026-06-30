@@ -92,6 +92,60 @@ impl FrameStream {
     }
 }
 
+/// Streaming reader over ffmpeg's keyframe-only PPM output.
+///
+/// Uses `-skip_frame nokey` to decode only I-frames. Timestamps come from a
+/// pre-probed list rather than computed from fps.
+pub struct KeyframeStream {
+    child: Child,
+    reader: BufReader<ChildStdout>,
+    tok: Vec<u8>,
+    timestamps: Vec<f32>,
+    idx: usize,
+    aspect: Option<f32>,
+    eof: bool,
+}
+
+impl KeyframeStream {
+    /// Return the source frame aspect ratio once at least one frame was read.
+    pub fn aspect(&self) -> Option<f32> {
+        self.aspect
+    }
+
+    /// Read the next keyframe, or `None` after a clean EOF.
+    ///
+    /// Timestamps are taken from the pre-probed list passed at construction;
+    /// if ffmpeg outputs more frames than expected, later frames get their
+    /// index as a fallback timestamp.
+    pub fn next_frame(&mut self) -> Result<Option<RgbFrame>> {
+        if self.eof {
+            return Ok(None);
+        }
+
+        let Some(rgb) = read_ppm(&mut self.reader, &mut self.tok)? else {
+            self.eof = true;
+            let status = self.child.wait().context("waiting for ffmpeg")?;
+            if !status.success() && self.idx == 0 {
+                bail!("ffmpeg exited with {status} and produced no frames");
+            }
+            return Ok(None);
+        };
+
+        if self.aspect.is_none() {
+            let (w, h) = rgb.dimensions();
+            self.aspect = Some(w as f32 / h as f32);
+        }
+
+        let ts = self
+            .timestamps
+            .get(self.idx)
+            .copied()
+            .unwrap_or(self.idx as f32);
+        self.idx += 1;
+        Ok(Some(RgbFrame { ts, rgb }))
+    }
+}
+
 /// Open a streaming extractor for the whole video.
 pub fn stream_frames(
     input: &Path,
@@ -115,6 +169,53 @@ pub fn stream_range(
     end: f32,
 ) -> Result<FrameStream> {
     stream_inner(input, fps, cell_min_edge, score_edge, Some((start, end)))
+}
+
+/// Open a keyframe-only streaming extractor.
+///
+/// Uses `-skip_frame nokey` so ffmpeg decodes only I-frames. The `timestamps`
+/// should come from [`probe::probe_keyframes`]; each decoded frame is paired
+/// with the corresponding timestamp by index.
+pub fn stream_keyframes(
+    input: &Path,
+    timestamps: Vec<f32>,
+    cell_min_edge: u32,
+    score_edge: u32,
+) -> Result<KeyframeStream> {
+    let rgb_edge = cell_min_edge.max(1);
+    let score_edge = if score_edge == 0 {
+        DEFAULT_SCORE_EDGE
+    } else {
+        score_edge
+    };
+    let pipe_edge = rgb_edge.max(score_edge);
+
+    let vf = format!("scale={pipe_edge}:{pipe_edge}:force_original_aspect_ratio=increase");
+    let mut child = Command::new("ffmpeg")
+        .arg("-skip_frame")
+        .arg("nokey")
+        .arg("-i")
+        .arg(input)
+        .arg("-vf")
+        .arg(vf)
+        .arg("-vsync")
+        .arg("0")
+        .args(["-f", "image2pipe", "-vcodec", "ppm", "pipe:1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn ffmpeg for keyframe extraction")?;
+
+    let stdout = child.stdout.take().expect("stdout was piped");
+    Ok(KeyframeStream {
+        child,
+        reader: BufReader::new(stdout),
+        tok: Vec::new(),
+        timestamps,
+        idx: 0,
+        aspect: None,
+        eof: false,
+    })
 }
 
 /// Convert a bounded RGB batch to [`ScoredFrame`]s, deriving grayscale in parallel.

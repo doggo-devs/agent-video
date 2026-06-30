@@ -11,6 +11,7 @@ mod extract;
 mod layout;
 mod pipeline;
 mod preset;
+mod probe;
 mod profile;
 mod score;
 mod subtitle;
@@ -20,9 +21,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 
-use crate::config::Config;
+use crate::config::{Config, StrategyOpts};
 use crate::pipeline::parse_range;
-use crate::preset::{model_max_pixels, resolve_preset};
+use crate::preset::resolve_preset;
+use crate::probe::SampleStrategy;
 use crate::profile::ProfileOverrides;
 use crate::types::{Detail, Quality};
 
@@ -74,12 +76,9 @@ struct IoArgs {
 /// Options shared by both subcommands.
 #[derive(clap::Args)]
 struct CommonOpts {
-    /// Model preset seeding `max_pixels` (qwen2.5vl, gpt4o, claude, internvl).
-    #[arg(long, default_value = "qwen2.5vl")]
-    model: String,
-    /// Override the canvas area budget in pixels.
-    #[arg(long)]
-    max_pixels: Option<u32>,
+    /// Canvas edge length in pixels.
+    #[arg(long, default_value_t = 2000)]
+    max_edge: u32,
     /// Resolution tier.
     #[arg(long, value_enum, default_value_t = QualityArg::High)]
     quality: QualityArg,
@@ -134,6 +133,28 @@ struct CommonOpts {
     /// Output JSON with base64 images to stdout instead of writing files.
     #[arg(long)]
     json: bool,
+
+    /// Explicit subtitle file (overrides embedded and sidecar detection).
+    #[arg(long, value_hint = ValueHint::FilePath)]
+    subtitle: Option<PathBuf>,
+
+    /// Embedded subtitle track index (0-based, use when multiple tracks exist).
+    #[arg(long)]
+    subtitle_track: Option<usize>,
+
+    // --- Strategy options ---
+    /// Frame sampling strategy.
+    #[arg(long, value_enum, default_value_t = StrategyArg::FixedFps)]
+    strategy: StrategyArg,
+    /// Allow fixed-fps on videos exceeding 1h duration limit.
+    #[arg(long)]
+    force: bool,
+    /// Minimum keyframes required for keyframes/adaptive strategies.
+    #[arg(long, default_value_t = StrategyOpts::DEFAULT_MIN_KEYFRAMES)]
+    min_keyframes: usize,
+    /// Gap threshold (seconds) for adaptive sparse region fill.
+    #[arg(long, default_value_t = StrategyOpts::DEFAULT_GAP_THRESHOLD)]
+    gap_threshold: f32,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -148,6 +169,14 @@ enum DetailArg {
     Coarse,
     Standard,
     Fine,
+}
+
+#[derive(Copy, Clone, Debug, Default, ValueEnum)]
+enum StrategyArg {
+    #[default]
+    FixedFps,
+    Keyframes,
+    Adaptive,
 }
 
 impl From<QualityArg> for Quality {
@@ -170,6 +199,16 @@ impl From<DetailArg> for Detail {
     }
 }
 
+impl From<StrategyArg> for SampleStrategy {
+    fn from(s: StrategyArg) -> Self {
+        match s {
+            StrategyArg::FixedFps => SampleStrategy::FixedFps,
+            StrategyArg::Keyframes => SampleStrategy::Keyframes,
+            StrategyArg::Adaptive => SampleStrategy::Adaptive,
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -178,20 +217,11 @@ fn main() -> anyhow::Result<()> {
         Command::Extract { io, opts, .. } => (io, opts),
     };
 
-    let max_pixels = match opts.max_pixels {
-        Some(p) => p,
-        None => model_max_pixels(&opts.model).ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown model preset '{}'; use --max-pixels or one of: \
-                 qwen2.5vl, gpt4o, claude, internvl",
-                opts.model
-            )
-        })?,
-    };
+    let max_edge = opts.max_edge;
 
     let quality = Quality::from(opts.quality);
     let detail = Detail::from(opts.detail);
-    let preset = resolve_preset(max_pixels, quality, detail);
+    let preset = resolve_preset(max_edge, quality, detail);
 
     let overrides = ProfileOverrides {
         w_scene: opts.w_scene,
@@ -207,12 +237,24 @@ fn main() -> anyhow::Result<()> {
         hero_border_px: opts.hero_border_px,
     };
     let prof = profile::resolve(opts.profile.as_deref(), &overrides)?;
-    let cfg = Config::new(preset, prof, quality, detail);
+
+    let strategy_opts = StrategyOpts {
+        strategy: SampleStrategy::from(opts.strategy),
+        gap_threshold: opts.gap_threshold,
+        min_keyframes: opts.min_keyframes,
+        force: opts.force,
+    };
+    let cfg = Config::new(preset, prof, quality, detail, strategy_opts);
 
     let mode = if opts.json {
         pipeline::OutputMode::Json
     } else {
         pipeline::OutputMode::Files
+    };
+
+    let subs = pipeline::SubtitleOpts {
+        path: opts.subtitle.as_deref(),
+        track: opts.subtitle_track,
     };
 
     match &cli.command {
@@ -221,11 +263,11 @@ fn main() -> anyhow::Result<()> {
         } => {
             let threads = threads.unwrap_or(0); // 0 = rayon default (CPU cores)
             let in_flight = in_flight.unwrap_or(pipeline::DEFAULT_IN_FLIGHT);
-            pipeline::process(&io.input, &io.output, &cfg, mode, threads, in_flight)
+            pipeline::process(&io.input, &io.output, &cfg, mode, threads, in_flight, subs)
         }
         Command::Extract { range, .. } => {
             let (start, end) = *range;
-            pipeline::extract_range(&io.input, &io.output, &cfg, start, end, mode)
+            pipeline::extract_range(&io.input, &io.output, &cfg, start, end, mode, subs)
         }
     }
 }
