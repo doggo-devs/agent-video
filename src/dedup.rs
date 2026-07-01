@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use image_hasher::{HasherConfig, ImageHash};
 use rayon::prelude::*;
 
-use crate::types::ScoredFrame;
+use crate::types::CandidateFrame;
 
 /// How many recently-kept hashes to compare against. A short window catches
 /// repeats across brief dips without letting slow drift accumulate into a
@@ -41,23 +41,35 @@ impl Deduper {
         }
     }
 
-    /// Drop duplicates from a bounded batch while preserving frame order.
+    /// Tag every frame of a bounded batch with its keep/drop verdict,
+    /// preserving frame order.
     ///
     /// Hashing within the batch runs in parallel; the keep/drop decisions remain
-    /// sequential so results match the streaming single-frame path.
-    pub fn filter(&mut self, frames: Vec<ScoredFrame>) -> Vec<ScoredFrame> {
+    /// sequential so results match the streaming single-frame path. Callers that
+    /// track dropped frames (static-stretch detection) get the verdict attached
+    /// to the frame itself instead of reconstructing it from timestamps.
+    pub fn judge(&mut self, frames: Vec<CandidateFrame>) -> Vec<(CandidateFrame, bool)> {
         let hashes: Vec<ImageHash> = frames
             .par_iter()
             .map(|frame| self.hasher.hash_image(&frame.gray))
             .collect();
 
-        let mut kept = Vec::with_capacity(frames.len());
-        for (frame, hash) in frames.into_iter().zip(hashes) {
-            if self.accepts_hash(hash) {
-                kept.push(frame);
-            }
-        }
-        kept
+        frames
+            .into_iter()
+            .zip(hashes)
+            .map(|(frame, hash)| {
+                let kept = self.accepts_hash(hash);
+                (frame, kept)
+            })
+            .collect()
+    }
+
+    /// Drop duplicates from a bounded batch while preserving frame order.
+    pub fn filter(&mut self, frames: Vec<CandidateFrame>) -> Vec<CandidateFrame> {
+        self.judge(frames)
+            .into_iter()
+            .filter_map(|(frame, kept)| kept.then_some(frame))
+            .collect()
     }
 
     fn accepts_hash(&mut self, hash: ImageHash) -> bool {
@@ -80,21 +92,19 @@ impl Deduper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::RawScores;
     use image::{GrayImage, RgbImage};
+    use std::sync::Arc;
 
     /// Build a frame whose grayscale is a flat fill of `level`.
-    fn flat_frame(ts: f32, level: u8) -> ScoredFrame {
-        ScoredFrame {
+    fn flat_frame(ts: f32, level: u8) -> CandidateFrame {
+        CandidateFrame {
             ts,
             gray: GrayImage::from_pixel(64, 64, image::Luma([level])),
-            rgb: RgbImage::new(1, 1),
-            raw: RawScores::default(),
-            score: 0.0,
+            rgb: Arc::new(RgbImage::new(1, 1)),
         }
     }
 
-    fn dedup(frames: Vec<ScoredFrame>, threshold: u32, window: usize) -> Vec<ScoredFrame> {
+    fn dedup(frames: Vec<CandidateFrame>, threshold: u32, window: usize) -> Vec<CandidateFrame> {
         Deduper::new(threshold, window).filter(frames)
     }
 
@@ -116,6 +126,22 @@ mod tests {
     }
 
     #[test]
+    fn tags_every_frame_with_its_verdict_in_order() {
+        let frames = vec![
+            flat_frame(0.0, 100),
+            flat_frame(1.0, 100),
+            flat_frame(2.0, 100),
+        ];
+        let judged = Deduper::new(8, 8).judge(frames);
+        let verdicts: Vec<(f32, bool)> = judged.iter().map(|(f, kept)| (f.ts, *kept)).collect();
+        assert_eq!(
+            verdicts,
+            vec![(0.0, true), (1.0, false), (2.0, false)],
+            "duplicates come back tagged dropped, in input order"
+        );
+    }
+
+    #[test]
     fn keeps_visually_distinct_frames() {
         // Half-black / half-white pattern vs its inverse hashes very differently.
         let mut a = GrayImage::new(64, 64);
@@ -127,12 +153,10 @@ mod tests {
                 b.put_pixel(x, y, image::Luma([if left { 255 } else { 0 }]));
             }
         }
-        let mk = |ts, g| ScoredFrame {
+        let mk = |ts, g| CandidateFrame {
             ts,
             gray: g,
-            rgb: RgbImage::new(1, 1),
-            raw: RawScores::default(),
-            score: 0.0,
+            rgb: Arc::new(RgbImage::new(1, 1)),
         };
         let kept = dedup(vec![mk(0.0, a), mk(1.0, b)], 8, 8);
         assert_eq!(kept.len(), 2, "distinct frames are both kept");

@@ -16,7 +16,18 @@
 use image::GrayImage;
 use rayon::prelude::*;
 
-use crate::types::{RawScores, ScoredFrame};
+use crate::types::{CandidateFrame, ScoredFrame};
+
+/// Raw per-dimension scores, in their natural (incomparable) units — a scoring
+/// transient, never stored on a frame. `clarity` is a Laplacian variance,
+/// `edge_density` a Sobel energy mean, `scene_diff` a mean absolute grayscale
+/// difference (0-255) from the previous frame.
+#[derive(Debug, Clone, Copy, Default)]
+struct RawScores {
+    clarity: f32,
+    edge_density: f32,
+    scene_diff: f32,
+}
 
 /// Scoring dimension weights, passed from the profile.
 #[derive(Debug, Clone, Copy)]
@@ -179,75 +190,101 @@ pub fn frame_diff(a: &GrayImage, b: &GrayImage) -> f32 {
     total as f32 / n as f32
 }
 
-/// Fill raw scores (clarity, edge density, scene diff) for a chunk in place.
+/// Score one competition set: compute raw dimensions, rank-normalize each to
+/// `0..=100` within the set, and attach the weighted final score. Consumes the
+/// candidates and returns [`ScoredFrame`]s in the same order.
 ///
-/// `scene_diff` of the first frame is 0 (no predecessor); each subsequent
-/// frame's is its difference from the previous frame in the slice.
+/// `prev` is the grayscale of the frame immediately preceding this set in time
+/// (e.g. the previous chunk's tail): with it, the first frame's `scene_diff`
+/// measures a real transition instead of defaulting to zero. Pass `None` when
+/// the set has no temporal predecessor or its frames are not consecutive.
+///
+/// This is the pipeline's single scoring boundary — everything upstream carries
+/// unscored [`CandidateFrame`]s.
+pub fn score_frames(
+    frames: Vec<CandidateFrame>,
+    weights: &Weights,
+    prev: Option<&GrayImage>,
+) -> Vec<ScoredFrame> {
+    let raws = compute_raw(&frames, prev);
+    let scores = rank_normalize(&raws, weights);
+    frames
+        .into_iter()
+        .zip(scores)
+        .map(|(f, score)| ScoredFrame {
+            ts: f.ts,
+            gray: f.gray,
+            rgb: f.rgb,
+            score,
+        })
+        .collect()
+}
+
+/// Compute raw scores (clarity, edge density, scene diff) for a competition set.
+///
+/// `scene_diff` of the first frame is its difference from `prev` when given
+/// (the frame just before this set), else 0; each subsequent frame's is its
+/// difference from the previous frame in the slice.
 ///
 /// Each frame's three dimensions are independent reads (scene_diff reads the
 /// previous frame's grayscale, never mutates it), so the per-frame work runs in
 /// parallel — this is the pipeline's hottest CPU stage.
-pub fn compute_raw(frames: &mut [ScoredFrame]) {
-    let raws: Vec<RawScores> = (0..frames.len())
+fn compute_raw(frames: &[CandidateFrame], prev: Option<&GrayImage>) -> Vec<RawScores> {
+    (0..frames.len())
         .into_par_iter()
         .map(|i| RawScores {
             clarity: clarity(&frames[i].gray),
             edge_density: edge_density(&frames[i].gray),
-            scene_diff: if i == 0 {
-                0.0
-            } else {
-                frame_diff(&frames[i].gray, &frames[i - 1].gray)
+            scene_diff: match i.checked_sub(1) {
+                Some(p) => frame_diff(&frames[i].gray, &frames[p].gray),
+                None => prev.map_or(0.0, |p| frame_diff(&frames[0].gray, p)),
             },
         })
-        .collect();
-    for (frame, raw) in frames.iter_mut().zip(raws) {
-        frame.raw = raw;
-    }
+        .collect()
 }
 
-/// Rank-normalize each dimension to `0..=100` within the slice, then write the
-/// weighted final score into each frame.
+/// Rank-normalize each raw dimension to `0..=100` within the set, then return
+/// the weighted final score per frame (index-aligned with `raws`).
 ///
 /// For a dimension, the frame with the smallest raw value gets 0, the largest
 /// gets 100, and the rest interpolate linearly by rank position. Ties share the
 /// rank of their first occurrence. With fewer than two frames every score is
-/// 100 (a single frame is trivially the best of its chunk).
-pub fn rank_normalize_and_score(frames: &mut [ScoredFrame], weights: &Weights) {
-    let n = frames.len();
+/// 100 (a single frame is trivially the best of its set).
+fn rank_normalize(raws: &[RawScores], weights: &Weights) -> Vec<f32> {
+    let n = raws.len();
     if n == 0 {
-        return;
+        return Vec::new();
     }
     if n == 1 {
-        frames[0].score = 100.0;
-        return;
+        return vec![100.0];
     }
 
-    let clarity_rank = rank_to_percentile(frames, |f| f.raw.clarity);
-    let edge_rank = rank_to_percentile(frames, |f| f.raw.edge_density);
-    let scene_rank = rank_to_percentile(frames, |f| f.raw.scene_diff);
+    let clarity_rank = rank_to_percentile(raws, |r| r.clarity);
+    let edge_rank = rank_to_percentile(raws, |r| r.edge_density);
+    let scene_rank = rank_to_percentile(raws, |r| r.scene_diff);
 
-    for ((frame, &scene), (&clarity, &edge)) in frames
-        .iter_mut()
-        .zip(&scene_rank)
-        .zip(clarity_rank.iter().zip(&edge_rank))
-    {
-        frame.score = weights.scene * scene + weights.clarity * clarity + weights.edge * edge;
-    }
+    (0..n)
+        .map(|i| {
+            weights.scene * scene_rank[i]
+                + weights.clarity * clarity_rank[i]
+                + weights.edge * edge_rank[i]
+        })
+        .collect()
 }
 
-/// Map each frame's value (via `key`) to a rank percentile in `0..=100`.
-fn rank_to_percentile(frames: &[ScoredFrame], key: impl Fn(&ScoredFrame) -> f32) -> Vec<f32> {
-    let n = frames.len();
+/// Map each raw value (via `key`) to a rank percentile in `0..=100`.
+fn rank_to_percentile(raws: &[RawScores], key: impl Fn(&RawScores) -> f32) -> Vec<f32> {
+    let n = raws.len();
     let mut idx: Vec<usize> = (0..n).collect();
     // Stable sort is load-bearing: tied raw values must map to deterministic
     // percentiles, or selection stops being reproducible across runs. total_cmp
     // matches partial_cmp for finite values but is faster and NaN-safe.
-    idx.sort_by(|&a, &b| key(&frames[a]).total_cmp(&key(&frames[b])));
+    idx.sort_by(|&a, &b| key(&raws[a]).total_cmp(&key(&raws[b])));
 
     let mut out = vec![0.0_f32; n];
     let denom = (n - 1) as f32;
-    for (rank, &frame_i) in idx.iter().enumerate() {
-        out[frame_i] = 100.0 * rank as f32 / denom;
+    for (rank, &raw_i) in idx.iter().enumerate() {
+        out[raw_i] = 100.0 * rank as f32 / denom;
     }
     out
 }
@@ -282,14 +319,15 @@ pub fn select_top_k(frames: &[ScoredFrame], k: usize, min_gap: f32) -> Vec<usize
 }
 
 /// Pick hero frames from an already-selected set: those whose score is at least
-/// one standard deviation above the mean. Returns at most 3 indices (into the
-/// passed slice), highest score first.
+/// one standard deviation above the mean. Returns at most `max_heroes` indices
+/// (into the passed slice), highest score first.
 ///
 /// These statistically-prominent frames drive layout template choice. An empty
-/// result means a uniform grid.
-pub fn pick_heroes(selected: &[ScoredFrame]) -> Vec<usize> {
+/// result means a uniform grid. Callers derive `max_heroes` from grid capacity
+/// (a hero occupies 4 cells, so at most `capacity / 4` heroes are placeable).
+pub fn pick_heroes(selected: &[ScoredFrame], max_heroes: usize) -> Vec<usize> {
     let n = selected.len();
-    if n < 2 {
+    if n < 2 || max_heroes == 0 {
         return Vec::new();
     }
     let mean: f32 = selected.iter().map(|f| f.score).sum::<f32>() / n as f32;
@@ -307,27 +345,31 @@ pub fn pick_heroes(selected: &[ScoredFrame]) -> Vec<usize> {
 
     let mut heroes: Vec<usize> = (0..n).filter(|&i| selected[i].score >= threshold).collect();
     heroes.sort_by(|&a, &b| selected[b].score.total_cmp(&selected[a].score));
-    heroes.truncate(3);
+    heroes.truncate(max_heroes);
     heroes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::RawScores;
     use image::{Luma, RgbImage};
+    use std::sync::Arc;
 
-    fn frame(ts: f32, clarity: f32, edge: f32, scene: f32) -> ScoredFrame {
+    /// A scored frame carrying only the fields selection and hero-picking read.
+    fn scored(ts: f32, score: f32) -> ScoredFrame {
         ScoredFrame {
             ts,
             gray: GrayImage::new(1, 1),
-            rgb: RgbImage::new(1, 1),
-            raw: RawScores {
-                clarity,
-                edge_density: edge,
-                scene_diff: scene,
-            },
-            score: 0.0,
+            rgb: Arc::new(RgbImage::new(1, 1)),
+            score,
+        }
+    }
+
+    fn raw(clarity: f32, edge: f32, scene: f32) -> RawScores {
+        RawScores {
+            clarity,
+            edge_density: edge,
+            scene_diff: scene,
         }
     }
 
@@ -399,83 +441,102 @@ mod tests {
     }
 
     #[test]
+    fn diffs_first_frame_against_boundary_context() {
+        let candidate = |gray: GrayImage| CandidateFrame {
+            ts: 0.0,
+            gray,
+            rgb: Arc::new(RgbImage::new(1, 1)),
+        };
+        let black = GrayImage::from_pixel(8, 8, Luma([0]));
+        let white = GrayImage::from_pixel(8, 8, Luma([255]));
+        let frames = vec![candidate(white.clone()), candidate(white)];
+
+        let no_ctx = compute_raw(&frames, None);
+        let with_ctx = compute_raw(&frames, Some(&black));
+
+        assert_eq!(no_ctx[0].scene_diff, 0.0, "no predecessor, no diff");
+        assert_eq!(
+            with_ctx[0].scene_diff, 255.0,
+            "boundary transition is scored, not zeroed"
+        );
+        assert_eq!(with_ctx[1].scene_diff, 0.0, "interior diffs unchanged");
+    }
+
+    #[test]
     fn normalizes_ranks_to_full_range() {
         // clarity ascending 1,2,3 → percentiles 0,50,100; same for others so
         // the weighted score collapses to those percentiles.
-        let mut fs = vec![
-            frame(0.0, 1.0, 1.0, 1.0),
-            frame(1.0, 2.0, 2.0, 2.0),
-            frame(2.0, 3.0, 3.0, 3.0),
-        ];
+        let raws = vec![raw(1.0, 1.0, 1.0), raw(2.0, 2.0, 2.0), raw(3.0, 3.0, 3.0)];
         let weights = Weights {
             scene: 0.40,
             clarity: 0.35,
             edge: 0.25,
         };
-        rank_normalize_and_score(&mut fs, &weights);
-        assert!((fs[0].score - 0.0).abs() < 1e-3);
-        assert!((fs[1].score - 50.0).abs() < 1e-3);
-        assert!((fs[2].score - 100.0).abs() < 1e-3);
+        let scores = rank_normalize(&raws, &weights);
+        assert!((scores[0] - 0.0).abs() < 1e-3);
+        assert!((scores[1] - 50.0).abs() < 1e-3);
+        assert!((scores[2] - 100.0).abs() < 1e-3);
     }
 
     #[test]
     fn single_frame_scores_full() {
-        let mut fs = vec![frame(0.0, 9.0, 9.0, 9.0)];
         let weights = Weights {
             scene: 0.40,
             clarity: 0.35,
             edge: 0.25,
         };
-        rank_normalize_and_score(&mut fs, &weights);
-        assert_eq!(fs[0].score, 100.0);
+        assert_eq!(rank_normalize(&[raw(9.0, 9.0, 9.0)], &weights), vec![100.0]);
     }
 
     #[test]
     fn enforces_minimum_temporal_gap() {
         // Two high scorers 0.5s apart; NMS with gap 2.0 keeps only the better.
-        let mut fs = vec![
-            frame(0.0, 0.0, 0.0, 0.0),
-            frame(0.5, 0.0, 0.0, 0.0),
-            frame(5.0, 0.0, 0.0, 0.0),
-        ];
-        fs[0].score = 90.0;
-        fs[1].score = 95.0;
-        fs[2].score = 80.0;
+        let fs = vec![scored(0.0, 90.0), scored(0.5, 95.0), scored(5.0, 80.0)];
         let sel = select_top_k(&fs, 3, 2.0);
         assert_eq!(sel, vec![1, 2], "0.5s neighbor of the best is suppressed");
     }
 
     #[test]
     fn returns_indices_sorted_by_time() {
-        let mut fs = vec![frame(9.0, 0.0, 0.0, 0.0), frame(1.0, 0.0, 0.0, 0.0)];
-        fs[0].score = 50.0;
-        fs[1].score = 99.0;
+        let fs = vec![scored(9.0, 50.0), scored(1.0, 99.0)];
         let sel = select_top_k(&fs, 2, 0.0);
         assert_eq!(sel, vec![1, 0], "output ordered by timestamp, not score");
     }
 
     #[test]
     fn picks_outlier_as_hero() {
-        let mut fs = vec![
-            frame(0.0, 0.0, 0.0, 0.0),
-            frame(1.0, 0.0, 0.0, 0.0),
-            frame(2.0, 0.0, 0.0, 0.0),
-            frame(3.0, 0.0, 0.0, 0.0),
+        let fs = vec![
+            scored(0.0, 50.0),
+            scored(1.0, 50.0),
+            scored(2.0, 50.0),
+            scored(3.0, 99.0),
         ];
-        fs[0].score = 50.0;
-        fs[1].score = 50.0;
-        fs[2].score = 50.0;
-        fs[3].score = 99.0;
-        let heroes = pick_heroes(&fs);
+        let heroes = pick_heroes(&fs, 3);
         assert_eq!(heroes, vec![3]);
     }
 
     #[test]
     fn no_hero_when_scores_uniform() {
-        let mut fs = vec![frame(0.0, 0.0, 0.0, 0.0), frame(1.0, 0.0, 0.0, 0.0)];
-        fs[0].score = 70.0;
-        fs[1].score = 70.0;
-        let heroes = pick_heroes(&fs);
+        let fs = vec![scored(0.0, 70.0), scored(1.0, 70.0)];
+        let heroes = pick_heroes(&fs, 3);
         assert!(heroes.is_empty(), "uniform scores yield a uniform grid");
+    }
+
+    #[test]
+    fn caps_hero_count_at_max() {
+        // Two clear outliers, but a capacity that only affords one hero.
+        let fs = vec![
+            scored(0.0, 10.0),
+            scored(1.0, 10.0),
+            scored(2.0, 10.0),
+            scored(3.0, 95.0),
+            scored(4.0, 99.0),
+        ];
+        let heroes = pick_heroes(&fs, 1);
+        assert_eq!(heroes, vec![4], "only the single best outlier is kept");
+        assert!(
+            pick_heroes(&fs, 0).is_empty(),
+            "zero budget means no heroes"
+        );
     }
 }

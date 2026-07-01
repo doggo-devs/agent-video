@@ -24,7 +24,7 @@ pub struct Overrides {
 }
 
 /// Strategy-related options.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct StrategyOpts {
     pub strategy: SampleStrategy,
     pub gap_threshold: f32,
@@ -38,12 +38,24 @@ impl StrategyOpts {
     pub const MAX_DURATION_DEFAULT: f32 = 3600.0;
 }
 
+impl Default for StrategyOpts {
+    /// Mirrors the CLI defaults so a programmatically-built config validates;
+    /// the derived all-zero default would make `gap_threshold` invalid.
+    fn default() -> Self {
+        Self {
+            strategy: SampleStrategy::default(),
+            gap_threshold: Self::DEFAULT_GAP_THRESHOLD,
+            min_keyframes: Self::DEFAULT_MIN_KEYFRAMES,
+            force: false,
+        }
+    }
+}
+
 /// All runtime parameters needed by the pipeline.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub max_edge: u32,
     pub min_frame_size: u32,
-    pub canvas_scale: f32,
     pub base_fps: f32,
     pub hash_threshold: u32,
     pub dedup_window: usize,
@@ -100,9 +112,8 @@ fn builtin_profile(name: &str) -> Option<ProfileDef> {
             ..Default::default()
         },
         "action" => ProfileDef {
-            w_scene: Some(0.55),
-            w_clarity: Some(0.25),
-            w_edge: Some(0.20),
+            w_scene: Some(0.75),
+            w_edge: Some(0.25),
             min_gap: Some(0.3),
             ..Default::default()
         },
@@ -128,25 +139,36 @@ impl Config {
                 None => {
                     return Err(Error::new(
                         ErrorCode::InvalidProfile,
-                        format!("unknown profile '{name}'; available: balanced, fast, quality, action"),
-                    ))
+                        format!(
+                            "unknown profile '{name}'; available: balanced, fast, quality, action"
+                        ),
+                    ));
                 }
             },
             None => None,
         };
 
-        // Quality tier → layout
-        let (min_frame_size, canvas_scale) = match quality {
-            Quality::Low => (256, 0.5),
-            Quality::Medium => (384, 0.75),
-            Quality::High => (512, 1.0),
+        // Quality tier → cell legibility floor. The canvas edge stays at
+        // max_edge regardless: quality trades per-cell size for grid capacity
+        // (capacity ∝ (edge / min_frame_size)²), so lower quality packs more
+        // frames onto the same canvas instead of shrinking the output image.
+        // Extraction pre-scales to this same edge, so cells at the floor are
+        // rendered 1:1 with no upscaling.
+        let min_frame_size = match quality {
+            Quality::Low => 256,
+            Quality::Medium => 384,
+            Quality::High => 512,
         };
 
-        // Detail tier → sampling defaults
-        let (detail_fps, detail_hash) = match detail {
-            Detail::Coarse => (0.5, 4),
-            Detail::Standard => (1.0, 8),
-            Detail::Fine => (3.0, 12),
+        // Detail tier → sampling density only. The dedup threshold is a
+        // candidate-pruning knob, not a density knob: tying it to detail made
+        // fine mode (3 fps, meant to catch subtle changes) dedup the most
+        // aggressively, silently merging small text/UI diffs that no later
+        // stage can recover. Density is handled by fps + NMS + capacity.
+        let detail_fps = match detail {
+            Detail::Coarse => 0.5,
+            Detail::Standard => 1.0,
+            Detail::Fine => 3.0,
         };
 
         // Resolve each field: CLI > profile > detail/default
@@ -158,19 +180,21 @@ impl Config {
             };
         }
 
-        Ok(Self {
+        let cfg = Self {
             max_edge,
             min_frame_size,
-            canvas_scale,
 
             base_fps: resolve!(base_fps, detail_fps),
-            hash_threshold: resolve!(hash_threshold, detail_hash),
+            hash_threshold: resolve!(hash_threshold, 8),
             dedup_window: resolve!(dedup_window, 8),
             score_edge: resolve!(score_edge, 256).max(1),
 
-            w_scene: resolve!(w_scene, 0.40),
-            w_clarity: resolve!(w_clarity, 0.35),
-            w_edge: resolve!(w_edge, 0.25),
+            // Clarity defaults to 0: Laplacian variance and Sobel energy are
+            // both high-frequency measures, so a nonzero clarity weight
+            // double-counts texture. It stays available as an override knob.
+            w_scene: resolve!(w_scene, 0.60),
+            w_clarity: resolve!(w_clarity, 0.0),
+            w_edge: resolve!(w_edge, 0.40),
 
             chunk_seconds: resolve!(chunk_seconds, 60.0),
             min_gap: resolve!(min_gap, 0.5),
@@ -185,13 +209,83 @@ impl Config {
             gap_threshold: strategy_opts.gap_threshold,
             min_keyframes: strategy_opts.min_keyframes,
             force_long_video: strategy_opts.force,
-        })
+        };
+        cfg.validate()?;
+        Ok(cfg)
     }
 
-    /// Canvas geometry for layout, with the quality scale applied to the edge.
+    /// Reject resolved values that would corrupt scoring or sampling arithmetic
+    /// before they reach the pipeline. Names the offending field and value.
+    fn validate(&self) -> crate::error::Result<()> {
+        let invalid = |field: &str, detail: String| -> crate::error::Result<()> {
+            Err(Error::new(
+                ErrorCode::InvalidConfig,
+                format!("invalid {field}: {detail}"),
+            ))
+        };
+
+        for (name, w) in [
+            ("w_scene", self.w_scene),
+            ("w_clarity", self.w_clarity),
+            ("w_edge", self.w_edge),
+        ] {
+            if !w.is_finite() || w < 0.0 {
+                return invalid(name, format!("{w} (weights must be finite and >= 0)"));
+            }
+        }
+        if self.w_scene + self.w_clarity + self.w_edge <= 0.0 {
+            return invalid("weights", "all zero (at least one must be > 0)".to_string());
+        }
+        if !self.base_fps.is_finite() || self.base_fps <= 0.0 {
+            return invalid(
+                "base_fps",
+                format!("{} (must be finite and > 0)", self.base_fps),
+            );
+        }
+        if !self.chunk_seconds.is_finite() || self.chunk_seconds <= 0.0 {
+            return invalid(
+                "chunk_seconds",
+                format!("{} (must be finite and > 0)", self.chunk_seconds),
+            );
+        }
+        if !self.min_gap.is_finite() || self.min_gap < 0.0 {
+            return invalid(
+                "min_gap",
+                format!("{} (must be finite and >= 0)", self.min_gap),
+            );
+        }
+        if !self.gap_threshold.is_finite() || self.gap_threshold <= 0.0 {
+            return invalid(
+                "gap_threshold",
+                format!("{} (must be finite and > 0)", self.gap_threshold),
+            );
+        }
+        if !(1..=100).contains(&self.jpeg_quality) {
+            return invalid(
+                "jpeg_quality",
+                format!("{} (must be in 1..=100)", self.jpeg_quality),
+            );
+        }
+        if self.hash_threshold > 64 {
+            return invalid(
+                "hash_threshold",
+                format!("{} (must be <= 64)", self.hash_threshold),
+            );
+        }
+        if self.dedup_window < 1 {
+            return invalid(
+                "dedup_window",
+                format!("{} (must be >= 1)", self.dedup_window),
+            );
+        }
+        Ok(())
+    }
+
+    /// Canvas geometry for layout: the full `max_edge` budget with the
+    /// quality tier's cell floor.
     pub fn canvas_spec(&self) -> crate::types::CanvasSpec {
         crate::types::CanvasSpec {
-            edge: (self.max_edge as f32 * self.canvas_scale).round() as u32,
+            edge: self.max_edge,
             min_cell_edge: self.min_frame_size,
         }
     }
@@ -210,5 +304,100 @@ impl Config {
             clarity: self.w_clarity,
             edge: self.w_edge,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with(overrides: Overrides) -> crate::error::Result<Config> {
+        Config::new(
+            2000,
+            Quality::High,
+            Detail::Standard,
+            None,
+            &overrides,
+            StrategyOpts::default(),
+        )
+    }
+
+    #[test]
+    fn accepts_default_overrides() {
+        assert!(config_with(Overrides::default()).is_ok());
+    }
+
+    #[test]
+    fn rejects_negative_weight() {
+        let ov = Overrides {
+            w_scene: Some(-0.1),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_with(ov).expect_err("negative weight rejected").code,
+            ErrorCode::InvalidConfig
+        );
+    }
+
+    #[test]
+    fn rejects_all_zero_weights() {
+        let ov = Overrides {
+            w_scene: Some(0.0),
+            w_clarity: Some(0.0),
+            w_edge: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_with(ov).expect_err("all-zero weights rejected").code,
+            ErrorCode::InvalidConfig
+        );
+    }
+
+    #[test]
+    fn rejects_zero_fps() {
+        let ov = Overrides {
+            base_fps: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_with(ov).expect_err("zero fps rejected").code,
+            ErrorCode::InvalidConfig
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_jpeg_quality() {
+        let ov = Overrides {
+            jpeg_quality: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_with(ov).expect_err("quality 0 rejected").code,
+            ErrorCode::InvalidConfig
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_hash_threshold() {
+        let ov = Overrides {
+            hash_threshold: Some(65),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_with(ov).expect_err("threshold > 64 rejected").code,
+            ErrorCode::InvalidConfig
+        );
+    }
+
+    #[test]
+    fn rejects_zero_dedup_window() {
+        let ov = Overrides {
+            dedup_window: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_with(ov).expect_err("window 0 rejected").code,
+            ErrorCode::InvalidConfig
+        );
     }
 }

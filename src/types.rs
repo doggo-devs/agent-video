@@ -1,40 +1,60 @@
 //! Public data types shared across the pipeline.
 //!
-//! The central design constraint lives here: [`ScoredFrame`] never holds a
+//! The central design constraint lives here: neither frame type holds a
 //! full-resolution decoded frame. Right after a frame is decoded, `extract`
 //! derives a small grayscale image (for scoring) and a small RGB image (for
-//! composition), then drops the original buffer. This keeps peak memory in the
-//! hundreds-of-MB range instead of GBs for long videos.
+//! composition), then drops the original buffer. Frames travel as
+//! [`CandidateFrame`] until the scoring boundary, where per-competition-set
+//! rank normalization turns them into [`ScoredFrame`]; both share their RGB
+//! pixels through an [`Arc`], so retaining a representative is a pointer clone,
+//! not a deep copy. This keeps peak memory in the hundreds-of-MB range instead
+//! of GBs for long videos.
+
+use std::sync::Arc;
 
 use image::{GrayImage, RgbImage};
 use serde::Serialize;
 
-/// Raw per-dimension scores, in their natural (incomparable) units.
+/// A sampled frame before scoring: what extract, dedup, and chunking carry.
 ///
-/// Only meaningful after per-chunk rank normalization — see [`crate::score`].
-/// `clarity` is a Laplacian variance, `edge_density` a Sobel energy mean,
-/// `scene_diff` a mean absolute pixel difference (0-255).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RawScores {
-    pub clarity: f32,
-    pub edge_density: f32,
-    /// Mean absolute grayscale difference from the previous kept frame.
-    pub scene_diff: f32,
-}
-
-/// A single sampled frame carrying everything the pipeline needs downstream.
-/// Holds only downscaled derivatives, never the source-resolution buffer.
+/// Holds only downscaled derivatives, never the source-resolution buffer. The
+/// RGB is shared via [`Arc`] so retaining a static-stretch representative is a
+/// pointer clone rather than a ~1.4 MB deep copy.
 #[derive(Debug, Clone)]
-pub struct ScoredFrame {
+pub struct CandidateFrame {
     /// Presentation timestamp in seconds.
     pub ts: f32,
     /// Small grayscale image used for scoring convolutions.
     pub gray: GrayImage,
     /// Small RGB image pasted onto the grid during composition.
-    pub rgb: RgbImage,
-    pub raw: RawScores,
-    /// Final weighted score in `0..=100`, filled after rank normalization.
+    pub rgb: Arc<RgbImage>,
+}
+
+/// A frame after per-competition-set rank normalization; `score` is `0..=100`.
+///
+/// Produced by [`crate::score::score_frames`] at the single scoring boundary.
+#[derive(Debug, Clone)]
+pub struct ScoredFrame {
+    /// Presentation timestamp in seconds.
+    pub ts: f32,
+    /// Small grayscale image, retained because `extract` re-scores globally.
+    pub gray: GrayImage,
+    /// Small RGB image pasted onto the grid during composition.
+    pub rgb: Arc<RgbImage>,
+    /// Final weighted score in `0..=100`.
     pub score: f32,
+}
+
+impl From<ScoredFrame> for CandidateFrame {
+    /// Drop the score to re-enter a fresh competition set — `extract`'s global
+    /// re-rank recomputes scores from scratch.
+    fn from(f: ScoredFrame) -> Self {
+        CandidateFrame {
+            ts: f.ts,
+            gray: f.gray,
+            rgb: f.rgb,
+        }
+    }
 }
 
 /// An axis-aligned rectangle on the output canvas, in pixels.
@@ -59,7 +79,9 @@ impl Rect {
     }
 }
 
-/// Resolution tier: controls minimum readable frame size and canvas scale.
+/// Cell legibility tier: sets the minimum readable cell edge. The canvas edge
+/// is fixed by `max_edge`, so lower quality packs more (smaller) frames onto
+/// the same canvas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Quality {
@@ -68,7 +90,7 @@ pub enum Quality {
     High,
 }
 
-/// Detail tier: controls sampling fps, dedup strictness, and clarity filtering.
+/// Detail tier: controls sampling fps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Detail {
@@ -77,7 +99,7 @@ pub enum Detail {
     Fine,
 }
 
-/// Resolved canvas geometry for layout; the quality scale is already applied.
+/// Resolved canvas geometry for layout.
 #[derive(Debug, Clone, Copy)]
 pub struct CanvasSpec {
     /// Longer canvas edge in pixels.
@@ -88,25 +110,65 @@ pub struct CanvasSpec {
     pub min_cell_edge: u32,
 }
 
+/// A closed time range in seconds; `start <= end` and both finite by
+/// construction. Serializes as `"MM:SS-MM:SS"`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TimeRange {
+    start: f32,
+    end: f32,
+}
+
+impl TimeRange {
+    /// Construct a range, or `None` if either bound is non-finite or `start >
+    /// end`.
+    pub fn new(start: f32, end: f32) -> Option<Self> {
+        (start.is_finite() && end.is_finite() && start <= end).then_some(Self { start, end })
+    }
+
+    pub fn start(&self) -> f32 {
+        self.start
+    }
+
+    pub fn end(&self) -> f32 {
+        self.end
+    }
+}
+
+impl Serialize for TimeRange {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!(
+            "{}-{}",
+            format_ts(self.start),
+            format_ts(self.end)
+        ))
+    }
+}
+
+/// A grid's image payload: exactly one of a written file path or an inline
+/// base64 blob, by construction.
+///
+/// Serialized externally tagged, so a single-variant value becomes a
+/// single-entry map (`{"file": …}` / `{"base64": …}`) that flattens into
+/// [`GridMeta`] under the original key.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GridImage {
+    File(String),
+    Base64(String),
+}
+
 /// Metadata for one rendered grid image.
 #[derive(Debug, Clone, Serialize)]
 pub struct GridMeta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file: Option<String>,
+    #[serde(flatten)]
+    pub image: GridImage,
     /// Time range as "MM:SS-MM:SS" for JSON output.
-    #[serde(serialize_with = "serialize_time_range")]
-    pub time_range: (f32, f32),
+    pub time_range: TimeRange,
     pub total_frames: usize,
     pub key_frames: Vec<KeyFrameMeta>,
-    pub layout: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base64: Option<String>,
+    pub layout: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitles: Option<String>,
-}
-
-fn serialize_time_range<S: serde::Serializer>(range: &(f32, f32), s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&format!("{}-{}", format_ts(range.0), format_ts(range.1)))
 }
 
 /// Format a timestamp as `MM:SS`, clamping negatives to zero and rounding to
@@ -121,7 +183,7 @@ pub fn format_ts(ts: f32) -> String {
 pub struct KeyFrameMeta {
     pub timestamp: String,
     pub score: u32,
-    pub grid_position: String,
+    pub grid_position: &'static str,
 }
 
 /// Top-level structured output written to `metadata.json`.
@@ -150,5 +212,30 @@ mod tests {
         assert_eq!(format_ts(0.0), "00:00");
         assert_eq!(format_ts(83.0), "01:23");
         assert_eq!(format_ts(605.4), "10:05");
+    }
+
+    #[test]
+    fn serializes_grid_image_under_original_key() {
+        // The flattened enum must keep the exact `"file"` / `"base64"` JSON
+        // keys, with only one present at a time.
+        let file_meta = GridMeta {
+            image: GridImage::File("grid_001.jpg".into()),
+            time_range: TimeRange::new(0.0, 5.0).expect("valid range"),
+            total_frames: 3,
+            key_frames: Vec::new(),
+            layout: "UNIFORM",
+            subtitles: None,
+        };
+        let json = serde_json::to_value(&file_meta).expect("serialize file meta");
+        assert_eq!(json["file"], "grid_001.jpg");
+        assert!(json.get("base64").is_none(), "file variant omits base64");
+
+        let b64_meta = GridMeta {
+            image: GridImage::Base64("QUJD".into()),
+            ..file_meta
+        };
+        let json = serde_json::to_value(&b64_meta).expect("serialize base64 meta");
+        assert_eq!(json["base64"], "QUJD");
+        assert!(json.get("file").is_none(), "base64 variant omits file");
     }
 }

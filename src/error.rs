@@ -10,46 +10,48 @@ use std::process::ExitStatus;
 
 /// Exit code categories, designed for harness-layer decision making.
 ///
+/// A Unix exit status carries only 8 bits, so every code must fit in a `u8`
+/// (the `repr` enforces this at compile time). The decades below also avoid
+/// the conventional codes: 1 (uncoded errors: bugs, panics), 2 (CLI usage
+/// errors from clap), and 126+ (shell/signal range).
+///
 /// Ranges:
-/// - 1xx: environment/dependency issues (may resolve with PATH or install)
-/// - 2xx: input issues (file not found, corrupt, constraints violated)
-/// - 3xx: configuration issues (invalid profile, ambiguous options)
-/// - 4xx: output issues (cannot write, permission denied)
-/// - 5xx: internal errors (bugs, panics)
+/// - 10-19: environment/dependency issues (may resolve with PATH or install)
+/// - 20-29: input issues (file not found, corrupt, constraints violated)
+/// - 30-39: configuration issues (invalid profile, ambiguous options)
+/// - 40-49: output issues (cannot write, permission denied)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u16)]
+#[repr(u8)]
 pub enum ErrorCode {
     // Environment / external dependencies
-    FfmpegNotFound = 100,
-    FfprobeNotFound = 101,
-    FfmpegFailed = 102,
-    FfprobeFailed = 103,
+    FfmpegNotFound = 10,
+    FfprobeNotFound = 11,
+    FfmpegFailed = 12,
+    FfprobeFailed = 13,
 
     // Input problems
-    InputNotFound = 200,
-    InputUnreadable = 201,
-    InputCorrupt = 202,
-    InputTooLong = 203,
-    InsufficientKeyframes = 204,
-    NoFramesExtracted = 205,
+    InputNotFound = 20,
+    InputUnreadable = 21,
+    InputCorrupt = 22,
+    InputTooLong = 23,
+    InsufficientKeyframes = 24,
+    NoFramesExtracted = 25,
 
     // Configuration problems
-    InvalidProfile = 300,
-    InvalidRange = 301,
-    AmbiguousSubtitle = 302,
+    InvalidProfile = 30,
+    InvalidRange = 31,
+    AmbiguousSubtitle = 32,
+    InvalidConfig = 33,
 
     // Output problems
-    OutputDirCreate = 400,
-    OutputWriteFailed = 401,
-
-    // Internal errors
-    Internal = 500,
+    OutputDirCreate = 40,
+    OutputWriteFailed = 41,
 }
 
 impl ErrorCode {
     /// Map to process exit code.
-    pub fn exit_code(self) -> i32 {
-        self as i32
+    pub fn exit_code(self) -> u8 {
+        self as u8
     }
 
     /// Short identifier for logs.
@@ -68,9 +70,9 @@ impl ErrorCode {
             ErrorCode::InvalidProfile => "INVALID_PROFILE",
             ErrorCode::InvalidRange => "INVALID_RANGE",
             ErrorCode::AmbiguousSubtitle => "AMBIGUOUS_SUBTITLE",
+            ErrorCode::InvalidConfig => "INVALID_CONFIG",
             ErrorCode::OutputDirCreate => "OUTPUT_DIR_CREATE",
             ErrorCode::OutputWriteFailed => "OUTPUT_WRITE_FAILED",
-            ErrorCode::Internal => "INTERNAL",
         }
     }
 }
@@ -136,10 +138,7 @@ impl Error {
         self
     }
 
-    pub fn with_source(
-        mut self,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
+    pub fn with_source(mut self, source: impl std::error::Error + Send + Sync + 'static) -> Self {
         self.source = Some(Box::new(source));
         self
     }
@@ -169,28 +168,16 @@ impl std::error::Error for Error {
 /// Convenience type alias for Results using our Error.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Convert std::io::Error to our Error with appropriate code.
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        use std::io::ErrorKind;
-        let code = match e.kind() {
-            ErrorKind::NotFound => ErrorCode::InputNotFound,
-            ErrorKind::PermissionDenied => ErrorCode::InputUnreadable,
-            _ => ErrorCode::Internal,
-        };
-        Error::new(code, e.to_string()).with_source(e)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn error_code_exit_codes_in_range() {
-        assert_eq!(ErrorCode::FfmpegNotFound.exit_code(), 100);
-        assert_eq!(ErrorCode::InputNotFound.exit_code(), 200);
-        assert_eq!(ErrorCode::Internal.exit_code(), 500);
+        assert_eq!(ErrorCode::FfmpegNotFound.exit_code(), 10);
+        assert_eq!(ErrorCode::InputNotFound.exit_code(), 20);
+        assert_eq!(ErrorCode::InvalidProfile.exit_code(), 30);
+        assert_eq!(ErrorCode::OutputDirCreate.exit_code(), 40);
     }
 
     #[test]
@@ -205,5 +192,18 @@ mod tests {
         let long_stderr = "x".repeat(1000);
         let ctx = ErrorContext::default().with_stderr(long_stderr);
         assert!(ctx.stderr_snippet.unwrap().len() < 600);
+    }
+
+    #[test]
+    fn preserves_error_code_through_context() {
+        // anyhow's `.context()` decorates the message but keeps the underlying
+        // typed error downcastable — the mechanism the exit-code path relies on.
+        let wrapped = anyhow::Error::from(Error::new(ErrorCode::FfmpegFailed, "boom"))
+            .context("after 5 frames (possible truncation)");
+        let code = wrapped
+            .downcast_ref::<Error>()
+            .map(|e| e.code)
+            .expect("coded error survives .context()");
+        assert_eq!(code, ErrorCode::FfmpegFailed);
     }
 }

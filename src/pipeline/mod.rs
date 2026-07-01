@@ -2,28 +2,31 @@
 //! → layout → compose, then write grids, `metadata.json`, and subtitles.
 //!
 //! Rank normalization and selection are deliberately per-chunk: scores are only
-//! meaningful relative to the frames they compete with, and a "minute" is the
-//! v1 unit of competition.
+//! meaningful relative to the frames they compete with. A chunk is at least
+//! `chunk_seconds` of video, and stretches further when sparse chunks merge
+//! forward (see [`state`]) — the unit of competition is "whatever fills one
+//! grid".
 
 mod chunk;
+mod extract;
 mod output;
+mod range;
 mod state;
 
 use std::fs;
-use std::mem;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::error::{Error, ErrorCode, ErrorContext};
 use crate::probe::{KeyframeInfo, SampleStrategy};
-use crate::types::Metadata;
-use crate::{compose, dedup, extract, layout, probe, score, subtitle};
+use crate::{extract as extract_frames, probe};
 
-use chunk::{build_grid_meta, extract_selected};
-use output::atomic_write;
-use state::{extract_batch_frames, ProcessState};
+use state::ProcessState;
+
+pub use extract::extract_range;
+pub use range::parse_range;
 
 /// Subtitle extraction options.
 #[derive(Debug, Clone, Copy, Default)]
@@ -46,6 +49,10 @@ struct RunCtx<'a> {
     max_in_flight: usize,
     pool: &'a rayon::ThreadPool,
     subs: SubtitleOpts<'a>,
+    /// Container duration from ffprobe, when a probe ran. Authoritative over
+    /// the frame-derived estimate: keyframe sampling can stop well short of
+    /// the tail, and its `+1/base_fps` padding only fits fixed-fps sampling.
+    probed_duration: Option<f32>,
 }
 
 /// Output mode: write files or JSON to stdout.
@@ -67,6 +74,7 @@ pub fn process(
     max_in_flight: usize,
     subs: SubtitleOpts<'_>,
 ) -> Result<()> {
+    validate_input(input)?;
     let keyframe_info = probe_if_needed(input, cfg)?;
     validate_strategy(cfg, keyframe_info.as_ref())?;
 
@@ -91,13 +99,18 @@ pub fn process(
         max_in_flight,
         pool: &pool,
         subs,
+        probed_duration: keyframe_info.as_ref().map(|i| i.duration),
     };
     match cfg.strategy {
         SampleStrategy::FixedFps => {
             ensure_output_dir(out_dir, mode)?;
             eprintln!("fixed-fps mode: sampling at {:.1} fps", cfg.base_fps);
-            let stream =
-                extract::stream_frames(input, cfg.base_fps, cfg.min_frame_size, cfg.score_edge)?;
+            let stream = extract_frames::stream_frames(
+                input,
+                cfg.base_fps,
+                cfg.min_frame_size,
+                cfg.score_edge,
+            )?;
             process_stream(&ctx, stream)
         }
         SampleStrategy::Keyframes => {
@@ -110,7 +123,7 @@ pub fn process(
                 info.mean_gap(),
                 info.max_gap()
             );
-            let stream = extract::stream_keyframes(
+            let stream = extract_frames::stream_keyframes(
                 input,
                 info.timestamps,
                 cfg.min_frame_size,
@@ -128,25 +141,26 @@ pub fn process(
 fn probe_if_needed(input: &Path, cfg: &Config) -> Result<Option<KeyframeInfo>> {
     match cfg.strategy {
         SampleStrategy::FixedFps if cfg.force_long_video => Ok(None),
-        SampleStrategy::FixedFps => {
-            match probe::probe_duration(input) {
-                Ok(duration) => Ok(Some(KeyframeInfo {
-                    timestamps: Vec::new(),
-                    duration,
-                })),
-                Err(e) => Err(Error::new(
-                    ErrorCode::FfprobeFailed,
-                    format!("{e}; cannot verify duration safety"),
-                )
-                .with_context(ErrorContext::default().with_input(input))
-                .into()),
-            }
-        }
+        SampleStrategy::FixedFps => match probe::probe_duration(input) {
+            Ok(duration) => Ok(Some(KeyframeInfo {
+                timestamps: Vec::new(),
+                duration,
+            })),
+            Err(e) => Err(Error::new(
+                ErrorCode::FfprobeFailed,
+                format!("{e}; cannot verify duration safety"),
+            )
+            .with_context(ErrorContext::default().with_input(input))
+            .into()),
+        },
         SampleStrategy::Keyframes | SampleStrategy::Adaptive => {
             if !probe::ffprobe_available() {
                 return Err(Error::new(
                     ErrorCode::FfprobeNotFound,
-                    format!("--strategy {:?} requires ffprobe (not found on PATH)", cfg.strategy),
+                    format!(
+                        "--strategy {:?} requires ffprobe (not found on PATH)",
+                        cfg.strategy
+                    ),
                 )
                 .into());
             }
@@ -160,8 +174,7 @@ fn validate_strategy(cfg: &Config, info: Option<&KeyframeInfo>) -> Result<()> {
 
     match cfg.strategy {
         SampleStrategy::FixedFps => {
-            if let Some(i) =
-                info.filter(|i| i.duration > StrategyOpts::MAX_DURATION_DEFAULT)
+            if let Some(i) = info.filter(|i| i.duration > StrategyOpts::MAX_DURATION_DEFAULT)
                 && !cfg.force_long_video
             {
                 let hours = i.duration / 3600.0;
@@ -195,6 +208,30 @@ fn validate_strategy(cfg: &Config, info: Option<&KeyframeInfo>) -> Result<()> {
     Ok(())
 }
 
+/// Reject a missing, unreadable, or non-file input before any external tool
+/// runs, so the harness gets a precise 2xx code instead of a generic ffprobe
+/// failure wrapping the real cause.
+fn validate_input(input: &Path) -> Result<()> {
+    let meta = fs::metadata(input).map_err(|e| {
+        let code = match e.kind() {
+            std::io::ErrorKind::NotFound => ErrorCode::InputNotFound,
+            _ => ErrorCode::InputUnreadable,
+        };
+        Error::new(code, format!("cannot open input {}", input.display()))
+            .with_context(ErrorContext::default().with_input(input))
+            .with_source(e)
+    })?;
+    if meta.is_dir() {
+        return Err(Error::new(
+            ErrorCode::InputUnreadable,
+            format!("input {} is a directory, not a video file", input.display()),
+        )
+        .with_context(ErrorContext::default().with_input(input))
+        .into());
+    }
+    Ok(())
+}
+
 fn ensure_output_dir(out_dir: &Path, mode: OutputMode) -> Result<()> {
     if mode == OutputMode::Files {
         fs::create_dir_all(out_dir).map_err(|e| {
@@ -211,7 +248,7 @@ fn ensure_output_dir(out_dir: &Path, mode: OutputMode) -> Result<()> {
 
 /// Drain a single frame stream into ProcessState.
 fn drain_source(
-    stream: &mut extract::FrameStream,
+    stream: &mut extract_frames::FrameStream,
     state: &mut ProcessState<'_>,
     out_dir: &Path,
 ) -> Result<()> {
@@ -229,12 +266,13 @@ fn drain_source(
 /// The caller ensures the output dir, prints the mode-specific progress line,
 /// and constructs `stream`; this shared tail runs for both fixed-fps and
 /// keyframe modes, which differ only in those caller-side steps.
-fn process_stream(ctx: &RunCtx<'_>, mut stream: extract::FrameStream) -> Result<()> {
+fn process_stream(ctx: &RunCtx<'_>, mut stream: extract_frames::FrameStream) -> Result<()> {
     let write_files = ctx.mode == OutputMode::Files;
-    let mut state = ProcessState::new(ctx.cfg, ctx.pool, write_files, ctx.max_in_flight, true);
+    let mut state = ProcessState::new(ctx.cfg, ctx.pool, write_files, ctx.max_in_flight);
 
     drain_source(&mut stream, &mut state, ctx.out_dir)?;
     let (duration, grid_metas) = state.finish(ctx.out_dir)?;
+    let duration = final_duration(duration, ctx.probed_duration);
 
     output::write_outputs(
         ctx.input,
@@ -261,26 +299,36 @@ fn process_adaptive(ctx: &RunCtx<'_>, info: KeyframeInfo) -> Result<()> {
     );
 
     let write_files = ctx.mode == OutputMode::Files;
-    let mut state = ProcessState::new(cfg, ctx.pool, write_files, ctx.max_in_flight, false);
+    let mut state = ProcessState::new(cfg, ctx.pool, write_files, ctx.max_in_flight);
 
-    let mut stream =
-        extract::stream_keyframes(ctx.input, info.timestamps, cfg.min_frame_size, cfg.score_edge)?;
-    drain_source(&mut stream, &mut state, ctx.out_dir)?;
+    let mut stream = extract_frames::stream_keyframes(
+        ctx.input,
+        info.timestamps,
+        cfg.min_frame_size,
+        cfg.score_edge,
+    )?;
 
-    for (start, end) in sparse_regions {
-        eprintln!("  filling sparse region {:.1}s-{:.1}s", start, end);
-        let mut fill_stream = extract::stream_range(
-            ctx.input,
-            cfg.base_fps,
-            cfg.min_frame_size,
-            cfg.score_edge,
-            start,
-            end,
-        )?;
-        drain_source(&mut fill_stream, &mut state, ctx.out_dir)?;
+    // Interleave sparse-region fills into the keyframe pass in time order:
+    // before pushing a keyframe at `ts`, drain every region that ends at or
+    // before `ts`. Regions ascending + non-overlapping and fill timestamps
+    // strictly below their region end make the merged arrival monotonic, so
+    // ProcessState's high-water-mark sealing and static detection stay valid.
+    let mut regions = sparse_regions.into_iter().peekable();
+    while let Some(frame) = stream.next_frame()? {
+        if let Some(aspect) = stream.aspect() {
+            state.set_aspect(aspect);
+        }
+        for (start, end) in due_regions(&mut regions, frame.ts) {
+            fill_region(ctx, &mut state, start, end)?;
+        }
+        state.push_rgb(frame, ctx.out_dir)?;
+    }
+    for (start, end) in regions {
+        fill_region(ctx, &mut state, start, end)?;
     }
 
     let (duration, grid_metas) = state.finish(ctx.out_dir)?;
+    let duration = final_duration(duration, ctx.probed_duration);
 
     output::write_outputs(
         ctx.input,
@@ -293,168 +341,41 @@ fn process_adaptive(ctx: &RunCtx<'_>, info: KeyframeInfo) -> Result<()> {
     )
 }
 
-/// Run the `extract` pipeline: high-density sampling of `[start, end)` into a
-/// single equal-cell grid, frames in time order (no hero emphasis).
-pub fn extract_range(
-    input: &Path,
-    out_dir: &Path,
-    cfg: &Config,
-    start: f32,
-    end: f32,
-    mode: OutputMode,
-    subs: SubtitleOpts<'_>,
-) -> Result<()> {
-    let write_files = mode == OutputMode::Files;
-    if write_files {
-        fs::create_dir_all(out_dir)
-            .with_context(|| format!("creating output dir {}", out_dir.display()))?;
-    }
-
-    let fps = cfg.base_fps * 3.0;
-    let mut stream =
-        extract::stream_range(input, fps, cfg.min_frame_size, cfg.score_edge, start, end)?;
-
-    let batch_size = extract_batch_frames(cfg);
-    let mut deduper = dedup::Deduper::new(cfg.hash_threshold, cfg.dedup_window);
-    let weights = cfg.weights();
-    let spec = cfg.canvas_spec();
-
-    let mut rgb_batch = Vec::with_capacity(batch_size);
-    let mut scored_batch: Vec<crate::types::ScoredFrame> = Vec::new();
-    let mut candidates: Vec<crate::types::ScoredFrame> = Vec::new();
-    let mut aspect = 1.0_f32;
-
-    while let Some(rgb) = stream.next_frame()? {
-        if let Some(a) = stream.aspect() {
-            aspect = a;
-        }
-        rgb_batch.push(rgb);
-        if rgb_batch.len() >= batch_size {
-            let scored =
-                extract::scored_frames_from_rgbs(mem::take(&mut rgb_batch), cfg.score_edge);
-            scored_batch.extend(deduper.filter(scored));
-        }
-
-        if scored_batch.len() >= batch_size {
-            flush_batch_to_candidates(
-                &mut scored_batch,
-                &mut candidates,
-                &weights,
-                &spec,
-                aspect,
-                cfg.min_gap,
-            );
-        }
-    }
-
-    if !rgb_batch.is_empty() {
-        let scored = extract::scored_frames_from_rgbs(rgb_batch, cfg.score_edge);
-        scored_batch.extend(deduper.filter(scored));
-    }
-    if !scored_batch.is_empty() {
-        flush_batch_to_candidates(
-            &mut scored_batch,
-            &mut candidates,
-            &weights,
-            &spec,
-            aspect,
-            cfg.min_gap,
-        );
-    }
-
-    let capacity = layout::grid_capacity(&spec, aspect);
-    let picked = if candidates.len() <= capacity {
-        candidates
-    } else {
-        score::compute_raw(&mut candidates);
-        score::rank_normalize_and_score(&mut candidates, &weights);
-        let selected = score::select_top_k(&candidates, capacity, cfg.min_gap);
-        extract_selected(&mut candidates, selected)
-    };
-
-    let lay = layout::compute(picked.len(), &[], aspect, &spec);
-    let jpeg = compose::render(&picked, &lay, &[], cfg.jpeg_quality, cfg.hero_border_px)?;
-
-    let file = "grid_extract.jpg";
-    let mut grid_meta = build_grid_meta(
-        if write_files { Some(file) } else { None },
-        if write_files { None } else { Some(&jpeg) },
-        &picked,
-        &[],
-        lay.template,
-    );
-
-    let srt_text = subtitle::resolve(input, subs.path, subs.track)?;
-    if let Some(ref text) = srt_text {
-        let cues = subtitle::parse_srt(text);
-        grid_meta.subtitles = subtitle::slice_for_range(&cues, start, end);
-    }
-
-    let meta = Metadata {
-        source: input.display().to_string(),
-        duration: end - start,
-        settings: cfg.settings(),
-        grids: vec![grid_meta],
-    };
-
-    if write_files {
-        atomic_write(out_dir, file, &jpeg)?;
-        let json = serde_json::to_string_pretty(&meta).context("serializing metadata")?;
-        atomic_write(out_dir, "metadata.json", json.as_bytes())?;
-        eprintln!("wrote {} to {}", file, out_dir.display());
-    } else {
-        let json = serde_json::to_string_pretty(&meta).context("serializing metadata")?;
-        println!("{json}");
-    }
-
-    Ok(())
+/// Duration reported in `metadata.json`: the probed container duration when
+/// available, floored by the frame-derived estimate in case the container
+/// header under-reports what was actually decoded.
+fn final_duration(observed: f32, probed: Option<f32>) -> f32 {
+    observed.max(probed.unwrap_or(0.0))
 }
 
-fn flush_batch_to_candidates(
-    batch: &mut Vec<crate::types::ScoredFrame>,
-    candidates: &mut Vec<crate::types::ScoredFrame>,
-    weights: &score::Weights,
-    spec: &crate::types::CanvasSpec,
-    aspect: f32,
-    min_gap: f32,
-) {
-    if batch.is_empty() {
-        return;
+/// Pop every region whose `end <= ts` off the front of `regions`, in order.
+///
+/// The regions are ascending and non-overlapping, so this yields exactly the
+/// fills that must be drained before a main-stream frame at `ts` to keep
+/// arrival order monotonic.
+fn due_regions(
+    regions: &mut std::iter::Peekable<std::vec::IntoIter<(f32, f32)>>,
+    ts: f32,
+) -> Vec<(f32, f32)> {
+    let mut due = Vec::new();
+    while regions.peek().is_some_and(|&(_, end)| ts >= end) {
+        due.push(regions.next().expect("peeked region exists"));
     }
-    score::compute_raw(batch);
-    score::rank_normalize_and_score(batch, weights);
-    let capacity = layout::grid_capacity(spec, aspect);
-    let selected = score::select_top_k(batch, capacity, min_gap);
-    candidates.extend(extract_selected(batch, selected));
-    batch.clear();
+    due
 }
 
-/// Parse a `MM:SS-MM:SS` (or `SS-SS`) range into `(start, end)` seconds.
-pub fn parse_range(s: &str) -> Result<(f32, f32)> {
-    let (a, b) = s.split_once('-').ok_or_else(|| {
-        Error::new(ErrorCode::InvalidRange, format!("range '{s}' must be START-END"))
-    })?;
-    let start = parse_clock(a)?;
-    let end = parse_clock(b)?;
-    if end <= start {
-        return Err(Error::new(
-            ErrorCode::InvalidRange,
-            format!("range end ({end}s) must be after start ({start}s)"),
-        )
-        .into());
-    }
-    Ok((start, end))
-}
-
-fn parse_clock(s: &str) -> Result<f32> {
-    let parts: Vec<&str> = s.split(':').collect();
-    let parse = |p: &str| p.parse::<f32>().with_context(|| format!("invalid time '{s}'"));
-    match parts.as_slice() {
-        [sec] => parse(sec),
-        [m, sec] => Ok(parse(m)? * 60.0 + parse(sec)?),
-        [h, m, sec] => Ok(parse(h)? * 3600.0 + parse(m)? * 60.0 + parse(sec)?),
-        _ => bail!("expected MM:SS or seconds, got '{s}'"),
-    }
+/// Drain one sparse region into `state` via a fixed-fps sub-stream.
+fn fill_region(ctx: &RunCtx<'_>, state: &mut ProcessState<'_>, start: f32, end: f32) -> Result<()> {
+    eprintln!("  filling sparse region {start:.1}s-{end:.1}s");
+    let mut fill_stream = extract_frames::stream_range(
+        ctx.input,
+        ctx.cfg.base_fps,
+        ctx.cfg.min_frame_size,
+        ctx.cfg.score_edge,
+        start,
+        end,
+    )?;
+    drain_source(&mut fill_stream, state, ctx.out_dir)
 }
 
 #[cfg(test)]
@@ -462,20 +383,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_mmss_range() {
-        let (s, e) = parse_range("01:23-01:35").expect("valid range");
-        assert_eq!(s, 83.0);
-        assert_eq!(e, 95.0);
+    fn rejects_missing_input_with_not_found_code() {
+        let err = validate_input(Path::new("definitely_missing_video.mp4"))
+            .expect_err("missing input must fail");
+        let code = err.downcast_ref::<Error>().map(|e| e.code);
+        assert_eq!(code, Some(ErrorCode::InputNotFound));
     }
 
     #[test]
-    fn parses_plain_seconds_range() {
-        let (s, e) = parse_range("5-12").expect("valid range");
-        assert_eq!((s, e), (5.0, 12.0));
+    fn rejects_directory_input_as_unreadable() {
+        let err = validate_input(Path::new(".")).expect_err("directory input must fail");
+        let code = err.downcast_ref::<Error>().map(|e| e.code);
+        assert_eq!(code, Some(ErrorCode::InputUnreadable));
     }
 
     #[test]
-    fn rejects_inverted_range() {
-        assert!(parse_range("01:35-01:23").is_err());
+    fn prefers_probed_duration_over_frame_estimate() {
+        assert_eq!(
+            final_duration(3500.5, Some(3600.0)),
+            3600.0,
+            "probe extends past the last sampled frame"
+        );
+        assert_eq!(
+            final_duration(3600.0, Some(3500.0)),
+            3600.0,
+            "observed frames floor an under-reporting header"
+        );
+        assert_eq!(final_duration(120.0, None), 120.0, "no probe, no change");
+    }
+
+    #[test]
+    fn fills_regions_before_first_frame_past_their_end() {
+        // A frame at ts=4 is at the boundary of the head region (0,4): that
+        // region is due; the next region (6,12) is not until a later frame.
+        let mut regions = vec![(0.0, 4.0), (6.0, 12.0)].into_iter().peekable();
+        assert_eq!(due_regions(&mut regions, 4.0), vec![(0.0, 4.0)]);
+        assert_eq!(due_regions(&mut regions, 6.0), Vec::new(), "end 12 > 6");
+        assert_eq!(due_regions(&mut regions, 20.0), vec![(6.0, 12.0)]);
+    }
+
+    #[test]
+    fn fills_trailing_regions_after_eof() {
+        // Frames only reach ts=10, so a tail region ending at 30 is never due
+        // during the pass and remains to be drained after EOF.
+        let mut regions = vec![(0.0, 4.0), (20.0, 30.0)].into_iter().peekable();
+        assert_eq!(due_regions(&mut regions, 10.0), vec![(0.0, 4.0)]);
+        let trailing: Vec<_> = regions.collect();
+        assert_eq!(trailing, vec![(20.0, 30.0)]);
     }
 }

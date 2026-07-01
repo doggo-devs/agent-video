@@ -51,7 +51,7 @@ plus a `metadata.json` describing each grid, its time range, and its key frames.
 |------|--------|---------|--------|
 | `--model` | `qwen2.5vl`, `gpt4o`, `claude`, `internvl` | `qwen2.5vl` | Seeds `--max-pixels` |
 | `--max-pixels` | integer | from model | Canvas area budget |
-| `--quality` | `low`, `medium`, `high` | `high` | Min frame size and canvas scale |
+| `--quality` | `low`, `medium`, `high` | `high` | Cell size floor; lower packs more frames per grid |
 | `--detail` | `coarse`, `standard`, `fine` | `standard` | Sampling fps and dedup strictness |
 | `--profile` | `balanced`, `fast`, `quality`, `action` | `balanced` | Named parameter preset |
 | `--json` | flag | off | Output JSON with base64 to stdout |

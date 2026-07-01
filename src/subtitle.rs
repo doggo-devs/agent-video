@@ -3,6 +3,7 @@
 //! Parses SRT and provides time-range slicing for aligning subtitles with grids.
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 
@@ -10,6 +11,26 @@ use anyhow::{Context, bail};
 
 use crate::child::TrackedChild;
 use crate::error::{Error, ErrorCode, ErrorContext};
+
+/// Upper bound on subtitle stdout we will buffer. Real subtitle tracks are far
+/// smaller; a stream that reaches this is treated as runaway output.
+const MAX_SUBTITLE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read an ffmpeg subtitle stream to a string, bounded by [`MAX_SUBTITLE_BYTES`].
+/// Bails if the cap is reached rather than returning silently truncated text.
+fn read_capped(r: impl Read) -> anyhow::Result<String> {
+    let mut text = String::new();
+    let read = r
+        .take(MAX_SUBTITLE_BYTES)
+        .read_to_string(&mut text)
+        .context("reading subtitle output")?;
+    if read as u64 >= MAX_SUBTITLE_BYTES {
+        bail!(
+            "subtitle output exceeded {MAX_SUBTITLE_BYTES} bytes; refusing to buffer runaway stream"
+        );
+    }
+    Ok(text)
+}
 
 /// A single parsed subtitle cue.
 #[derive(Debug, Clone)]
@@ -41,8 +62,7 @@ struct EmbeddedTrack {
 
 /// Extract subtitles from an explicit file path.
 fn extract_from_file(path: &Path) -> anyhow::Result<String> {
-    fs::read_to_string(path)
-        .with_context(|| format!("reading subtitle file: {}", path.display()))
+    fs::read_to_string(path).with_context(|| format!("reading subtitle file: {}", path.display()))
 }
 
 /// Extract a specific embedded subtitle track by index.
@@ -53,18 +73,17 @@ fn extract_track(input: &Path, track: usize) -> anyhow::Result<String> {
         .arg(input)
         .args(["-map", &map_arg, "-f", "srt", "pipe:1"]);
 
-    let (child, mut stdout) = TrackedChild::spawn(
+    let (child, stdout) = TrackedChild::spawn(
         &mut cmd,
         "ffmpeg for subtitle extraction",
         ErrorCode::FfmpegNotFound,
     )?;
 
-    let mut text = String::new();
-    std::io::Read::read_to_string(&mut stdout, &mut text)
-        .context("reading subtitle output")?;
+    let text = read_capped(stdout)?;
 
     child.wait("ffmpeg subtitle extraction").map_err(|e| {
-        anyhow::anyhow!("failed to extract subtitle track {track}: {e}")
+        anyhow::Error::from(e.into_error(ErrorCode::FfmpegFailed))
+            .context(format!("extracting subtitle track {track}"))
     })?;
 
     let text = text.trim().to_string();
@@ -189,16 +208,19 @@ fn sidecar_dir(input: &Path) -> Option<&Path> {
 fn list_embedded_tracks(input: &Path) -> crate::error::Result<Vec<EmbeddedTrack>> {
     let output = Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-select_streams", "s",
-            "-show_entries", "stream=index:stream_tags=language",
-            "-of", "csv=p=0",
+            "-v",
+            "error",
+            "-select_streams",
+            "s",
+            "-show_entries",
+            "stream=index:stream_tags=language",
+            "-of",
+            "csv=p=0",
         ])
         .arg(input)
         .output()
         .map_err(|e| {
-            Error::new(ErrorCode::FfprobeNotFound, "ffprobe not found on PATH")
-                .with_source(e)
+            Error::new(ErrorCode::FfprobeNotFound, "ffprobe not found on PATH").with_source(e)
         })?;
 
     if !output.status.success() {
@@ -257,19 +279,18 @@ fn extract_embedded(input: &Path, track: usize) -> anyhow::Result<String> {
         .arg(input)
         .args(["-map", &map_arg, "-f", "srt", "pipe:1"]);
 
-    let (child, mut stdout) = TrackedChild::spawn(
+    let (child, stdout) = TrackedChild::spawn(
         &mut cmd,
         "ffmpeg for embedded subtitle",
         ErrorCode::FfmpegNotFound,
     )?;
 
-    let mut text = String::new();
-    std::io::Read::read_to_string(&mut stdout, &mut text)
-        .context("reading subtitle output")?;
+    let text = read_capped(stdout)?;
 
-    child
-        .wait("ffmpeg embedded subtitle")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    child.wait("ffmpeg embedded subtitle").map_err(|e| {
+        anyhow::Error::from(e.into_error(ErrorCode::FfmpegFailed))
+            .context(format!("extracting embedded subtitle stream {track}"))
+    })?;
 
     let text = text.trim().to_string();
     if text.is_empty() {

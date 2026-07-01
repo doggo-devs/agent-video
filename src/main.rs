@@ -25,7 +25,7 @@ use crate::config::{Config, Overrides, StrategyOpts};
 use crate::error::Error;
 use crate::pipeline::parse_range;
 use crate::probe::SampleStrategy;
-use crate::types::{Detail, Quality};
+use crate::types::{Detail, Quality, TimeRange};
 
 #[derive(Parser)]
 #[command(name = "vidgrid", about = "Video → VLM-readable grid images")]
@@ -55,7 +55,7 @@ enum Command {
         io: IoArgs,
         /// Time range, e.g. `01:23-01:35`, validated at parse time.
         #[arg(long, value_parser = parse_range)]
-        range: (f32, f32),
+        range: TimeRange,
         #[command(flatten)]
         opts: CommonOpts,
     },
@@ -217,7 +217,7 @@ fn main() -> ExitCode {
                 .map(|e| e.code.exit_code())
                 .unwrap_or(1);
             eprintln!("error: {e:#}");
-            ExitCode::from(code as u8)
+            ExitCode::from(code)
         }
     }
 }
@@ -282,9 +282,14 @@ fn run() -> anyhow::Result<()> {
             let in_flight = in_flight.unwrap_or(pipeline::DEFAULT_IN_FLIGHT);
             pipeline::process(&io.input, &io.output, &cfg, mode, threads, in_flight, subs)
         }
-        Command::Extract { range, .. } => {
-            let (start, end) = *range;
-            pipeline::extract_range(&io.input, &io.output, &cfg, start, end, mode, subs)
-        }
+        Command::Extract { range, .. } => pipeline::extract_range(
+            &io.input,
+            &io.output,
+            &cfg,
+            range.start(),
+            range.end(),
+            mode,
+            subs,
+        ),
     }
 }

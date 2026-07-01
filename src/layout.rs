@@ -1,18 +1,21 @@
 //! Grid geometry. Pure calculation — no image operations.
 //!
-//! The layout is aspect-aware: cell aspect ratio follows the source frame, so
-//! landscape and portrait videos tile differently. [`CanvasSpec::edge`] caps
-//! the canvas **edge** (the longer side, in pixels); the grid is sized to keep
-//! the canvas roughly square, which maximizes the pixel budget a VLM actually
-//! sees.
+//! The layout is justified: frames are partitioned into rows, every row spans
+//! the full canvas width, and each cell keeps the source aspect ratio exactly.
+//! Cell counts may differ between rows (so cell sizes vary slightly row to
+//! row), but rows always fill their width — the canvas is tiled completely,
+//! with no filler cells, by construction.
 //!
-//! Hero frames occupy 2×2 blocks; normal frames a single cell. Placement uses
-//! an occupancy packer rather than fixed-coordinate templates: it generalizes
-//! to any frame count and guarantees non-overlapping, in-bounds rectangles. The
-//! four template names (UNIFORM / HERO_LEFT / DUAL_HERO / TOP_STRIP) simply
-//! label the hero count for metadata. Scan order is orientation-aware so heroes
-//! land top-left and read naturally (a top strip for landscape, a left column
-//! for portrait).
+//! Hero rows come first and hold half as many cells as normal rows, making a
+//! hero ~2× larger on each edge. A short hero row is topped up with the
+//! highest-scored normal frames instead of leaving holes. Portrait sources
+//! transpose the whole scheme: justified columns, heroes on the left.
+//! [`CanvasSpec::edge`] caps the longer canvas edge; row counts are chosen so
+//! the canvas stays roughly square, which maximizes the pixel budget a VLM
+//! actually sees. The template names (UNIFORM / HERO_LEFT / DUAL_HERO /
+//! TOP_STRIP) simply label the hero count for metadata.
+
+use std::mem;
 
 use crate::types::{CanvasSpec, Rect};
 
@@ -50,13 +53,14 @@ fn template_name(hero_count: usize) -> &'static str {
     }
 }
 
-/// Compute the layout for `n` frames, where `heroes` lists which frame indices
-/// (into `0..n`) are heroes. `aspect` is the source frame `w/h`.
+/// Compute the layout for the frames whose scores are given (one per frame,
+/// in time order), where `heroes` lists hero frame indices. `aspect` is the
+/// source frame `w/h`.
 ///
-/// Heroes occupy 2×2 cell blocks; all others a single cell. The returned
-/// `rects` are aligned with the input frame order.
-pub fn compute(n: usize, heroes: &[usize], aspect: f32, spec: &CanvasSpec) -> Layout {
-    if n == 0 {
+/// Scores rank normal frames for promotion into a short hero row; they play
+/// no other role. The returned `rects` are aligned with the input frame order.
+pub fn compute(scores: &[f32], heroes: &[usize], aspect: f32, spec: &CanvasSpec) -> Layout {
+    if scores.is_empty() {
         return Layout {
             rects: Vec::new(),
             canvas_w: 0,
@@ -64,159 +68,116 @@ pub fn compute(n: usize, heroes: &[usize], aspect: f32, spec: &CanvasSpec) -> La
             template: "UNIFORM",
         };
     }
+    if aspect < 1.0 {
+        // Portrait: lay out transposed (wide cells), then swap the axes so
+        // hero rows become hero columns on the left.
+        let mut layout = compute_wide(scores, heroes, 1.0 / aspect, spec);
+        for r in &mut layout.rects {
+            mem::swap(&mut r.x, &mut r.y);
+            mem::swap(&mut r.w, &mut r.h);
+        }
+        mem::swap(&mut layout.canvas_w, &mut layout.canvas_h);
+        return layout;
+    }
+    compute_wide(scores, heroes, aspect, spec)
+}
 
-    // Mark hero frames, deduplicating and counting in a single pass: a caller
-    // may pass the same index twice, which must not place two 2×2 blocks.
-    let mut hero_set = vec![false; n];
-    let mut hero_count = 0;
+/// Justified layout for cell aspect `a >= 1` (landscape orientation).
+fn compute_wide(scores: &[f32], heroes: &[usize], a: f32, spec: &CanvasSpec) -> Layout {
+    let n = scores.len();
+
+    // Mark hero frames, deduplicating: a caller may pass the same index twice,
+    // which must not occupy two hero slots.
+    let mut is_hero = vec![false; n];
+    let mut hero_list: Vec<usize> = Vec::new();
     for &h in heroes {
-        if h < n && !hero_set[h] {
-            hero_set[h] = true;
-            hero_count += 1;
+        if h < n && !is_hero[h] {
+            is_hero[h] = true;
+            hero_list.push(h);
         }
     }
+    let hero_count = hero_list.len();
 
-    // Weighted cell demand: a hero needs 4 cells, a normal 1.
+    // Cells per normal row, sized so the canvas is roughly square: a hero is
+    // worth ~4 normal cells of area (2× per edge), hence the weighted demand.
     let weighted = (n - hero_count) + 4 * hero_count;
+    let c = ((weighted as f32 / a).sqrt().round() as usize).max(1);
+    let k_hero = c.div_ceil(2);
 
-    // Grid dimensions sized to keep the canvas roughly square given cell aspect.
-    let (cols, rows) = grid_dims(weighted, aspect, hero_count > 0);
-
-    // Occupancy grid; place heroes (score order) first, then normals (time order).
-    let landscape = aspect >= 1.0;
-    let mut occupied = vec![false; cols * rows];
-    let mut grid_cells: Vec<Option<(usize, usize, usize, usize)>> = vec![None; n];
-
-    for &h in heroes {
-        if h >= n || grid_cells[h].is_some() {
-            continue;
-        }
-        if let Some((gx, gy)) = find_block(&occupied, cols, rows, 2, 2, landscape) {
-            mark(&mut occupied, cols, gx, gy, 2, 2);
-            grid_cells[h] = Some((gx, gy, 2, 2));
-        }
-    }
-    for i in 0..n {
-        if hero_set[i] {
-            continue;
-        }
-        if let Some((gx, gy)) = find_block(&occupied, cols, rows, 1, 1, landscape) {
-            mark(&mut occupied, cols, gx, gy, 1, 1);
-            grid_cells[i] = Some((gx, gy, 1, 1));
-        }
-    }
-
-    // Pixel sizing: keep cell aspect = source aspect, cap the longer canvas edge.
-    let edge = spec.edge as f32;
-    let cell_h = edge / (cols as f32 * aspect).max(rows as f32);
-    let cell_w = cell_h * aspect;
-
-    let rects = grid_cells
-        .iter()
-        .map(|cell| match cell {
-            Some((gx, gy, gw, gh)) => {
-                // Derive edges from rounded cell boundaries so adjacent cells
-                // share an exact boundary — independent rounding would overlap.
-                let x0 = (*gx as f32 * cell_w).round() as u32;
-                let y0 = (*gy as f32 * cell_h).round() as u32;
-                let x1 = ((*gx + *gw) as f32 * cell_w).round() as u32;
-                let y1 = ((*gy + *gh) as f32 * cell_h).round() as u32;
-                Rect {
-                    x: x0,
-                    y: y0,
-                    w: x1 - x0,
-                    h: y1 - y0,
-                }
+    // Hero rows first (time order within rows), in groups of k_hero. A short
+    // last group is topped up with the best-scored normals so the row still
+    // spans the full width; leftover deficit (no normals left) just makes the
+    // row's cells wider — justified either way.
+    hero_list.sort_unstable();
+    let mut rows: Vec<Vec<usize>> = hero_list.chunks(k_hero).map(<[usize]>::to_vec).collect();
+    let mut in_hero_row = is_hero;
+    if let Some(last) = rows.last_mut() {
+        let deficit = k_hero - last.len();
+        if deficit > 0 {
+            let mut pool: Vec<usize> = (0..n).filter(|&i| !in_hero_row[i]).collect();
+            pool.sort_by(|&x, &y| scores[y].total_cmp(&scores[x]));
+            for i in pool.into_iter().take(deficit) {
+                in_hero_row[i] = true;
+                last.push(i);
             }
-            // Unplaced (packer ran out of room) — zero-size, skipped by compose.
-            None => Rect {
-                x: 0,
-                y: 0,
-                w: 0,
-                h: 0,
-            },
-        })
-        .collect();
+            last.sort_unstable();
+        }
+    }
 
-    let canvas_w = (cols as f32 * cell_w).round() as u32;
-    let canvas_h = (rows as f32 * cell_h).round() as u32;
+    // Remaining frames in time order, split into rows as evenly as possible
+    // (sizes differ by at most one) so no row degenerates into a lone giant.
+    let normals: Vec<usize> = (0..n).filter(|&i| !in_hero_row[i]).collect();
+    if !normals.is_empty() {
+        let row_count = normals.len().div_ceil(c);
+        let base = normals.len() / row_count;
+        let extra = normals.len() % row_count;
+        let mut it = normals.into_iter();
+        for i in 0..row_count {
+            let take = base + usize::from(i < extra);
+            rows.push(it.by_ref().take(take).collect());
+        }
+    }
+
+    // Pixel sizing: row height = width / (cells × a). Cap the longer canvas
+    // edge at spec.edge.
+    let height_ratio: f32 = rows.iter().map(|row| 1.0 / (row.len() as f32 * a)).sum();
+    let width = spec.edge as f32 / height_ratio.max(1.0);
+
+    // Cell edges derive from rounded row/column boundaries, so adjacent cells
+    // share exact boundaries and the rows tile the canvas without gaps.
+    let mut rects = vec![
+        Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0
+        };
+        n
+    ];
+    let mut y = 0.0_f32;
+    for row in &rows {
+        let k = row.len() as f32;
+        let row_h = width / (k * a);
+        let y0 = y.round() as u32;
+        let y1 = (y + row_h).round() as u32;
+        for (j, &idx) in row.iter().enumerate() {
+            let x0 = (j as f32 * width / k).round() as u32;
+            let x1 = ((j + 1) as f32 * width / k).round() as u32;
+            rects[idx] = Rect {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            };
+        }
+        y += row_h;
+    }
 
     Layout {
         rects,
-        canvas_w,
-        canvas_h,
+        canvas_w: width.round() as u32,
+        canvas_h: y.round() as u32,
         template: template_name(hero_count),
-    }
-}
-
-/// Choose `(cols, rows)` so `cols × rows ≥ weighted` and the canvas (cells
-/// scaled by `aspect`) is as square as possible. When heroes are present both
-/// dimensions are at least 2 so a 2×2 block fits.
-fn grid_dims(weighted: usize, aspect: f32, has_hero: bool) -> (usize, usize) {
-    let min_dim = if has_hero { 2 } else { 1 };
-    // round(sqrt(weighted / aspect)) makes the *canvas* (not the grid) square.
-    let mut cols = ((weighted as f32 / aspect).sqrt().round() as usize).max(min_dim);
-    let mut rows = weighted.div_ceil(cols).max(min_dim);
-    // Grow to guarantee capacity after the min_dim clamps.
-    while cols * rows < weighted {
-        if (cols as f32 * aspect) <= rows as f32 {
-            cols += 1;
-        } else {
-            rows += 1;
-        }
-    }
-    (cols, rows)
-}
-
-/// Find the top-left of the first free `bw × bh` block, scanning in an
-/// orientation-aware order (row-major for landscape, column-major for portrait)
-/// so heroes cluster top-left.
-fn find_block(
-    occupied: &[bool],
-    cols: usize,
-    rows: usize,
-    bw: usize,
-    bh: usize,
-    landscape: bool,
-) -> Option<(usize, usize)> {
-    if bw > cols || bh > rows {
-        return None;
-    }
-    let fits = |gx: usize, gy: usize| -> bool {
-        for dy in 0..bh {
-            for dx in 0..bw {
-                if occupied[(gy + dy) * cols + (gx + dx)] {
-                    return false;
-                }
-            }
-        }
-        true
-    };
-    if landscape {
-        for gy in 0..=rows - bh {
-            for gx in 0..=cols - bw {
-                if fits(gx, gy) {
-                    return Some((gx, gy));
-                }
-            }
-        }
-    } else {
-        for gx in 0..=cols - bw {
-            for gy in 0..=rows - bh {
-                if fits(gx, gy) {
-                    return Some((gx, gy));
-                }
-            }
-        }
-    }
-    None
-}
-
-fn mark(occupied: &mut [bool], cols: usize, gx: usize, gy: usize, bw: usize, bh: usize) {
-    for dy in 0..bh {
-        for dx in 0..bw {
-            occupied[(gy + dy) * cols + (gx + dx)] = true;
-        }
     }
 }
 
@@ -231,112 +192,158 @@ mod tests {
         }
     }
 
-    fn assert_valid(layout: &Layout) {
-        let rs: Vec<_> = layout.rects.iter().filter(|r| r.w > 0 && r.h > 0).collect();
-        for r in &rs {
+    /// Uniform scores for `n` frames (promotion order irrelevant).
+    fn flat(n: usize) -> Vec<f32> {
+        vec![50.0; n]
+    }
+
+    /// Rects are in bounds, non-overlapping, all placed, and tile the canvas
+    /// completely — justified layout leaves no filler area by construction.
+    fn assert_tiles(layout: &Layout) {
+        let mut area = 0_u64;
+        for r in &layout.rects {
+            assert!(r.w > 0 && r.h > 0, "every frame gets a cell: {r:?}");
             assert!(
                 r.x + r.w <= layout.canvas_w && r.y + r.h <= layout.canvas_h,
                 "rect {r:?} exceeds canvas {}x{}",
                 layout.canvas_w,
                 layout.canvas_h
             );
+            area += u64::from(r.w) * u64::from(r.h);
         }
-        for i in 0..rs.len() {
-            for j in (i + 1)..rs.len() {
+        for i in 0..layout.rects.len() {
+            for j in (i + 1)..layout.rects.len() {
                 assert!(
-                    !rs[i].overlaps(rs[j]),
+                    !layout.rects[i].overlaps(&layout.rects[j]),
                     "overlap: {:?} vs {:?}",
-                    rs[i],
-                    rs[j]
+                    layout.rects[i],
+                    layout.rects[j]
                 );
             }
         }
+        assert_eq!(
+            area,
+            u64::from(layout.canvas_w) * u64::from(layout.canvas_h),
+            "cells must tile the canvas with no holes"
+        );
     }
 
     #[test]
     fn lays_out_uniform_landscape() {
-        let l = compute(12, &[], 16.0 / 9.0, &spec());
+        let l = compute(&flat(12), &[], 16.0 / 9.0, &spec());
         assert_eq!(l.template, "UNIFORM");
         assert_eq!(l.rects.len(), 12);
-        assert_valid(&l);
+        assert_tiles(&l);
     }
 
     #[test]
     fn lays_out_uniform_portrait() {
-        let l = compute(12, &[], 9.0 / 16.0, &spec());
-        assert_valid(&l);
+        let l = compute(&flat(12), &[], 9.0 / 16.0, &spec());
+        assert_tiles(&l);
         // Portrait cells are taller than wide.
-        let r = l.rects.iter().find(|r| r.w > 0).expect("a cell");
+        let r = l.rects[0];
         assert!(r.h > r.w, "portrait cell should be taller than wide: {r:?}");
     }
 
     #[test]
     fn landscape_cell_is_wider_than_tall() {
-        let l = compute(12, &[], 16.0 / 9.0, &spec());
-        let r = l.rects.iter().find(|r| r.w > 0).expect("a cell");
+        let l = compute(&flat(12), &[], 16.0 / 9.0, &spec());
+        let r = l.rects[0];
         assert!(r.w > r.h, "landscape cell should be wider than tall: {r:?}");
     }
 
     #[test]
-    fn hero_block_is_larger_than_normal() {
-        let l = compute(10, &[0], 16.0 / 9.0, &spec());
+    fn awkward_frame_count_still_tiles() {
+        // 7 is prime: the old rectangular packer always left a black hole here.
+        for n in [3, 5, 7, 11, 13] {
+            let l = compute(&flat(n), &[], 16.0 / 9.0, &spec());
+            assert_tiles(&l);
+        }
+    }
+
+    #[test]
+    fn hero_cell_is_larger_than_normal() {
+        // Frame 9 has the top normal score, so it gets promoted beside the
+        // hero; frame 1 stays in a normal row for the size comparison.
+        let mut scores = vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 90.0];
+        scores[0] = 95.0;
+        let l = compute(&scores, &[0], 16.0 / 9.0, &spec());
         assert_eq!(l.template, "HERO_LEFT");
-        assert_valid(&l);
+        assert_tiles(&l);
         let hero = l.rects[0];
         let normal = l.rects[1];
         assert!(
             hero.w > normal.w && hero.h > normal.h,
-            "hero must be bigger"
+            "hero must be bigger: {hero:?} vs {normal:?}"
         );
     }
 
     #[test]
     fn deduplicates_repeated_hero_index() {
-        // A repeated index must place one 2×2 block, not two, and leave a valid
-        // grid. HERO_LEFT (single hero) is the correct template.
-        let l = compute(10, &[0, 0], 16.0 / 9.0, &spec());
+        // A repeated index must occupy one hero slot, not two. HERO_LEFT
+        // (single hero) is the correct template.
+        let l = compute(&flat(10), &[0, 0], 16.0 / 9.0, &spec());
         assert_eq!(l.template, "HERO_LEFT");
-        assert_valid(&l);
-        let placed = l.rects.iter().filter(|r| r.w > 0 && r.h > 0).count();
-        assert_eq!(placed, 10, "all frames placed exactly once");
+        assert_tiles(&l);
     }
 
     #[test]
     fn dual_hero_names_template() {
-        let l = compute(10, &[0, 1], 16.0 / 9.0, &spec());
+        let l = compute(&flat(10), &[0, 1], 16.0 / 9.0, &spec());
         assert_eq!(l.template, "DUAL_HERO");
-        assert_valid(&l);
+        assert_tiles(&l);
     }
 
     #[test]
     fn three_heroes_make_top_strip() {
-        let l = compute(12, &[0, 1, 2], 16.0 / 9.0, &spec());
+        let l = compute(&flat(12), &[0, 1, 2], 16.0 / 9.0, &spec());
         assert_eq!(l.template, "TOP_STRIP");
-        assert_valid(&l);
+        assert_tiles(&l);
     }
 
     #[test]
-    fn portrait_hero_lays_out_valid() {
-        let l = compute(10, &[0], 9.0 / 16.0, &spec());
-        assert_valid(&l);
-        let hero = l.rects[0];
-        // Hero anchors at the top-left for portrait (column-major scan).
-        assert_eq!((hero.x, hero.y), (0, 0));
+    fn portrait_hero_lays_out_left_column() {
+        let l = compute(&flat(10), &[0], 9.0 / 16.0, &spec());
+        assert_tiles(&l);
+        // Hero anchors at the top-left: hero rows transpose to left columns.
+        assert_eq!((l.rects[0].x, l.rects[0].y), (0, 0));
     }
 
     #[test]
-    fn quality_tiers_preserve_capacity() {
-        // Quality changes pixel density, not layout structure: the canvas edge
-        // and min cell edge scale together, so capacity stays identical.
-        let hi = grid_capacity(&CanvasSpec { edge: 8000, min_cell_edge: 512 }, 1.0);
-        let lo = grid_capacity(&CanvasSpec { edge: 4000, min_cell_edge: 256 }, 1.0);
-        assert_eq!(hi, lo);
+    fn hero_only_chunk_tiles_without_normals() {
+        // Eviction can leave nothing but heroes; rows shrink to fit them.
+        let l = compute(&flat(2), &[0, 1], 16.0 / 9.0, &spec());
+        assert_eq!(l.template, "DUAL_HERO");
+        assert_tiles(&l);
     }
 
     #[test]
-    fn single_frame_fills_one_cell() {
-        let l = compute(1, &[], 1.0, &spec());
+    fn lower_quality_packs_more_frames_on_same_canvas() {
+        // Quality trades per-cell size for capacity at a fixed canvas edge:
+        // halving the cell floor quadruples how many frames fit.
+        let hi = grid_capacity(
+            &CanvasSpec {
+                edge: 8000,
+                min_cell_edge: 512,
+            },
+            1.0,
+        );
+        let lo = grid_capacity(
+            &CanvasSpec {
+                edge: 8000,
+                min_cell_edge: 256,
+            },
+            1.0,
+        );
+        assert_eq!(lo, hi * 4);
+    }
+
+    #[test]
+    fn single_frame_fills_whole_canvas() {
+        let l = compute(&flat(1), &[], 1.0, &spec());
         assert_eq!(l.rects.len(), 1);
-        assert_valid(&l);
+        assert_tiles(&l);
+        assert_eq!(l.rects[0].w, l.canvas_w);
+        assert_eq!(l.rects[0].h, l.canvas_h);
     }
 }

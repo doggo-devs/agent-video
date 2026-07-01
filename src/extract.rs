@@ -14,6 +14,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{ChildStdout, Command};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use image::imageops::FilterType;
@@ -22,13 +23,13 @@ use rayon::prelude::*;
 
 use crate::child::TrackedChild;
 use crate::error::ErrorCode;
-use crate::types::{RawScores, ScoredFrame};
+use crate::types::CandidateFrame;
 
 /// One sampled RGB frame from ffmpeg, already downscaled for composition.
 ///
-/// The frame owns its pixel buffer. Call [`scored_frames_from_rgbs`] on a small
-/// batch to derive scoring grayscale images while keeping memory bounded by the
-/// batch size rather than by the full video.
+/// The frame owns its pixel buffer. Call [`candidate_frames_from_rgbs`] on a
+/// small batch to derive scoring grayscale images while keeping memory bounded
+/// by the batch size rather than by the full video.
 #[derive(Debug)]
 pub struct RgbFrame {
     /// Presentation timestamp in seconds.
@@ -41,15 +42,18 @@ pub struct RgbFrame {
 enum TsPolicy {
     /// ts = start + idx / fps (fixed-rate sampling).
     Fps { fps: f32, start: f32 },
-    /// ts from a pre-probed list, falling back to the index when exhausted.
+    /// ts from a pre-probed keyframe list.
     List(Vec<f32>),
 }
 
 impl TsPolicy {
-    fn ts_at(&self, idx: usize) -> f32 {
+    /// Timestamp for the frame at `idx`, or `None` once a probed keyframe list
+    /// is exhausted — the decoder produced more frames than ffprobe listed, so
+    /// we cannot attribute a timestamp. The `Fps` arm is always `Some`.
+    fn ts_at(&self, idx: usize) -> Option<f32> {
         match self {
-            TsPolicy::Fps { fps, start } => start + idx as f32 / fps,
-            TsPolicy::List(list) => list.get(idx).copied().unwrap_or(idx as f32),
+            TsPolicy::Fps { fps, start } => Some(start + idx as f32 / fps),
+            TsPolicy::List(list) => list.get(idx).copied(),
         }
     }
 }
@@ -103,11 +107,26 @@ impl FrameStream {
                 && let Err(e) = child.wait(self.wait_context)
             {
                 if self.idx == 0 {
-                    let err = e.into_error(ErrorCode::NoFramesExtracted);
-                    bail!("{err}");
+                    return Err(e.into_error(ErrorCode::NoFramesExtracted).into());
                 }
-                let err = e.into_error(ErrorCode::FfmpegFailed);
-                bail!("{err} after {} frames (possible truncation)", self.idx);
+                return Err(anyhow::Error::from(e.into_error(ErrorCode::FfmpegFailed))
+                    .context(format!("after {} frames (possible truncation)", self.idx)));
+            }
+            return Ok(None);
+        };
+
+        let Some(ts) = self.ts.ts_at(self.idx) else {
+            // More decoded frames than probed keyframes (open GOP, attached
+            // pictures): stop rather than fabricate a timestamp that would
+            // corrupt time ranges, chunking, and subtitle alignment.
+            eprintln!(
+                "warning: decoder produced more frames than probed keyframes; \
+                 ignoring extras after {} frames",
+                self.idx
+            );
+            self.eof = true;
+            if let Some(child) = self.child.take() {
+                child.kill_and_wait();
             }
             return Ok(None);
         };
@@ -117,7 +136,6 @@ impl FrameStream {
             self.aspect = Some(w as f32 / h as f32);
         }
 
-        let ts = self.ts.ts_at(self.idx);
         self.idx += 1;
         Ok(Some(RgbFrame { ts, rgb }))
     }
@@ -192,22 +210,20 @@ pub fn stream_keyframes(
     })
 }
 
-/// Convert a bounded RGB batch to [`ScoredFrame`]s, deriving grayscale in parallel.
-pub fn scored_frames_from_rgbs(frames: Vec<RgbFrame>, score_edge: u32) -> Vec<ScoredFrame> {
+/// Convert a bounded RGB batch to [`CandidateFrame`]s, deriving grayscale in parallel.
+pub fn candidate_frames_from_rgbs(frames: Vec<RgbFrame>, score_edge: u32) -> Vec<CandidateFrame> {
     frames
         .into_par_iter()
-        .map(|frame| scored_frame_from_rgb(frame, score_edge))
+        .map(|frame| candidate_frame_from_rgb(frame, score_edge))
         .collect()
 }
 
-/// Convert a single RGB frame to a [`ScoredFrame`] with grayscale for scoring.
-fn scored_frame_from_rgb(frame: RgbFrame, score_edge: u32) -> ScoredFrame {
-    ScoredFrame {
+/// Convert a single RGB frame to a [`CandidateFrame`] with grayscale for scoring.
+fn candidate_frame_from_rgb(frame: RgbFrame, score_edge: u32) -> CandidateFrame {
+    CandidateFrame {
         ts: frame.ts,
         gray: to_gray(&frame.rgb, score_edge),
-        rgb: frame.rgb,
-        raw: RawScores::default(),
-        score: 0.0,
+        rgb: Arc::new(frame.rgb),
     }
 }
 
@@ -234,11 +250,13 @@ fn stream_inner(
     // exactly on `pipe_edge`, preserving aspect.
     let vf =
         format!("fps={fps},scale={pipe_edge}:{pipe_edge}:force_original_aspect_ratio=increase");
-    cmd.arg("-i")
-        .arg(input)
-        .arg("-vf")
-        .arg(vf)
-        .args(["-f", "image2pipe", "-vcodec", "ppm", "pipe:1"]);
+    cmd.arg("-i").arg(input).arg("-vf").arg(vf).args([
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "ppm",
+        "pipe:1",
+    ]);
 
     let (child, stdout) = TrackedChild::spawn(
         &mut cmd,
@@ -286,6 +304,11 @@ fn target_dims(w: u32, h: u32, min_edge: u32) -> (u32, u32) {
     (nw, nh)
 }
 
+/// Upper bound on frames we will allocate from a PPM header: 67 MP (~200 MB
+/// RGB). Our own piped frames are ≤ ~3 MP even at extreme aspect ratios, so a
+/// larger dimension means a desynced or corrupt stream, not a real frame.
+const MAX_FRAME_PIXELS: u64 = 1 << 26;
+
 /// Read one PPM (P6) image from a buffered reader, or `None` at clean EOF.
 /// `tok` is a scratch buffer reused across calls so header parsing allocates
 /// nothing per frame.
@@ -298,6 +321,12 @@ fn read_ppm<R: BufRead>(r: &mut R, tok: &mut Vec<u8>) -> Result<Option<RgbImage>
     }
     let w = read_header_u32(r, tok)?;
     let h = read_header_u32(r, tok)?;
+    // Never size an allocation from an untrusted header alone: a desynced stream
+    // can present absurd dimensions, turning a huge allocation into an abort
+    // instead of a clean error.
+    if w == 0 || h == 0 || (w as u64) * (h as u64) > MAX_FRAME_PIXELS {
+        bail!("implausible PPM dimensions {w}x{h}");
+    }
     let maxval = read_header_u32(r, tok)?;
     if maxval != 255 {
         bail!("unsupported PPM maxval {maxval} (expected 255)");
@@ -432,6 +461,36 @@ mod tests {
             .expect("frame");
         assert_eq!(img.dimensions(), (2, 1));
         assert_eq!(img.get_pixel(1, 0).0, [0, 255, 0]);
+    }
+
+    #[test]
+    fn rejects_implausible_ppm_dimensions() {
+        // A P6 header claiming a gigantic frame must error, not attempt a huge
+        // allocation; a zero-size frame is likewise rejected.
+        let huge = b"P6\n1000000 1000000\n255\n";
+        assert!(
+            read_ppm(&mut Cursor::new(&huge[..]), &mut Vec::new()).is_err(),
+            "gigantic frame rejected"
+        );
+        let zero = b"P6\n0 0\n255\n";
+        assert!(
+            read_ppm(&mut Cursor::new(&zero[..]), &mut Vec::new()).is_err(),
+            "zero-size frame rejected"
+        );
+    }
+
+    #[test]
+    fn stops_at_probed_timestamp_list_exhaustion() {
+        // A probed keyframe list attributes only as many frames as it lists;
+        // extras get `None` instead of a fabricated `idx`-as-seconds timestamp.
+        let policy = TsPolicy::List(vec![0.0, 2.5]);
+        assert_eq!(policy.ts_at(0), Some(0.0));
+        assert_eq!(policy.ts_at(1), Some(2.5));
+        assert_eq!(
+            policy.ts_at(2),
+            None,
+            "no fabricated ts past the probed list"
+        );
     }
 
     #[test]

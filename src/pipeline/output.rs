@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::error::{Error, ErrorCode, ErrorContext};
-use crate::types::{GridMeta, Metadata};
 use crate::subtitle;
+use crate::types::{GridMeta, Metadata};
 
 use super::{OutputMode, SubtitleOpts};
 
@@ -28,8 +28,8 @@ pub fn write_outputs(
     if let Some(ref text) = srt_text {
         let cues = subtitle::parse_srt(text);
         for grid in &mut grid_metas {
-            let (start, end) = grid.time_range;
-            grid.subtitles = subtitle::slice_for_range(&cues, start, end);
+            grid.subtitles =
+                subtitle::slice_for_range(&cues, grid.time_range.start(), grid.time_range.end());
         }
         if write_files {
             atomic_write(out_dir, "subtitles.txt", text.as_bytes())?;
@@ -72,7 +72,10 @@ pub fn atomic_write(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
 
     if let Err(e) = fs::rename(&tmp_path, &final_path) {
         if let Err(rm_err) = fs::remove_file(&tmp_path) {
-            eprintln!("warning: failed to clean up {}: {rm_err}", tmp_path.display());
+            eprintln!(
+                "warning: failed to clean up {}: {rm_err}",
+                tmp_path.display()
+            );
         }
         return Err(Error::new(
             ErrorCode::OutputWriteFailed,

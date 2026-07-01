@@ -100,8 +100,7 @@ pub fn probe_duration(input: &Path) -> Result<f32> {
         .arg(input)
         .output()
         .map_err(|e| {
-            Error::new(ErrorCode::FfprobeNotFound, "ffprobe not found on PATH")
-                .with_source(e)
+            Error::new(ErrorCode::FfprobeNotFound, "ffprobe not found on PATH").with_source(e)
         })?;
 
     if !output.status.success() {
@@ -155,8 +154,7 @@ fn probe_iframe_timestamps(input: &Path) -> Result<Vec<f32>> {
         .arg(input)
         .output()
         .map_err(|e| {
-            Error::new(ErrorCode::FfprobeNotFound, "ffprobe not found on PATH")
-                .with_source(e)
+            Error::new(ErrorCode::FfprobeNotFound, "ffprobe not found on PATH").with_source(e)
         })?;
 
     if !output.status.success() {
@@ -174,26 +172,12 @@ fn probe_iframe_timestamps(input: &Path) -> Result<Vec<f32>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut timestamps: Vec<f32> = Vec::new();
-    let mut parse_errors: Vec<(usize, String)> = Vec::new();
-
-    for (line_num, line) in stdout.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match trimmed.parse::<f32>() {
-            Ok(ts) => timestamps.push(ts),
-            Err(_) => parse_errors.push((line_num + 1, trimmed.to_string())),
-        }
-    }
+    let (timestamps, parse_errors) = parse_pts_csv(&stdout);
 
     // Warn about parse failures but don't fail entirely if we got some timestamps
     if !parse_errors.is_empty() {
         let count = parse_errors.len();
-        eprintln!(
-            "warning: skipped {count} unparseable pts_time lines from ffprobe"
-        );
+        eprintln!("warning: skipped {count} unparseable pts_time lines from ffprobe");
         for (line_num, content) in parse_errors.iter().take(3) {
             eprintln!("  line {line_num}: {content:?}");
         }
@@ -202,8 +186,37 @@ fn probe_iframe_timestamps(input: &Path) -> Result<Vec<f32>> {
         }
     }
 
-    timestamps.sort_by(|a, b| a.total_cmp(b));
     Ok(timestamps)
+}
+
+/// Parse ffprobe's per-frame pts_time csv into sorted timestamps plus the
+/// 1-indexed lines that failed to parse.
+///
+/// Only the first csv field is the timestamp: ffmpeg appends empty trailing
+/// fields for frames carrying side data (e.g. `"0.000000,"`), and treating the
+/// whole line as the number would drop that frame and shift every timestamp by
+/// one keyframe position.
+fn parse_pts_csv(stdout: &str) -> (Vec<f32>, Vec<(usize, String)>) {
+    let mut timestamps: Vec<f32> = Vec::new();
+    let mut parse_errors: Vec<(usize, String)> = Vec::new();
+
+    for (line_num, line) in stdout.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let field = trimmed
+            .split(',')
+            .next()
+            .expect("split yields at least one field");
+        match field.parse::<f32>() {
+            Ok(ts) => timestamps.push(ts),
+            Err(_) => parse_errors.push((line_num + 1, trimmed.to_string())),
+        }
+    }
+
+    timestamps.sort_by(|a, b| a.total_cmp(b));
+    (timestamps, parse_errors)
 }
 
 /// Check if ffprobe is available on PATH.
@@ -247,6 +260,15 @@ mod tests {
         };
         let regions = info.sparse_regions(5.0);
         assert_eq!(regions, vec![(2.0, 10.0)]);
+    }
+
+    #[test]
+    fn parses_pts_lines_with_trailing_csv_fields() {
+        // ffmpeg 8.x emits "0.000000," for frames with side data; the frame
+        // must be kept, or every later timestamp shifts one keyframe position.
+        let (ts, errors) = parse_pts_csv("0.000000,\n2.000000\nbogus\n\n4.000000,extra\n");
+        assert_eq!(ts, vec![0.0, 2.0, 4.0]);
+        assert_eq!(errors, vec![(3, "bogus".to_string())]);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Grid composition: paste resized frames onto a canvas, draw timestamp labels
 //! and hero highlight borders, encode as JPEG.
 
+use std::sync::LazyLock;
+
 use ab_glyph::{FontRef, PxScale};
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
@@ -12,7 +14,10 @@ use crate::layout::Layout;
 use crate::types::ScoredFrame;
 
 /// Embedded font for timestamp labels — keeps the build a single binary.
-const FONT: &[u8] = include_bytes!("../assets/font.ttf");
+static FONT: LazyLock<FontRef<'static>> = LazyLock::new(|| {
+    FontRef::try_from_slice(include_bytes!("../assets/font.ttf"))
+        .expect("embedded font is a valid TTF")
+});
 
 const HERO_BORDER: Rgb<u8> = Rgb([255, 210, 0]);
 
@@ -28,7 +33,6 @@ pub fn render(
     jpeg_quality: u8,
     hero_border_px: u32,
 ) -> Result<Vec<u8>> {
-    let font = FontRef::try_from_slice(FONT).context("embedded font failed to load")?;
     let mut canvas = RgbImage::from_pixel(
         layout.canvas_w.max(1),
         layout.canvas_h.max(1),
@@ -40,7 +44,7 @@ pub fn render(
         if rect.w == 0 || rect.h == 0 {
             continue;
         }
-        let cell = image::imageops::resize(&frame.rgb, rect.w, rect.h, FilterType::Triangle);
+        let cell = image::imageops::resize(&*frame.rgb, rect.w, rect.h, FilterType::Triangle);
         image::imageops::overlay(&mut canvas, &cell, rect.x as i64, rect.y as i64);
 
         // hero_idx holds at most 3 entries, so a linear check is cheaper than
@@ -56,9 +60,18 @@ pub fn render(
                 hero_border_px,
             );
         }
-        draw_timestamp(&mut canvas, &font, rect.x, rect.y, frame.ts);
+        draw_timestamp(&mut canvas, &FONT, rect.x, rect.y, frame.ts);
     }
 
+    encode_jpeg(&canvas, jpeg_quality)
+}
+
+/// Render a single representative frame at its stored size with a timestamp
+/// label. Used for static stretches, where one frame stands in for a whole
+/// unchanged time range.
+pub fn render_single(rgb: &RgbImage, ts: f32, jpeg_quality: u8) -> Result<Vec<u8>> {
+    let mut canvas = rgb.clone();
+    draw_timestamp(&mut canvas, &FONT, 0, 0, ts);
     encode_jpeg(&canvas, jpeg_quality)
 }
 
@@ -121,15 +134,14 @@ fn encode_jpeg(img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::RawScores;
     use image::GrayImage;
+    use std::sync::Arc;
 
     fn frame(ts: f32) -> ScoredFrame {
         ScoredFrame {
             ts,
             gray: GrayImage::new(1, 1),
-            rgb: RgbImage::from_pixel(32, 18, Rgb([100, 120, 140])),
-            raw: RawScores::default(),
+            rgb: Arc::new(RgbImage::from_pixel(32, 18, Rgb([100, 120, 140]))),
             score: 0.0,
         }
     }
@@ -141,7 +153,7 @@ mod tests {
             min_cell_edge: 256,
         };
         let frames: Vec<_> = (0..4).map(|i| frame(i as f32)).collect();
-        let layout = crate::layout::compute(4, &[], 16.0 / 9.0, &spec);
+        let layout = crate::layout::compute(&[0.0; 4], &[], 16.0 / 9.0, &spec);
         let bytes = render(&frames, &layout, &[], 92, 4).expect("render ok");
         assert!(bytes.len() > 100, "JPEG should have real content");
         assert_eq!(&bytes[0..2], &[0xff, 0xd8]);
