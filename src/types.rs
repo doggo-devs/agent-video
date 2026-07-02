@@ -43,18 +43,12 @@ pub struct ScoredFrame {
     pub rgb: Arc<RgbImage>,
     /// Final weighted score in `0..=100`.
     pub score: f32,
-}
-
-impl From<ScoredFrame> for CandidateFrame {
-    /// Drop the score to re-enter a fresh competition set — `extract`'s global
-    /// re-rank recomputes scores from scratch.
-    fn from(f: ScoredFrame) -> Self {
-        CandidateFrame {
-            ts: f.ts,
-            gray: f.gray,
-            rgb: f.rgb,
-        }
-    }
+    /// Raw scene difference from the frame scored immediately before this one
+    /// (mean absolute grayscale difference, `0..=255`). Drives hero detection,
+    /// which needs absolute magnitude where `score` only preserves rank, and
+    /// travels with the frame into global re-ranks (`extract`'s compaction),
+    /// where recomputing it between non-consecutive frames would be noise.
+    pub scene_diff: f32,
 }
 
 /// An axis-aligned rectangle on the output canvas, in pixels.
@@ -111,7 +105,7 @@ pub struct CanvasSpec {
 }
 
 /// A closed time range in seconds; `start <= end` and both finite by
-/// construction. Serializes as `"MM:SS-MM:SS"`.
+/// construction. Serializes as `"MM:SS-MM:SS"` (`H:MM:SS` past an hour).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimeRange {
     start: f32,
@@ -162,7 +156,7 @@ pub enum GridImage {
 pub struct GridMeta {
     #[serde(flatten)]
     pub image: GridImage,
-    /// Time range as "MM:SS-MM:SS" for JSON output.
+    /// Time range as "MM:SS-MM:SS" ("H:MM:SS" past an hour) for JSON output.
     pub time_range: TimeRange,
     pub total_frames: usize,
     pub key_frames: Vec<KeyFrameMeta>,
@@ -171,11 +165,17 @@ pub struct GridMeta {
     pub subtitles: Option<String>,
 }
 
-/// Format a timestamp as `MM:SS`, clamping negatives to zero and rounding to
-/// the nearest second.
+/// Format a timestamp as `MM:SS`, or `H:MM:SS` from one hour up (keyframe
+/// strategies support videos past the hour), clamping negatives to zero and
+/// rounding to the nearest second.
 pub fn format_ts(ts: f32) -> String {
     let total = ts.max(0.0).round() as u32;
-    format!("{:02}:{:02}", total / 60, total % 60)
+    let (h, m, s) = (total / 3600, total % 3600 / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
 }
 
 /// Metadata for a single key (hero) frame inside a grid.
@@ -212,6 +212,14 @@ mod tests {
         assert_eq!(format_ts(0.0), "00:00");
         assert_eq!(format_ts(83.0), "01:23");
         assert_eq!(format_ts(605.4), "10:05");
+    }
+
+    #[test]
+    fn formats_hour_plus_timestamps_with_hours() {
+        assert_eq!(format_ts(3600.0), "1:00:00");
+        assert_eq!(format_ts(5025.0), "1:23:45");
+        assert_eq!(format_ts(3599.6), "1:00:00", "rounds up into the hour");
+        assert_eq!(format_ts(3599.4), "59:59", "stays MM:SS below the hour");
     }
 
     #[test]

@@ -38,10 +38,23 @@ pub struct Layout {
 /// `min_cell_edge`, so its area is `min_cell_edge² × max(aspect, 1/aspect)`.
 /// Returns at least 1.
 pub fn grid_capacity(spec: &CanvasSpec, aspect: f32) -> usize {
+    let aspect = sane_aspect(aspect);
     let edge = spec.edge as f32;
     let long_ratio = aspect.max(1.0 / aspect);
     let cell_area = (spec.min_cell_edge as f32).powi(2) * long_ratio;
     ((edge * edge) / cell_area).floor().max(1.0) as usize
+}
+
+/// Guard against a degenerate aspect (0, negative, NaN, inf), which would
+/// round the whole geometry into zero-sized rects or a NaN canvas. Frames
+/// decoded by [`crate::extract`] always yield a finite positive aspect, so the
+/// square fallback is defense in depth for other callers, not a normal path.
+fn sane_aspect(aspect: f32) -> f32 {
+    if aspect.is_finite() && aspect > 0.0 {
+        aspect
+    } else {
+        1.0
+    }
 }
 
 fn template_name(hero_count: usize) -> &'static str {
@@ -60,6 +73,7 @@ fn template_name(hero_count: usize) -> &'static str {
 /// Scores rank normal frames for promotion into a short hero row; they play
 /// no other role. The returned `rects` are aligned with the input frame order.
 pub fn compute(scores: &[f32], heroes: &[usize], aspect: f32, spec: &CanvasSpec) -> Layout {
+    let aspect = sane_aspect(aspect);
     if scores.is_empty() {
         return Layout {
             rects: Vec::new(),
@@ -336,6 +350,20 @@ mod tests {
             1.0,
         );
         assert_eq!(lo, hi * 4);
+    }
+
+    #[test]
+    fn degenerate_aspect_falls_back_to_square() {
+        // 0, NaN, and inf would otherwise produce zero-sized rects or a NaN
+        // canvas; the layout must stay a valid tiling.
+        for aspect in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let l = compute(&flat(6), &[], aspect, &spec());
+            assert_tiles(&l);
+            assert!(
+                grid_capacity(&spec(), aspect) >= 1,
+                "capacity stays positive for aspect {aspect}"
+            );
+        }
     }
 
     #[test]

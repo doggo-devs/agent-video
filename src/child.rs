@@ -85,8 +85,9 @@ impl TrackedChild {
     /// stdin is nulled so an interactive child — ffmpeg reads keyboard commands
     /// when stdin is a TTY — cannot consume terminal input or stall on it.
     ///
-    /// `not_found_code` is used when spawn fails (typically `FfmpegNotFound` or
-    /// `FfprobeNotFound`).
+    /// `not_found_code` names the tool (typically `FfmpegNotFound` or
+    /// `FfprobeNotFound`); spawn failures are classified by cause via
+    /// [`spawn_error_code`].
     pub fn spawn(
         cmd: &mut Command,
         spawn_context: &'static str,
@@ -98,8 +99,11 @@ impl TrackedChild {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
-                Error::new(not_found_code, format!("failed to spawn: {spawn_context}"))
-                    .with_source(e)
+                Error::new(
+                    spawn_error_code(&e, not_found_code),
+                    format!("failed to spawn {spawn_context}: {e}"),
+                )
+                .with_source(e)
             })?;
 
         let stdout = child.stdout.take().expect("stdout was piped");
@@ -171,6 +175,75 @@ impl TrackedChild {
         // Drop impl handles the actual cleanup
         drop(self);
     }
+
+    /// Kill the child, reap it, and return whatever stderr it wrote.
+    ///
+    /// For error paths where the stdout consumer failed mid-stream: the child
+    /// may still be alive and blocked writing to the full pipe, so a plain
+    /// `wait` could deadlock — it must be killed first, and its stderr often
+    /// carries the real cause of the consumer's failure.
+    pub fn kill_collect_stderr(mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let (bytes, truncated) = self
+            .stderr_thread
+            .take()
+            .and_then(|t| t.join().ok())
+            .unwrap_or_default();
+        decode_stderr(&bytes, truncated)
+    }
+}
+
+/// Run a tool to completion, returning its stdout lossily decoded.
+///
+/// The collect-mode sibling of [`TrackedChild::spawn`], for short probe
+/// commands: stdout is capped at `stdout_cap` bytes — a stream past the cap
+/// fails as runaway instead of buffering without bound — and stderr gets the
+/// usual tail-capped capture, riding along on failures. A non-zero exit maps
+/// to `failed_code`; spawn failures are classified via [`spawn_error_code`]
+/// with `not_found_code`.
+pub fn run_capped(
+    cmd: &mut Command,
+    context: &'static str,
+    not_found_code: ErrorCode,
+    failed_code: ErrorCode,
+    stdout_cap: u64,
+) -> crate::error::Result<String> {
+    let (child, stdout) = TrackedChild::spawn(cmd, context, not_found_code)?;
+
+    let mut buf = Vec::new();
+    // One byte past the cap distinguishes "exactly cap" from "runaway".
+    // Error paths return before `wait`, dropping the child: it may still be
+    // blocked writing to the abandoned pipe, and Drop kills before reaping.
+    if let Err(e) = stdout.take(stdout_cap + 1).read_to_end(&mut buf) {
+        return Err(
+            Error::new(failed_code, format!("reading {context} output: {e}")).with_source(e),
+        );
+    }
+    if buf.len() as u64 > stdout_cap {
+        return Err(Error::new(
+            failed_code,
+            format!(
+                "{context} produced more than {stdout_cap} bytes on stdout; \
+                 refusing to buffer runaway output"
+            ),
+        ));
+    }
+
+    child.wait(context).map_err(|e| e.into_error(failed_code))?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Classify a process-launch failure: only [`std::io::ErrorKind::NotFound`]
+/// means the binary is missing from PATH. Other OS failures (permission
+/// denied, resource exhaustion) map to the tool's `Failed` code, so the
+/// harness is not told to install a tool that is already present.
+pub fn spawn_error_code(e: &std::io::Error, not_found_code: ErrorCode) -> ErrorCode {
+    match (e.kind(), not_found_code) {
+        (std::io::ErrorKind::NotFound, _) => not_found_code,
+        (_, ErrorCode::FfprobeNotFound) => ErrorCode::FfprobeFailed,
+        _ => ErrorCode::FfmpegFailed,
+    }
 }
 
 /// Read all of `r`, retaining only the last [`STDERR_CAP`] bytes. Returns the
@@ -228,8 +301,76 @@ mod tests {
     }
 
     #[test]
+    fn classifies_spawn_failures_by_cause() {
+        use std::io::{Error as IoError, ErrorKind};
+
+        let missing = IoError::new(ErrorKind::NotFound, "no such file");
+        let denied = IoError::new(ErrorKind::PermissionDenied, "permission denied");
+
+        assert_eq!(
+            spawn_error_code(&missing, ErrorCode::FfmpegNotFound),
+            ErrorCode::FfmpegNotFound
+        );
+        assert_eq!(
+            spawn_error_code(&denied, ErrorCode::FfmpegNotFound),
+            ErrorCode::FfmpegFailed,
+            "EACCES is not a missing binary"
+        );
+        assert_eq!(
+            spawn_error_code(&denied, ErrorCode::FfprobeNotFound),
+            ErrorCode::FfprobeFailed
+        );
+    }
+
+    #[test]
     fn prefixes_marker_only_when_truncated() {
         assert_eq!(decode_stderr(b"  boom  ", false), "boom");
         assert_eq!(decode_stderr(b"boom", true), "[stderr truncated] boom");
+    }
+
+    #[test]
+    fn run_capped_collects_stdout_below_cap() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf ok"]);
+        let out = run_capped(
+            &mut cmd,
+            "test echo",
+            ErrorCode::FfprobeNotFound,
+            ErrorCode::FfprobeFailed,
+            1024,
+        )
+        .expect("small stdout is collected");
+        assert_eq!(out, "ok");
+    }
+
+    #[test]
+    fn run_capped_rejects_runaway_stdout() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 4096 /dev/zero"]);
+        let err = run_capped(
+            &mut cmd,
+            "test runaway",
+            ErrorCode::FfprobeNotFound,
+            ErrorCode::FfprobeFailed,
+            1024,
+        )
+        .expect_err("over-cap stdout is runaway");
+        assert_eq!(err.code, ErrorCode::FfprobeFailed);
+    }
+
+    #[test]
+    fn run_capped_maps_nonzero_exit_with_stderr() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo boom >&2; exit 3"]);
+        let err = run_capped(
+            &mut cmd,
+            "test failure",
+            ErrorCode::FfprobeNotFound,
+            ErrorCode::FfprobeFailed,
+            1024,
+        )
+        .expect_err("non-zero exit fails");
+        assert_eq!(err.code, ErrorCode::FfprobeFailed);
+        assert!(err.reason.contains("boom"), "stderr rides along: {err}");
     }
 }

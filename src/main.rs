@@ -16,6 +16,7 @@ mod score;
 mod subtitle;
 mod types;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -42,12 +43,14 @@ enum Command {
         io: IoArgs,
         #[command(flatten)]
         opts: CommonOpts,
+        #[command(flatten)]
+        strategy: StrategyArgs,
         /// Rayon worker threads (default: CPU cores).
         #[arg(long, short = 'j')]
         threads: Option<usize>,
-        /// Max in-flight chunk jobs; bounds memory (default: 2).
+        /// Max in-flight chunk jobs; bounds memory (default: 2, must be >= 1).
         #[arg(long)]
-        in_flight: Option<usize>,
+        in_flight: Option<NonZeroUsize>,
     },
     /// High-density sampling of a specific time range into a single grid.
     Extract {
@@ -76,15 +79,15 @@ struct IoArgs {
 #[derive(clap::Args)]
 struct CommonOpts {
     /// Canvas edge length in pixels.
-    #[arg(long, default_value_t = 2000)]
+    #[arg(long, default_value_t = 2048)]
     max_edge: u32,
     /// Resolution tier.
-    #[arg(long, value_enum, default_value_t = QualityArg::High)]
+    #[arg(long, value_enum, default_value_t = QualityArg::Low)]
     quality: QualityArg,
     /// Detail / sampling-density tier.
     #[arg(long, value_enum, default_value_t = DetailArg::Standard)]
     detail: DetailArg,
-    /// Named profile (balanced, fast, quality, action, or custom).
+    /// Named profile (balanced, fast, quality, action).
     #[arg(long)]
     profile: Option<String>,
 
@@ -95,9 +98,9 @@ struct CommonOpts {
     /// Override pHash Hamming distance threshold for dedup.
     #[arg(long)]
     hash_threshold: Option<u32>,
-    /// Override dedup sliding window size in frames.
+    /// Override dedup sliding window size in frames (must be >= 1).
     #[arg(long)]
-    dedup_window: Option<usize>,
+    dedup_window: Option<NonZeroUsize>,
     /// Override edge length of grayscale image for scoring.
     #[arg(long)]
     score_edge: Option<u32>,
@@ -130,6 +133,7 @@ struct CommonOpts {
     hero_border_px: Option<u32>,
 
     /// Output JSON with base64 images to stdout instead of writing files.
+    /// Holds all grids in memory until done; prefer files for long videos.
     #[arg(long)]
     json: bool,
 
@@ -138,10 +142,15 @@ struct CommonOpts {
     subtitle: Option<PathBuf>,
 
     /// Embedded subtitle track index (0-based, use when multiple tracks exist).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "subtitle")]
     subtitle_track: Option<usize>,
+}
 
-    // --- Strategy options ---
+/// Sampling-strategy options, `process` only: `extract` always samples its
+/// explicit range at fixed fps, so accepting these there would be a silent
+/// no-op.
+#[derive(clap::Args)]
+struct StrategyArgs {
     /// Frame sampling strategy.
     #[arg(long, value_enum, default_value_t = StrategyArg::FixedFps)]
     strategy: StrategyArg,
@@ -247,11 +256,14 @@ fn run() -> anyhow::Result<()> {
         hero_border_px: opts.hero_border_px,
     };
 
-    let strategy_opts = StrategyOpts {
-        strategy: SampleStrategy::from(opts.strategy),
-        gap_threshold: opts.gap_threshold,
-        min_keyframes: opts.min_keyframes,
-        force: opts.force,
+    let strategy_opts = match &cli.command {
+        Command::Process { strategy, .. } => StrategyOpts {
+            strategy: SampleStrategy::from(strategy.strategy),
+            gap_threshold: strategy.gap_threshold,
+            min_keyframes: strategy.min_keyframes,
+            force: strategy.force,
+        },
+        Command::Extract { .. } => StrategyOpts::default(),
     };
 
     let cfg = Config::new(
@@ -269,9 +281,11 @@ fn run() -> anyhow::Result<()> {
         pipeline::OutputMode::Files
     };
 
-    let subs = pipeline::SubtitleOpts {
-        path: opts.subtitle.as_deref(),
-        track: opts.subtitle_track,
+    // clap's `conflicts_with` guarantees the flags are mutually exclusive.
+    let subs = match (&opts.subtitle, opts.subtitle_track) {
+        (Some(path), _) => pipeline::SubtitleSource::File(path),
+        (None, Some(track)) => pipeline::SubtitleSource::Track(track),
+        (None, None) => pipeline::SubtitleSource::Auto,
     };
 
     match &cli.command {
@@ -282,14 +296,8 @@ fn run() -> anyhow::Result<()> {
             let in_flight = in_flight.unwrap_or(pipeline::DEFAULT_IN_FLIGHT);
             pipeline::process(&io.input, &io.output, &cfg, mode, threads, in_flight, subs)
         }
-        Command::Extract { range, .. } => pipeline::extract_range(
-            &io.input,
-            &io.output,
-            &cfg,
-            range.start(),
-            range.end(),
-            mode,
-            subs,
-        ),
+        Command::Extract { range, .. } => {
+            pipeline::extract_range(&io.input, &io.output, &cfg, *range, mode, subs)
+        }
     }
 }

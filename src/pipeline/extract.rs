@@ -5,45 +5,59 @@
 //! multi-chunk orchestration in the parent module — it scores and selects
 //! within a single competition set instead of per-chunk.
 
-use std::fs;
 use std::mem;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use image::GrayImage;
 
 use crate::config::Config;
-use crate::types::{CandidateFrame, CanvasSpec, Metadata, ScoredFrame};
-use crate::{compose, dedup, extract, layout, score, subtitle};
+use crate::error::{Error, ErrorCode, ErrorContext};
+use crate::subtitle::Subtitles;
+use crate::types::{CandidateFrame, CanvasSpec, Metadata, ScoredFrame, TimeRange, format_ts};
+use crate::{compose, dedup, extract, layout, score};
 
 use super::chunk::{build_grid_meta, extract_selected, grid_image};
-use super::output::atomic_write;
+use super::output::OutputSession;
 use super::state::extract_batch_frames;
-use super::{OutputMode, SubtitleOpts};
+use super::{OutputMode, SubtitleSource};
 
-/// Run the `extract` pipeline: high-density sampling of `[start, end)` into a
-/// single equal-cell grid, frames in time order (no hero emphasis).
+/// Run the `extract` pipeline: high-density sampling of `range` into a single
+/// equal-cell grid, frames in time order (no hero emphasis).
+///
+/// Output contract: `grid_extract.jpg` and `metadata.json` only. Subtitles for
+/// the requested range travel inside the metadata's `subtitles` field; no
+/// `subtitles.txt` is written — the full-video text is not an artifact of a
+/// range extraction.
 pub fn extract_range(
     input: &Path,
     out_dir: &Path,
     cfg: &Config,
-    start: f32,
-    end: f32,
+    range: TimeRange,
     mode: OutputMode,
-    subs: SubtitleOpts<'_>,
+    subs: SubtitleSource<'_>,
 ) -> Result<()> {
     super::validate_input(input)?;
+    // Resolve subtitles before the expensive sampling/scoring pass: subtitle
+    // errors (ambiguous sources, unreadable files) should fail fast, not
+    // after all the CPU and IO have been spent.
+    let subs = Subtitles::resolve(input, subs)?;
     let write_files = mode == OutputMode::Files;
-    if write_files {
-        fs::create_dir_all(out_dir)
-            .with_context(|| format!("creating output dir {}", out_dir.display()))?;
-    }
+    let session = OutputSession::open(out_dir, mode)?;
 
-    let fps = cfg.base_fps * 3.0;
-    let mut stream =
-        extract::stream_range(input, fps, cfg.min_frame_size, cfg.score_edge, start, end)?;
+    let fps = cfg.extract_fps;
+    // `extract` exposes no --threads flag; the decoder keeps ffmpeg defaults.
+    let mut stream = extract::stream_range(
+        input,
+        fps,
+        cfg.min_frame_size,
+        cfg.score_edge,
+        range.start(),
+        range.end(),
+        None,
+    )?;
 
-    let batch_size = extract_batch_frames(cfg);
+    let batch_size = extract_batch_frames(fps, cfg.chunk_seconds);
     let mut deduper = dedup::Deduper::new(cfg.hash_threshold, cfg.dedup_window);
     let weights = cfg.weights();
     let spec = cfg.canvas_spec();
@@ -116,6 +130,22 @@ pub fn extract_range(
         select_capacity(candidates, capacity, &weights, cfg.min_gap)
     };
 
+    // An empty selection means the range yielded nothing (e.g. it lies past
+    // the end of the video). Rendering an empty grid and reporting success
+    // would hand the caller a fabricated artifact; fail with a code instead.
+    if picked.is_empty() {
+        return Err(Error::new(
+            ErrorCode::NoFramesExtracted,
+            format!(
+                "no frames extracted in range {}-{}; does the range lie within the video?",
+                format_ts(range.start()),
+                format_ts(range.end())
+            ),
+        )
+        .with_context(ErrorContext::default().with_input(input))
+        .into());
+    }
+
     let scores: Vec<f32> = picked.iter().map(|f| f.score).collect();
     let lay = layout::compute(&scores, &[], aspect, &spec);
     let jpeg = compose::render(&picked, &lay, &[], cfg.jpeg_quality, cfg.hero_border_px)?;
@@ -124,28 +154,21 @@ pub fn extract_range(
     let image = grid_image(write_files, file.to_string(), &jpeg);
     let mut grid_meta = build_grid_meta(image, &picked, &[], lay.template);
 
-    let srt_text = subtitle::resolve(input, subs.path, subs.track)?;
-    if let Some(ref text) = srt_text {
-        let cues = subtitle::parse_srt(text);
-        grid_meta.subtitles = subtitle::slice_for_range(&cues, start, end);
+    if let Some(ref subs) = subs {
+        grid_meta.subtitles = subs.slice(range);
     }
 
     let meta = Metadata {
         source: input.display().to_string(),
-        duration: end - start,
+        duration: range.end() - range.start(),
         settings: cfg.settings(),
         grids: vec![grid_meta],
     };
 
-    if write_files {
-        atomic_write(out_dir, file, &jpeg)?;
-        let json = serde_json::to_string_pretty(&meta).context("serializing metadata")?;
-        atomic_write(out_dir, "metadata.json", json.as_bytes())?;
-        eprintln!("wrote {} to {}", file, out_dir.display());
-    } else {
-        let json = serde_json::to_string_pretty(&meta).context("serializing metadata")?;
-        println!("{json}");
-    }
+    session.write_image(file, &jpeg)?;
+    // No subtitles.txt: the range-sliced cues already travel in the metadata
+    // (see the fn docs for the extract output contract).
+    session.commit(&meta, None)?;
 
     Ok(())
 }
@@ -163,7 +186,10 @@ fn flush_batch_to_candidates(
         return;
     }
     let tail = batch.last().map(|f| f.gray.clone());
-    let mut scored = score::score_frames(mem::take(batch), weights, prev_tail.as_ref());
+    // Keep the buffer's capacity across flushes: mem::take would leave a
+    // zero-capacity Vec that reallocates as the next batch refills it.
+    let drained = mem::replace(batch, Vec::with_capacity(batch.capacity()));
+    let mut scored = score::score_frames(drained, weights, prev_tail.as_ref());
     *prev_tail = tail;
     let capacity = layout::grid_capacity(spec, aspect);
     let selected = score::select_top_k(&scored, capacity, min_gap);
@@ -171,19 +197,20 @@ fn flush_batch_to_candidates(
 }
 
 /// Re-rank per-batch winners as one global competition set and keep the top
-/// `capacity` by score. Rank normalization is per-competition-set, so dropping
-/// the stale per-batch scores (`ScoredFrame` → `CandidateFrame`) and re-scoring
-/// the survivors together is the consistent choice.
+/// `capacity` by score.
+///
+/// The survivors are non-consecutive in time, so their `scene_diff` is NOT
+/// recomputed against slice neighbors (frames possibly minutes apart — that
+/// difference is noise, not a transition). [`score::rescore_frames`] keeps
+/// each frame's carried `scene_diff` from its original consecutive batch and
+/// rank-normalizes within this set, consistent with the final pass.
 fn select_capacity(
     candidates: Vec<ScoredFrame>,
     capacity: usize,
     weights: &score::Weights,
     min_gap: f32,
 ) -> Vec<ScoredFrame> {
-    let recandidates: Vec<CandidateFrame> =
-        candidates.into_iter().map(CandidateFrame::from).collect();
-    // Survivors are non-consecutive winners; there is no boundary predecessor.
-    let mut rescored = score::score_frames(recandidates, weights, None);
+    let mut rescored = score::rescore_frames(candidates, weights);
     let selected = score::select_top_k(&rescored, capacity, min_gap);
     extract_selected(&mut rescored, selected)
 }

@@ -8,21 +8,18 @@
 //! finally-selected frames across the timeline.
 
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 
 use image_hasher::{HasherConfig, ImageHash};
 use rayon::prelude::*;
 
 use crate::types::CandidateFrame;
 
-/// How many recently-kept hashes to compare against. A short window catches
-/// repeats across brief dips without letting slow drift accumulate into a
-/// missed duplicate.
-const DEFAULT_WINDOW: usize = 8;
-
 /// Streaming perceptual-hash deduplicator.
 ///
 /// Retains only the hashes of recently-kept frames so duplicates are dropped
-/// before they reach the scoring buffer.
+/// before they reach the scoring buffer. A short window catches repeats across
+/// brief dips without letting slow drift accumulate into a missed duplicate.
 pub struct Deduper {
     hasher: image_hasher::Hasher,
     recent: VecDeque<ImageHash>,
@@ -31,13 +28,14 @@ pub struct Deduper {
 }
 
 impl Deduper {
-    pub fn new(hash_threshold: u32, window: usize) -> Self {
-        let window_size = if window == 0 { DEFAULT_WINDOW } else { window };
+    /// `window` is the number of recently-kept hashes to compare against; the
+    /// type rules out zero, which would grow `recent` without bound.
+    pub fn new(hash_threshold: u32, window: NonZeroUsize) -> Self {
         Self {
             hasher: HasherConfig::new().to_hasher(),
-            recent: VecDeque::with_capacity(window_size),
+            recent: VecDeque::with_capacity(window.get()),
             hash_threshold,
-            window_size,
+            window_size: window.get(),
         }
     }
 
@@ -104,8 +102,12 @@ mod tests {
         }
     }
 
+    fn win(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("test window is nonzero")
+    }
+
     fn dedup(frames: Vec<CandidateFrame>, threshold: u32, window: usize) -> Vec<CandidateFrame> {
-        Deduper::new(threshold, window).filter(frames)
+        Deduper::new(threshold, win(window)).filter(frames)
     }
 
     #[test]
@@ -132,7 +134,7 @@ mod tests {
             flat_frame(1.0, 100),
             flat_frame(2.0, 100),
         ];
-        let judged = Deduper::new(8, 8).judge(frames);
+        let judged = Deduper::new(8, win(8)).judge(frames);
         let verdicts: Vec<(f32, bool)> = judged.iter().map(|(f, kept)| (f.ts, *kept)).collect();
         assert_eq!(
             verdicts,

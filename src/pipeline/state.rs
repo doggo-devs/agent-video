@@ -6,28 +6,27 @@
 //! content produces fewer, fuller grids instead of one half-empty grid per
 //! chunk.
 //!
-//! It also detects static stretches. Dedup collapses an unchanging scene into a
-//! long gap between kept frames; when such a gap spans at least a chunk and
-//! enough sampled frames were dropped inside it as duplicates (the evidence
-//! that the stretch was watched, not just unsampled), the state emits a single
+//! Static-stretch detection lives in [`super::stretch`]; this module feeds it
+//! the dedup verdicts and renders qualifying stretches as a single
 //! representative image plus the covered time range instead of empty grids.
 
 use std::collections::BTreeMap;
 use std::mem;
+use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
-use anyhow::{Context, Result};
-use image::{GrayImage, RgbImage};
+use anyhow::Result;
+use image::GrayImage;
 
 use crate::config::Config;
 use crate::types::{CandidateFrame, GridMeta, TimeRange, format_ts};
 use crate::{compose, dedup, extract, layout};
 
-use super::chunk::{ChunkMsg, GridResult, ProcessChunkEnv, process_chunk};
-use super::output::atomic_write;
+use super::OutputMode;
+use super::chunk::{GridResult, ProcessChunkEnv, process_chunk};
+use super::jobs::OrderedJobs;
+use super::output::OutputSession;
+use super::stretch::{Stretch, StretchDetector};
 
 /// Lower bound for an extraction batch.
 const MIN_EXTRACT_BATCH_FRAMES: usize = 32;
@@ -35,23 +34,20 @@ const MIN_EXTRACT_BATCH_FRAMES: usize = 32;
 /// Upper bound for an extraction batch.
 const MAX_EXTRACT_BATCH_FRAMES: usize = 240;
 
-/// Minimum number of frames dropped as duplicates inside a kept-frame gap for
-/// the gap to count as a static stretch. One drop could be a flicker; a few
-/// spanning drops are evidence that the scene genuinely held still. Gaps
-/// without drops (sparse keyframe sampling) are left alone.
-const MIN_STATIC_DROPS: usize = 3;
-
 pub struct ProcessState<'a> {
     cfg: &'a Config,
+    /// The run's output session: incremental grid/static writes go through it,
+    /// so file-vs-JSON dispatch lives in one place.
+    session: &'a OutputSession<'a>,
     /// Worker pool for chunk jobs and per-frame batch work. The state's own
-    /// methods run on the caller's thread and may block on `rx`, so they must
-    /// never execute on a pool thread — a single-thread pool would deadlock.
+    /// methods run on the caller's thread and may block on job completions,
+    /// so they must never execute on a pool thread — a single-thread pool
+    /// would deadlock.
     pool: &'a rayon::ThreadPool,
     pub(super) env: ProcessChunkEnv,
     deduper: dedup::Deduper,
     rgb_batch: Vec<extract::RgbFrame>,
     batch_frames: usize,
-    max_in_flight: usize,
     pending: BTreeMap<usize, Vec<CandidateFrame>>,
     /// Frames from sealed time chunks that have not yet filled a grid. The
     /// time chunk is a throttle (at most one grid per `chunk_seconds`), not a
@@ -62,22 +58,16 @@ pub struct ProcessState<'a> {
     /// true predecessor instead of a hardcoded zero.
     prev_chunk_tail: Option<GrayImage>,
     high_water_mark: Option<usize>,
-    next_chunk_ci: usize,
-    tx: Option<Sender<ChunkMsg>>,
-    rx: Receiver<ChunkMsg>,
-    ready: BTreeMap<usize, Result<GridResult>>,
-    outstanding: usize,
-    next_emit: usize,
+    /// Timestamp of the last pushed frame, enforcing the monotonic-arrival
+    /// contract of [`Self::push_rgb`].
+    last_ts: Option<f32>,
+    /// Chunk jobs in flight: assigns chunk indexes, caps buffered chunks at
+    /// `max_in_flight`, and hands results back in chunk order.
+    jobs: OrderedJobs<Result<GridResult>>,
+    /// Static-stretch detector, fed every dedup verdict in timestamp order.
+    stretches: StretchDetector,
     pub(super) duration: f32,
     pub(super) grid_metas: Vec<GridMeta>,
-    /// Timestamp and shared RGB of the most recent kept frame — the candidate
-    /// representative should a static gap follow it. The `Arc` makes retaining
-    /// it a pointer clone rather than a deep copy of the ~1.4 MB image.
-    last_kept: Option<(f32, Arc<RgbImage>)>,
-    /// Frames dropped as duplicates since the last kept frame.
-    drops_since_kept: usize,
-    /// Timestamp of the most recent dropped frame (bounds a trailing stretch).
-    last_dropped_ts: f32,
     static_seq: usize,
     static_metas: Vec<GridMeta>,
 }
@@ -86,12 +76,14 @@ impl<'a> ProcessState<'a> {
     pub fn new(
         cfg: &'a Config,
         pool: &'a rayon::ThreadPool,
-        write_files: bool,
-        parallelism: usize,
+        session: &'a OutputSession<'a>,
+        parallelism: NonZeroUsize,
     ) -> Self {
-        let (tx, rx) = mpsc::channel();
+        let batch_frames = extract_batch_frames(cfg.base_fps, cfg.chunk_seconds);
+        let write_files = session.mode() == OutputMode::Files;
         Self {
             cfg,
+            session,
             pool,
             env: ProcessChunkEnv {
                 spec: cfg.canvas_spec(),
@@ -103,24 +95,17 @@ impl<'a> ProcessState<'a> {
                 hero_border_px: cfg.hero_border_px,
             },
             deduper: dedup::Deduper::new(cfg.hash_threshold, cfg.dedup_window),
-            rgb_batch: Vec::with_capacity(extract_batch_frames(cfg)),
-            batch_frames: extract_batch_frames(cfg),
-            max_in_flight: parallelism.max(1),
+            rgb_batch: Vec::with_capacity(batch_frames),
+            batch_frames,
             pending: BTreeMap::new(),
             carry: Vec::new(),
             prev_chunk_tail: None,
             high_water_mark: None,
-            next_chunk_ci: 0,
-            tx: Some(tx),
-            rx,
-            ready: BTreeMap::new(),
-            outstanding: 0,
-            next_emit: 0,
+            last_ts: None,
+            jobs: OrderedJobs::new(parallelism),
+            stretches: StretchDetector::new(cfg.chunk_seconds),
             duration: 0.0,
             grid_metas: Vec::new(),
-            last_kept: None,
-            drops_since_kept: 0,
-            last_dropped_ts: 0.0,
             static_seq: 0,
             static_metas: Vec::new(),
         }
@@ -130,25 +115,40 @@ impl<'a> ProcessState<'a> {
         self.env.aspect = aspect;
     }
 
-    /// Buffer one sampled frame. Frames must arrive in non-decreasing `ts`
-    /// order: chunk keying, high-water-mark sealing, and static detection all
-    /// assume a monotonic stream (adaptive mode interleaves fills to preserve
-    /// this).
-    pub fn push_rgb(&mut self, frame: extract::RgbFrame, out_dir: &Path) -> Result<()> {
+    /// Buffer one sampled frame. Timestamps must be finite and arrive in
+    /// non-decreasing order: chunk keying, high-water-mark sealing, and
+    /// static detection all assume a monotonic stream (adaptive mode
+    /// interleaves fills to preserve this). A violation is rejected here
+    /// rather than silently mixing old frames into the wrong chunk.
+    pub fn push_rgb(&mut self, frame: extract::RgbFrame) -> Result<()> {
+        if !frame.ts.is_finite() {
+            anyhow::bail!("frame timestamp must be finite: got {}", frame.ts);
+        }
+        if let Some(last) = self.last_ts
+            && frame.ts < last
+        {
+            anyhow::bail!(
+                "frame timestamps must be non-decreasing: got {} after {last}",
+                frame.ts
+            );
+        }
+        self.last_ts = Some(frame.ts);
         self.rgb_batch.push(frame);
         if self.rgb_batch.len() == self.batch_frames {
-            self.flush_extract_batch(out_dir)?;
-            self.drain_results(out_dir, Some(self.max_in_flight))?;
+            self.flush_extract_batch()?;
         }
         Ok(())
     }
 
-    pub fn finish(mut self, out_dir: &Path) -> Result<(f32, Vec<GridMeta>)> {
-        self.flush_extract_batch(out_dir)?;
-        self.finish_trailing_static(out_dir)?;
-        self.seal_all();
-        self.tx = None;
-        self.drain_results(out_dir, Some(0))?;
+    pub fn finish(mut self) -> Result<(f32, Vec<GridMeta>)> {
+        self.flush_extract_batch()?;
+        if let Some(stretch) = self.stretches.finish() {
+            self.emit_static(stretch)?;
+        }
+        self.seal_all()?;
+        for result in self.jobs.finish()? {
+            self.emit_grid(result?)?;
+        }
 
         // Interleave static entries with grids by start time. Both lists are
         // already time-ascending; a static range starts inside the grid that
@@ -159,7 +159,7 @@ impl<'a> ProcessState<'a> {
         Ok((self.duration, metas))
     }
 
-    fn flush_extract_batch(&mut self, out_dir: &Path) -> Result<()> {
+    fn flush_extract_batch(&mut self) -> Result<()> {
         if self.rgb_batch.is_empty() {
             return Ok(());
         }
@@ -178,65 +178,25 @@ impl<'a> ProcessState<'a> {
         for (frame, kept) in judged {
             self.duration = self.duration.max(frame.ts + 1.0 / self.cfg.base_fps);
             if kept {
-                self.note_kept(&frame, out_dir)?;
-                self.push_chunked_frame(frame);
+                if let Some(stretch) = self.stretches.note_kept(frame.ts, &frame.rgb) {
+                    self.emit_static(stretch)?;
+                }
+                self.push_chunked_frame(frame)?;
             } else {
-                self.note_dropped(frame.ts);
+                self.stretches.note_dropped(frame.ts);
             }
-        }
-        Ok(())
-    }
-
-    /// Record a kept frame for static detection: close out a static stretch if
-    /// the gap since the previous kept frame qualifies, then make this frame
-    /// the new representative candidate.
-    fn note_kept(&mut self, frame: &CandidateFrame, out_dir: &Path) -> Result<()> {
-        let stretch = match &self.last_kept {
-            Some((prev_ts, prev_rgb))
-                if frame.ts - prev_ts >= self.cfg.chunk_seconds
-                    && self.drops_since_kept >= MIN_STATIC_DROPS =>
-            {
-                Some((*prev_ts, prev_rgb.clone()))
-            }
-            _ => None,
-        };
-        if let Some((start, rgb)) = stretch {
-            self.emit_static(start, frame.ts, &rgb, out_dir)?;
-        }
-        self.last_kept = Some((frame.ts, frame.rgb.clone()));
-        self.drops_since_kept = 0;
-        Ok(())
-    }
-
-    fn note_dropped(&mut self, ts: f32) {
-        self.drops_since_kept += 1;
-        self.last_dropped_ts = ts;
-    }
-
-    /// Close out a static stretch that runs to the end of the stream, bounded
-    /// by the last dropped duplicate rather than a following kept frame.
-    fn finish_trailing_static(&mut self, out_dir: &Path) -> Result<()> {
-        if self.drops_since_kept < MIN_STATIC_DROPS {
-            return Ok(());
-        }
-        let Some((prev_ts, prev_rgb)) = self.last_kept.take() else {
-            return Ok(());
-        };
-        if self.last_dropped_ts - prev_ts >= self.cfg.chunk_seconds {
-            self.emit_static(prev_ts, self.last_dropped_ts, &prev_rgb, out_dir)?;
         }
         Ok(())
     }
 
     /// Render and record one static-stretch entry: the last visually-distinct
-    /// frame stands in for the whole unchanged `[start, end]` range.
-    fn emit_static(&mut self, start: f32, end: f32, rgb: &RgbImage, out_dir: &Path) -> Result<()> {
+    /// frame stands in for the whole unchanged range.
+    fn emit_static(&mut self, stretch: Stretch) -> Result<()> {
+        let Stretch { start, end, rgb } = stretch;
         self.static_seq += 1;
-        let jpeg = compose::render_single(rgb, start, self.cfg.jpeg_quality)?;
+        let jpeg = compose::render_single(&rgb, start, self.cfg.jpeg_quality)?;
         let file = format!("static_{:03}.jpg", self.static_seq);
-        if self.env.write_files {
-            atomic_write(out_dir, &file, &jpeg)?;
-        }
+        self.session.write_image(&file, &jpeg)?;
         eprintln!(
             "  static stretch {}-{} collapsed into {file}",
             format_ts(start),
@@ -253,19 +213,20 @@ impl<'a> ProcessState<'a> {
         Ok(())
     }
 
-    fn push_chunked_frame(&mut self, frame: CandidateFrame) {
+    fn push_chunked_frame(&mut self, frame: CandidateFrame) -> Result<()> {
         let key = (frame.ts / self.cfg.chunk_seconds).floor() as usize;
         self.pending.entry(key).or_default().push(frame);
 
         if let Some(hwm) = self.high_water_mark
             && key > hwm
         {
-            self.seal_up_to(hwm);
+            self.seal_up_to(hwm)?;
         }
         self.high_water_mark = Some(self.high_water_mark.unwrap_or(key).max(key));
+        Ok(())
     }
 
-    fn seal_up_to(&mut self, seal_key: usize) {
+    fn seal_up_to(&mut self, seal_key: usize) -> Result<()> {
         let keys: Vec<usize> = self
             .pending
             .keys()
@@ -281,83 +242,65 @@ impl<'a> ProcessState<'a> {
             // half-empty grid. Dense chunks reach capacity alone and behave as
             // before.
             if self.carry.len() >= layout::grid_capacity(&self.env.spec, self.env.aspect) {
-                self.spawn_carry();
-            }
-        }
-    }
-
-    fn seal_all(&mut self) {
-        self.seal_up_to(usize::MAX);
-        // Whatever is left becomes the final (possibly under-full) grid.
-        self.spawn_carry();
-    }
-
-    fn spawn_carry(&mut self) {
-        if self.carry.is_empty() {
-            return;
-        }
-        let chunk = mem::take(&mut self.carry);
-        let tail = chunk.last().map(|f| f.gray.clone());
-        let prev_tail = mem::replace(&mut self.prev_chunk_tail, tail);
-        let ci = self.next_chunk_ci;
-        self.next_chunk_ci += 1;
-        self.spawn_chunk(ci, chunk, prev_tail);
-    }
-
-    fn spawn_chunk(&mut self, ci: usize, chunk: Vec<CandidateFrame>, prev_tail: Option<GrayImage>) {
-        self.outstanding += 1;
-        let tx = self.tx.as_ref().expect("sender lives until finish").clone();
-        let env = self.env;
-        self.pool.spawn_fifo(move || {
-            let result =
-                panic::catch_unwind(AssertUnwindSafe(|| process_chunk(ci, chunk, prev_tail, env)))
-                    .unwrap_or_else(|panic| Err(panic_to_anyhow(panic)));
-            let _ = tx.send((ci, result));
-        });
-    }
-
-    fn drain_results(&mut self, out_dir: &Path, max_in_flight: Option<usize>) -> Result<()> {
-        loop {
-            let buffered = self.outstanding + self.ready.len();
-            if max_in_flight.is_some_and(|max| buffered > max) {
-                let (ci, result) = self.rx.recv().context("receiving grid result")?;
-                self.outstanding -= 1;
-                self.ready.insert(ci, result);
-            } else {
-                loop {
-                    match self.rx.try_recv() {
-                        Ok((ci, result)) => {
-                            self.outstanding -= 1;
-                            self.ready.insert(ci, result);
-                        }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => break,
-                    }
-                }
-            }
-
-            while let Some(result) = self.ready.remove(&self.next_emit) {
-                let result = result?;
-                debug_assert_eq!(result.ci, self.next_emit);
-                if self.env.write_files {
-                    let file = format!("grid_{:03}.jpg", result.ci + 1);
-                    atomic_write(out_dir, &file, &result.jpeg)?;
-                }
-                self.grid_metas.push(result.meta);
-                self.next_emit += 1;
-            }
-
-            let buffered = self.outstanding + self.ready.len();
-            if max_in_flight.is_none_or(|max| buffered <= max) {
-                break;
+                self.spawn_carry()?;
             }
         }
         Ok(())
     }
+
+    fn seal_all(&mut self) -> Result<()> {
+        self.seal_up_to(usize::MAX)?;
+        // Whatever is left becomes the final (possibly under-full) grid.
+        self.spawn_carry()
+    }
+
+    fn spawn_carry(&mut self) -> Result<()> {
+        if self.carry.is_empty() {
+            return Ok(());
+        }
+        let chunk = mem::take(&mut self.carry);
+        let tail = chunk.last().map(|f| f.gray.clone());
+        let prev_tail = mem::replace(&mut self.prev_chunk_tail, tail);
+        self.spawn_chunk(chunk, prev_tail)
+    }
+
+    fn spawn_chunk(
+        &mut self,
+        chunk: Vec<CandidateFrame>,
+        prev_tail: Option<GrayImage>,
+    ) -> Result<()> {
+        // `jobs` enforces the in-flight cap at this spawn boundary: one
+        // extraction batch can seal several chunks in a row, so waiting for
+        // room here (rather than once per pushed frame) is what actually
+        // bounds buffered chunks.
+        let env = self.env;
+        let results = self.jobs.spawn(self.pool, move |ci| {
+            panic::catch_unwind(AssertUnwindSafe(|| {
+                process_chunk(ci, chunk, prev_tail, env)
+            }))
+            .unwrap_or_else(|panic| Err(panic_to_anyhow(panic)))
+        })?;
+        for result in results {
+            self.emit_grid(result?)?;
+        }
+        Ok(())
+    }
+
+    /// Write one finished grid and record its metadata. Grids arrive from
+    /// `jobs` in chunk order, so emission order is chunk order.
+    fn emit_grid(&mut self, result: GridResult) -> Result<()> {
+        let file = format!("grid_{:03}.jpg", result.ci + 1);
+        self.session.write_image(&file, &result.jpeg)?;
+        self.grid_metas.push(result.meta);
+        Ok(())
+    }
 }
 
-pub fn extract_batch_frames(cfg: &Config) -> usize {
-    ((cfg.base_fps * cfg.chunk_seconds).round().max(1.0) as usize)
+/// Frames per extraction batch for a stream sampled at `fps` and chunked every
+/// `chunk_seconds`, clamped to the batch bounds. Parameterized on fps because
+/// `process` and `extract` sample at different densities.
+pub fn extract_batch_frames(fps: f32, chunk_seconds: f32) -> usize {
+    ((fps * chunk_seconds).round().max(1.0) as usize)
         .clamp(MIN_EXTRACT_BATCH_FRAMES, MAX_EXTRACT_BATCH_FRAMES)
 }
 
@@ -438,20 +381,27 @@ mod tests {
         run_on(cfg, &pool(2), parallelism, frames)
     }
 
+    /// A JSON-mode session for tests: opening it touches no files.
+    fn json_session() -> OutputSession<'static> {
+        OutputSession::open(std::path::Path::new("out"), OutputMode::Json)
+            .expect("json session opens without touching disk")
+    }
+
     fn run_on(
         cfg: &Config,
         pool: &rayon::ThreadPool,
         parallelism: usize,
         frames: &[(f32, u32)],
     ) -> Vec<GridMeta> {
-        let out_dir = Path::new("out");
-        let mut state = ProcessState::new(cfg, pool, false, parallelism);
+        let session = json_session();
+        let parallelism = NonZeroUsize::new(parallelism).expect("test parallelism is nonzero");
+        let mut state = ProcessState::new(cfg, pool, &session, parallelism);
         for &(ts, seed) in frames {
             state
-                .push_rgb(distinct_frame(ts, seed), out_dir)
+                .push_rgb(distinct_frame(ts, seed))
                 .expect("push frame");
         }
-        let (_duration, grid_metas) = state.finish(out_dir).expect("finish");
+        let (_duration, grid_metas) = state.finish().expect("finish");
         grid_metas
     }
 
@@ -524,19 +474,36 @@ mod tests {
 
     #[test]
     fn clamps_extract_batch_to_bounds() {
-        let mut cfg = base_config();
+        assert_eq!(extract_batch_frames(0.1, 1.0), MIN_EXTRACT_BATCH_FRAMES);
+        assert_eq!(extract_batch_frames(100.0, 100.0), MAX_EXTRACT_BATCH_FRAMES);
+        assert_eq!(extract_batch_frames(1.0, 100.0), 100);
+    }
 
-        cfg.base_fps = 0.1;
-        cfg.chunk_seconds = 1.0;
-        assert_eq!(extract_batch_frames(&cfg), MIN_EXTRACT_BATCH_FRAMES);
+    #[test]
+    fn bounds_buffered_chunks_within_one_batch_flush() {
+        // 64 frames exceed the 60-frame batch, so a single flush seals ~15
+        // full chunks in a row. With --in-flight 1 the spawn boundary must
+        // wait for room each time; buffered chunks may never exceed 1.
+        let cfg = small_grid_config();
+        let frames: Vec<_> = (0..16).flat_map(full_chunk).collect();
 
-        cfg.base_fps = 100.0;
-        cfg.chunk_seconds = 100.0;
-        assert_eq!(extract_batch_frames(&cfg), MAX_EXTRACT_BATCH_FRAMES);
+        let pool = pool(2);
+        let session = json_session();
+        let one = NonZeroUsize::new(1).expect("1 is nonzero");
+        let mut state = ProcessState::new(&cfg, &pool, &session, one);
+        for (ts, seed) in frames {
+            state
+                .push_rgb(distinct_frame(ts, seed))
+                .expect("push frame");
+        }
+        assert!(
+            state.jobs.peak_buffered() <= 1,
+            "in-flight cap violated during batch flush: peak {}",
+            state.jobs.peak_buffered()
+        );
 
-        cfg.base_fps = 1.0;
-        cfg.chunk_seconds = 100.0;
-        assert_eq!(extract_batch_frames(&cfg), 100);
+        let (_duration, metas) = state.finish().expect("finish");
+        assert_eq!(metas.len(), 16, "every sealed chunk still becomes a grid");
     }
 
     #[test]
@@ -606,6 +573,20 @@ mod tests {
             metas.iter().all(|m| m.layout != "STATIC"),
             "no static entries without dropped-duplicate evidence"
         );
+    }
+
+    #[test]
+    fn rejects_backwards_timestamps() {
+        let cfg = small_grid_config();
+        let pool = pool(2);
+        let session = json_session();
+        let one = NonZeroUsize::new(1).expect("1 is nonzero");
+        let mut state = ProcessState::new(&cfg, &pool, &session, one);
+
+        state.push_rgb(distinct_frame(10.0, 0)).expect("first push");
+        state
+            .push_rgb(distinct_frame(5.0, 1))
+            .expect_err("a timestamp going backwards must be rejected");
     }
 
     #[test]

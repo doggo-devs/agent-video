@@ -3,16 +3,26 @@
 //! All parameters live in [`Config`]. Construction resolves named profiles,
 //! quality/detail tiers, and CLI overrides in one place — no layered merging.
 
+use std::num::NonZeroUsize;
+
 use crate::error::{Error, ErrorCode};
 use crate::probe::SampleStrategy;
 use crate::types::{Detail, Quality};
 
-/// CLI overrides — all optional, highest priority.
+/// JPEG caps image dimensions at 65535 px; a larger canvas would run the whole
+/// pipeline only to fail at encode time (after a multi-GB allocation).
+const MAX_CANVAS_EDGE: u32 = 65_535;
+
+/// Default dedup sliding window, in kept frames.
+const DEFAULT_DEDUP_WINDOW: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+
+/// A partial parameter set: CLI overrides (highest priority) and named
+/// profiles both resolve through this shape.
 #[derive(Debug, Clone, Default)]
 pub struct Overrides {
     pub base_fps: Option<f32>,
     pub hash_threshold: Option<u32>,
-    pub dedup_window: Option<usize>,
+    pub dedup_window: Option<NonZeroUsize>,
     pub score_edge: Option<u32>,
     pub w_scene: Option<f32>,
     pub w_clarity: Option<f32>,
@@ -57,8 +67,13 @@ pub struct Config {
     pub max_edge: u32,
     pub min_frame_size: u32,
     pub base_fps: f32,
+    /// Sampling fps for the `extract` subcommand. Defaults to three times the
+    /// detail tier's fps (extract exists for high-density passes over short
+    /// ranges), but an explicit `--base-fps` or profile value wins as-is, so
+    /// the flag means the same density in both subcommands.
+    pub extract_fps: f32,
     pub hash_threshold: u32,
-    pub dedup_window: usize,
+    pub dedup_window: NonZeroUsize,
     pub score_edge: u32,
 
     pub w_scene: f32,
@@ -80,38 +95,24 @@ pub struct Config {
     pub force_long_video: bool,
 }
 
-/// Named profile — partial overrides.
-#[derive(Debug, Clone, Default)]
-struct ProfileDef {
-    base_fps: Option<f32>,
-    hash_threshold: Option<u32>,
-    dedup_window: Option<usize>,
-    score_edge: Option<u32>,
-    w_scene: Option<f32>,
-    w_clarity: Option<f32>,
-    w_edge: Option<f32>,
-    chunk_seconds: Option<f32>,
-    min_gap: Option<f32>,
-    jpeg_quality: Option<u8>,
-    hero_border_px: Option<u32>,
-}
-
-fn builtin_profile(name: &str) -> Option<ProfileDef> {
+/// Named profiles are partial parameter sets — the same shape as CLI
+/// overrides, one priority level below them.
+fn builtin_profile(name: &str) -> Option<Overrides> {
     Some(match name {
-        "balanced" => ProfileDef::default(),
-        "fast" => ProfileDef {
+        "balanced" => Overrides::default(),
+        "fast" => Overrides {
             chunk_seconds: Some(90.0),
             min_gap: Some(1.0),
             jpeg_quality: Some(85),
             ..Default::default()
         },
-        "quality" => ProfileDef {
+        "quality" => Overrides {
             chunk_seconds: Some(45.0),
             min_gap: Some(0.3),
             jpeg_quality: Some(95),
             ..Default::default()
         },
-        "action" => ProfileDef {
+        "action" => Overrides {
             w_scene: Some(0.75),
             w_edge: Some(0.25),
             min_gap: Some(0.3),
@@ -185,9 +186,10 @@ impl Config {
             min_frame_size,
 
             base_fps: resolve!(base_fps, detail_fps),
+            extract_fps: resolve!(base_fps, detail_fps * 3.0),
             hash_threshold: resolve!(hash_threshold, 8),
-            dedup_window: resolve!(dedup_window, 8),
-            score_edge: resolve!(score_edge, 256).max(1),
+            dedup_window: resolve!(dedup_window, DEFAULT_DEDUP_WINDOW),
+            score_edge: resolve!(score_edge, 256),
 
             // Clarity defaults to 0: Laplacian variance and Sobel energy are
             // both high-frequency measures, so a nonzero clarity weight
@@ -224,6 +226,30 @@ impl Config {
             ))
         };
 
+        // The canvas must hold at least one cell at the quality tier's
+        // legibility floor; anything smaller (down to --max-edge 0) would
+        // still "succeed" as a degenerate, unreadable image.
+        if self.max_edge < self.min_frame_size {
+            return invalid(
+                "max_edge",
+                format!(
+                    "{} (canvas must fit one cell at the quality floor, >= {}px)",
+                    self.max_edge, self.min_frame_size
+                ),
+            );
+        }
+        // The canvas allocation is sized directly from this value; without a
+        // cap, an oversized flag burns the full pipeline before JPEG encoding
+        // rejects the dimensions (or the allocation aborts first).
+        if self.max_edge > MAX_CANVAS_EDGE {
+            return invalid(
+                "max_edge",
+                format!(
+                    "{} (exceeds JPEG's {MAX_CANVAS_EDGE}px dimension limit)",
+                    self.max_edge
+                ),
+            );
+        }
         for (name, w) in [
             ("w_scene", self.w_scene),
             ("w_clarity", self.w_clarity),
@@ -272,11 +298,8 @@ impl Config {
                 format!("{} (must be <= 64)", self.hash_threshold),
             );
         }
-        if self.dedup_window < 1 {
-            return invalid(
-                "dedup_window",
-                format!("{} (must be >= 1)", self.dedup_window),
-            );
+        if self.score_edge == 0 {
+            return invalid("score_edge", "0 (must be >= 1)".to_string());
         }
         Ok(())
     }
@@ -325,6 +348,46 @@ mod tests {
     #[test]
     fn accepts_default_overrides() {
         assert!(config_with(Overrides::default()).is_ok());
+    }
+
+    #[test]
+    fn extract_fps_defaults_to_triple_detail_fps() {
+        let cfg = config_with(Overrides::default()).expect("default config builds");
+        assert_eq!(cfg.base_fps, 1.0, "standard detail samples at 1 fps");
+        assert_eq!(cfg.extract_fps, 3.0, "extract densifies the detail tier");
+    }
+
+    #[test]
+    fn explicit_base_fps_sets_extract_fps_verbatim() {
+        let ov = Overrides {
+            base_fps: Some(2.0),
+            ..Default::default()
+        };
+        let cfg = config_with(ov).expect("config builds");
+        assert_eq!(
+            cfg.extract_fps, 2.0,
+            "an explicit --base-fps means the same density in both subcommands"
+        );
+    }
+
+    #[test]
+    fn rejects_canvas_below_cell_floor() {
+        // quality high → 512px floor; a 0 or sub-floor canvas cannot hold a
+        // single legible cell.
+        for max_edge in [0, 511] {
+            let cfg = Config::new(
+                max_edge,
+                Quality::High,
+                Detail::Standard,
+                None,
+                &Overrides::default(),
+                StrategyOpts::default(),
+            );
+            assert_eq!(
+                cfg.expect_err("sub-floor canvas rejected").code,
+                ErrorCode::InvalidConfig
+            );
+        }
     }
 
     #[test]
@@ -390,13 +453,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_dedup_window() {
+    fn rejects_zero_score_edge() {
         let ov = Overrides {
-            dedup_window: Some(0),
+            score_edge: Some(0),
             ..Default::default()
         };
         assert_eq!(
-            config_with(ov).expect_err("window 0 rejected").code,
+            config_with(ov).expect_err("score_edge 0 rejected").code,
+            ErrorCode::InvalidConfig
+        );
+    }
+
+    #[test]
+    fn rejects_canvas_above_jpeg_dimension_limit() {
+        let cfg = Config::new(
+            65_536,
+            Quality::High,
+            Detail::Standard,
+            None,
+            &Overrides::default(),
+            StrategyOpts::default(),
+        );
+        assert_eq!(
+            cfg.expect_err("over-limit canvas rejected").code,
             ErrorCode::InvalidConfig
         );
     }

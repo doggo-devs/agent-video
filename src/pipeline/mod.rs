@@ -9,46 +9,49 @@
 
 mod chunk;
 mod extract;
+mod jobs;
 mod output;
 mod range;
 mod state;
+mod stretch;
 
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::error::{Error, ErrorCode, ErrorContext};
-use crate::probe::{KeyframeInfo, SampleStrategy};
+use crate::probe::{KeyframeInfo, MonotonicTimestamps, SampleStrategy};
+use crate::subtitle::Subtitles;
+use crate::types::GridMeta;
 use crate::{extract as extract_frames, probe};
 
+use output::OutputSession;
 use state::ProcessState;
 
+pub use crate::subtitle::SubtitleSource;
 pub use extract::extract_range;
 pub use range::parse_range;
 
-/// Subtitle extraction options.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SubtitleOpts<'a> {
-    /// Explicit subtitle file path (highest priority).
-    pub path: Option<&'a Path>,
-    /// Embedded track index (used when path is None).
-    pub track: Option<usize>,
-}
-
 /// Default max in-flight chunks (running + queued results awaiting emit).
-pub const DEFAULT_IN_FLIGHT: usize = 2;
+pub const DEFAULT_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
 /// Shared context for one `process` run, threaded through the strategy paths.
 struct RunCtx<'a> {
     input: &'a Path,
-    out_dir: &'a Path,
     cfg: &'a Config,
-    mode: OutputMode,
-    max_in_flight: usize,
+    max_in_flight: NonZeroUsize,
     pool: &'a rayon::ThreadPool,
-    subs: SubtitleOpts<'a>,
+    /// Decoder thread cap forwarded to every ffmpeg spawn (`None` = ffmpeg
+    /// default). Derived from `--threads`, which otherwise only bounds the
+    /// rayon pool while ffmpeg schedules its own threads outside Rust.
+    ffmpeg_threads: Option<NonZeroUsize>,
+    /// Subtitles resolved before any frame work: subtitle errors (ambiguous
+    /// sources, unreadable files) must fail the run before grids are written,
+    /// never after.
+    subs: Option<Subtitles>,
     /// Container duration from ffprobe, when a probe ran. Authoritative over
     /// the frame-derived estimate: keyframe sampling can stop well short of
     /// the tail, and its `+1/base_fps` padding only fits fixed-fps sampling.
@@ -71,12 +74,16 @@ pub fn process(
     cfg: &Config,
     mode: OutputMode,
     threads: usize,
-    max_in_flight: usize,
-    subs: SubtitleOpts<'_>,
+    max_in_flight: NonZeroUsize,
+    subs: SubtitleSource<'_>,
 ) -> Result<()> {
     validate_input(input)?;
     let keyframe_info = probe_if_needed(input, cfg)?;
     validate_strategy(cfg, keyframe_info.as_ref())?;
+    // Resolve subtitles before any extraction or output: whether the final
+    // outputs can be assembled must be settled before side effects begin, so
+    // a subtitle failure cannot leave grids on disk without metadata.
+    let subs = Subtitles::resolve(input, subs)?;
 
     let mut builder = rayon::ThreadPoolBuilder::new();
     if threads > 0 {
@@ -93,28 +100,27 @@ pub fn process(
     // would block the one thread the spawned chunk jobs need.
     let ctx = RunCtx {
         input,
-        out_dir,
         cfg,
-        mode,
         max_in_flight,
         pool: &pool,
+        ffmpeg_threads: NonZeroUsize::new(threads),
         subs,
         probed_duration: keyframe_info.as_ref().map(|i| i.duration),
     };
+    let session = OutputSession::open(out_dir, mode)?;
     match cfg.strategy {
         SampleStrategy::FixedFps => {
-            ensure_output_dir(out_dir, mode)?;
             eprintln!("fixed-fps mode: sampling at {:.1} fps", cfg.base_fps);
             let stream = extract_frames::stream_frames(
                 input,
                 cfg.base_fps,
                 cfg.min_frame_size,
                 cfg.score_edge,
+                ctx.ffmpeg_threads,
             )?;
-            process_stream(&ctx, stream)
+            process_stream(&ctx, session, stream)
         }
         SampleStrategy::Keyframes => {
-            ensure_output_dir(out_dir, mode)?;
             let info = keyframe_info.expect("validated");
             eprintln!(
                 "keyframes mode: {} I-frames over {:.1}s (mean gap {:.1}s, max {:.1}s)",
@@ -128,12 +134,13 @@ pub fn process(
                 info.timestamps,
                 cfg.min_frame_size,
                 cfg.score_edge,
+                ctx.ffmpeg_threads,
             )?;
-            process_stream(&ctx, stream)
+            process_stream(&ctx, session, stream)
         }
         SampleStrategy::Adaptive => {
             let info = keyframe_info.expect("validated");
-            process_adaptive(&ctx, info)
+            process_adaptive(&ctx, session, info)
         }
     }
 }
@@ -141,18 +148,17 @@ pub fn process(
 fn probe_if_needed(input: &Path, cfg: &Config) -> Result<Option<KeyframeInfo>> {
     match cfg.strategy {
         SampleStrategy::FixedFps if cfg.force_long_video => Ok(None),
-        SampleStrategy::FixedFps => match probe::probe_duration(input) {
-            Ok(duration) => Ok(Some(KeyframeInfo {
-                timestamps: Vec::new(),
+        // `.context` keeps the probe's own error code downcastable, so a
+        // missing ffprobe still exits as FFPROBE_NOT_FOUND rather than being
+        // folded into FFPROBE_FAILED.
+        SampleStrategy::FixedFps => {
+            let duration = probe::probe_duration(input)
+                .context("cannot verify duration safety for fixed-fps sampling (use --force to skip this check)")?;
+            Ok(Some(KeyframeInfo {
+                timestamps: MonotonicTimestamps::default(),
                 duration,
-            })),
-            Err(e) => Err(Error::new(
-                ErrorCode::FfprobeFailed,
-                format!("{e}; cannot verify duration safety"),
-            )
-            .with_context(ErrorContext::default().with_input(input))
-            .into()),
-        },
+            }))
+        }
         SampleStrategy::Keyframes | SampleStrategy::Adaptive => {
             if !probe::ffprobe_available() {
                 return Err(Error::new(
@@ -232,64 +238,55 @@ fn validate_input(input: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_output_dir(out_dir: &Path, mode: OutputMode) -> Result<()> {
-    if mode == OutputMode::Files {
-        fs::create_dir_all(out_dir).map_err(|e| {
-            Error::new(
-                ErrorCode::OutputDirCreate,
-                format!("creating output dir {}: {e}", out_dir.display()),
-            )
-            .with_context(ErrorContext::default().with_output(out_dir))
-            .with_source(e)
-        })?;
-    }
-    Ok(())
-}
-
 /// Drain a single frame stream into ProcessState.
 fn drain_source(
     stream: &mut extract_frames::FrameStream,
     state: &mut ProcessState<'_>,
-    out_dir: &Path,
 ) -> Result<()> {
     while let Some(frame) = stream.next_frame()? {
         if let Some(aspect) = stream.aspect() {
             state.set_aspect(aspect);
         }
-        state.push_rgb(frame, out_dir)?;
+        state.push_rgb(frame)?;
     }
     Ok(())
 }
 
 /// Drive a single-stream pipeline: drain into state, seal by time chunk, write.
 ///
-/// The caller ensures the output dir, prints the mode-specific progress line,
-/// and constructs `stream`; this shared tail runs for both fixed-fps and
-/// keyframe modes, which differ only in those caller-side steps.
-fn process_stream(ctx: &RunCtx<'_>, mut stream: extract_frames::FrameStream) -> Result<()> {
-    let write_files = ctx.mode == OutputMode::Files;
-    let mut state = ProcessState::new(ctx.cfg, ctx.pool, write_files, ctx.max_in_flight);
+/// The caller opens the session, prints the mode-specific progress line, and
+/// constructs `stream`; this shared tail runs for both fixed-fps and keyframe
+/// modes, which differ only in those caller-side steps.
+fn process_stream(
+    ctx: &RunCtx<'_>,
+    session: OutputSession<'_>,
+    mut stream: extract_frames::FrameStream,
+) -> Result<()> {
+    let mut state = ProcessState::new(ctx.cfg, ctx.pool, &session, ctx.max_in_flight);
 
-    drain_source(&mut stream, &mut state, ctx.out_dir)?;
-    let (duration, grid_metas) = state.finish(ctx.out_dir)?;
+    drain_source(&mut stream, &mut state)?;
+    let (duration, grid_metas) = state.finish()?;
+    reject_empty_run(ctx.input, &grid_metas)?;
     let duration = final_duration(duration, ctx.probed_duration);
 
     output::write_outputs(
+        session,
         ctx.input,
-        ctx.out_dir,
         ctx.cfg,
-        ctx.mode,
         duration,
         grid_metas,
-        ctx.subs,
+        ctx.subs.as_ref(),
     )
 }
 
-fn process_adaptive(ctx: &RunCtx<'_>, info: KeyframeInfo) -> Result<()> {
+fn process_adaptive(
+    ctx: &RunCtx<'_>,
+    session: OutputSession<'_>,
+    info: KeyframeInfo,
+) -> Result<()> {
     let cfg = ctx.cfg;
-    ensure_output_dir(ctx.out_dir, ctx.mode)?;
 
-    let sparse_regions = info.sparse_regions(cfg.gap_threshold);
+    let sparse_regions = merge_regions(info.sparse_regions(cfg.gap_threshold), cfg.gap_threshold);
     eprintln!(
         "adaptive mode: {} I-frames (max gap {:.1}s), {} sparse regions (threshold {:.1}s)",
         info.count(),
@@ -298,14 +295,35 @@ fn process_adaptive(ctx: &RunCtx<'_>, info: KeyframeInfo) -> Result<()> {
         cfg.gap_threshold
     );
 
-    let write_files = ctx.mode == OutputMode::Files;
-    let mut state = ProcessState::new(cfg, ctx.pool, write_files, ctx.max_in_flight);
+    // When sparse regions dominate the timeline, adaptive mode degenerates
+    // into spawning an ffmpeg per region while the keyframe pass contributes
+    // little; a single fixed-fps stream covers the same ground with one
+    // process and no per-region seek overhead.
+    let covered: f32 = sparse_regions.iter().map(|&(s, e)| e - s).sum();
+    if covered > 0.5 * info.duration {
+        eprintln!(
+            "adaptive mode: sparse regions cover {:.0}% of the video; \
+             falling back to a single fixed-fps pass",
+            100.0 * covered / info.duration
+        );
+        let stream = extract_frames::stream_frames(
+            ctx.input,
+            cfg.base_fps,
+            cfg.min_frame_size,
+            cfg.score_edge,
+            ctx.ffmpeg_threads,
+        )?;
+        return process_stream(ctx, session, stream);
+    }
+
+    let mut state = ProcessState::new(cfg, ctx.pool, &session, ctx.max_in_flight);
 
     let mut stream = extract_frames::stream_keyframes(
         ctx.input,
         info.timestamps,
         cfg.min_frame_size,
         cfg.score_edge,
+        ctx.ffmpeg_threads,
     )?;
 
     // Interleave sparse-region fills into the keyframe pass in time order:
@@ -321,24 +339,52 @@ fn process_adaptive(ctx: &RunCtx<'_>, info: KeyframeInfo) -> Result<()> {
         for (start, end) in due_regions(&mut regions, frame.ts) {
             fill_region(ctx, &mut state, start, end)?;
         }
-        state.push_rgb(frame, ctx.out_dir)?;
+        // A keyframe strictly inside the pending region must be dropped:
+        // merged regions span dense keyframe runs that the fill stream
+        // re-covers at base_fps, and pushing the keyframe now would break
+        // timestamp monotonicity once that fill later drains from the
+        // region's start. (due_regions already popped regions ending at or
+        // before `ts`, so the peeked region is known to end after it.)
+        if regions.peek().is_some_and(|&(start, _)| frame.ts > start) {
+            continue;
+        }
+        state.push_rgb(frame)?;
     }
     for (start, end) in regions {
         fill_region(ctx, &mut state, start, end)?;
     }
 
-    let (duration, grid_metas) = state.finish(ctx.out_dir)?;
+    let (duration, grid_metas) = state.finish()?;
+    reject_empty_run(ctx.input, &grid_metas)?;
     let duration = final_duration(duration, ctx.probed_duration);
 
     output::write_outputs(
+        session,
         ctx.input,
-        ctx.out_dir,
         cfg,
-        ctx.mode,
         duration,
         grid_metas,
-        ctx.subs,
+        ctx.subs.as_ref(),
     )
+}
+
+/// Reject a run that produced no grids before any metadata is written.
+///
+/// `extract_range` already fails an empty selection with
+/// [`ErrorCode::NoFramesExtracted`]; `process` must honor the same contract —
+/// README promises "one or more grid images", and a successful exit with
+/// `grids: []` (e.g. ffmpeg exited 0 without emitting a single PPM frame)
+/// would hand callers a fabricated success.
+fn reject_empty_run(input: &Path, metas: &[GridMeta]) -> Result<()> {
+    if metas.is_empty() {
+        return Err(Error::new(
+            ErrorCode::NoFramesExtracted,
+            "no frames decoded from the video stream; is the input empty or corrupt?",
+        )
+        .with_context(ErrorContext::default().with_input(input))
+        .into());
+    }
+    Ok(())
 }
 
 /// Duration reported in `metadata.json`: the probed container duration when
@@ -346,6 +392,24 @@ fn process_adaptive(ctx: &RunCtx<'_>, info: KeyframeInfo) -> Result<()> {
 /// header under-reports what was actually decoded.
 fn final_duration(observed: f32, probed: Option<f32>) -> f32 {
     observed.max(probed.unwrap_or(0.0))
+}
+
+/// Merge sparse regions separated by a dense run shorter than `bridge`.
+///
+/// Each region becomes one `-ss` ffmpeg spawn ([`fill_region`]); absorbing a
+/// short dense run costs at most `bridge` seconds of extra decode at base_fps,
+/// which is cheaper than another process spawn + seek + container parse.
+/// Input regions are ascending and non-overlapping (see
+/// [`KeyframeInfo::sparse_regions`]); output preserves both invariants.
+fn merge_regions(regions: Vec<(f32, f32)>, bridge: f32) -> Vec<(f32, f32)> {
+    let mut merged: Vec<(f32, f32)> = Vec::with_capacity(regions.len());
+    for (start, end) in regions {
+        match merged.last_mut() {
+            Some(last) if start - last.1 <= bridge => last.1 = end,
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
 /// Pop every region whose `end <= ts` off the front of `regions`, in order.
@@ -374,8 +438,9 @@ fn fill_region(ctx: &RunCtx<'_>, state: &mut ProcessState<'_>, start: f32, end: 
         ctx.cfg.score_edge,
         start,
         end,
+        ctx.ffmpeg_threads,
     )?;
-    drain_source(&mut fill_stream, state, ctx.out_dir)
+    drain_source(&mut fill_stream, state)
 }
 
 #[cfg(test)]
@@ -430,5 +495,27 @@ mod tests {
         assert_eq!(due_regions(&mut regions, 10.0), vec![(0.0, 4.0)]);
         let trailing: Vec<_> = regions.collect();
         assert_eq!(trailing, vec![(20.0, 30.0)]);
+    }
+
+    #[test]
+    fn rejects_empty_run_with_no_frames_code() {
+        let err = reject_empty_run(Path::new("video.mp4"), &[])
+            .expect_err("zero grids must fail, not write grids: []");
+        let code = err.downcast_ref::<Error>().map(|e| e.code);
+        assert_eq!(code, Some(ErrorCode::NoFramesExtracted));
+    }
+
+    #[test]
+    fn merges_regions_bridged_by_short_dense_runs() {
+        // (0,10) and (12,20) are 2s apart (<= bridge 5): one ffmpeg spawn
+        // covering both is cheaper than two. (40,50) stays separate.
+        let regions = vec![(0.0, 10.0), (12.0, 20.0), (40.0, 50.0)];
+        assert_eq!(merge_regions(regions, 5.0), vec![(0.0, 20.0), (40.0, 50.0)]);
+    }
+
+    #[test]
+    fn keeps_regions_separated_by_long_dense_runs() {
+        let regions = vec![(0.0, 10.0), (30.0, 40.0)];
+        assert_eq!(merge_regions(regions.clone(), 5.0), regions);
     }
 }

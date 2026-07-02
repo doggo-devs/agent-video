@@ -33,12 +33,23 @@ fn parse_clock(s: &str) -> Result<f32> {
         p.parse::<f32>()
             .with_context(|| format!("invalid time '{s}'"))
     };
-    match parts.as_slice() {
-        [sec] => parse(sec),
-        [m, sec] => Ok(parse(m)? * 60.0 + parse(sec)?),
-        [h, m, sec] => Ok(parse(h)? * 3600.0 + parse(m)? * 60.0 + parse(sec)?),
+    let secs = match parts.as_slice() {
+        [sec] => parse(sec)?,
+        [m, sec] => parse(m)? * 60.0 + parse(sec)?,
+        [h, m, sec] => parse(h)? * 3600.0 + parse(m)? * 60.0 + parse(sec)?,
         _ => bail!("expected MM:SS or seconds, got '{s}'"),
+    };
+    // f32::parse accepts NaN/inf and components may be negative or overflow;
+    // none of these are valid clock times, and NaN would slip past the
+    // `end <= start` ordering check below.
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(Error::new(
+            ErrorCode::InvalidRange,
+            format!("time '{s}' must be a finite, non-negative clock value"),
+        )
+        .into());
     }
+    Ok(secs)
 }
 
 #[cfg(test)]
@@ -61,5 +72,25 @@ mod tests {
     #[test]
     fn rejects_inverted_range() {
         assert!(parse_range("01:35-01:23").is_err());
+    }
+
+    #[test]
+    fn rejects_non_finite_bounds() {
+        // NaN compares false against everything, so it must be rejected
+        // before the ordering check — not panic past it.
+        assert!(parse_range("NaN-1").is_err());
+        assert!(parse_range("0-inf").is_err());
+        assert!(parse_range("0-infinity").is_err());
+    }
+
+    #[test]
+    fn rejects_negative_clock_components() {
+        assert!(parse_range("0:-30-1:00").is_err());
+    }
+
+    #[test]
+    fn rejects_overflowing_clock() {
+        // Finite components can still overflow f32 when scaled to seconds.
+        assert!(parse_range("1e38:0:0-2e38:0:0").is_err());
     }
 }

@@ -103,13 +103,19 @@ impl ErrorContext {
     }
 
     pub fn with_stderr(mut self, stderr: impl Into<String>) -> Self {
-        let s = stderr.into();
-        // Truncate to first 500 chars to avoid bloating logs
-        self.stderr_snippet = Some(if s.len() > 500 {
-            format!("{}...", &s[..500])
-        } else {
-            s
-        });
+        let mut s = stderr.into();
+        // Truncate to ~500 bytes to avoid bloating logs, backing up to a char
+        // boundary: a byte slice landing inside a multi-byte character would
+        // panic, turning error construction itself into a crash.
+        if s.len() > 500 {
+            let mut end = 500;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+            s.push_str("...");
+        }
+        self.stderr_snippet = Some(s);
         self
     }
 }
@@ -135,6 +141,13 @@ impl Error {
 
     pub fn with_context(mut self, ctx: ErrorContext) -> Self {
         self.context = Some(Box::new(ctx));
+        self
+    }
+
+    /// Attach the input path, preserving any context fields already set
+    /// (unlike [`with_context`](Self::with_context), which replaces them all).
+    pub fn with_input(mut self, path: impl Into<PathBuf>) -> Self {
+        self.context.get_or_insert_with(Default::default).input_path = Some(path.into());
         self
     }
 
@@ -192,6 +205,16 @@ mod tests {
         let long_stderr = "x".repeat(1000);
         let ctx = ErrorContext::default().with_stderr(long_stderr);
         assert!(ctx.stderr_snippet.unwrap().len() < 600);
+    }
+
+    #[test]
+    fn truncates_multibyte_stderr_at_char_boundary() {
+        // 3-byte chars put byte 500 mid-character; a naive byte slice panics.
+        let long_stderr = "€".repeat(200);
+        let ctx = ErrorContext::default().with_stderr(long_stderr);
+        let snippet = ctx.stderr_snippet.expect("snippet set");
+        assert!(snippet.ends_with("..."));
+        assert!(snippet.len() <= 503);
     }
 
     #[test]

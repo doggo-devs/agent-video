@@ -8,7 +8,11 @@ frames get larger cells so important moments keep their detail.
 ## Requirements
 
 - Rust (edition 2024)
-- `ffmpeg` on `PATH` (used for decoding and pre-scaling frames)
+- `ffmpeg` on `PATH` (decoding and pre-scaling frames)
+- `ffprobe` on `PATH` (ships with ffmpeg; verifies duration in the default
+  fixed-fps mode and probes keyframes for `--strategy keyframes`/`adaptive`.
+  `--strategy fixed-fps --force` and `extract` run without it, skipping
+  embedded-subtitle auto-detection with a warning)
 
 ## Build
 
@@ -17,17 +21,18 @@ cargo build --release
 # binary at target/release/vidgrid
 ```
 
+`.cargo/config.toml` targets `x86-64-v3` (AVX2, ~all x86-64 CPUs since 2015).
+When distributing to older hardware, override with
+`RUSTFLAGS="-C target-cpu=x86-64"`.
+
 ## Usage
 
 ```bash
 # Smart frame selection + grid composition
 vidgrid process video.mp4 -o out/
 
-# Target a specific model's pixel budget
-vidgrid process video.mp4 --model gpt4o -o out/
-
-# Override the pixel budget directly
-vidgrid process video.mp4 --max-pixels 4096 -o out/
+# Override the canvas edge length
+vidgrid process video.mp4 --max-edge 4096 -o out/
 
 # High-density sampling of one time range into a single grid
 vidgrid extract video.mp4 --range 01:23-01:35 -o out/
@@ -45,27 +50,26 @@ vidgrid process video.mp4 -j 4 --in-flight 2 -o out/
 Output is written to the directory given by `-o`: one or more `grid_*.jpg` images
 plus a `metadata.json` describing each grid, its time range, and its key frames.
 
+File output streams grids to disk as they finish, so memory stays flat over any
+video length. `--json` instead holds every grid in memory (base64-inline) until
+the run completes — fine for inline consumption of short videos, but prefer
+file output for long ones.
+
 ## Options
 
 | Flag | Values | Default | Effect |
 |------|--------|---------|--------|
-| `--model` | `qwen2.5vl`, `gpt4o`, `claude`, `internvl` | `qwen2.5vl` | Seeds `--max-pixels` |
-| `--max-pixels` | integer | from model | Canvas area budget |
-| `--quality` | `low`, `medium`, `high` | `high` | Cell size floor; lower packs more frames per grid |
-| `--detail` | `coarse`, `standard`, `fine` | `standard` | Sampling fps and dedup strictness |
+| `--max-edge` | integer | `2048` | Canvas edge length in pixels |
+| `--quality` | `low`, `medium`, `high` | `low` | Cell size floor; lower packs more frames per grid |
+| `--detail` | `coarse`, `standard`, `fine` | `standard` | Sampling fps |
 | `--profile` | `balanced`, `fast`, `quality`, `action` | `balanced` | Named parameter preset |
+| `--strategy` | `fixed-fps`, `keyframes`, `adaptive` | `fixed-fps` | Frame sampling strategy |
 | `--json` | flag | off | Output JSON with base64 to stdout |
 | `-j` / `--threads` | integer | CPU cores | Rayon worker threads |
 | `--in-flight` | integer | 2 | Max chunks buffered in pipeline |
 
-Custom profiles can be defined in `~/.config/vidgrid/profiles.toml`:
-
-```toml
-[my-profile]
-chunk_seconds = 45
-jpeg_quality = 95
-w_scene = 0.5
-```
+Run `vidgrid process --help` for the full list of override knobs (sampling,
+scoring weights, timing, subtitles).
 
 ## How it works
 

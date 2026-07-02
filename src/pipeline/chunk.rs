@@ -24,8 +24,6 @@ pub struct ProcessChunkEnv {
     pub hero_border_px: u32,
 }
 
-pub type ChunkMsg = (usize, Result<GridResult>);
-
 /// Score, select, lay out, and compose one chunk into a grid.
 ///
 /// `prev_tail` is the grayscale of the frame immediately before `chunk` (the
@@ -188,6 +186,7 @@ mod tests {
             gray: GrayImage::new(1, 1),
             rgb: Arc::new(RgbImage::new(1, 1)),
             score: 0.0,
+            scene_diff: 0.0,
         }
     }
 

@@ -9,6 +9,7 @@ use image::imageops::FilterType;
 use image::{Rgb, RgbImage};
 use imageproc::drawing::{self, draw_filled_rect_mut};
 use imageproc::rect::Rect as IpRect;
+use rayon::prelude::*;
 
 use crate::layout::Layout;
 use crate::types::ScoredFrame;
@@ -39,17 +40,30 @@ pub fn render(
         Rgb([16, 16, 16]),
     );
 
+    // Resizing dominates render time and each cell is independent, so it runs
+    // in parallel; pasting mutates the shared canvas and stays sequential.
+    // The resized cells together cover at most one canvas, so the extra peak
+    // memory is bounded by the canvas itself.
+    let cells: Vec<Option<RgbImage>> = frames
+        .par_iter()
+        .zip(layout.rects.par_iter())
+        .map(|(frame, rect)| {
+            (rect.w > 0 && rect.h > 0)
+                .then(|| image::imageops::resize(&*frame.rgb, rect.w, rect.h, FilterType::Triangle))
+        })
+        .collect();
+
     for (i, frame) in frames.iter().enumerate() {
         let rect = layout.rects[i];
-        if rect.w == 0 || rect.h == 0 {
+        let Some(cell) = &cells[i] else {
             continue;
-        }
-        let cell = image::imageops::resize(&*frame.rgb, rect.w, rect.h, FilterType::Triangle);
-        image::imageops::overlay(&mut canvas, &cell, rect.x as i64, rect.y as i64);
+        };
+        image::imageops::overlay(&mut canvas, cell, rect.x as i64, rect.y as i64);
 
         // hero_idx holds at most 3 entries, so a linear check is cheaper than
         // allocating an n-sized lookup table.
-        if hero_idx.contains(&i) {
+        let is_hero = hero_idx.contains(&i);
+        if is_hero {
             draw_border(
                 &mut canvas,
                 rect.x,
@@ -60,7 +74,10 @@ pub fn render(
                 hero_border_px,
             );
         }
-        draw_timestamp(&mut canvas, &FONT, rect.x, rect.y, frame.ts);
+        // Inset the label past the hero border: the label's translucent strip
+        // darkens pixels in place and would dim the border's top-left corner.
+        let inset = if is_hero { hero_border_px } else { 0 };
+        draw_timestamp(&mut canvas, &FONT, rect.x + inset, rect.y + inset, frame.ts);
     }
 
     encode_jpeg(&canvas, jpeg_quality)
@@ -143,6 +160,7 @@ mod tests {
             gray: GrayImage::new(1, 1),
             rgb: Arc::new(RgbImage::from_pixel(32, 18, Rgb([100, 120, 140]))),
             score: 0.0,
+            scene_diff: 0.0,
         }
     }
 

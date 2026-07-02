@@ -12,6 +12,7 @@
 //! video in memory.
 
 use std::io::{BufRead, BufReader, Read};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::process::{ChildStdout, Command};
 use std::sync::Arc;
@@ -22,7 +23,8 @@ use image::{GrayImage, RgbImage};
 use rayon::prelude::*;
 
 use crate::child::TrackedChild;
-use crate::error::ErrorCode;
+use crate::error::{Error, ErrorCode};
+use crate::probe::MonotonicTimestamps;
 use crate::types::CandidateFrame;
 
 /// One sampled RGB frame from ffmpeg, already downscaled for composition.
@@ -101,7 +103,26 @@ impl FrameStream {
             return Ok(None);
         }
 
-        let Some(rgb) = read_ppm(&mut self.reader, &mut self.tok)? else {
+        let rgb = match read_ppm(&mut self.reader, &mut self.tok) {
+            Ok(rgb) => rgb,
+            Err(e) => {
+                // A broken PPM stream is usually a symptom: ffmpeg's stderr
+                // carries the real cause (codec errors, corrupt input). Kill
+                // rather than wait — the child may be blocked writing to the
+                // pipe we just stopped draining.
+                self.eof = true;
+                let stderr = self
+                    .child
+                    .take()
+                    .map(TrackedChild::kill_collect_stderr)
+                    .unwrap_or_default();
+                if stderr.is_empty() {
+                    return Err(e);
+                }
+                return Err(e.context(format!("ffmpeg stderr: {stderr}")));
+            }
+        };
+        let Some(rgb) = rgb else {
             self.eof = true;
             if let Some(child) = self.child.take()
                 && let Err(e) = child.wait(self.wait_context)
@@ -112,23 +133,45 @@ impl FrameStream {
                 return Err(anyhow::Error::from(e.into_error(ErrorCode::FfmpegFailed))
                     .context(format!("after {} frames (possible truncation)", self.idx)));
             }
+            // ffmpeg exited cleanly but decoded fewer frames than the probed
+            // keyframe list: a dropped frame anywhere before the tail shifts
+            // every later frame onto the wrong timestamp, silently. Fail with
+            // a code, mirroring the more-frames-than-probed case below.
+            if let TsPolicy::List(list) = &self.ts
+                && self.idx < list.len()
+            {
+                return Err(Error::new(
+                    ErrorCode::InputCorrupt,
+                    format!(
+                        "decoder produced {} frames but ffprobe listed {} keyframes; \
+                         timestamps cannot be trusted — use --strategy fixed-fps",
+                        self.idx,
+                        list.len()
+                    ),
+                )
+                .into());
+            }
             return Ok(None);
         };
 
         let Some(ts) = self.ts.ts_at(self.idx) else {
-            // More decoded frames than probed keyframes (open GOP, attached
-            // pictures): stop rather than fabricate a timestamp that would
-            // corrupt time ranges, chunking, and subtitle alignment.
-            eprintln!(
-                "warning: decoder produced more frames than probed keyframes; \
-                 ignoring extras after {} frames",
-                self.idx
-            );
+            // More decoded frames than probed keyframes: index pairing has
+            // broken down, so the frames already streamed may carry shifted
+            // timestamps and the tail cannot be attributed at all. Fail with a
+            // code rather than exit 0 with silently partial, misaligned output.
             self.eof = true;
             if let Some(child) = self.child.take() {
                 child.kill_and_wait();
             }
-            return Ok(None);
+            return Err(Error::new(
+                ErrorCode::InputCorrupt,
+                format!(
+                    "decoder produced more frames than the {} probed keyframes; \
+                     timestamps cannot be attributed — use --strategy fixed-fps",
+                    self.idx
+                ),
+            )
+            .into());
         };
 
         if self.aspect.is_none() {
@@ -142,19 +185,24 @@ impl FrameStream {
 }
 
 /// Open a streaming extractor for the whole video.
+///
+/// `threads` caps the ffmpeg decoder's thread count (`None` = ffmpeg default);
+/// see [`apply_thread_cap`].
 pub fn stream_frames(
     input: &Path,
     fps: f32,
     cell_min_edge: u32,
     score_edge: u32,
+    threads: Option<NonZeroUsize>,
 ) -> Result<FrameStream> {
-    stream_inner(input, fps, cell_min_edge, score_edge, None)
+    stream_inner(input, fps, cell_min_edge, score_edge, None, threads)
 }
 
 /// Open a streaming extractor for `[start, end)` seconds.
 ///
 /// Timestamps produced by [`FrameStream::next_frame`] are absolute, offset by
-/// `start`.
+/// `start`. `threads` caps the ffmpeg decoder's thread count (`None` = ffmpeg
+/// default).
 pub fn stream_range(
     input: &Path,
     fps: f32,
@@ -162,30 +210,47 @@ pub fn stream_range(
     score_edge: u32,
     start: f32,
     end: f32,
+    threads: Option<NonZeroUsize>,
 ) -> Result<FrameStream> {
-    stream_inner(input, fps, cell_min_edge, score_edge, Some((start, end)))
+    stream_inner(
+        input,
+        fps,
+        cell_min_edge,
+        score_edge,
+        Some((start, end)),
+        threads,
+    )
 }
 
 /// Open a keyframe-only streaming extractor.
 ///
-/// Uses `-skip_frame nokey` so ffmpeg decodes only I-frames. The `timestamps`
-/// should come from [`probe::probe_keyframes`]; each decoded frame is paired
-/// with the corresponding timestamp by index.
+/// Uses `-skip_frame nokey` so ffmpeg decodes only I-frames. Each decoded
+/// frame is paired with the corresponding timestamp by index; taking
+/// [`MonotonicTimestamps`] (from [`crate::probe::probe_keyframes`]) makes a
+/// list whose order disagrees with the decoder's emission order
+/// unconstructible. `threads` caps the ffmpeg decoder's thread count (`None`
+/// = ffmpeg default).
 pub fn stream_keyframes(
     input: &Path,
-    timestamps: Vec<f32>,
+    timestamps: MonotonicTimestamps,
     cell_min_edge: u32,
     score_edge: u32,
+    threads: Option<NonZeroUsize>,
 ) -> Result<FrameStream> {
     let rgb_edge = cell_min_edge.max(1);
     let pipe_edge = rgb_edge.max(score_edge);
 
     let vf = format!("scale={pipe_edge}:{pipe_edge}:force_original_aspect_ratio=increase");
     let mut cmd = Command::new("ffmpeg");
+    apply_thread_cap(&mut cmd, threads);
+    // `-map 0:v:0` pins the same stream ffprobe scanned (`-select_streams
+    // v:0`); ffmpeg's default "best stream" pick can differ (e.g. cover art),
+    // which would desync the index pairing between frames and timestamps.
     cmd.arg("-skip_frame")
         .arg("nokey")
         .arg("-i")
         .arg(input)
+        .args(["-map", "0:v:0"])
         .arg("-vf")
         .arg(vf)
         .arg("-vsync")
@@ -202,7 +267,7 @@ pub fn stream_keyframes(
         child: Some(child),
         reader: BufReader::new(stdout),
         tok: Vec::new(),
-        ts: TsPolicy::List(timestamps),
+        ts: TsPolicy::List(timestamps.into_vec()),
         idx: 0,
         aspect: None,
         eof: false,
@@ -233,6 +298,7 @@ fn stream_inner(
     cell_min_edge: u32,
     score_edge: u32,
     range: Option<(f32, f32)>,
+    threads: Option<NonZeroUsize>,
 ) -> Result<FrameStream> {
     let rgb_edge = cell_min_edge.max(1);
     // The piped frame doubles as the composition RGB, so pre-scale to the larger
@@ -241,6 +307,7 @@ fn stream_inner(
     let pipe_edge = rgb_edge.max(score_edge);
 
     let mut cmd = Command::new("ffmpeg");
+    apply_thread_cap(&mut cmd, threads);
     // Seek before -i for speed; -t bounds the duration read.
     if let Some((start, end)) = range {
         cmd.args(["-ss", &start.to_string()]);
@@ -277,6 +344,19 @@ fn stream_inner(
         eof: false,
         wait_context: "ffmpeg frame extraction",
     })
+}
+
+/// Cap the ffmpeg decoder's thread count.
+///
+/// `--threads` bounds the rayon pool, but ffmpeg subprocesses schedule their
+/// own decoder threads outside Rust; without this cap a core-limited
+/// environment (container, CI) still sees each ffmpeg spawn threads per its
+/// own defaults. Must be applied before `-i` so it acts as an input (decoder)
+/// option; PPM "encoding" on the output side is trivial and needs no cap.
+fn apply_thread_cap(cmd: &mut Command, threads: Option<NonZeroUsize>) {
+    if let Some(n) = threads {
+        cmd.args(["-threads", &n.to_string()]);
+    }
 }
 
 /// Downscale RGB to grayscale with shorter edge `min_edge`; no-op if already smaller.
