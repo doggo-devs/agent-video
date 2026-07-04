@@ -35,11 +35,40 @@ struct RawScores {
 /// Scoring dimension weights, passed from the profile. Weights are relative:
 /// the scoring boundary normalizes by their sum, so only ratios matter and the
 /// final score honors [`ScoredFrame`]'s `0..=100` contract at any scale.
+///
+/// Finite, non-negative, and not all zero by construction — the invariants the
+/// rank-normalization arithmetic in this module depends on live in
+/// [`Weights::new`], not in a caller-side check.
 #[derive(Debug, Clone, Copy)]
 pub struct Weights {
-    pub scene: f32,
-    pub clarity: f32,
-    pub edge: f32,
+    scene: f32,
+    clarity: f32,
+    edge: f32,
+}
+
+impl Weights {
+    pub fn new(scene: f32, clarity: f32, edge: f32) -> crate::error::Result<Self> {
+        use crate::error::{Error, ErrorCode};
+        for (name, w) in [("w_scene", scene), ("w_clarity", clarity), ("w_edge", edge)] {
+            if !w.is_finite() || w < 0.0 {
+                return Err(Error::new(
+                    ErrorCode::InvalidConfig,
+                    format!("invalid {name}: {w} (weights must be finite and >= 0)"),
+                ));
+            }
+        }
+        if scene + clarity + edge <= 0.0 {
+            return Err(Error::new(
+                ErrorCode::InvalidConfig,
+                "invalid weights: all zero (at least one must be > 0)",
+            ));
+        }
+        Ok(Self {
+            scene,
+            clarity,
+            edge,
+        })
+    }
 }
 
 /// Clamped pixel read for border convolutions: out-of-range coordinates

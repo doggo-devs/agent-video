@@ -6,7 +6,6 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::process::ExitStatus;
 
 /// Exit code categories, designed for harness-layer decision making.
 ///
@@ -16,18 +15,18 @@ use std::process::ExitStatus;
 /// errors from clap), and 126+ (shell/signal range).
 ///
 /// Ranges:
-/// - 10-19: environment/dependency issues (may resolve with PATH or install)
+/// - 10-19: media-stack issues (a decoder this build lacks, decode failures)
 /// - 20-29: input issues (file not found, corrupt, constraints violated)
 /// - 30-39: configuration issues (invalid profile, ambiguous options)
 /// - 40-49: output issues (cannot write, permission denied)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ErrorCode {
-    // Environment / external dependencies
-    FfmpegNotFound = 10,
-    FfprobeNotFound = 11,
-    FfmpegFailed = 12,
-    FfprobeFailed = 13,
+    // Media stack (in-process FFmpeg libraries)
+    /// The linked libavcodec has no decoder for the stream's codec.
+    DecoderMissing = 10,
+    /// Demuxing or decoding failed mid-stream.
+    DecodeFailed = 12,
 
     // Input problems
     InputNotFound = 20,
@@ -57,10 +56,8 @@ impl ErrorCode {
     /// Short identifier for logs.
     pub fn as_str(self) -> &'static str {
         match self {
-            ErrorCode::FfmpegNotFound => "FFMPEG_NOT_FOUND",
-            ErrorCode::FfprobeNotFound => "FFPROBE_NOT_FOUND",
-            ErrorCode::FfmpegFailed => "FFMPEG_FAILED",
-            ErrorCode::FfprobeFailed => "FFPROBE_FAILED",
+            ErrorCode::DecoderMissing => "DECODER_MISSING",
+            ErrorCode::DecodeFailed => "DECODE_FAILED",
             ErrorCode::InputNotFound => "INPUT_NOT_FOUND",
             ErrorCode::InputUnreadable => "INPUT_UNREADABLE",
             ErrorCode::InputCorrupt => "INPUT_CORRUPT",
@@ -82,8 +79,6 @@ impl ErrorCode {
 pub struct ErrorContext {
     pub input_path: Option<PathBuf>,
     pub output_path: Option<PathBuf>,
-    pub exit_status: Option<ExitStatus>,
-    pub stderr_snippet: Option<String>,
 }
 
 impl ErrorContext {
@@ -94,28 +89,6 @@ impl ErrorContext {
 
     pub fn with_output(mut self, path: impl Into<PathBuf>) -> Self {
         self.output_path = Some(path.into());
-        self
-    }
-
-    pub fn with_exit_status(mut self, status: ExitStatus) -> Self {
-        self.exit_status = Some(status);
-        self
-    }
-
-    pub fn with_stderr(mut self, stderr: impl Into<String>) -> Self {
-        let mut s = stderr.into();
-        // Truncate to ~500 bytes to avoid bloating logs, backing up to a char
-        // boundary: a byte slice landing inside a multi-byte character would
-        // panic, turning error construction itself into a crash.
-        if s.len() > 500 {
-            let mut end = 500;
-            while !s.is_char_boundary(end) {
-                end -= 1;
-            }
-            s.truncate(end);
-            s.push_str("...");
-        }
-        self.stderr_snippet = Some(s);
         self
     }
 }
@@ -187,7 +160,7 @@ mod tests {
 
     #[test]
     fn error_code_exit_codes_in_range() {
-        assert_eq!(ErrorCode::FfmpegNotFound.exit_code(), 10);
+        assert_eq!(ErrorCode::DecoderMissing.exit_code(), 10);
         assert_eq!(ErrorCode::InputNotFound.exit_code(), 20);
         assert_eq!(ErrorCode::InvalidProfile.exit_code(), 30);
         assert_eq!(ErrorCode::OutputDirCreate.exit_code(), 40);
@@ -201,32 +174,15 @@ mod tests {
     }
 
     #[test]
-    fn context_truncates_long_stderr() {
-        let long_stderr = "x".repeat(1000);
-        let ctx = ErrorContext::default().with_stderr(long_stderr);
-        assert!(ctx.stderr_snippet.unwrap().len() < 600);
-    }
-
-    #[test]
-    fn truncates_multibyte_stderr_at_char_boundary() {
-        // 3-byte chars put byte 500 mid-character; a naive byte slice panics.
-        let long_stderr = "€".repeat(200);
-        let ctx = ErrorContext::default().with_stderr(long_stderr);
-        let snippet = ctx.stderr_snippet.expect("snippet set");
-        assert!(snippet.ends_with("..."));
-        assert!(snippet.len() <= 503);
-    }
-
-    #[test]
     fn preserves_error_code_through_context() {
         // anyhow's `.context()` decorates the message but keeps the underlying
         // typed error downcastable — the mechanism the exit-code path relies on.
-        let wrapped = anyhow::Error::from(Error::new(ErrorCode::FfmpegFailed, "boom"))
+        let wrapped = anyhow::Error::from(Error::new(ErrorCode::DecodeFailed, "boom"))
             .context("after 5 frames (possible truncation)");
         let code = wrapped
             .downcast_ref::<Error>()
             .map(|e| e.code)
             .expect("coded error survives .context()");
-        assert_eq!(code, ErrorCode::FfmpegFailed);
+        assert_eq!(code, ErrorCode::DecodeFailed);
     }
 }

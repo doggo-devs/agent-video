@@ -5,10 +5,18 @@
 // Usage: node scripts/npm-platform.mjs <platform> <version> <binary> <out-dir>
 //   platform  one of: linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64
 //   version   package version, must match the core crate version
-//   binary    path to the built agent-video[.exe]
+//   binary    path to the built agent-video[.exe], or a directory holding it
+//             plus any runtime libraries (win32 bundles the FFmpeg DLLs)
 //   out-dir   directory to write the package into (created/overwritten)
 
-import { chmodSync, copyFileSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
 const PLATFORMS = {
@@ -63,9 +71,16 @@ writeFileSync(
     "not meant to be installed directly.\n",
 );
 
-const dest = join(outDir, "bin", binName);
-copyFileSync(binary, dest);
+// A directory means "the binary plus everything it loads from its own dir"
+// (the win32 FFmpeg DLLs); the exe's directory is on the DLL search path.
+if (statSync(binary).isDirectory()) {
+  for (const entry of readdirSync(binary)) {
+    copyFileSync(join(binary, entry), join(outDir, "bin", entry));
+  }
+} else {
+  copyFileSync(binary, join(outDir, "bin", binName));
+}
 // upload-artifact drops the executable bit; restore it here.
-chmodSync(dest, 0o755);
+chmodSync(join(outDir, "bin", binName), 0o755);
 
 console.log(`${outDir}: @agent-video/${platform}@${version} (${binName})`);

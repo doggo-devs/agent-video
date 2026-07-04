@@ -39,9 +39,9 @@ pub struct Layout {
 /// Returns at least 1.
 pub fn grid_capacity(spec: &CanvasSpec, aspect: f32) -> usize {
     let aspect = sane_aspect(aspect);
-    let edge = spec.edge as f32;
+    let edge = spec.edge() as f32;
     let long_ratio = aspect.max(1.0 / aspect);
-    let cell_area = (spec.min_cell_edge as f32).powi(2) * long_ratio;
+    let cell_area = (spec.min_cell_edge() as f32).powi(2) * long_ratio;
     ((edge * edge) / cell_area).floor().max(1.0) as usize
 }
 
@@ -155,7 +155,7 @@ fn compute_wide(scores: &[f32], heroes: &[usize], a: f32, spec: &CanvasSpec) -> 
     // Pixel sizing: row height = width / (cells × a). Cap the longer canvas
     // edge at spec.edge.
     let height_ratio: f32 = rows.iter().map(|row| 1.0 / (row.len() as f32 * a)).sum();
-    let width = spec.edge as f32 / height_ratio.max(1.0);
+    let width = spec.edge() as f32 / height_ratio.max(1.0);
 
     // Cell edges derive from rounded row/column boundaries, so adjacent cells
     // share exact boundaries and the rows tile the canvas without gaps.
@@ -200,10 +200,7 @@ mod tests {
     use super::*;
 
     fn spec() -> CanvasSpec {
-        CanvasSpec {
-            edge: 8000,
-            min_cell_edge: 512,
-        }
+        crate::types::CanvasSpec::new(8000, 512).expect("valid test spec")
     }
 
     /// Uniform scores for `n` frames (promotion order irrelevant).
@@ -336,17 +333,11 @@ mod tests {
         // Quality trades per-cell size for capacity at a fixed canvas edge:
         // halving the cell floor quadruples how many frames fit.
         let hi = grid_capacity(
-            &CanvasSpec {
-                edge: 8000,
-                min_cell_edge: 512,
-            },
+            &crate::types::CanvasSpec::new(8000, 512).expect("valid test spec"),
             1.0,
         );
         let lo = grid_capacity(
-            &CanvasSpec {
-                edge: 8000,
-                min_cell_edge: 256,
-            },
+            &crate::types::CanvasSpec::new(8000, 256).expect("valid test spec"),
             1.0,
         );
         assert_eq!(lo, hi * 4);

@@ -1,5 +1,5 @@
-//! ProcessState: the streaming state machine that buffers RGB frames, deduplicates,
-//! chunks by time, and spawns parallel chunk-processing jobs.
+//! ProcessState: the streaming state machine that consumes judged candidate
+//! frames, chunks them by time, and spawns parallel chunk-processing jobs.
 //!
 //! Time chunks are a throttle, not a floor: a chunk whose surviving frames
 //! cannot fill a grid is merged forward into the next chunk(s), so sparse
@@ -20,9 +20,8 @@ use image::GrayImage;
 
 use crate::config::Config;
 use crate::types::{CandidateFrame, GridMeta, TimeRange, format_ts};
-use crate::{compose, dedup, extract, layout};
+use crate::{compose, layout};
 
-use super::OutputMode;
 use super::chunk::{GridResult, ProcessChunkEnv, process_chunk};
 use super::jobs::OrderedJobs;
 use super::output::OutputSession;
@@ -39,15 +38,11 @@ pub struct ProcessState<'a> {
     /// The run's output session: incremental grid/static writes go through it,
     /// so file-vs-JSON dispatch lives in one place.
     session: &'a OutputSession<'a>,
-    /// Worker pool for chunk jobs and per-frame batch work. The state's own
-    /// methods run on the caller's thread and may block on job completions,
-    /// so they must never execute on a pool thread — a single-thread pool
-    /// would deadlock.
+    /// Worker pool for chunk jobs. The state's own methods run on the
+    /// caller's thread and may block on job completions, so they must never
+    /// execute on a pool thread — a single-thread pool would deadlock.
     pool: &'a rayon::ThreadPool,
     pub(super) env: ProcessChunkEnv,
-    deduper: dedup::Deduper,
-    rgb_batch: Vec<extract::RgbFrame>,
-    batch_frames: usize,
     pending: BTreeMap<usize, Vec<CandidateFrame>>,
     /// Frames from sealed time chunks that have not yet filled a grid. The
     /// time chunk is a throttle (at most one grid per `chunk_seconds`), not a
@@ -79,8 +74,6 @@ impl<'a> ProcessState<'a> {
         session: &'a OutputSession<'a>,
         parallelism: NonZeroUsize,
     ) -> Self {
-        let batch_frames = extract_batch_frames(cfg.base_fps, cfg.chunk_seconds);
-        let write_files = session.mode() == OutputMode::Files;
         Self {
             cfg,
             session,
@@ -89,21 +82,17 @@ impl<'a> ProcessState<'a> {
                 spec: cfg.canvas_spec(),
                 aspect: 1.0,
                 weights: cfg.weights(),
-                write_files,
-                min_gap_floor: cfg.min_gap,
-                jpeg_quality: cfg.jpeg_quality,
-                hero_border_px: cfg.hero_border_px,
+                min_gap_floor: cfg.min_gap(),
+                jpeg_quality: cfg.jpeg_quality(),
+                hero_border_px: cfg.hero_border_px(),
             },
-            deduper: dedup::Deduper::new(cfg.hash_threshold, cfg.dedup_window),
-            rgb_batch: Vec::with_capacity(batch_frames),
-            batch_frames,
             pending: BTreeMap::new(),
             carry: Vec::new(),
             prev_chunk_tail: None,
             high_water_mark: None,
             last_ts: None,
             jobs: OrderedJobs::new(parallelism),
-            stretches: StretchDetector::new(cfg.chunk_seconds),
+            stretches: StretchDetector::new(cfg.chunk_seconds()),
             duration: 0.0,
             grid_metas: Vec::new(),
             static_seq: 0,
@@ -115,12 +104,15 @@ impl<'a> ProcessState<'a> {
         self.env.aspect = aspect;
     }
 
-    /// Buffer one sampled frame. Timestamps must be finite and arrive in
-    /// non-decreasing order: chunk keying, high-water-mark sealing, and
-    /// static detection all assume a monotonic stream (adaptive mode
-    /// interleaves fills to preserve this). A violation is rejected here
+    /// Record one judged frame: a kept frame joins its time chunk, a dropped
+    /// one feeds static-stretch evidence; both extend the observed duration.
+    ///
+    /// Timestamps must be finite and arrive in non-decreasing order: chunk
+    /// keying, high-water-mark sealing, and static detection all assume a
+    /// monotonic stream (the single decode pass emits frames in presentation
+    /// order, so this holds structurally). A violation is rejected here
     /// rather than silently mixing old frames into the wrong chunk.
-    pub fn push_rgb(&mut self, frame: extract::RgbFrame) -> Result<()> {
+    pub fn push_judged(&mut self, frame: CandidateFrame, kept: bool) -> Result<()> {
         if !frame.ts.is_finite() {
             anyhow::bail!("frame timestamp must be finite: got {}", frame.ts);
         }
@@ -133,15 +125,19 @@ impl<'a> ProcessState<'a> {
             );
         }
         self.last_ts = Some(frame.ts);
-        self.rgb_batch.push(frame);
-        if self.rgb_batch.len() == self.batch_frames {
-            self.flush_extract_batch()?;
+        self.duration = self.duration.max(frame.ts + 1.0 / self.cfg.base_fps());
+        if kept {
+            if let Some(stretch) = self.stretches.note_kept(frame.ts, &frame.rgb) {
+                self.emit_static(stretch)?;
+            }
+            self.push_chunked_frame(frame)
+        } else {
+            self.stretches.note_dropped(frame.ts);
+            Ok(())
         }
-        Ok(())
     }
 
     pub fn finish(mut self) -> Result<(f32, Vec<GridMeta>)> {
-        self.flush_extract_batch()?;
         if let Some(stretch) = self.stretches.finish() {
             self.emit_static(stretch)?;
         }
@@ -159,62 +155,32 @@ impl<'a> ProcessState<'a> {
         Ok((self.duration, metas))
     }
 
-    fn flush_extract_batch(&mut self) -> Result<()> {
-        if self.rgb_batch.is_empty() {
-            return Ok(());
-        }
-
-        // Reuse the buffer's capacity: mem::take would leave an empty Vec that
-        // reallocates as the next batch fills.
-        let batch = mem::replace(&mut self.rgb_batch, Vec::with_capacity(self.batch_frames));
-        let score_edge = self.cfg.score_edge;
-        let deduper = &mut self.deduper;
-        // Run the per-frame parallel work (grayscale, pHash) on the configured
-        // pool so `--threads` caps it too.
-        let judged = self
-            .pool
-            .install(|| deduper.judge(extract::candidate_frames_from_rgbs(batch, score_edge)));
-
-        for (frame, kept) in judged {
-            self.duration = self.duration.max(frame.ts + 1.0 / self.cfg.base_fps);
-            if kept {
-                if let Some(stretch) = self.stretches.note_kept(frame.ts, &frame.rgb) {
-                    self.emit_static(stretch)?;
-                }
-                self.push_chunked_frame(frame)?;
-            } else {
-                self.stretches.note_dropped(frame.ts);
-            }
-        }
-        Ok(())
-    }
-
     /// Render and record one static-stretch entry: the last visually-distinct
     /// frame stands in for the whole unchanged range.
     fn emit_static(&mut self, stretch: Stretch) -> Result<()> {
         let Stretch { start, end, rgb } = stretch;
         self.static_seq += 1;
-        let jpeg = compose::render_single(&rgb, start, self.cfg.jpeg_quality)?;
+        let jpeg = compose::render_single(&rgb, start, self.cfg.jpeg_quality())?;
         let file = format!("static_{:03}.jpg", self.static_seq);
-        self.session.write_image(&file, &jpeg)?;
+        let image = self.session.emit_image(&file, &jpeg)?;
         eprintln!(
             "  static stretch {}-{} collapsed into {file}",
             format_ts(start),
             format_ts(end)
         );
         self.static_metas.push(GridMeta {
-            image: super::chunk::grid_image(self.env.write_files, file, &jpeg),
+            image,
             time_range: TimeRange::new(start, end).expect("static stretch has start <= end"),
             total_frames: 1,
             key_frames: Vec::new(),
             layout: "STATIC",
-            subtitles: None,
+            subtitles: crate::types::GridSubtitles::Unresolved,
         });
         Ok(())
     }
 
     fn push_chunked_frame(&mut self, frame: CandidateFrame) -> Result<()> {
-        let key = (frame.ts / self.cfg.chunk_seconds).floor() as usize;
+        let key = (frame.ts / self.cfg.chunk_seconds()).floor() as usize;
         self.pending.entry(key).or_default().push(frame);
 
         if let Some(hwm) = self.high_water_mark
@@ -286,12 +252,14 @@ impl<'a> ProcessState<'a> {
         Ok(())
     }
 
-    /// Write one finished grid and record its metadata. Grids arrive from
-    /// `jobs` in chunk order, so emission order is chunk order.
+    /// Emit one finished grid and record its metadata. Grids arrive from
+    /// `jobs` in chunk order, so emission order is chunk order. The grid's
+    /// file name is assigned here, at the single emission point, rather than
+    /// inside the worker.
     fn emit_grid(&mut self, result: GridResult) -> Result<()> {
         let file = format!("grid_{:03}.jpg", result.ci + 1);
-        self.session.write_image(&file, &result.jpeg)?;
-        self.grid_metas.push(result.meta);
+        let image = self.session.emit_image(&file, &result.jpeg)?;
+        self.grid_metas.push(result.draft.into_meta(image));
         Ok(())
     }
 }
@@ -320,35 +288,37 @@ mod tests {
     use super::*;
     use crate::config::{Overrides, StrategyOpts};
     use crate::types::{Detail, GridImage, GridMeta, Quality};
+    use crate::{dedup, extract};
     use image::{Rgb, RgbImage};
 
-    fn base_config() -> Config {
+    /// Config with explicit 60s chunks at 1 fps — the values the tests'
+    /// timestamp math assumes — set through [`Overrides`], the same door the
+    /// CLI uses (Config fields are private by design).
+    fn config_with_edge(max_edge: u32) -> Config {
+        let ov = Overrides {
+            chunk_seconds: Some(60.0),
+            base_fps: Some(1.0),
+            ..Default::default()
+        };
         Config::new(
-            2000,
+            max_edge,
             Quality::High,
             Detail::Standard,
             None,
-            &Overrides::default(),
+            &ov,
             StrategyOpts::default(),
         )
-        .expect("default config builds")
+        .expect("test config builds")
+    }
+
+    fn base_config() -> Config {
+        config_with_edge(2000)
     }
 
     /// Config whose grid capacity is 4 for the square 64x64 test frames
     /// (1024² / 512² = 4), so four distinct frames fill a grid exactly.
     fn small_grid_config() -> Config {
-        let mut cfg = Config::new(
-            1024,
-            Quality::High,
-            Detail::Standard,
-            None,
-            &Overrides::default(),
-            StrategyOpts::default(),
-        )
-        .expect("config builds");
-        cfg.chunk_seconds = 60.0;
-        cfg.base_fps = 1.0;
-        cfg
+        config_with_edge(1024)
     }
 
     /// Four distinct frames inside chunk `key` — exactly one grid's worth.
@@ -375,15 +345,26 @@ mod tests {
             .expect("test pool builds")
     }
 
-    /// Drive a full push→finish cycle with `write_files = false` and return the
-    /// grid metadata in emission order.
+    /// Judge synthetic frames through the real dedup machinery, exactly as
+    /// the candidate stream does in production.
+    fn judge(cfg: &Config, frames: &[(f32, u32)]) -> Vec<(CandidateFrame, bool)> {
+        let rgbs = frames
+            .iter()
+            .map(|&(ts, seed)| distinct_frame(ts, seed))
+            .collect();
+        let candidates = extract::candidate_frames_from_rgbs(rgbs, cfg.score_edge());
+        dedup::Deduper::new(cfg.hash_threshold(), cfg.dedup_window()).judge(candidates)
+    }
+
+    /// Drive a full push→finish cycle in JSON mode and return the grid
+    /// metadata in emission order.
     fn run(cfg: &Config, parallelism: usize, frames: &[(f32, u32)]) -> Vec<GridMeta> {
         run_on(cfg, &pool(2), parallelism, frames)
     }
 
     /// A JSON-mode session for tests: opening it touches no files.
     fn json_session() -> OutputSession<'static> {
-        OutputSession::open(std::path::Path::new("out"), OutputMode::Json)
+        OutputSession::open(std::path::Path::new("out"), super::super::OutputMode::Json)
             .expect("json session opens without touching disk")
     }
 
@@ -396,10 +377,8 @@ mod tests {
         let session = json_session();
         let parallelism = NonZeroUsize::new(parallelism).expect("test parallelism is nonzero");
         let mut state = ProcessState::new(cfg, pool, &session, parallelism);
-        for &(ts, seed) in frames {
-            state
-                .push_rgb(distinct_frame(ts, seed))
-                .expect("push frame");
+        for (frame, kept) in judge(cfg, frames) {
+            state.push_judged(frame, kept).expect("push frame");
         }
         let (_duration, grid_metas) = state.finish().expect("finish");
         grid_metas
@@ -481,9 +460,9 @@ mod tests {
 
     #[test]
     fn bounds_buffered_chunks_within_one_batch_flush() {
-        // 64 frames exceed the 60-frame batch, so a single flush seals ~15
-        // full chunks in a row. With --in-flight 1 the spawn boundary must
-        // wait for room each time; buffered chunks may never exceed 1.
+        // 16 chunks' worth of frames seal one full chunk after another. With
+        // --in-flight 1 the spawn boundary must wait for room each time;
+        // buffered chunks may never exceed 1.
         let cfg = small_grid_config();
         let frames: Vec<_> = (0..16).flat_map(full_chunk).collect();
 
@@ -491,10 +470,8 @@ mod tests {
         let session = json_session();
         let one = NonZeroUsize::new(1).expect("1 is nonzero");
         let mut state = ProcessState::new(&cfg, &pool, &session, one);
-        for (ts, seed) in frames {
-            state
-                .push_rgb(distinct_frame(ts, seed))
-                .expect("push frame");
+        for (frame, kept) in judge(&cfg, &frames) {
+            state.push_judged(frame, kept).expect("push frame");
         }
         assert!(
             state.jobs.peak_buffered() <= 1,
@@ -508,9 +485,7 @@ mod tests {
 
     #[test]
     fn collapses_static_stretch_into_single_entry() {
-        let mut cfg = base_config();
-        cfg.chunk_seconds = 60.0;
-        cfg.base_fps = 1.0;
+        let cfg = base_config();
 
         // Two distinct frames, then 69 duplicates of the second (dedup drops
         // them), then a distinct frame at 75s: a 74s static stretch.
@@ -539,9 +514,7 @@ mod tests {
 
     #[test]
     fn closes_trailing_static_stretch_at_finish() {
-        let mut cfg = base_config();
-        cfg.chunk_seconds = 60.0;
-        cfg.base_fps = 1.0;
+        let cfg = base_config();
 
         // The video ends inside the static stretch: no following kept frame,
         // so the last dropped duplicate bounds the range.
@@ -560,9 +533,7 @@ mod tests {
 
     #[test]
     fn sparse_sampling_gap_is_not_static() {
-        let mut cfg = base_config();
-        cfg.chunk_seconds = 60.0;
-        cfg.base_fps = 1.0;
+        let cfg = base_config();
 
         // Big gaps between kept frames but zero dropped duplicates inside them
         // (sparse keyframe sampling): no evidence of stillness, no static entry.
@@ -583,9 +554,12 @@ mod tests {
         let one = NonZeroUsize::new(1).expect("1 is nonzero");
         let mut state = ProcessState::new(&cfg, &pool, &session, one);
 
-        state.push_rgb(distinct_frame(10.0, 0)).expect("first push");
+        let mut frames = judge(&cfg, &[(10.0, 0), (5.0, 1)]).into_iter();
+        let (first, kept) = frames.next().expect("two frames judged");
+        state.push_judged(first, kept).expect("first push");
+        let (backwards, kept) = frames.next().expect("two frames judged");
         state
-            .push_rgb(distinct_frame(5.0, 1))
+            .push_judged(backwards, kept)
             .expect_err("a timestamp going backwards must be rejected");
     }
 

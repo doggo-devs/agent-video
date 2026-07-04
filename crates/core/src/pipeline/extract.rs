@@ -17,7 +17,8 @@ use crate::subtitle::Subtitles;
 use crate::types::{CandidateFrame, CanvasSpec, Metadata, ScoredFrame, TimeRange, format_ts};
 use crate::{compose, dedup, extract, layout, score};
 
-use super::chunk::{build_grid_meta, extract_selected, grid_image};
+use super::candidates::CandidateStream;
+use super::chunk::{build_grid_draft, extract_selected};
 use super::output::OutputSession;
 use super::state::extract_batch_frames;
 use super::{OutputMode, SubtitleSource};
@@ -42,27 +43,32 @@ pub fn extract_range(
     // errors (ambiguous sources, unreadable files) should fail fast, not
     // after all the CPU and IO have been spent.
     let subs = Subtitles::resolve(input, subs)?;
-    let write_files = mode == OutputMode::Files;
     let session = OutputSession::open(out_dir, mode)?;
 
-    let fps = cfg.extract_fps;
-    // `extract` exposes no --threads flag; the decoder keeps ffmpeg defaults.
-    let mut stream = extract::stream_range(
+    let fps = cfg.extract_fps();
+    // `extract` exposes no --threads flag; the decoder auto-sizes its pool.
+    let stream = extract::stream_range(
         input,
         fps,
-        cfg.min_frame_size,
-        cfg.score_edge,
-        range.start(),
-        range.end(),
+        cfg.min_frame_size(),
+        cfg.score_edge(),
+        range,
         None,
     )?;
 
-    let batch_size = extract_batch_frames(fps, cfg.chunk_seconds);
-    let mut deduper = dedup::Deduper::new(cfg.hash_threshold, cfg.dedup_window);
+    let batch_size = extract_batch_frames(fps, cfg.chunk_seconds());
+    // The same judging machinery `process` uses — the two subcommands must
+    // select surviving frames identically for the same input.
+    let mut stream = CandidateStream::new(
+        stream,
+        dedup::Deduper::new(cfg.hash_threshold(), cfg.dedup_window()),
+        batch_size,
+        cfg.score_edge(),
+        None,
+    );
     let weights = cfg.weights();
     let spec = cfg.canvas_spec();
 
-    let mut rgb_batch = Vec::with_capacity(batch_size);
     let mut candidate_batch: Vec<CandidateFrame> = Vec::new();
     let mut candidates: Vec<ScoredFrame> = Vec::new();
     // Tail grayscale of the previously scored batch: batches are consecutive
@@ -70,18 +76,15 @@ pub fn extract_range(
     let mut prev_tail: Option<GrayImage> = None;
     let mut aspect = 1.0_f32;
 
-    while let Some(rgb) = stream.next_frame()? {
+    while let Some(judged) = stream.next_batch()? {
         if let Some(a) = stream.aspect() {
             aspect = a;
         }
-        rgb_batch.push(rgb);
-        if rgb_batch.len() >= batch_size {
-            let deduped = deduper.filter(extract::candidate_frames_from_rgbs(
-                mem::replace(&mut rgb_batch, Vec::with_capacity(batch_size)),
-                cfg.score_edge,
-            ));
-            candidate_batch.extend(deduped);
-        }
+        candidate_batch.extend(
+            judged
+                .into_iter()
+                .filter_map(|(frame, kept)| kept.then_some(frame)),
+        );
 
         if candidate_batch.len() >= batch_size {
             flush_batch_to_candidates(
@@ -91,7 +94,7 @@ pub fn extract_range(
                 &weights,
                 &spec,
                 aspect,
-                cfg.min_gap,
+                cfg.min_gap(),
             );
             // Bound memory over arbitrarily long ranges: once per-batch winners
             // pile up to several grids' worth, re-rank them as one set and keep
@@ -99,18 +102,11 @@ pub fn extract_range(
             // this periodic compaction is consistent with the final pass.
             let capacity = layout::grid_capacity(&spec, aspect);
             if candidates.len() >= 4 * capacity {
-                candidates = select_capacity(candidates, capacity, &weights, cfg.min_gap);
+                candidates = select_capacity(candidates, capacity, &weights, cfg.min_gap());
             }
         }
     }
 
-    if !rgb_batch.is_empty() {
-        let deduped = deduper.filter(extract::candidate_frames_from_rgbs(
-            rgb_batch,
-            cfg.score_edge,
-        ));
-        candidate_batch.extend(deduped);
-    }
     if !candidate_batch.is_empty() {
         flush_batch_to_candidates(
             &mut candidate_batch,
@@ -119,7 +115,7 @@ pub fn extract_range(
             &weights,
             &spec,
             aspect,
-            cfg.min_gap,
+            cfg.min_gap(),
         );
     }
 
@@ -127,7 +123,7 @@ pub fn extract_range(
     let picked = if candidates.len() <= capacity {
         candidates
     } else {
-        select_capacity(candidates, capacity, &weights, cfg.min_gap)
+        select_capacity(candidates, capacity, &weights, cfg.min_gap())
     };
 
     // An empty selection means the range yielded nothing (e.g. it lies past
@@ -148,15 +144,16 @@ pub fn extract_range(
 
     let scores: Vec<f32> = picked.iter().map(|f| f.score).collect();
     let lay = layout::compute(&scores, &[], aspect, &spec);
-    let jpeg = compose::render(&picked, &lay, &[], cfg.jpeg_quality, cfg.hero_border_px)?;
+    let jpeg = compose::render(&picked, &lay, &[], cfg.jpeg_quality(), cfg.hero_border_px())?;
 
     let file = "grid_extract.jpg";
-    let image = grid_image(write_files, file.to_string(), &jpeg);
-    let mut grid_meta = build_grid_meta(image, &picked, &[], lay.template);
+    let image = session.emit_image(file, &jpeg)?;
+    let mut grid_meta = build_grid_draft(&picked, &[], lay.template).into_meta(image);
 
-    if let Some(ref subs) = subs {
-        grid_meta.subtitles = subs.slice(range);
-    }
+    grid_meta.subtitles = match subs {
+        Some(ref subs) => subs.slice(range),
+        None => crate::types::GridSubtitles::NoSource,
+    };
 
     let meta = Metadata {
         source: input.display().to_string(),
@@ -165,7 +162,6 @@ pub fn extract_range(
         grids: vec![grid_meta],
     };
 
-    session.write_image(file, &jpeg)?;
     // No subtitles.txt: the range-sliced cues already travel in the metadata
     // (see the fn docs for the extract output contract).
     session.commit(&meta, None)?;

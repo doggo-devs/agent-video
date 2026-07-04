@@ -62,14 +62,6 @@ impl Deduper {
             .collect()
     }
 
-    /// Drop duplicates from a bounded batch while preserving frame order.
-    pub fn filter(&mut self, frames: Vec<CandidateFrame>) -> Vec<CandidateFrame> {
-        self.judge(frames)
-            .into_iter()
-            .filter_map(|(frame, kept)| kept.then_some(frame))
-            .collect()
-    }
-
     fn accepts_hash(&mut self, hash: ImageHash) -> bool {
         let is_dup = self
             .recent
@@ -107,7 +99,11 @@ mod tests {
     }
 
     fn dedup(frames: Vec<CandidateFrame>, threshold: u32, window: usize) -> Vec<CandidateFrame> {
-        Deduper::new(threshold, win(window)).filter(frames)
+        Deduper::new(threshold, win(window))
+            .judge(frames)
+            .into_iter()
+            .filter_map(|(frame, kept)| kept.then_some(frame))
+            .collect()
     }
 
     #[test]

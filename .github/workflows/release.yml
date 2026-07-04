@@ -9,35 +9,67 @@ permissions:
 
 jobs:
   build:
-    name: ${{ matrix.platform }}
+    name: ${{ matrix.target }} (${{ matrix.variant }})
     runs-on: ${{ matrix.os }}
-    # Linux builds run in a Debian 13 container so the binary links against
-    # trixie's glibc rather than the newer one on the GitHub runner, keeping
-    # it loadable on any distro at least as recent.
+    # Linux builds run in a Debian 13 (trixie) container so the binary links
+    # against trixie's glibc rather than the newer one on the GitHub runner,
+    # keeping it loadable on any distro at least as recent.
     container: ${{ matrix.container }}
     strategy:
+      fail-fast: false
       matrix:
+        # `npm_platform` marks the variant that feeds the @agent-video/<platform>
+        # npm package: static on Linux (self-contained is the point of npm
+        # installs), dynamic elsewhere. Release tarballs ship every variant —
+        # dynamic without a suffix, static with `-static`.
         include:
-          - platform: linux-x64
-            os: ubuntu-latest
+          # --- Linux x86_64 -----------------------------------------------
+          # dynamic: links the system FFmpeg; runs on hosts with a matching
+          # FFmpeg major installed (the trixie build env determines the soname).
+          - os: ubuntu-latest
             container: rust:1-trixie
             target: x86_64-unknown-linux-gnu
-          - platform: linux-arm64
-            os: ubuntu-24.04-arm
+            variant: dynamic
+          # static: self-contained, software AV1 via bundled dav1d, no hwaccel.
+          - os: ubuntu-latest
+            container: rust:1-trixie
+            target: x86_64-unknown-linux-gnu
+            variant: static
+            ffmpeg_cpu: x86-64-v3
+            npm_platform: linux-x64
+
+          # --- Linux aarch64 (native arm runner, no cross-compile) --------
+          - os: ubuntu-24.04-arm
             container: rust:1-trixie
             target: aarch64-unknown-linux-gnu
-          - platform: darwin-x64
-            os: macos-latest
+            variant: dynamic
+          - os: ubuntu-24.04-arm
+            container: rust:1-trixie
+            target: aarch64-unknown-linux-gnu
+            variant: static
+            ffmpeg_cpu: armv8-a
+            npm_platform: linux-arm64
+
+          # --- macOS x86_64 (dynamic; requires `brew install ffmpeg`) ------
+          - os: macos-15-intel
             container: ""
             target: x86_64-apple-darwin
-          - platform: darwin-arm64
-            os: macos-latest
+            variant: dynamic
+            npm_platform: darwin-x64
+
+          # --- macOS aarch64 (dynamic; requires `brew install ffmpeg`) -----
+          - os: macos-latest
             container: ""
             target: aarch64-apple-darwin
-          - platform: win32-x64
-            os: windows-latest
+            variant: dynamic
+            npm_platform: darwin-arm64
+
+          # --- Windows x86_64 (dynamic; FFmpeg DLLs bundled) ---------------
+          - os: windows-latest
             container: ""
             target: x86_64-pc-windows-msvc
+            variant: dynamic
+            npm_platform: win32-x64
     steps:
       - uses: actions/checkout@v4
 
@@ -49,33 +81,76 @@ jobs:
             echo "tag $GITHUB_REF_NAME != crate version $crate" >&2; exit 1; }
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+
+      # --- FFmpeg / build-tool provisioning -----------------------------------
+      - name: Install build deps (Linux, static)
+        if: runner.os == 'Linux' && matrix.variant == 'static'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential nasm meson ninja-build pkg-config git
+      - name: Install FFmpeg dev libs (Linux, dynamic)
+        if: runner.os == 'Linux' && matrix.variant == 'dynamic'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev pkg-config
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg pkg-config
+      - name: Install FFmpeg (Windows, vcpkg)
+        if: runner.os == 'Windows'
+        run: |
+          vcpkg install ffmpeg[avcodec,avformat,avutil,swscale]:x64-windows
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-${{ matrix.variant }}
 
-      # Always build with an explicit --target so the output path is uniform
-      # (target/<triple>/release) across native and cross builds.
-      - run: cargo build --release --target ${{ matrix.target }}
+      # --- Build --------------------------------------------------------------
+      - name: Build (static)
+        if: matrix.variant == 'static'
+        env:
+          FFMPEG_TARGET_CPU: ${{ matrix.ffmpeg_cpu }}
+        run: ./scripts/build-static.sh
+      - name: Build (dynamic)
+        if: matrix.variant == 'dynamic'
+        run: cargo build --release
 
-      # Raw binary for the npm publish job (exec bit is restored there).
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bin-${{ matrix.platform }}
-          path: target/${{ matrix.target }}/release/agent-video${{ runner.os == 'Windows' && '.exe' || '' }}
-          if-no-files-found: error
-
+      # --- Package ------------------------------------------------------------
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
-          tar -C "target/${{ matrix.target }}/release" -czf \
-            "agent-video-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" agent-video
-      - name: Package (windows)
+          suffix=""
+          [ "${{ matrix.variant }}" = "static" ] && suffix="-static"
+          tar -C target/release -czf \
+            "agent-video-${GITHUB_REF_NAME}-${{ matrix.target }}${suffix}.tar.gz" agent-video
+      - name: Package (windows, bundle FFmpeg DLLs)
         if: runner.os == 'Windows'
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/agent-video.exe" `
+          $stage = "stage/agent-video"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/agent-video.exe $stage
+          Copy-Item "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\*.dll" $stage
+          Compress-Archive -Path "$stage/*" `
             -DestinationPath "agent-video-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
+
+      # Raw binary for the npm publish job (exec bit is restored there). The
+      # Windows artifact is the staged exe + FFmpeg DLLs, which must travel
+      # together into the npm package's bin/.
+      - uses: actions/upload-artifact@v4
+        if: matrix.npm_platform != '' && runner.os != 'Windows'
+        with:
+          name: bin-${{ matrix.npm_platform }}
+          path: target/release/agent-video
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: matrix.npm_platform != '' && runner.os == 'Windows'
+        with:
+          name: bin-${{ matrix.npm_platform }}
+          path: stage/agent-video/*
+          if-no-files-found: error
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -106,9 +181,8 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           for platform in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
-            bin="artifacts/bin-$platform/agent-video"
-            [ -f "$bin" ] || bin="$bin.exe"
-            node scripts/npm-platform.mjs "$platform" "$version" "$bin" "dist/$platform"
+            node scripts/npm-platform.mjs "$platform" "$version" \
+              "artifacts/bin-$platform" "dist/$platform"
             npm publish "dist/$platform" --provenance --access public
           done
 

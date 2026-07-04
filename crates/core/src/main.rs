@@ -4,13 +4,13 @@
 //! `extract` (high-density sampling of a time range), and `probe` (media
 //! inspection to machine-readable JSON).
 
-mod child;
 mod compose;
 mod config;
 mod dedup;
 mod error;
 mod extract;
 mod layout;
+mod media;
 mod pipeline;
 mod probe;
 mod report;
@@ -22,12 +22,11 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum, ValueHint};
+use clap::{Parser, Subcommand, ValueHint};
 
 use crate::config::{Config, Overrides, StrategyOpts};
 use crate::error::Error;
 use crate::pipeline::parse_range;
-use crate::probe::SampleStrategy;
 use crate::types::{Detail, Quality, TimeRange};
 
 #[derive(Parser)]
@@ -49,8 +48,11 @@ enum Command {
         io: IoArgs,
         #[command(flatten)]
         opts: CommonOpts,
+        /// Sampling-strategy options, `process` only: `extract` always samples
+        /// its explicit range at fixed fps, so accepting these there would be
+        /// a silent no-op.
         #[command(flatten)]
-        strategy: StrategyArgs,
+        strategy: StrategyOpts,
         /// Only decode from this timestamp in seconds; grid timestamps stay
         /// absolute to the file.
         #[arg(long)]
@@ -97,62 +99,26 @@ struct IoArgs {
     output: PathBuf,
 }
 
-/// Options shared by both subcommands.
+/// Options shared by both subcommands. The parameter overrides live directly
+/// on [`Overrides`] (flattened), so the CLI surface and the config override
+/// set are one declaration.
 #[derive(clap::Args)]
 struct CommonOpts {
     /// Canvas edge length in pixels.
     #[arg(long, default_value_t = 2048)]
     max_edge: u32,
     /// Resolution tier.
-    #[arg(long, value_enum, default_value_t = QualityArg::Low)]
-    quality: QualityArg,
+    #[arg(long, value_enum, default_value_t = Quality::Low)]
+    quality: Quality,
     /// Detail / sampling-density tier.
-    #[arg(long, value_enum, default_value_t = DetailArg::Standard)]
-    detail: DetailArg,
+    #[arg(long, value_enum, default_value_t = Detail::Standard)]
+    detail: Detail,
     /// Named profile (balanced, fast, quality, action).
     #[arg(long)]
     profile: Option<String>,
 
-    // --- Sampling overrides ---
-    /// Override base sampling fps.
-    #[arg(long)]
-    base_fps: Option<f32>,
-    /// Override pHash Hamming distance threshold for dedup.
-    #[arg(long)]
-    hash_threshold: Option<u32>,
-    /// Override dedup sliding window size in frames (must be >= 1).
-    #[arg(long)]
-    dedup_window: Option<NonZeroUsize>,
-    /// Override edge length of grayscale image for scoring.
-    #[arg(long)]
-    score_edge: Option<u32>,
-
-    // --- Scoring overrides ---
-    /// Override scene-change weight in scoring.
-    #[arg(long)]
-    w_scene: Option<f32>,
-    /// Override clarity weight in scoring.
-    #[arg(long)]
-    w_clarity: Option<f32>,
-    /// Override edge-density weight in scoring.
-    #[arg(long)]
-    w_edge: Option<f32>,
-
-    // --- Timing overrides ---
-    /// Override chunk size in seconds.
-    #[arg(long)]
-    chunk_seconds: Option<f32>,
-    /// Override minimum temporal gap (seconds) between selected frames.
-    #[arg(long)]
-    min_gap: Option<f32>,
-
-    // --- Output overrides ---
-    /// Override JPEG output quality (0-100).
-    #[arg(long)]
-    jpeg_quality: Option<u8>,
-    /// Override hero frame border thickness in pixels.
-    #[arg(long)]
-    hero_border_px: Option<u32>,
+    #[command(flatten)]
+    overrides: Overrides,
 
     /// Output JSON with base64 images to stdout instead of writing files.
     /// Holds all grids in memory until done; prefer files for long videos.
@@ -166,77 +132,6 @@ struct CommonOpts {
     /// Embedded subtitle track index (0-based, use when multiple tracks exist).
     #[arg(long, conflicts_with = "subtitle")]
     subtitle_track: Option<usize>,
-}
-
-/// Sampling-strategy options, `process` only: `extract` always samples its
-/// explicit range at fixed fps, so accepting these there would be a silent
-/// no-op.
-#[derive(clap::Args)]
-struct StrategyArgs {
-    /// Frame sampling strategy.
-    #[arg(long, value_enum, default_value_t = StrategyArg::FixedFps)]
-    strategy: StrategyArg,
-    /// Allow fixed-fps on videos exceeding 1h duration limit.
-    #[arg(long)]
-    force: bool,
-    /// Minimum keyframes required for keyframes/adaptive strategies.
-    #[arg(long, default_value_t = StrategyOpts::DEFAULT_MIN_KEYFRAMES)]
-    min_keyframes: usize,
-    /// Gap threshold (seconds) for adaptive sparse region fill.
-    #[arg(long, default_value_t = StrategyOpts::DEFAULT_GAP_THRESHOLD)]
-    gap_threshold: f32,
-}
-
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum QualityArg {
-    Low,
-    Medium,
-    High,
-}
-
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum DetailArg {
-    Coarse,
-    Standard,
-    Fine,
-}
-
-#[derive(Copy, Clone, Debug, Default, ValueEnum)]
-enum StrategyArg {
-    #[default]
-    FixedFps,
-    Keyframes,
-    Adaptive,
-}
-
-impl From<QualityArg> for Quality {
-    fn from(q: QualityArg) -> Self {
-        match q {
-            QualityArg::Low => Quality::Low,
-            QualityArg::Medium => Quality::Medium,
-            QualityArg::High => Quality::High,
-        }
-    }
-}
-
-impl From<DetailArg> for Detail {
-    fn from(d: DetailArg) -> Self {
-        match d {
-            DetailArg::Coarse => Detail::Coarse,
-            DetailArg::Standard => Detail::Standard,
-            DetailArg::Fine => Detail::Fine,
-        }
-    }
-}
-
-impl From<StrategyArg> for crate::probe::SampleStrategy {
-    fn from(s: StrategyArg) -> Self {
-        match s {
-            StrategyArg::FixedFps => Self::FixedFps,
-            StrategyArg::Keyframes => Self::Keyframes,
-            StrategyArg::Adaptive => Self::Adaptive,
-        }
-    }
 }
 
 fn main() -> ExitCode {
@@ -262,39 +157,17 @@ fn run() -> anyhow::Result<()> {
         Command::Probe { input, keyframes } => return report::run(input, *keyframes),
     };
 
-    let quality = Quality::from(opts.quality);
-    let detail = Detail::from(opts.detail);
-
-    let overrides = Overrides {
-        w_scene: opts.w_scene,
-        w_clarity: opts.w_clarity,
-        w_edge: opts.w_edge,
-        base_fps: opts.base_fps,
-        hash_threshold: opts.hash_threshold,
-        dedup_window: opts.dedup_window,
-        score_edge: opts.score_edge,
-        chunk_seconds: opts.chunk_seconds,
-        min_gap: opts.min_gap,
-        jpeg_quality: opts.jpeg_quality,
-        hero_border_px: opts.hero_border_px,
-    };
-
     let strategy_opts = match &cli.command {
-        Command::Process { strategy, .. } => StrategyOpts {
-            strategy: SampleStrategy::from(strategy.strategy),
-            gap_threshold: strategy.gap_threshold,
-            min_keyframes: strategy.min_keyframes,
-            force: strategy.force,
-        },
+        Command::Process { strategy, .. } => *strategy,
         Command::Extract { .. } | Command::Probe { .. } => StrategyOpts::default(),
     };
 
     let cfg = Config::new(
         opts.max_edge,
-        quality,
-        detail,
+        opts.quality,
+        opts.detail,
         opts.profile.as_deref(),
-        &overrides,
+        &opts.overrides,
         strategy_opts,
     )?;
 

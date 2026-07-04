@@ -3,14 +3,14 @@
 use anyhow::Result;
 use image::GrayImage;
 
-use crate::types::{CandidateFrame, GridImage, GridMeta, KeyFrameMeta, ScoredFrame, TimeRange};
+use crate::types::{CandidateFrame, GridDraft, KeyFrameMeta, ScoredFrame, TimeRange};
 use crate::{compose, layout, score};
 
 #[derive(Debug)]
 pub struct GridResult {
     pub ci: usize,
     pub jpeg: Vec<u8>,
-    pub meta: GridMeta,
+    pub draft: GridDraft,
 }
 
 #[derive(Clone, Copy)]
@@ -18,7 +18,6 @@ pub struct ProcessChunkEnv {
     pub spec: crate::types::CanvasSpec,
     pub aspect: f32,
     pub weights: score::Weights,
-    pub write_files: bool,
     pub min_gap_floor: f32,
     pub jpeg_quality: u8,
     pub hero_border_px: u32,
@@ -50,11 +49,9 @@ pub fn process_chunk(
     let lay = evict_for_heroes(&mut picked, &mut heroes, env.aspect, &env.spec);
 
     let jpeg = compose::render(&picked, &lay, &heroes, env.jpeg_quality, env.hero_border_px)?;
-    let image = grid_image(env.write_files, format!("grid_{:03}.jpg", ci + 1), &jpeg);
+    let draft = build_grid_draft(&picked, &heroes, lay.template);
 
-    let meta = build_grid_meta(image, &picked, &heroes, lay.template);
-
-    Ok(GridResult { ci, jpeg, meta })
+    Ok(GridResult { ci, jpeg, draft })
 }
 
 /// Evict the lowest-scored normal frames until hero enlargement no longer
@@ -80,7 +77,7 @@ fn evict_for_heroes(
     // Fixed bar from the pre-eviction frame set: evicting frames must not
     // raise the bar, or the loop would chase its own tail.
     let uniform = layout::compute(&scores, &[], aspect, spec);
-    let baseline = min_short_edge(&uniform).min(spec.min_cell_edge);
+    let baseline = min_short_edge(&uniform).min(spec.min_cell_edge());
 
     loop {
         let scores: Vec<f32> = picked.iter().map(|f| f.score).collect();
@@ -127,24 +124,11 @@ pub fn extract_selected(
     picked
 }
 
-/// Build the [`GridImage`] for a rendered grid: a written file path, or the
-/// base64-encoded JPEG for inline JSON output. The one-of invariant lives here.
-pub fn grid_image(write_files: bool, file: String, jpeg: &[u8]) -> GridImage {
-    use base64::{Engine, engine::general_purpose::STANDARD};
-
-    if write_files {
-        GridImage::File(file)
-    } else {
-        GridImage::Base64(STANDARD.encode(jpeg))
-    }
-}
-
-pub fn build_grid_meta(
-    image: GridImage,
+pub fn build_grid_draft(
     picked: &[ScoredFrame],
     heroes: &[usize],
     template: &'static str,
-) -> GridMeta {
+) -> GridDraft {
     let (first, last) = (
         picked.first().map(|f| f.ts).unwrap_or(0.0),
         picked.last().map(|f| f.ts).unwrap_or(0.0),
@@ -157,13 +141,11 @@ pub fn build_grid_meta(
             grid_position: "hero",
         })
         .collect();
-    GridMeta {
-        image,
+    GridDraft {
         time_range: TimeRange::new(first, last).expect("picked frames are ts-sorted ascending"),
         total_frames: picked.len(),
         key_frames,
         layout: template,
-        subtitles: None,
     }
 }
 
@@ -216,10 +198,7 @@ mod tests {
     fn evicts_weakest_frames_until_cells_stay_readable() {
         // 16 frames tile a 2048/512 square canvas at exactly the readable
         // floor; a hero must displace weak frames, not shrink everyone.
-        let spec = crate::types::CanvasSpec {
-            edge: 2048,
-            min_cell_edge: 512,
-        };
+        let spec = crate::types::CanvasSpec::new(2048, 512).expect("valid test spec");
         let mut picked: Vec<ScoredFrame> = (0..16).map(|i| scored(i as f32, i as f32)).collect();
         let mut heroes = vec![15];
 
@@ -242,10 +221,7 @@ mod tests {
     fn keeps_all_frames_when_hero_fits_free() {
         // An under-full grid has slack: the hero enlarges into free space and
         // nothing needs to go.
-        let spec = crate::types::CanvasSpec {
-            edge: 1024,
-            min_cell_edge: 512,
-        };
+        let spec = crate::types::CanvasSpec::new(1024, 512).expect("valid test spec");
         let mut picked: Vec<ScoredFrame> =
             (0..4).map(|i| scored(i as f32, 50.0 + i as f32)).collect();
         let mut heroes = vec![3];

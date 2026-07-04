@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use crate::config::Config;
 use crate::error::{Error, ErrorCode, ErrorContext};
 use crate::subtitle::Subtitles;
-use crate::types::{GridMeta, Metadata};
+use crate::types::{GridImage, GridMeta, Metadata};
 
 use super::OutputMode;
 
@@ -46,10 +46,6 @@ impl<'a> OutputSession<'a> {
         Ok(session)
     }
 
-    pub fn mode(&self) -> OutputMode {
-        self.mode
-    }
-
     fn dir_error(&self, what: &str, e: std::io::Error) -> Error {
         Error::new(
             ErrorCode::OutputDirCreate,
@@ -78,15 +74,23 @@ impl<'a> OutputSession<'a> {
         Ok(())
     }
 
-    /// Write one incremental image artifact (grid or static entry). A no-op in
-    /// JSON mode, where images travel base64-inline in the metadata instead.
-    pub fn write_image(&self, name: &str, jpeg: &[u8]) -> Result<()> {
+    /// Emit one image artifact (grid or static entry) and return its metadata
+    /// payload. In file mode the JPEG is written to disk and referenced by
+    /// name; in JSON mode nothing touches the filesystem and the bytes travel
+    /// base64-inline. This is the only constructor of [`GridImage`] in the
+    /// pipeline: the file-vs-base64 one-of invariant lives here, so no worker
+    /// needs to know the output mode exists.
+    pub fn emit_image(&self, name: &str, jpeg: &[u8]) -> Result<GridImage> {
         match self.mode {
             OutputMode::Files => {
                 self.sweep_stale()?;
-                atomic_write(self.dir, name, jpeg)
+                atomic_write(self.dir, name, jpeg)?;
+                Ok(GridImage::File(name.to_string()))
             }
-            OutputMode::Json => Ok(()),
+            OutputMode::Json => {
+                use base64::{Engine, engine::general_purpose::STANDARD};
+                Ok(GridImage::Base64(STANDARD.encode(jpeg)))
+            }
         }
     }
 
@@ -144,10 +148,11 @@ pub fn write_outputs(
     mut grid_metas: Vec<GridMeta>,
     subs: Option<&Subtitles>,
 ) -> Result<()> {
-    if let Some(subs) = subs {
-        for grid in &mut grid_metas {
-            grid.subtitles = subs.slice(grid.time_range);
-        }
+    for grid in &mut grid_metas {
+        grid.subtitles = match subs {
+            Some(subs) => subs.slice(grid.time_range),
+            None => crate::types::GridSubtitles::NoSource,
+        };
     }
 
     let meta = Metadata {
@@ -235,7 +240,11 @@ mod tests {
             "sweep deferred: a run failing before output must destroy nothing"
         );
 
-        session.write_image("grid_001.jpg", b"new").expect("write");
+        let image = session.emit_image("grid_001.jpg", b"new").expect("write");
+        assert!(
+            matches!(image, GridImage::File(name) if name == "grid_001.jpg"),
+            "file mode emits a file reference"
+        );
 
         assert!(!stale.exists(), "stale grid removed at first write");
         assert!(foreign.exists(), "foreign file untouched");
@@ -250,9 +259,13 @@ mod tests {
         // The directory is never created: open, write_image, and commit must
         // all stay off the filesystem in JSON mode.
         let session = OutputSession::open(&dir, OutputMode::Json).expect("open session");
-        session
-            .write_image("grid_001.jpg", b"jpeg")
-            .expect("write is a no-op");
+        let image = session
+            .emit_image("grid_001.jpg", b"jpeg")
+            .expect("emit touches no files");
+        assert!(
+            matches!(image, GridImage::Base64(_)),
+            "json mode embeds the payload"
+        );
         assert!(!dir.exists(), "json session created the output dir");
     }
 }

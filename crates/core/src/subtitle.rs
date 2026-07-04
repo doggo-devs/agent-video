@@ -1,4 +1,5 @@
-//! Subtitle resolution: embedded streams via ffmpeg, or external sidecar files.
+//! Subtitle resolution: embedded streams via the in-process decoder, or
+//! external sidecar files.
 //!
 //! [`Subtitles`] is the single boundary of the subtitle domain: source
 //! resolution (explicit path > explicit track > auto-detection), SRT parsing,
@@ -6,44 +7,11 @@
 //! structured [`Error`] code regardless of which source was used.
 
 use std::fs;
-use std::io::Read;
 use std::path::Path;
-use std::process::Command;
 
-use crate::child::TrackedChild;
 use crate::error::{Error, ErrorCode, ErrorContext, Result};
-use crate::types::TimeRange;
-
-/// Upper bound on subtitle stdout we will buffer. Real subtitle tracks are far
-/// smaller; a stream that reaches this is treated as runaway output.
-const MAX_SUBTITLE_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Read an ffmpeg subtitle stream to a string, bounded by [`MAX_SUBTITLE_BYTES`].
-/// Fails if the cap is exceeded rather than returning silently truncated text.
-fn read_capped(r: impl Read) -> Result<String> {
-    let mut text = String::new();
-    // Take one byte past the cap: `take(cap)` alone cannot distinguish
-    // "exactly cap" (acceptable) from "more than cap" (runaway).
-    let read = r
-        .take(MAX_SUBTITLE_BYTES + 1)
-        .read_to_string(&mut text)
-        .map_err(|e| {
-            Error::new(
-                ErrorCode::FfmpegFailed,
-                "reading subtitle output from ffmpeg",
-            )
-            .with_source(e)
-        })?;
-    if read as u64 > MAX_SUBTITLE_BYTES {
-        return Err(Error::new(
-            ErrorCode::InputCorrupt,
-            format!(
-                "subtitle output exceeded {MAX_SUBTITLE_BYTES} bytes; refusing to buffer runaway stream"
-            ),
-        ));
-    }
-    Ok(text)
-}
+use crate::media;
+use crate::types::{GridSubtitles, TimeRange};
 
 /// A single parsed subtitle cue.
 #[derive(Debug, Clone)]
@@ -91,12 +59,24 @@ impl Subtitles {
     /// empty while the run reports success — a corrupt input, not a resolved
     /// one.
     pub fn resolve(input: &Path, source: SubtitleSource<'_>) -> Result<Option<Self>> {
-        let raw = match source {
-            SubtitleSource::File(p) => Some(extract_from_file(p)?),
-            SubtitleSource::Track(t) => Some(extract_embedded(input, t, "subtitle track")?),
-            SubtitleSource::Auto => auto_detect(input)?,
-        };
-        let Some(raw) = raw else { return Ok(None) };
+        match source {
+            SubtitleSource::File(p) => Ok(Some(Self::from_srt_text(input, extract_from_file(p)?)?)),
+            SubtitleSource::Track(t) => Ok(Some(Self::from_cues(media::subtitle::extract_track(
+                input,
+                t,
+                "subtitle track",
+            )?))),
+            SubtitleSource::Auto => match auto_detect(input)? {
+                Some(AutoSource::Sidecar(text)) => Ok(Some(Self::from_srt_text(input, text)?)),
+                Some(AutoSource::Embedded(cues)) => Ok(Some(Self::from_cues(cues))),
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// Build from SRT text (explicit file or sidecar), keeping the raw text
+    /// as the `subtitles.txt` payload.
+    fn from_srt_text(input: &Path, raw: String) -> Result<Self> {
         let cues = parse_srt(&raw);
         if cues.is_empty() {
             return Err(Error::new(
@@ -105,12 +85,26 @@ impl Subtitles {
             )
             .with_context(ErrorContext::default().with_input(input)));
         }
-        Ok(Some(Subtitles { raw, cues }))
+        Ok(Subtitles { raw, cues })
+    }
+
+    /// Build from decoded embedded cues; the `subtitles.txt` payload is
+    /// rendered back to SRT (the extractor guarantees at least one cue).
+    fn from_cues(cues: Vec<Cue>) -> Self {
+        Subtitles {
+            raw: media::subtitle::cues_to_srt(&cues),
+            cues,
+        }
     }
 
     /// Text of every cue overlapping `range`, for a grid's metadata entry.
-    pub fn slice(&self, range: TimeRange) -> Option<String> {
-        slice_for_range(&self.cues, range.start(), range.end())
+    /// A miss is [`GridSubtitles::NoCueInRange`], distinct by type from "the
+    /// run had no source" — the caller cannot collapse the two.
+    pub fn slice(&self, range: TimeRange) -> GridSubtitles {
+        match slice_for_range(&self.cues, range.start(), range.end()) {
+            Some(text) => GridSubtitles::Text(text),
+            None => GridSubtitles::NoCueInRange,
+        }
     }
 
     /// The full resolved SRT text — the `subtitles.txt` payload.
@@ -119,11 +113,11 @@ impl Subtitles {
     }
 }
 
-/// Embedded subtitle track info.
-#[derive(Debug)]
-struct EmbeddedTrack {
-    index: usize,
-    language: Option<String>,
+/// What auto-detection resolved to: sidecar SRT text, or decoded embedded
+/// cues.
+enum AutoSource {
+    Sidecar(String),
+    Embedded(Vec<Cue>),
 }
 
 /// Extract subtitles from an explicit file path. A missing or unreadable file
@@ -144,20 +138,9 @@ fn extract_from_file(path: &Path) -> Result<String> {
 ///
 /// Fails if multiple sources exist (embedded + sidecar, or multiple sidecars/tracks).
 /// Returns `None` when no subtitles are found.
-fn auto_detect(input: &Path) -> Result<Option<String>> {
+fn auto_detect(input: &Path) -> Result<Option<AutoSource>> {
     let sidecars = find_all_sidecars(input);
-    // ffprobe is optional on this path: `--strategy fixed-fps --force` and
-    // `extract` are contracted to run without it, and auto-detection is the
-    // only ffprobe use they reach. A missing binary downgrades embedded
-    // detection to a warning; an ffprobe that exists but fails still errors.
-    let embedded = match list_embedded_tracks(input) {
-        Ok(tracks) => tracks,
-        Err(e) if e.code == ErrorCode::FfprobeNotFound => {
-            eprintln!("warning: ffprobe not found; skipping embedded subtitle detection");
-            Vec::new()
-        }
-        Err(e) => return Err(e),
-    };
+    let embedded = media::subtitle::list_tracks(input)?;
 
     let total = sidecars.len() + embedded.len();
     if total > 1 {
@@ -181,7 +164,7 @@ fn auto_detect(input: &Path) -> Result<Option<String>> {
     // Single sidecar
     if let Some(path) = sidecars.into_iter().next() {
         return match read_sidecar(&path)? {
-            Some(content) => Ok(Some(content)),
+            Some(content) => Ok(Some(AutoSource::Sidecar(content))),
             None => Err(Error::new(
                 ErrorCode::InputCorrupt,
                 format!("sidecar file is empty: {}", path.display()),
@@ -191,11 +174,11 @@ fn auto_detect(input: &Path) -> Result<Option<String>> {
 
     // Single embedded stream
     if embedded.len() == 1 {
-        return Ok(Some(extract_embedded(
+        return Ok(Some(AutoSource::Embedded(media::subtitle::extract_track(
             input,
             0,
             "embedded subtitle stream",
-        )?));
+        )?)));
     }
 
     Ok(None)
@@ -275,51 +258,6 @@ fn sidecar_dir(input: &Path) -> Option<&Path> {
     })
 }
 
-/// List embedded subtitle tracks with language info.
-///
-/// Returns an error if ffprobe fails; returns empty Vec if no subtitle streams.
-fn list_embedded_tracks(input: &Path) -> crate::error::Result<Vec<EmbeddedTrack>> {
-    let mut cmd = Command::new("ffprobe");
-    cmd.args([
-        "-v",
-        "error",
-        "-select_streams",
-        "s",
-        // `stream=index` is requested only to anchor one CSV row per
-        // stream: a stream lacking a language tag would otherwise emit an
-        // empty line and could desync the enumerate() below. The value
-        // itself is the *global* stream index and is deliberately unused
-        // — `-map 0:s:{i}` takes the subtitle-relative index, which is
-        // exactly the enumerate position.
-        "-show_entries",
-        "stream=index:stream_tags=language",
-        "-of",
-        "csv=p=0",
-    ])
-    .arg(input);
-    // One short CSV row per subtitle stream; 1 MiB covers thousands of them.
-    let stdout = crate::child::run_capped(
-        &mut cmd,
-        "ffprobe subtitle scan",
-        ErrorCode::FfprobeNotFound,
-        ErrorCode::FfprobeFailed,
-        1024 * 1024,
-    )
-    .map_err(|e| e.with_input(input))?;
-
-    Ok(stdout
-        .lines()
-        .enumerate()
-        .map(|(i, line)| {
-            let language = line.split(',').nth(1).map(|s| s.trim().to_string());
-            EmbeddedTrack {
-                index: i,
-                language: language.filter(|s| !s.is_empty()),
-            }
-        })
-        .collect())
-}
-
 /// Read a sidecar file, distinguishing "not found" from "read error" from "empty".
 ///
 /// Returns:
@@ -345,41 +283,6 @@ fn read_sidecar(path: &Path) -> Result<Option<String>> {
         .with_context(ErrorContext::default().with_input(path))
         .with_source(e)),
     }
-}
-
-/// Extract embedded subtitle stream `track` (subtitle-relative index) as SRT
-/// text via ffmpeg. `what` names the source in errors — "subtitle track" for
-/// an explicit `--subtitle-track`, "embedded subtitle stream" when
-/// auto-detection picked it.
-fn extract_embedded(input: &Path, track: usize, what: &str) -> Result<String> {
-    let map_arg = format!("0:s:{track}");
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-i")
-        .arg(input)
-        .args(["-map", &map_arg, "-f", "srt", "pipe:1"]);
-
-    let (child, stdout) = TrackedChild::spawn(
-        &mut cmd,
-        "ffmpeg for subtitle extraction",
-        ErrorCode::FfmpegNotFound,
-    )?;
-
-    let text = read_capped(stdout)?;
-
-    child.wait("ffmpeg subtitle extraction").map_err(|e| {
-        let mut err = e.into_error(ErrorCode::FfmpegFailed);
-        err.reason = format!("extracting {what} {track}: {}", err.reason);
-        err
-    })?;
-
-    let text = text.trim().to_string();
-    if text.is_empty() {
-        return Err(
-            Error::new(ErrorCode::InputCorrupt, format!("{what} {track} is empty"))
-                .with_context(ErrorContext::default().with_input(input)),
-        );
-    }
-    Ok(text)
 }
 
 /// Parse SRT text into a list of cues.
@@ -593,21 +496,6 @@ with continuation
         assert_eq!(err.code, ErrorCode::InputCorrupt);
 
         fs::remove_dir_all(&dir).expect("cleanup test dir");
-    }
-
-    #[test]
-    fn accepts_subtitle_at_exact_byte_cap() {
-        // Exactly MAX_SUBTITLE_BYTES is within the cap, not a runaway stream.
-        let data = vec![b'a'; MAX_SUBTITLE_BYTES as usize];
-        let text = read_capped(&data[..]).expect("exact-cap input is acceptable");
-        assert_eq!(text.len() as u64, MAX_SUBTITLE_BYTES);
-    }
-
-    #[test]
-    fn rejects_subtitle_past_byte_cap() {
-        let data = vec![b'a'; MAX_SUBTITLE_BYTES as usize + 1];
-        let err = read_capped(&data[..]).expect_err("over-cap input is runaway");
-        assert_eq!(err.code, ErrorCode::InputCorrupt);
     }
 
     #[test]

@@ -1,98 +1,272 @@
 //! Unified runtime configuration.
 //!
-//! All parameters live in [`Config`]. Construction resolves named profiles,
-//! quality/detail tiers, and CLI overrides in one place — no layered merging.
+//! Parse, don't validate: [`Config`] is a bundle of domain groups whose
+//! invariants live in their constructors — holding a `Config` means every
+//! parameter has already been checked, and there is no post-hoc `validate()`
+//! step to forget or bypass. Fields are private; the pipeline reads through
+//! getters. Construction resolves named profiles, quality/detail tiers, and
+//! CLI overrides in one place — no layered merging.
 
 use std::num::NonZeroUsize;
 
 use crate::error::{Error, ErrorCode};
 use crate::probe::SampleStrategy;
-use crate::types::{Detail, Quality};
-
-/// JPEG caps image dimensions at 65535 px; a larger canvas would run the whole
-/// pipeline only to fail at encode time (after a multi-GB allocation).
-const MAX_CANVAS_EDGE: u32 = 65_535;
+use crate::score::Weights;
+use crate::types::{CanvasSpec, Detail, Quality};
 
 /// Default dedup sliding window, in kept frames.
 const DEFAULT_DEDUP_WINDOW: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
+/// Reject a resolved value that would corrupt scoring or sampling arithmetic,
+/// naming the offending field and value.
+fn invalid<T>(field: &str, detail: impl std::fmt::Display) -> crate::error::Result<T> {
+    Err(Error::new(
+        ErrorCode::InvalidConfig,
+        format!("invalid {field}: {detail}"),
+    ))
+}
+
 /// A partial parameter set: CLI overrides (highest priority) and named
 /// profiles both resolve through this shape.
-#[derive(Debug, Clone, Default)]
+///
+/// Derives [`clap::Args`] directly, so the CLI flags and the override fields
+/// are the same declaration: adding an override is one field here, with no
+/// hand-copied mirror to drift in `main.rs`.
+#[derive(Debug, Clone, Default, clap::Args)]
 pub struct Overrides {
+    /// Override base sampling fps.
+    #[arg(long)]
     pub base_fps: Option<f32>,
+    /// Override pHash Hamming distance threshold for dedup.
+    #[arg(long)]
     pub hash_threshold: Option<u32>,
+    /// Override dedup sliding window size in frames (must be >= 1).
+    #[arg(long)]
     pub dedup_window: Option<NonZeroUsize>,
+    /// Override edge length of grayscale image for scoring.
+    #[arg(long)]
     pub score_edge: Option<u32>,
+
+    /// Override scene-change weight in scoring.
+    #[arg(long)]
     pub w_scene: Option<f32>,
+    /// Override clarity weight in scoring.
+    #[arg(long)]
     pub w_clarity: Option<f32>,
+    /// Override edge-density weight in scoring.
+    #[arg(long)]
     pub w_edge: Option<f32>,
+
+    /// Override chunk size in seconds.
+    #[arg(long)]
     pub chunk_seconds: Option<f32>,
+    /// Override minimum temporal gap (seconds) between selected frames.
+    #[arg(long)]
     pub min_gap: Option<f32>,
+
+    /// Override JPEG output quality (1-100).
+    #[arg(long)]
     pub jpeg_quality: Option<u8>,
+    /// Override hero frame border thickness in pixels.
+    #[arg(long)]
     pub hero_border_px: Option<u32>,
 }
 
-/// Strategy-related options.
-#[derive(Debug, Clone, Copy)]
+/// Sampling-strategy options, `process` only: `extract` always samples its
+/// explicit range at fixed fps, so it uses the [`Default`] values.
+///
+/// The clap defaults and [`Default`] share the `DEFAULT_*` consts, so the CLI
+/// and a programmatically-built config cannot disagree.
+#[derive(Debug, Clone, Copy, clap::Args)]
 pub struct StrategyOpts {
+    /// Frame sampling strategy.
+    #[arg(long, value_enum, default_value_t = SampleStrategy::FixedFps)]
     pub strategy: SampleStrategy,
+    /// Gap threshold (seconds) for adaptive sparse region fill.
+    #[arg(long, default_value_t = Self::DEFAULT_GAP_THRESHOLD)]
     pub gap_threshold: f32,
+    /// Minimum keyframes required for keyframes/adaptive strategies.
+    #[arg(long, default_value_t = Self::DEFAULT_MIN_KEYFRAMES)]
     pub min_keyframes: usize,
+    /// Max duration (seconds) allowed for fixed-fps sampling; longer videos
+    /// need --force or a keyframe strategy.
+    #[arg(long, default_value_t = Self::DEFAULT_MAX_DURATION)]
+    pub max_duration: f32,
+    /// Allow fixed-fps on videos exceeding the max-duration limit.
+    #[arg(long)]
     pub force: bool,
 }
 
 impl StrategyOpts {
     pub const DEFAULT_GAP_THRESHOLD: f32 = 5.0;
     pub const DEFAULT_MIN_KEYFRAMES: usize = 10;
-    pub const MAX_DURATION_DEFAULT: f32 = 3600.0;
+    pub const DEFAULT_MAX_DURATION: f32 = 3600.0;
 }
 
 impl Default for StrategyOpts {
-    /// Mirrors the CLI defaults so a programmatically-built config validates;
-    /// the derived all-zero default would make `gap_threshold` invalid.
     fn default() -> Self {
         Self {
             strategy: SampleStrategy::default(),
             gap_threshold: Self::DEFAULT_GAP_THRESHOLD,
             min_keyframes: Self::DEFAULT_MIN_KEYFRAMES,
+            max_duration: Self::DEFAULT_MAX_DURATION,
             force: false,
         }
     }
 }
 
-/// All runtime parameters needed by the pipeline.
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub max_edge: u32,
-    pub min_frame_size: u32,
-    pub base_fps: f32,
+/// Sampling density and chunking cadence. All values finite by construction;
+/// fps and chunk length strictly positive, `min_gap` non-negative.
+#[derive(Debug, Clone, Copy)]
+struct Sampling {
+    base_fps: f32,
     /// Sampling fps for the `extract` subcommand. Defaults to three times the
     /// detail tier's fps (extract exists for high-density passes over short
     /// ranges), but an explicit `--base-fps` or profile value wins as-is, so
     /// the flag means the same density in both subcommands.
-    pub extract_fps: f32,
-    pub hash_threshold: u32,
-    pub dedup_window: NonZeroUsize,
-    pub score_edge: u32,
+    extract_fps: f32,
+    chunk_seconds: f32,
+    min_gap: f32,
+    /// Shorter edge of the grayscale image scoring convolutions run on; >= 1.
+    score_edge: u32,
+}
 
-    pub w_scene: f32,
-    pub w_clarity: f32,
-    pub w_edge: f32,
+impl Sampling {
+    fn new(
+        base_fps: f32,
+        extract_fps: f32,
+        chunk_seconds: f32,
+        min_gap: f32,
+        score_edge: u32,
+    ) -> crate::error::Result<Self> {
+        if !base_fps.is_finite() || base_fps <= 0.0 {
+            return invalid("base_fps", format!("{base_fps} (must be finite and > 0)"));
+        }
+        if !extract_fps.is_finite() || extract_fps <= 0.0 {
+            return invalid(
+                "extract_fps",
+                format!("{extract_fps} (must be finite and > 0)"),
+            );
+        }
+        if !chunk_seconds.is_finite() || chunk_seconds <= 0.0 {
+            return invalid(
+                "chunk_seconds",
+                format!("{chunk_seconds} (must be finite and > 0)"),
+            );
+        }
+        if !min_gap.is_finite() || min_gap < 0.0 {
+            return invalid("min_gap", format!("{min_gap} (must be finite and >= 0)"));
+        }
+        if score_edge == 0 {
+            return invalid("score_edge", "0 (must be >= 1)");
+        }
+        Ok(Self {
+            base_fps,
+            extract_fps,
+            chunk_seconds,
+            min_gap,
+            score_edge,
+        })
+    }
+}
 
-    pub chunk_seconds: f32,
-    pub min_gap: f32,
+/// Perceptual-dedup parameters. The pHash is 64 bits, so a Hamming threshold
+/// past 64 would silently mean "drop everything after the first frame".
+#[derive(Debug, Clone, Copy)]
+struct DedupCfg {
+    hash_threshold: u32,
+    window: NonZeroUsize,
+}
 
-    pub jpeg_quality: u8,
-    pub hero_border_px: u32,
+impl DedupCfg {
+    fn new(hash_threshold: u32, window: NonZeroUsize) -> crate::error::Result<Self> {
+        if hash_threshold > 64 {
+            return invalid(
+                "hash_threshold",
+                format!("{hash_threshold} (must be <= 64)"),
+            );
+        }
+        Ok(Self {
+            hash_threshold,
+            window,
+        })
+    }
+}
 
-    pub quality: Quality,
-    pub detail: Detail,
+/// JPEG/compose parameters. Quality 0 is rejected by the encoder at the end
+/// of the run; catching it here fails before any frame work.
+#[derive(Debug, Clone, Copy)]
+struct RenderCfg {
+    jpeg_quality: u8,
+    hero_border_px: u32,
+}
 
-    pub strategy: SampleStrategy,
-    pub gap_threshold: f32,
-    pub min_keyframes: usize,
-    pub force_long_video: bool,
+impl RenderCfg {
+    fn new(jpeg_quality: u8, hero_border_px: u32) -> crate::error::Result<Self> {
+        if !(1..=100).contains(&jpeg_quality) {
+            return invalid(
+                "jpeg_quality",
+                format!("{jpeg_quality} (must be in 1..=100)"),
+            );
+        }
+        Ok(Self {
+            jpeg_quality,
+            hero_border_px,
+        })
+    }
+}
+
+/// Resolved strategy parameters; thresholds finite and positive by
+/// construction.
+#[derive(Debug, Clone, Copy)]
+struct StrategyCfg {
+    strategy: SampleStrategy,
+    gap_threshold: f32,
+    min_keyframes: usize,
+    max_duration: f32,
+    force_long_video: bool,
+}
+
+impl StrategyCfg {
+    fn new(opts: StrategyOpts) -> crate::error::Result<Self> {
+        if !opts.gap_threshold.is_finite() || opts.gap_threshold <= 0.0 {
+            return invalid(
+                "gap_threshold",
+                format!("{} (must be finite and > 0)", opts.gap_threshold),
+            );
+        }
+        if !opts.max_duration.is_finite() || opts.max_duration <= 0.0 {
+            return invalid(
+                "max_duration",
+                format!("{} (must be finite and > 0)", opts.max_duration),
+            );
+        }
+        Ok(Self {
+            strategy: opts.strategy,
+            gap_threshold: opts.gap_threshold,
+            min_keyframes: opts.min_keyframes,
+            max_duration: opts.max_duration,
+            force_long_video: opts.force,
+        })
+    }
+}
+
+/// All runtime parameters needed by the pipeline, grouped by domain.
+///
+/// Every group is built by a validating constructor, so a held `Config` is
+/// valid by construction; fields are private so nothing — production code or
+/// tests — can route around those constructors. Tests wanting non-default
+/// values go through [`Overrides`], the same door the CLI uses.
+#[derive(Debug, Clone)]
+pub struct Config {
+    canvas: CanvasSpec,
+    sampling: Sampling,
+    dedup: DedupCfg,
+    weights: Weights,
+    render: RenderCfg,
+    strategy: StrategyCfg,
+    quality: Quality,
+    detail: Detail,
 }
 
 /// Named profiles are partial parameter sets — the same shape as CLI
@@ -181,151 +355,115 @@ impl Config {
             };
         }
 
-        let cfg = Self {
-            max_edge,
-            min_frame_size,
-
-            base_fps: resolve!(base_fps, detail_fps),
-            extract_fps: resolve!(base_fps, detail_fps * 3.0),
-            hash_threshold: resolve!(hash_threshold, 8),
-            dedup_window: resolve!(dedup_window, DEFAULT_DEDUP_WINDOW),
-            score_edge: resolve!(score_edge, 256),
-
+        Ok(Self {
+            canvas: CanvasSpec::new(max_edge, min_frame_size)?,
+            sampling: Sampling::new(
+                resolve!(base_fps, detail_fps),
+                resolve!(base_fps, detail_fps * 3.0),
+                resolve!(chunk_seconds, 60.0),
+                resolve!(min_gap, 0.5),
+                resolve!(score_edge, 256),
+            )?,
+            dedup: DedupCfg::new(
+                resolve!(hash_threshold, 8),
+                resolve!(dedup_window, DEFAULT_DEDUP_WINDOW),
+            )?,
             // Clarity defaults to 0: Laplacian variance and Sobel energy are
             // both high-frequency measures, so a nonzero clarity weight
             // double-counts texture. It stays available as an override knob.
-            w_scene: resolve!(w_scene, 0.60),
-            w_clarity: resolve!(w_clarity, 0.0),
-            w_edge: resolve!(w_edge, 0.40),
-
-            chunk_seconds: resolve!(chunk_seconds, 60.0),
-            min_gap: resolve!(min_gap, 0.5),
-
-            jpeg_quality: resolve!(jpeg_quality, 92),
-            hero_border_px: resolve!(hero_border_px, 4),
-
+            weights: Weights::new(
+                resolve!(w_scene, 0.60),
+                resolve!(w_clarity, 0.0),
+                resolve!(w_edge, 0.40),
+            )?,
+            render: RenderCfg::new(resolve!(jpeg_quality, 92), resolve!(hero_border_px, 4))?,
+            strategy: StrategyCfg::new(strategy_opts)?,
             quality,
             detail,
-
-            strategy: strategy_opts.strategy,
-            gap_threshold: strategy_opts.gap_threshold,
-            min_keyframes: strategy_opts.min_keyframes,
-            force_long_video: strategy_opts.force,
-        };
-        cfg.validate()?;
-        Ok(cfg)
+        })
     }
 
-    /// Reject resolved values that would corrupt scoring or sampling arithmetic
-    /// before they reach the pipeline. Names the offending field and value.
-    fn validate(&self) -> crate::error::Result<()> {
-        let invalid = |field: &str, detail: String| -> crate::error::Result<()> {
-            Err(Error::new(
-                ErrorCode::InvalidConfig,
-                format!("invalid {field}: {detail}"),
-            ))
-        };
+    pub fn max_edge(&self) -> u32 {
+        self.canvas.edge()
+    }
 
-        // The canvas must hold at least one cell at the quality tier's
-        // legibility floor; anything smaller (down to --max-edge 0) would
-        // still "succeed" as a degenerate, unreadable image.
-        if self.max_edge < self.min_frame_size {
-            return invalid(
-                "max_edge",
-                format!(
-                    "{} (canvas must fit one cell at the quality floor, >= {}px)",
-                    self.max_edge, self.min_frame_size
-                ),
-            );
-        }
-        // The canvas allocation is sized directly from this value; without a
-        // cap, an oversized flag burns the full pipeline before JPEG encoding
-        // rejects the dimensions (or the allocation aborts first).
-        if self.max_edge > MAX_CANVAS_EDGE {
-            return invalid(
-                "max_edge",
-                format!(
-                    "{} (exceeds JPEG's {MAX_CANVAS_EDGE}px dimension limit)",
-                    self.max_edge
-                ),
-            );
-        }
-        for (name, w) in [
-            ("w_scene", self.w_scene),
-            ("w_clarity", self.w_clarity),
-            ("w_edge", self.w_edge),
-        ] {
-            if !w.is_finite() || w < 0.0 {
-                return invalid(name, format!("{w} (weights must be finite and >= 0)"));
-            }
-        }
-        if self.w_scene + self.w_clarity + self.w_edge <= 0.0 {
-            return invalid("weights", "all zero (at least one must be > 0)".to_string());
-        }
-        if !self.base_fps.is_finite() || self.base_fps <= 0.0 {
-            return invalid(
-                "base_fps",
-                format!("{} (must be finite and > 0)", self.base_fps),
-            );
-        }
-        if !self.chunk_seconds.is_finite() || self.chunk_seconds <= 0.0 {
-            return invalid(
-                "chunk_seconds",
-                format!("{} (must be finite and > 0)", self.chunk_seconds),
-            );
-        }
-        if !self.min_gap.is_finite() || self.min_gap < 0.0 {
-            return invalid(
-                "min_gap",
-                format!("{} (must be finite and >= 0)", self.min_gap),
-            );
-        }
-        if !self.gap_threshold.is_finite() || self.gap_threshold <= 0.0 {
-            return invalid(
-                "gap_threshold",
-                format!("{} (must be finite and > 0)", self.gap_threshold),
-            );
-        }
-        if !(1..=100).contains(&self.jpeg_quality) {
-            return invalid(
-                "jpeg_quality",
-                format!("{} (must be in 1..=100)", self.jpeg_quality),
-            );
-        }
-        if self.hash_threshold > 64 {
-            return invalid(
-                "hash_threshold",
-                format!("{} (must be <= 64)", self.hash_threshold),
-            );
-        }
-        if self.score_edge == 0 {
-            return invalid("score_edge", "0 (must be >= 1)".to_string());
-        }
-        Ok(())
+    /// The quality tier's minimum readable cell edge; extraction pre-scales
+    /// frames to this size.
+    pub fn min_frame_size(&self) -> u32 {
+        self.canvas.min_cell_edge()
     }
 
     /// Canvas geometry for layout: the full `max_edge` budget with the
     /// quality tier's cell floor.
-    pub fn canvas_spec(&self) -> crate::types::CanvasSpec {
-        crate::types::CanvasSpec {
-            edge: self.max_edge,
-            min_cell_edge: self.min_frame_size,
-        }
+    pub fn canvas_spec(&self) -> CanvasSpec {
+        self.canvas
+    }
+
+    pub fn base_fps(&self) -> f32 {
+        self.sampling.base_fps
+    }
+
+    pub fn extract_fps(&self) -> f32 {
+        self.sampling.extract_fps
+    }
+
+    pub fn chunk_seconds(&self) -> f32 {
+        self.sampling.chunk_seconds
+    }
+
+    pub fn min_gap(&self) -> f32 {
+        self.sampling.min_gap
+    }
+
+    pub fn score_edge(&self) -> u32 {
+        self.sampling.score_edge
+    }
+
+    pub fn hash_threshold(&self) -> u32 {
+        self.dedup.hash_threshold
+    }
+
+    pub fn dedup_window(&self) -> NonZeroUsize {
+        self.dedup.window
+    }
+
+    pub fn weights(&self) -> Weights {
+        self.weights
+    }
+
+    pub fn jpeg_quality(&self) -> u8 {
+        self.render.jpeg_quality
+    }
+
+    pub fn hero_border_px(&self) -> u32 {
+        self.render.hero_border_px
+    }
+
+    pub fn strategy(&self) -> SampleStrategy {
+        self.strategy.strategy
+    }
+
+    pub fn gap_threshold(&self) -> f32 {
+        self.strategy.gap_threshold
+    }
+
+    pub fn min_keyframes(&self) -> usize {
+        self.strategy.min_keyframes
+    }
+
+    pub fn max_duration(&self) -> f32 {
+        self.strategy.max_duration
+    }
+
+    pub fn force_long_video(&self) -> bool {
+        self.strategy.force_long_video
     }
 
     pub fn settings(&self) -> crate::types::Settings {
         crate::types::Settings {
-            max_edge: self.max_edge,
+            max_edge: self.max_edge(),
             quality: self.quality,
             detail: self.detail,
-        }
-    }
-
-    pub fn weights(&self) -> crate::score::Weights {
-        crate::score::Weights {
-            scene: self.w_scene,
-            clarity: self.w_clarity,
-            edge: self.w_edge,
         }
     }
 }
@@ -353,8 +491,8 @@ mod tests {
     #[test]
     fn extract_fps_defaults_to_triple_detail_fps() {
         let cfg = config_with(Overrides::default()).expect("default config builds");
-        assert_eq!(cfg.base_fps, 1.0, "standard detail samples at 1 fps");
-        assert_eq!(cfg.extract_fps, 3.0, "extract densifies the detail tier");
+        assert_eq!(cfg.base_fps(), 1.0, "standard detail samples at 1 fps");
+        assert_eq!(cfg.extract_fps(), 3.0, "extract densifies the detail tier");
     }
 
     #[test]
@@ -365,7 +503,8 @@ mod tests {
         };
         let cfg = config_with(ov).expect("config builds");
         assert_eq!(
-            cfg.extract_fps, 2.0,
+            cfg.extract_fps(),
+            2.0,
             "an explicit --base-fps means the same density in both subcommands"
         );
     }
@@ -478,5 +617,32 @@ mod tests {
             cfg.expect_err("over-limit canvas rejected").code,
             ErrorCode::InvalidConfig
         );
+    }
+
+    #[test]
+    fn rejects_invalid_strategy_thresholds() {
+        for opts in [
+            StrategyOpts {
+                gap_threshold: 0.0,
+                ..Default::default()
+            },
+            StrategyOpts {
+                max_duration: f32::NAN,
+                ..Default::default()
+            },
+        ] {
+            let cfg = Config::new(
+                2000,
+                Quality::High,
+                Detail::Standard,
+                None,
+                &Overrides::default(),
+                opts,
+            );
+            assert_eq!(
+                cfg.expect_err("invalid strategy opts rejected").code,
+                ErrorCode::InvalidConfig
+            );
+        }
     }
 }

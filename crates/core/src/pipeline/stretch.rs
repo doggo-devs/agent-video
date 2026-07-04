@@ -25,6 +25,15 @@ pub struct Stretch {
     pub rgb: Arc<RgbImage>,
 }
 
+/// The run of frames dropped as duplicates since the last kept frame: how
+/// many, and when the last one was seen. Present only after at least one
+/// drop, so "no drops yet" and "a drop at 0.0s" are distinct states by type
+/// rather than by a sentinel value.
+struct DropRun {
+    count: usize,
+    last_ts: f32,
+}
+
 /// Streaming detector for static stretches.
 ///
 /// Feed every dedup verdict in timestamp order via [`note_kept`] /
@@ -41,10 +50,8 @@ pub struct StretchDetector {
     /// representative should a static gap follow it. The `Arc` makes retaining
     /// it a pointer clone rather than a deep copy of the ~1.4 MB image.
     last_kept: Option<(f32, Arc<RgbImage>)>,
-    /// Frames dropped as duplicates since the last kept frame.
-    drops_since_kept: usize,
-    /// Timestamp of the most recent dropped frame (bounds a trailing stretch).
-    last_dropped_ts: f32,
+    /// Duplicates dropped since the last kept frame, if any.
+    drops: Option<DropRun>,
 }
 
 impl StretchDetector {
@@ -52,9 +59,13 @@ impl StretchDetector {
         Self {
             min_span,
             last_kept: None,
-            drops_since_kept: 0,
-            last_dropped_ts: 0.0,
+            drops: None,
         }
+    }
+
+    /// Number of duplicates dropped since the last kept frame.
+    fn drop_count(&self) -> usize {
+        self.drops.as_ref().map_or(0, |d| d.count)
     }
 
     /// Record a kept frame: returns the closed stretch if the gap since the
@@ -63,7 +74,7 @@ impl StretchDetector {
     pub fn note_kept(&mut self, ts: f32, rgb: &Arc<RgbImage>) -> Option<Stretch> {
         let stretch = match &self.last_kept {
             Some((prev_ts, prev_rgb))
-                if ts - prev_ts >= self.min_span && self.drops_since_kept >= MIN_STATIC_DROPS =>
+                if ts - prev_ts >= self.min_span && self.drop_count() >= MIN_STATIC_DROPS =>
             {
                 Some(Stretch {
                     start: *prev_ts,
@@ -74,26 +85,27 @@ impl StretchDetector {
             _ => None,
         };
         self.last_kept = Some((ts, rgb.clone()));
-        self.drops_since_kept = 0;
+        self.drops = None;
         stretch
     }
 
     /// Record a frame dropped as a duplicate of the last kept frame.
     pub fn note_dropped(&mut self, ts: f32) {
-        self.drops_since_kept += 1;
-        self.last_dropped_ts = ts;
+        let count = self.drop_count() + 1;
+        self.drops = Some(DropRun { count, last_ts: ts });
     }
 
     /// Close out a stretch that runs to the end of the stream, bounded by the
     /// last dropped duplicate rather than a following kept frame.
     pub fn finish(&mut self) -> Option<Stretch> {
-        if self.drops_since_kept < MIN_STATIC_DROPS {
+        let drops = self.drops.take()?;
+        if drops.count < MIN_STATIC_DROPS {
             return None;
         }
         let (prev_ts, rgb) = self.last_kept.take()?;
-        (self.last_dropped_ts - prev_ts >= self.min_span).then_some(Stretch {
+        (drops.last_ts - prev_ts >= self.min_span).then_some(Stretch {
             start: prev_ts,
-            end: self.last_dropped_ts,
+            end: drops.last_ts,
             rgb,
         })
     }

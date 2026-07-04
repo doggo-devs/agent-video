@@ -8,11 +8,10 @@ frames get larger cells so important moments keep their detail.
 ## Requirements
 
 - Rust (edition 2024)
-- `ffmpeg` on `PATH` (decoding and pre-scaling frames)
-- `ffprobe` on `PATH` (ships with ffmpeg; verifies duration in the default
-  fixed-fps mode and probes keyframes for `--strategy keyframes`/`adaptive`.
-  `--strategy fixed-fps --force` and `extract` run without it, skipping
-  embedded-subtitle auto-detection with a warning)
+- FFmpeg shared libraries + headers to build against (e.g. `pacman -S ffmpeg`,
+  `apt install libavcodec-dev libavformat-dev libswscale-dev`). Decoding,
+  probing, and subtitle extraction all run in-process — no `ffmpeg`/`ffprobe`
+  executables are spawned or required on `PATH`.
 
 ## Build
 
@@ -21,9 +20,29 @@ cargo build --release
 # binary at target/release/agent-video
 ```
 
+The default build links the system FFmpeg libraries dynamically, so the host
+needs a matching FFmpeg installed at runtime.
+
+For a self-contained release binary with **zero runtime dependencies**, build
+FFmpeg from source and link it statically. Software AV1 decoding additionally
+needs libdav1d (FFmpeg's native AV1 decoder is a hardware-only stub), so use the
+helper script — it builds a static dav1d, then builds with `static-ffmpeg`:
+
+```bash
+./scripts/build-static.sh
+# requires: git, nasm, meson, ninja, pkg-config, a C toolchain; a few minutes
+# on the first build (it compiles dav1d and FFmpeg from source).
+```
+
+The static binary has **no hardware acceleration** — FFmpeg is configured with
+`--disable-autodetect`, so all decoding is pure CPU (dav1d SIMD, dispatched at
+runtime). This is the right trade-off for a portable binary; use the dynamic
+build if you need the host's hardware decoders.
+
 `.cargo/config.toml` targets `x86-64-v3` (AVX2, ~all x86-64 CPUs since 2015).
 When distributing to older hardware, override with
-`RUSTFLAGS="-C target-cpu=x86-64"`.
+`RUSTFLAGS="-C target-cpu=x86-64"` and set `FFMPEG_TARGET_CPU=x86-64` so the
+statically compiled FFmpeg matches the same baseline.
 
 ## Usage
 
@@ -73,8 +92,9 @@ scoring weights, timing, subtitles).
 
 ## How it works
 
-1. **Extract** — ffmpeg samples frames at an fps set by `--detail`, streaming
-   through a dedup filter that drops perceptual-hash duplicates.
+1. **Extract** — an in-process decoder samples frames at an fps set by
+   `--detail`, streaming through a dedup filter that drops perceptual-hash
+   duplicates.
 2. **Score** — each frame gets a composite score from scene change, clarity,
    and edge density; top scorers become key frames.
 3. **Lay out & compose** — frames are packed into a grid within the pixel budget,
@@ -83,5 +103,6 @@ scoring weights, timing, subtitles).
 ## License
 
 MIT. The embedded timestamp font (Liberation Sans Bold) is licensed under the
-SIL Open Font License 1.1 — see `assets/OFL.txt`. ffmpeg/ffprobe are invoked
-as external executables and are not bundled or linked.
+SIL Open Font License 1.1 — see `assets/OFL.txt`. FFmpeg libraries are linked
+(dynamically by default, statically with `--features static-ffmpeg`) and carry
+their own LGPL/GPL licensing depending on the build configuration.

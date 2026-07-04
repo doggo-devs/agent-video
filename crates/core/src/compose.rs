@@ -166,10 +166,7 @@ mod tests {
 
     #[test]
     fn renders_nonempty_jpeg() {
-        let spec = crate::types::CanvasSpec {
-            edge: 1024,
-            min_cell_edge: 256,
-        };
+        let spec = crate::types::CanvasSpec::new(1024, 256).expect("valid test spec");
         let frames: Vec<_> = (0..4).map(|i| frame(i as f32)).collect();
         let layout = crate::layout::compute(&[0.0; 4], &[], 16.0 / 9.0, &spec);
         let bytes = render(&frames, &layout, &[], 92, 4).expect("render ok");
