@@ -3,7 +3,19 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 
-import { DownloadError, downloadDirect, headContentLength } from '../src/source/direct.ts'
+import {
+	availablePath,
+	DownloadError,
+	directIdentity,
+	downloadDirect,
+	extFromContainer,
+	headContentLength,
+} from '../src/source/direct.ts'
+import type { ProbeSummary } from '../src/tool/schema.ts'
+
+function probeWith(overrides: Partial<ProbeSummary> = {}): ProbeSummary {
+	return { duration: 300, width: 1280, height: 720, sizeBytes: 1, subtitles: [], ...overrides }
+}
 
 let server: ReturnType<typeof Bun.serve>
 let base: string
@@ -85,6 +97,47 @@ describe('downloadDirect', () => {
 		await downloadDirect(`${base}/file.mp4`, dest, 1024 ** 2, (b, t) => reports.push([b, t]))
 		const last = reports.at(-1)
 		expect(last).toEqual([BODY.length, BODY.length])
+	})
+})
+
+describe('directIdentity', () => {
+	test('takes_extension_and_filename_from_the_url_path', () => {
+		const id = directIdentity('https://cdn.example.com/a/b/Talk%202024.mp4?sig=x', probeWith())
+		expect(id.ext).toBe('mp4')
+		expect(id.filename).toBe('Talk 2024.mp4')
+	})
+
+	test('falls_back_to_container_when_the_path_has_no_extension', () => {
+		const id = directIdentity('https://cdn.example.com/stream', probeWith({ container: 'matroska,webm' }))
+		expect(id.ext).toBe('mkv')
+		expect(id.filename).toBe('stream.mkv')
+	})
+
+	test('degenerate_urls_get_a_generic_filename', () => {
+		expect(directIdentity('https://cdn.example.com/', probeWith()).filename).toBe('download.mp4')
+	})
+})
+
+describe('extFromContainer', () => {
+	test('maps_container_names_to_extensions', () => {
+		expect(extFromContainer('mov,mp4,m4a,3gp,3g2,mj2')).toBe('mp4')
+		expect(extFromContainer('matroska,webm')).toBe('mkv')
+		expect(extFromContainer(undefined)).toBe('mp4')
+		expect(extFromContainer('avi')).toBe('avi')
+	})
+})
+
+describe('availablePath', () => {
+	test('returns_the_path_itself_when_free', async () => {
+		const p = path.join(tmp, 'fresh.mp4')
+		expect(await availablePath(p)).toBe(p)
+	})
+
+	test('appends_a_counter_past_existing_files', async () => {
+		const p = path.join(tmp, 'taken.mp4')
+		fs.writeFileSync(p, 'x')
+		fs.writeFileSync(path.join(tmp, 'taken (1).mp4'), 'x')
+		expect(await availablePath(p)).toBe(path.join(tmp, 'taken (2).mp4'))
 	})
 })
 

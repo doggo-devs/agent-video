@@ -25,11 +25,19 @@ export interface Config {
 		analysisMaxHeight: number
 		// where `dl-keep-*` downloads land; the file belongs to the user
 		keepDir: string
+		// how long a confirmed download may block the call before going background
+		syncWaitSeconds: number
 	}
 	cache: {
 		dir: string
 		// LRU eviction threshold over `downloads/`
 		maxBytes: number
+	}
+	transcribe: {
+		// explicit whisper binary; overrides PATH detection
+		bin?: string
+		// model name (openai dialect) or ggml file path (whisper.cpp, required there)
+		model?: string
 	}
 }
 
@@ -39,8 +47,9 @@ const GIB = 1024 ** 3
 export function defaultConfig(home: string = os.homedir()): Config {
 	return {
 		budget: { autoRun: 2, max: 8 },
-		download: { maxBytes: 2 * GIB, analysisMaxHeight: 480, keepDir: path.join(home, 'Downloads') },
+		download: { maxBytes: 2 * GIB, analysisMaxHeight: 480, keepDir: path.join(home, 'Downloads'), syncWaitSeconds: 20 },
 		cache: { dir: path.join(home, '.cache', 'agent-video'), maxBytes: 10 * GIB },
+		transcribe: {},
 	}
 }
 
@@ -57,8 +66,9 @@ export class ConfigError extends Error {
 // JSON file shape: snake_case keys, every field optional, unknown keys rejected
 interface ConfigFile {
 	budget?: { auto_run?: number; max?: number }
-	download?: { max_bytes?: number; analysis_max_height?: number; keep_dir?: string }
+	download?: { max_bytes?: number; analysis_max_height?: number; keep_dir?: string; sync_wait_seconds?: number }
 	cache?: { dir?: string; max_bytes?: number }
+	transcribe?: { bin?: string; model?: string }
 }
 
 function requirePositiveInt(value: unknown, key: string): number {
@@ -88,7 +98,7 @@ function applyFile(cfg: Config, raw: unknown): void {
 		throw new ConfigError('config file root must be a JSON object')
 	}
 	const file = raw as ConfigFile
-	rejectUnknownKeys(file, ['budget', 'download', 'cache'], '')
+	rejectUnknownKeys(file, ['budget', 'download', 'cache', 'transcribe'], '')
 
 	if (file.budget !== undefined) {
 		rejectUnknownKeys(file.budget, ['auto_run', 'max'], 'budget.')
@@ -97,19 +107,28 @@ function applyFile(cfg: Config, raw: unknown): void {
 		if (b.max !== undefined) cfg.budget.max = requirePositiveInt(b.max, 'budget.max')
 	}
 	if (file.download !== undefined) {
-		rejectUnknownKeys(file.download, ['max_bytes', 'analysis_max_height', 'keep_dir'], 'download.')
+		rejectUnknownKeys(file.download, ['max_bytes', 'analysis_max_height', 'keep_dir', 'sync_wait_seconds'], 'download.')
 		const d = file.download
 		if (d.max_bytes !== undefined) cfg.download.maxBytes = requirePositiveInt(d.max_bytes, 'download.max_bytes')
 		if (d.analysis_max_height !== undefined) {
 			cfg.download.analysisMaxHeight = requirePositiveInt(d.analysis_max_height, 'download.analysis_max_height')
 		}
 		if (d.keep_dir !== undefined) cfg.download.keepDir = requireString(d.keep_dir, 'download.keep_dir')
+		if (d.sync_wait_seconds !== undefined) {
+			cfg.download.syncWaitSeconds = requirePositiveInt(d.sync_wait_seconds, 'download.sync_wait_seconds')
+		}
 	}
 	if (file.cache !== undefined) {
 		rejectUnknownKeys(file.cache, ['dir', 'max_bytes'], 'cache.')
 		const c = file.cache
 		if (c.dir !== undefined) cfg.cache.dir = requireString(c.dir, 'cache.dir')
 		if (c.max_bytes !== undefined) cfg.cache.maxBytes = requirePositiveInt(c.max_bytes, 'cache.max_bytes')
+	}
+	if (file.transcribe !== undefined) {
+		rejectUnknownKeys(file.transcribe, ['bin', 'model'], 'transcribe.')
+		const t = file.transcribe
+		if (t.bin !== undefined) cfg.transcribe.bin = requireString(t.bin, 'transcribe.bin')
+		if (t.model !== undefined) cfg.transcribe.model = requireString(t.model, 'transcribe.model')
 	}
 }
 
@@ -130,8 +149,11 @@ function applyEnv(cfg: Config, env: NodeJS.ProcessEnv): void {
 	cfg.download.analysisMaxHeight =
 		envInt(env, 'AGENT_VIDEO_DOWNLOAD_ANALYSIS_MAX_HEIGHT') ?? cfg.download.analysisMaxHeight
 	cfg.download.keepDir = env['AGENT_VIDEO_DOWNLOAD_KEEP_DIR'] ?? cfg.download.keepDir
+	cfg.download.syncWaitSeconds = envInt(env, 'AGENT_VIDEO_DOWNLOAD_SYNC_WAIT_SECONDS') ?? cfg.download.syncWaitSeconds
 	cfg.cache.dir = env['AGENT_VIDEO_CACHE_DIR'] ?? cfg.cache.dir
 	cfg.cache.maxBytes = envInt(env, 'AGENT_VIDEO_CACHE_MAX_BYTES') ?? cfg.cache.maxBytes
+	cfg.transcribe.bin = env['AGENT_VIDEO_TRANSCRIBE_BIN'] ?? cfg.transcribe.bin
+	cfg.transcribe.model = env['AGENT_VIDEO_TRANSCRIBE_MODEL'] ?? cfg.transcribe.model
 }
 
 // ── loading ──

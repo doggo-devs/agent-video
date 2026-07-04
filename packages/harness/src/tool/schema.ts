@@ -116,10 +116,16 @@ export interface ConfirmRequired {
 	tokens: OfferedToken[]
 }
 
+// A download continues in the background; poll by calling again with the same source
+export interface Pending {
+	status: 'pending'
+	message: string
+}
+
 // Invalid input or environment failure; message can be shown to the model
 export interface Failed {
 	status: 'failed'
 	error: string
 }
 
-export type VideoResult = Ready | Plan | ConfirmRequired | Failed
+export type VideoResult = Ready | Plan | ConfirmRequired | Pending | Failed

@@ -10,27 +10,26 @@ export interface DownloadPlan {
 	url: string
 	// cache = disposable analysis copy; keep = user-owned file in keep_dir
 	dest: 'cache' | 'keep'
-	method:
-		| {
-				type: 'direct'
-				// file extension for the cache path
-				ext: string
-				// human-readable filename used when dest is keep
-				filename: string
-		  }
-		| {
-				type: 'ytdlp'
-				// yt-dlp -f format selector, decided at offer time
-				format: string
-				// also fetch subtitle sidecar (analysis copy only)
-				subs: boolean
-		  }
+	// name of the UrlSource that issued (and will execute) this plan
+	source: string
+	// source-private recipe describing exactly what to fetch
+	recipe: unknown
 	// best-effort size estimate; undefined = unknown before download
 	estimatedBytes?: number
 }
 
+// A transcription decision: the media is local by probe time
+export interface TranscribePlan {
+	file: string
+	// content fingerprint keying the cached transcript
+	fingerprint: string
+}
+
 // The action authorized once a token is redeemed
-export type PendingAction = { kind: 'core'; invocation: CoreInvocation } | { kind: 'download'; plan: DownloadPlan }
+export type PendingAction =
+	| { kind: 'core'; invocation: CoreInvocation }
+	| { kind: 'download'; plan: DownloadPlan }
+	| { kind: 'transcribe'; plan: TranscribePlan }
 
 // Storage interface the policy engine needs; hand-fakeable in tests
 export interface PendingStore {

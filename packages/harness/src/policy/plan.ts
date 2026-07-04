@@ -10,7 +10,7 @@ import { ArgError } from './errors.ts'
 import { presetFor } from './look.ts'
 import { parseRaw } from './raw.ts'
 import { formatTimestamp, resolveWindow, type Window } from './time.ts'
-import type { DownloadPlan, PendingStore } from './tokens.ts'
+import type { DownloadPlan, PendingStore, TranscribePlan } from './tokens.ts'
 
 // A fully-decided core run; the server injects source and I/O flags
 export interface CoreInvocation {
@@ -33,6 +33,7 @@ export interface PlanDecision {
 export type Decision =
 	| { kind: 'run'; invocation: CoreInvocation; notices: string[] }
 	| { kind: 'download'; plan: DownloadPlan; notices: string[] }
+	| { kind: 'transcribe'; plan: TranscribePlan; notices: string[] }
 	| PlanDecision
 	| { kind: 'confirm'; consequence: string; tokens: OfferedToken[] }
 	| { kind: 'reject'; message: string }
@@ -68,9 +69,14 @@ export function redeem(args: VideoArgs, store: PendingStore): Decision {
 		}
 	}
 	const notices = [`confirmed: ${token}`]
-	return action.kind === 'core'
-		? { kind: 'run', invocation: action.invocation, notices }
-		: { kind: 'download', plan: action.plan, notices }
+	switch (action.kind) {
+		case 'core':
+			return { kind: 'run', invocation: action.invocation, notices }
+		case 'download':
+			return { kind: 'download', plan: action.plan, notices }
+		case 'transcribe':
+			return { kind: 'transcribe', plan: action.plan, notices }
+	}
 }
 
 function decideInner(args: VideoArgs, probe: ProbeSummary, cfg: Config, store: PendingStore): Decision {

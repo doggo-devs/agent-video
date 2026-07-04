@@ -8,9 +8,13 @@
 // --print after_move:filepath for the final path; the human bar is never parsed.
 
 import { spawn } from 'node:child_process'
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
 
-import type { KeepTier, SiteUrlInfo } from '../policy/url.ts'
-import type { ProgressFn } from './direct.ts'
+import { formatBytes } from '../policy/plan.ts'
+import { formatTimestamp } from '../policy/time.ts'
+import type { Config } from '../store/config.ts'
+import { type DownloadOption, estimateLabel, type ProgressFn, type SourceInfo, type UrlSource } from './source.ts'
 
 // yt-dlp failed or is not installed; message is model-presentable.
 export class YtdlpError extends Error {
@@ -30,6 +34,50 @@ const INSTALL_HINT =
 // How many keep tiers (distinct heights) to offer at most.
 export const KEEP_TIER_LIMIT = 3
 
+// Recipe carried by yt-dlp download plans
+export interface YtdlpRecipe {
+	// yt-dlp -f format selector, decided at offer time
+	format: string
+	// also fetch subtitle sidecar (analysis copy only)
+	subs: boolean
+}
+
+// The pluggable site source: yt-dlp -J probe, yt-dlp download
+export function createYtdlpSource(cfg: Config): UrlSource {
+	return {
+		name: 'ytdlp',
+		async probe(url) {
+			return siteSourceInfo(await probeSite(url, cfg.download.analysisMaxHeight), cfg)
+		},
+		async download(plan, io, onProgress) {
+			const recipe = plan.recipe as YtdlpRecipe
+			if (io.dest === 'cache') {
+				const { filepath } = await downloadSite(
+					{
+						url: plan.url,
+						format: recipe.format,
+						maxBytes: cfg.download.maxBytes,
+						output: path.join(io.dir, `${io.key}.%(ext)s`),
+						subtitleOutput: recipe.subs ? path.join(io.dir, `${io.key}.%(lang)s.%(ext)s`) : undefined,
+					},
+					onProgress
+				)
+				if (recipe.subs) await promoteSubtitle(io.dir, io.key)
+				return { filepath }
+			}
+			return downloadSite(
+				{
+					url: plan.url,
+					format: recipe.format,
+					maxBytes: cfg.download.maxBytes,
+					output: path.join(io.dir, '%(title)s [%(id)s].%(ext)s'),
+				},
+				onProgress
+			)
+		},
+	}
+}
+
 // ── -J document ──
 
 export interface YtdlpFormat {
@@ -46,6 +94,24 @@ export interface YtdlpJson {
 	duration?: number
 	subtitles?: Record<string, unknown>
 	formats?: YtdlpFormat[]
+}
+
+// One keep tier derived from a site's format list
+export interface KeepTier {
+	height: number
+	estimatedBytes?: number
+}
+
+// A site page probed via yt-dlp -J
+export interface SiteUrlInfo {
+	title: string
+	// Seconds; live streams may not report one
+	duration?: number
+	subtitleLangs: string[]
+	// Distinct available heights, descending, already capped in count
+	keepTiers: KeepTier[]
+	// Estimate for the analysis rip (video-only, height-capped)
+	analysisEstimatedBytes?: number
 }
 
 function sizeOf(f: YtdlpFormat): number | undefined {
@@ -67,9 +133,9 @@ function maxSize(fmts: YtdlpFormat[]): number | undefined {
 	return sizes.length > 0 ? Math.max(...sizes) : undefined
 }
 
-// Reduce a -J document to the policy-facing SiteUrlInfo; pure. Size estimates
-// mirror download selectors: keep = best video at tier + best audio, analysis =
-// best video-only rendition at or under analysisMaxHeight.
+// Reduce a -J document to SiteUrlInfo; pure. Size estimates mirror download
+// selectors: keep = best video at tier + best audio, analysis = best
+// video-only rendition at or under analysisMaxHeight.
 export function siteInfo(doc: YtdlpJson, analysisMaxHeight: number): SiteUrlInfo {
 	const formats = doc.formats ?? []
 	const video = formats.filter(isVideo)
@@ -90,12 +156,70 @@ export function siteInfo(doc: YtdlpJson, analysisMaxHeight: number): SiteUrlInfo
 	const bestHeight = pool.length > 0 ? Math.max(...pool.map(f => f.height as number)) : undefined
 
 	return {
-		kind: 'site',
 		title: doc.title ?? doc.id ?? 'untitled',
 		duration: typeof doc.duration === 'number' && doc.duration > 0 ? doc.duration : undefined,
 		subtitleLangs: Object.keys(doc.subtitles ?? {}),
 		keepTiers,
 		analysisEstimatedBytes: bestHeight === undefined ? undefined : maxSize(pool.filter(f => f.height === bestHeight)),
+	}
+}
+
+// Turn site facts into the source info: analysis rip plus keep tiers
+export function siteSourceInfo(info: SiteUrlInfo, cfg: Config): SourceInfo {
+	const h = cfg.download.analysisMaxHeight
+	const duration = info.duration !== undefined ? formatTimestamp(info.duration) : 'unknown duration'
+	const subs = info.subtitleLangs.length > 0 ? `subtitles: ${info.subtitleLangs.join(', ')}` : 'no subtitles listed'
+
+	const options: DownloadOption[] = [
+		{
+			token: 'dl-analysis',
+			dest: 'cache',
+			label:
+				info.analysisEstimatedBytes !== undefined
+					? `analysis rip (${formatBytes(info.analysisEstimatedBytes)})`
+					: 'analysis rip',
+			effect: `download a video-only rip (≤${h}p, ${estimateLabel(info.analysisEstimatedBytes)}) plus subtitles into the analysis cache (evictable)`,
+			estimatedBytes: info.analysisEstimatedBytes,
+			recipe: { format: `bv[height<=${h}]/bv*[height<=${h}]/b`, subs: true } satisfies YtdlpRecipe,
+		},
+	]
+	for (const tier of info.keepTiers) {
+		options.push({
+			token: `dl-keep-${tier.height}`,
+			dest: 'keep',
+			label:
+				tier.estimatedBytes !== undefined ? `${tier.height}p (${formatBytes(tier.estimatedBytes)})` : `${tier.height}p`,
+			effect: `save best audio+video at ≤${tier.height}p (${estimateLabel(tier.estimatedBytes)}) to ${cfg.download.keepDir} for the user`,
+			estimatedBytes: tier.estimatedBytes,
+			recipe: {
+				format: `bv*[height<=${tier.height}]+ba/b[height<=${tier.height}]/b`,
+				subs: false,
+			} satisfies YtdlpRecipe,
+		})
+	}
+
+	return { headline: `"${info.title}" — ${duration}, ${subs}. Nothing is downloaded yet.`, options }
+}
+
+// Copy the preferred-language subtitle to `<key>.srt` so it rides along with every grid
+export async function promoteSubtitle(dir: string, key: string): Promise<void> {
+	let names: string[]
+	try {
+		names = await fs.readdir(dir)
+	} catch {
+		return
+	}
+	const re = new RegExp(`^${key}\\.([^.]+)\\.(srt|vtt|ass)$`)
+	const candidates = names.map(n => re.exec(n)).filter((m): m is RegExpExecArray => m !== null)
+	if (candidates.length === 0) return
+	const preferred =
+		candidates.find(m => m[1]?.startsWith('en')) ?? candidates.find(m => m[1]?.startsWith('zh')) ?? candidates[0]
+	if (!preferred) return
+	const target = path.join(dir, `${key}.${preferred[2]}`)
+	try {
+		await fs.access(target)
+	} catch {
+		await fs.copyFile(path.join(dir, preferred[0]), target)
 	}
 }
 

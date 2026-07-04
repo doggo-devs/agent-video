@@ -10,13 +10,17 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 import { captureCore } from '../src/core/binary.ts'
 import type { Metadata } from '../src/core/contract.ts'
 import { createServer, handleVideoCall, type ServerDeps } from '../src/mcp/server.ts'
+import { DownloadTracker } from '../src/mcp/tracker.ts'
 import { TokenRegistry } from '../src/policy/tokens.ts'
-import type { SiteUrlInfo } from '../src/policy/url.ts'
-import { ProbeError, probeLocalFile } from '../src/probe/ffprobe.ts'
-import { YtdlpError } from '../src/source/ytdlp.ts'
+import { probeLocalFile } from '../src/probe/ffprobe.ts'
+import { directInfo } from '../src/source/direct.ts'
+import type { DownloadIO, ProgressFn, SourceInfo, UrlSource } from '../src/source/source.ts'
+import { type SiteUrlInfo, siteSourceInfo, YtdlpError } from '../src/source/ytdlp.ts'
 import { Cache, urlKey } from '../src/store/cache.ts'
 import { defaultConfig } from '../src/store/config.ts'
+import { fingerprintFile } from '../src/store/identity.ts'
 import type { ProbeSummary, VideoResult } from '../src/tool/schema.ts'
+import type { WhisperFacade } from '../src/transcribe/whisper.ts'
 
 // ── fixtures ──
 
@@ -87,7 +91,35 @@ function probeOf(duration: number): ProbeSummary {
 	return { duration, width: 1920, height: 1080, sizeBytes: 4096, subtitles: [] }
 }
 
-/** Deps with throwing side effects and a fixed probe; override what the test owns. */
+// A source that never claims a URL (chain continues past it)
+const directPasses: UrlSource = {
+	name: 'direct',
+	probe: async () => undefined,
+	download: async () => {
+		throw new Error('no direct download expected')
+	},
+}
+
+// A yt-dlp stand-in with no binary: probe reports the install hint
+const ytdlpMissing: UrlSource = {
+	name: 'ytdlp',
+	probe: async () => {
+		throw new YtdlpError('yt-dlp not found on PATH — install it', true)
+	},
+	download: async () => {
+		throw new Error('no site download expected')
+	},
+}
+
+// Whisper that is never available; degrades to a hint
+const whisperAbsent: WhisperFacade = {
+	available: async () => false,
+	transcribe: async () => {
+		throw new Error('no transcription expected')
+	},
+}
+
+/** Deps with inert URL sources, no whisper, and a fixed probe; override what the test owns. */
 function fakeDeps(overrides: Partial<ServerDeps> = {}): ServerDeps {
 	const config = defaultConfig('/home/u')
 	config.cache.dir = fs.mkdtempSync(path.join(os.tmpdir(), 'av-server-cache-'))
@@ -97,18 +129,9 @@ function fakeDeps(overrides: Partial<ServerDeps> = {}): ServerDeps {
 		cache: new Cache(config.cache),
 		tokens: new TokenRegistry(),
 		probeFile: async () => probeOf(600),
-		probeMediaUrl: async () => {
-			throw new ProbeError('not a direct media link')
-		},
-		probeSite: async () => {
-			throw new YtdlpError('yt-dlp not found on PATH — install it', true)
-		},
-		downloadDirect: async () => {
-			throw new Error('no direct download expected in this test')
-		},
-		downloadSite: async () => {
-			throw new Error('no site download expected in this test')
-		},
+		sources: [directPasses, ytdlpMissing],
+		downloads: new DownloadTracker(),
+		whisper: whisperAbsent,
 		runCore: async () => {
 			throw new Error('no core run expected in this test')
 		},
@@ -120,6 +143,29 @@ function bodyOf(result: CallToolResult): VideoResult {
 	const first = result.content[0]
 	if (first?.type !== 'text') throw new Error('expected a text block first')
 	return JSON.parse(first.text) as VideoResult
+}
+
+// A URL source whose probe returns a fixed SourceInfo and whose download runs `impl`
+function claimingSource(
+	name: string,
+	info: SourceInfo,
+	download: (
+		plan: { url: string; dest: 'cache' | 'keep'; recipe: unknown },
+		io: DownloadIO,
+		p?: ProgressFn
+	) => Promise<{ filepath: string }>
+): UrlSource {
+	return { name, probe: async () => info, download: download as UrlSource['download'] }
+}
+
+function siteInfoFixture(): SiteUrlInfo {
+	return {
+		title: 'A Talk',
+		duration: 1800,
+		subtitleLangs: ['en'],
+		keepTiers: [{ height: 720, estimatedBytes: 500 * 1024 ** 2 }],
+		analysisEstimatedBytes: 80 * 1024 ** 2,
+	}
 }
 
 // ── MCP wiring (real client ↔ server over linked transports) ──
@@ -263,20 +309,13 @@ describe('handleVideoCall', () => {
 
 const SITE_URL = 'https://tube.example/watch?v=42'
 
-function siteInfoFixture(): SiteUrlInfo {
-	return {
-		kind: 'site',
-		title: 'A Talk',
-		duration: 1800,
-		subtitleLangs: ['en'],
-		keepTiers: [{ height: 720, estimatedBytes: 500 * 1024 ** 2 }],
-		analysisEstimatedBytes: 80 * 1024 ** 2,
-	}
+function sitePlanSource(download: Parameters<typeof claimingSource>[2]): UrlSource {
+	return claimingSource('ytdlp', siteSourceInfo(siteInfoFixture(), defaultConfig('/home/u')), download)
 }
 
 describe('handleVideoCall: URL stack', () => {
 	test('first_contact_with_site_url_offers_download_tokens', async () => {
-		const deps = fakeDeps({ probeSite: async () => siteInfoFixture() })
+		const deps = fakeDeps({ sources: [directPasses, sitePlanSource(async () => ({ filepath: '/unused' }))] })
 		const result = await handleVideoCall({ source: SITE_URL }, deps)
 		const body = bodyOf(result)
 		if (body.status !== 'confirm_required') throw new Error(`expected confirm, got ${body.status}`)
@@ -285,7 +324,11 @@ describe('handleVideoCall: URL stack', () => {
 	})
 
 	test('first_contact_with_direct_link_offers_download_tokens', async () => {
-		const deps = fakeDeps({ probeMediaUrl: async () => ({ ...probeOf(300), sizeBytes: 700 * 1024 ** 2 }) })
+		const cfg = defaultConfig('/home/u')
+		const info = directInfo('https://cdn.example.com/talk.mp4', { ...probeOf(300), sizeBytes: 700 * 1024 ** 2 }, cfg)
+		const deps = fakeDeps({
+			sources: [claimingSource('direct', info, async () => ({ filepath: '/unused' })), ytdlpMissing],
+		})
 		const result = await handleVideoCall({ source: 'https://cdn.example.com/talk.mp4' }, deps)
 		const body = bodyOf(result)
 		if (body.status !== 'confirm_required') throw new Error(`expected confirm, got ${body.status}`)
@@ -293,37 +336,39 @@ describe('handleVideoCall: URL stack', () => {
 	})
 
 	test('confirmed_analysis_download_lands_in_cache_and_answers_with_a_plan', async () => {
-		let requested: string | undefined
+		let recipe: unknown
 		const progressReports: number[] = []
+		const key = urlKey(SITE_URL)
 		const deps = fakeDeps({
-			probeSite: async () => siteInfoFixture(),
-			downloadSite: async (req, onProgress) => {
-				requested = req.format
-				onProgress?.(1024, 2048)
-				const filepath = req.output.replace('%(ext)s', 'webm')
-				fs.writeFileSync(filepath, Buffer.alloc(2048, 1))
-				if (req.subtitleOutput) fs.writeFileSync(req.subtitleOutput.replace('%(lang)s.%(ext)s', 'en.srt'), '1\nsubs')
-				return { filepath }
-			},
 			probeFile: async () => probeOf(1800),
+			sources: [
+				directPasses,
+				sitePlanSource(async (plan, io, onProgress) => {
+					recipe = plan.recipe
+					if (io.dest !== 'cache') throw new Error('expected cache dest')
+					onProgress?.(1024, 2048)
+					const filepath = path.join(io.dir, `${io.key}.webm`)
+					fs.writeFileSync(filepath, Buffer.alloc(2048, 1))
+					return { filepath }
+				}),
+			],
 		})
 
 		// 1: first contact issues tokens
 		await handleVideoCall({ source: SITE_URL }, deps)
-		// 2: redeem dl-analysis — downloads, then answers with a plan
+		// 2: redeem dl-analysis — downloads within the sync window, answers with a plan
 		const result = await handleVideoCall({ source: SITE_URL, confirm: 'dl-analysis' }, deps, p =>
 			progressReports.push(p)
 		)
 		const body = bodyOf(result)
 		if (body.status !== 'plan') throw new Error(`expected plan, got ${body.status}`)
 		expect(body.guidance).toContain('Analysis rip downloaded')
-		expect(requested).toContain('height<=480')
+		expect(recipe).toMatchObject({ format: expect.stringContaining('height<=480'), subs: true })
 		expect(progressReports).toEqual([1024])
-		// subtitle promoted to the exact video stem for sidecar pickup
-		const key = urlKey(SITE_URL)
-		expect(fs.existsSync(path.join(deps.config.cache.dir, 'downloads', `${key}.srt`))).toBe(true)
+		// finished within the window: nothing left in the tracker
+		expect(deps.downloads.peek(key)).toBeUndefined()
 
-		// 3: the URL now resolves to the cached rip and runs core on it. The rip's probe (1800s) is already cached by content.
+		// 3: the URL now resolves to the cached rip and runs core on it.
 		const argv: string[][] = []
 		deps.runCore = async args => {
 			argv.push([...args])
@@ -336,14 +381,17 @@ describe('handleVideoCall: URL stack', () => {
 
 	test('confirmed_keep_download_hands_the_file_over', async () => {
 		const deps = fakeDeps({
-			probeSite: async () => siteInfoFixture(),
-			downloadSite: async req => {
-				expect(req.subtitleOutput).toBeUndefined()
-				const filepath = req.output.replace('%(title)s [%(id)s].%(ext)s', 'A Talk [42].mp4')
-				fs.writeFileSync(filepath, Buffer.alloc(1024, 1))
-				return { filepath }
-			},
 			probeFile: async () => probeOf(1800),
+			sources: [
+				directPasses,
+				sitePlanSource(async (_plan, io) => {
+					if (io.dest !== 'keep') throw new Error('expected keep dest')
+					const filepath = path.join(io.dir, 'A Talk [42].mp4')
+					fs.mkdirSync(io.dir, { recursive: true })
+					fs.writeFileSync(filepath, Buffer.alloc(1024, 1))
+					return { filepath }
+				}),
+			],
 		})
 
 		await handleVideoCall({ source: SITE_URL }, deps)
@@ -366,10 +414,12 @@ describe('handleVideoCall: URL stack', () => {
 
 	test('download_failure_surfaces_as_failed_result', async () => {
 		const deps = fakeDeps({
-			probeSite: async () => siteInfoFixture(),
-			downloadSite: async () => {
-				throw new YtdlpError('yt-dlp download failed (exit 1): network sad')
-			},
+			sources: [
+				directPasses,
+				sitePlanSource(async () => {
+					throw new YtdlpError('yt-dlp download failed (exit 1): network sad')
+				}),
+			],
 		})
 		await handleVideoCall({ source: SITE_URL }, deps)
 		const result = await handleVideoCall({ source: SITE_URL, confirm: 'dl-analysis' }, deps)
@@ -377,5 +427,175 @@ describe('handleVideoCall: URL stack', () => {
 		const body = bodyOf(result)
 		if (body.status !== 'failed') throw new Error(`expected failed, got ${body.status}`)
 		expect(body.error).toContain('network sad')
+	})
+})
+
+// ── async downloads (tracker) ──
+
+function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
+	let resolve!: (v: T) => void
+	const promise = new Promise<T>(r => {
+		resolve = r
+	})
+	return { promise, resolve }
+}
+
+async function waitSettled(deps: ServerDeps, key: string): Promise<void> {
+	for (let i = 0; i < 400; i += 1) {
+		if (deps.downloads.peek(key)?.settled !== undefined) return
+		await new Promise(r => setTimeout(r, 5))
+	}
+	throw new Error('background download never settled')
+}
+
+describe('async downloads', () => {
+	test('slow_download_detaches_then_hands_its_result_out_exactly_once', async () => {
+		const key = urlKey(SITE_URL)
+		const gate = deferred<void>()
+		const deps = fakeDeps({
+			probeFile: async () => probeOf(1800),
+			sources: [
+				directPasses,
+				sitePlanSource(async (_plan, io) => {
+					await gate.promise
+					const filepath = path.join(io.dir, `${(io as { key: string }).key}.webm`)
+					fs.writeFileSync(filepath, Buffer.alloc(2048, 1))
+					return { filepath }
+				}),
+			],
+		})
+		deps.config.download.syncWaitSeconds = 0
+
+		await handleVideoCall({ source: SITE_URL }, deps)
+		// redeem: the download stalls past the (zero) sync window and detaches
+		const pending = bodyOf(await handleVideoCall({ source: SITE_URL, confirm: 'dl-analysis' }, deps))
+		expect(pending.status).toBe('pending')
+		expect(deps.downloads.peek(key)).toBeDefined()
+
+		// a bare poll while in-flight reports progress, does not restart the download
+		const poll = bodyOf(await handleVideoCall({ source: SITE_URL }, deps))
+		expect(poll.status).toBe('pending')
+
+		gate.resolve()
+		await waitSettled(deps, key)
+
+		// first poll after completion hands out the settled plan
+		const settled = bodyOf(await handleVideoCall({ source: SITE_URL }, deps))
+		if (settled.status !== 'plan') throw new Error(`expected plan, got ${settled.status}`)
+		expect(settled.guidance).toContain('Analysis rip downloaded')
+		expect(deps.downloads.peek(key)).toBeUndefined()
+
+		// the next poll no longer replays it: the cached rip serves instead
+		const again = bodyOf(await handleVideoCall({ source: SITE_URL }, deps))
+		if (again.status !== 'plan') throw new Error(`expected plan, got ${again.status}`)
+		expect(again.guidance).not.toContain('Analysis rip downloaded')
+	})
+
+	test('fast_download_answers_inline_and_leaves_no_tracker_entry', async () => {
+		const key = urlKey(SITE_URL)
+		const deps = fakeDeps({
+			probeFile: async () => probeOf(1800),
+			sources: [
+				directPasses,
+				sitePlanSource(async (_plan, io) => {
+					const filepath = path.join(io.dir, `${(io as { key: string }).key}.webm`)
+					fs.writeFileSync(filepath, Buffer.alloc(2048, 1))
+					return { filepath }
+				}),
+			],
+		})
+		// generous sync window: the (instant) download wins the race
+		deps.config.download.syncWaitSeconds = 30
+
+		await handleVideoCall({ source: SITE_URL }, deps)
+		const body = bodyOf(await handleVideoCall({ source: SITE_URL, confirm: 'dl-analysis' }, deps))
+		if (body.status !== 'plan') throw new Error(`expected plan, got ${body.status}`)
+		expect(body.guidance).toContain('Analysis rip downloaded')
+		expect(deps.downloads.peek(key)).toBeUndefined()
+	})
+})
+
+// ── whisper transcription ──
+
+// A whisper facade that writes a canned srt on transcribe
+function whisperWriting(available = true): WhisperFacade {
+	return {
+		available: async () => available,
+		transcribe: async (_file, outSrt) => {
+			fs.mkdirSync(path.dirname(outSrt), { recursive: true })
+			fs.writeFileSync(outSrt, '1\n00:00:00,000 --> 00:00:02,000\nhello\n')
+		},
+	}
+}
+
+describe('whisper transcription', () => {
+	test('subtitleless_plan_offers_a_transcribe_call_when_whisper_is_available', async () => {
+		const deps = fakeDeps({ whisper: whisperWriting() })
+		const body = bodyOf(await handleVideoCall({ source: videoPath }, deps))
+		if (body.status !== 'plan') throw new Error(`expected plan, got ${body.status}`)
+		const offer = body.recommended_calls.find(c => c.call.confirm === 'transcribe')
+		expect(offer).toBeDefined()
+		expect(offer?.call.source).toBe(videoPath)
+	})
+
+	test('subtitleless_plan_falls_back_to_a_hint_without_whisper', async () => {
+		const deps = fakeDeps({ whisper: whisperAbsent })
+		const body = bodyOf(await handleVideoCall({ source: videoPath }, deps))
+		if (body.status !== 'plan') throw new Error(`expected plan, got ${body.status}`)
+		expect(body.recommended_calls.some(c => c.call.confirm === 'transcribe')).toBe(false)
+		expect(body.guidance).toContain('no whisper tool detected')
+	})
+
+	test('confirming_transcribe_runs_whisper_and_caches_the_transcript', async () => {
+		const deps = fakeDeps({ whisper: whisperWriting() })
+		await handleVideoCall({ source: videoPath }, deps)
+		const body = bodyOf(await handleVideoCall({ source: videoPath, confirm: 'transcribe' }, deps))
+		if (body.status !== 'plan') throw new Error(`expected plan, got ${body.status}`)
+		expect(body.guidance).toContain('Transcript generated and cached')
+		expect(body.probe.subtitles).toContain('transcript (whisper)')
+		const fp = (await fingerprintFile(videoPath)).hex
+		expect(fs.existsSync(deps.cache.transcriptPath(fp))).toBe(true)
+	})
+
+	test('a_cached_transcript_rides_along_as_a_core_subtitle', async () => {
+		let captured: readonly string[] = []
+		const deps = fakeDeps({
+			probeFile: async () => probeOf(45),
+			runCore: async args => {
+				captured = args
+				return { code: 0, stdout: JSON.stringify(CANNED_METADATA), stderr: '' }
+			},
+		})
+		const fp = (await fingerprintFile(videoPath)).hex
+		const srt = deps.cache.transcriptPath(fp)
+		fs.mkdirSync(path.dirname(srt), { recursive: true })
+		fs.writeFileSync(srt, '1\n00:00:00,000 --> 00:00:01,000\nhi\n')
+
+		const result = await handleVideoCall({ source: videoPath }, deps)
+		expect(result.isError).toBeUndefined()
+		const sub = captured.indexOf('--subtitle')
+		expect(sub).toBeGreaterThan(-1)
+		expect(captured[sub + 1]).toBe(srt)
+	})
+
+	test('a_raw_call_carrying_its_own_subtitle_is_left_untouched', async () => {
+		let captured: readonly string[] = []
+		const deps = fakeDeps({
+			probeFile: async () => probeOf(45),
+			runCore: async args => {
+				captured = args
+				return { code: 0, stdout: JSON.stringify(CANNED_METADATA), stderr: '' }
+			},
+		})
+		const fp = (await fingerprintFile(videoPath)).hex
+		const srt = deps.cache.transcriptPath(fp)
+		fs.mkdirSync(path.dirname(srt), { recursive: true })
+		fs.writeFileSync(srt, '1\n00:00:00,000 --> 00:00:01,000\nhi\n')
+
+		await handleVideoCall({ source: videoPath, raw: 'process --subtitle /my/own.srt' }, deps)
+		// exactly one --subtitle, and it is the caller's, not the cached transcript
+		expect(captured.filter(a => a === '--subtitle')).toHaveLength(1)
+		expect(captured).toContain('/my/own.srt')
+		expect(captured).not.toContain(srt)
 	})
 })

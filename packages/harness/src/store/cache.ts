@@ -34,10 +34,12 @@ async function statOrNull(p: string): Promise<{ size: number; mtimeMs: number } 
 export class Cache {
 	private readonly downloadsDir: string
 	private readonly probeDir: string
+	private readonly transcriptsDir: string
 
 	constructor(private readonly cfg: Config['cache']) {
 		this.downloadsDir = path.join(cfg.dir, 'downloads')
 		this.probeDir = path.join(cfg.dir, 'probe')
+		this.transcriptsDir = path.join(cfg.dir, 'transcripts')
 	}
 
 	// ── probe documents ──
@@ -64,6 +66,21 @@ export class Cache {
 
 	private probePath(fingerprint: string): string {
 		return path.join(this.probeDir, `${fingerprint}.json`)
+	}
+
+	// ── transcripts ──
+
+	// target path for a whisper transcript, keyed by content fingerprint
+	transcriptPath(fingerprint: string): string {
+		return path.join(this.transcriptsDir, `${fingerprint}.srt`)
+	}
+
+	// locate a finished transcript; hits refresh the age clock
+	async findTranscript(fingerprint: string): Promise<string | undefined> {
+		const p = this.transcriptPath(fingerprint)
+		if ((await statOrNull(p)) === null) return undefined
+		await touch(p)
+		return p
 	}
 
 	// ── downloads ──
@@ -121,10 +138,12 @@ export class Cache {
 			removed.push(f.path)
 		}
 
-		for (const f of await listWithStats(this.probeDir)) {
-			if (now - f.mtimeMs > PROBE_MAX_AGE_MS) {
-				await fs.rm(f.path, { force: true })
-				removed.push(f.path)
+		for (const dir of [this.probeDir, this.transcriptsDir]) {
+			for (const f of await listWithStats(dir)) {
+				if (now - f.mtimeMs > PROBE_MAX_AGE_MS) {
+					await fs.rm(f.path, { force: true })
+					removed.push(f.path)
+				}
 			}
 		}
 		return removed
