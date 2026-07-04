@@ -1,7 +1,8 @@
 //! agent-video CLI entry point.
 //!
-//! Two subcommands: `process` (smart frame selection + grid composition for
-//! short/medium videos) and `extract` (high-density sampling of a time range).
+//! Three subcommands: `process` (smart frame selection + grid composition),
+//! `extract` (high-density sampling of a time range), and `probe` (media
+//! inspection to machine-readable JSON).
 
 mod child;
 mod compose;
@@ -12,6 +13,7 @@ mod extract;
 mod layout;
 mod pipeline;
 mod probe;
+mod report;
 mod score;
 mod subtitle;
 mod types;
@@ -49,6 +51,13 @@ enum Command {
         opts: CommonOpts,
         #[command(flatten)]
         strategy: StrategyArgs,
+        /// Only decode from this timestamp in seconds; grid timestamps stay
+        /// absolute to the file.
+        #[arg(long)]
+        from: Option<f32>,
+        /// Only decode until this timestamp in seconds.
+        #[arg(long)]
+        until: Option<f32>,
         /// Rayon worker threads (default: CPU cores).
         #[arg(long, short = 'j')]
         threads: Option<usize>,
@@ -65,6 +74,15 @@ enum Command {
         range: TimeRange,
         #[command(flatten)]
         opts: CommonOpts,
+    },
+    /// Inspect a video: machine-readable JSON metadata on stdout.
+    Probe {
+        /// Input video file.
+        #[arg(value_hint = ValueHint::FilePath)]
+        input: PathBuf,
+        /// Add keyframe statistics (slower: scans every video packet).
+        #[arg(long)]
+        keyframes: bool,
     },
 }
 
@@ -241,6 +259,7 @@ fn run() -> anyhow::Result<()> {
     let (io, opts) = match &cli.command {
         Command::Process { io, opts, .. } => (io, opts),
         Command::Extract { io, opts, .. } => (io, opts),
+        Command::Probe { input, keyframes } => return report::run(input, *keyframes),
     };
 
     let quality = Quality::from(opts.quality);
@@ -267,7 +286,7 @@ fn run() -> anyhow::Result<()> {
             min_keyframes: strategy.min_keyframes,
             force: strategy.force,
         },
-        Command::Extract { .. } => StrategyOpts::default(),
+        Command::Extract { .. } | Command::Probe { .. } => StrategyOpts::default(),
     };
 
     let cfg = Config::new(
@@ -294,14 +313,22 @@ fn run() -> anyhow::Result<()> {
 
     match &cli.command {
         Command::Process {
-            threads, in_flight, ..
+            threads,
+            in_flight,
+            from,
+            until,
+            ..
         } => {
+            let window = pipeline::Window::from_args(*from, *until)?;
             let threads = threads.unwrap_or(0);
             let in_flight = in_flight.unwrap_or(pipeline::DEFAULT_IN_FLIGHT);
-            pipeline::process(&io.input, &io.output, &cfg, mode, threads, in_flight, subs)
+            pipeline::process(
+                &io.input, &io.output, &cfg, mode, threads, in_flight, subs, window,
+            )
         }
         Command::Extract { range, .. } => {
             pipeline::extract_range(&io.input, &io.output, &cfg, *range, mode, subs)
         }
+        Command::Probe { .. } => unreachable!("probe returns before config resolution"),
     }
 }

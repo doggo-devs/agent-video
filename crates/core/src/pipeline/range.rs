@@ -1,4 +1,4 @@
-//! Time range parsing for the `extract` CLI subcommand.
+//! Time range parsing (`extract --range`) and the `process` attention window.
 
 use anyhow::{Context, Result, bail};
 
@@ -25,6 +25,49 @@ pub fn parse_range(s: &str) -> Result<TimeRange> {
         .into());
     }
     Ok(TimeRange::new(start, end).expect("end > start implies a valid range"))
+}
+
+/// Absolute attention window for `process` (`--from`/`--until`): decoding is
+/// clamped to it while frame timestamps stay absolute to the file.
+#[derive(Debug, Clone, Copy)]
+pub struct Window {
+    /// Start in seconds.
+    pub start: f32,
+    /// End in seconds; `None` reads to the end of the video.
+    pub end: Option<f32>,
+}
+
+impl Window {
+    /// Build from the CLI flags; `None` when neither is given. Bounds must be
+    /// finite, non-negative, and ordered.
+    pub fn from_args(from: Option<f32>, until: Option<f32>) -> Result<Option<Self>> {
+        if from.is_none() && until.is_none() {
+            return Ok(None);
+        }
+        let start = from.unwrap_or(0.0);
+        if !start.is_finite() || start < 0.0 {
+            return Err(Error::new(
+                ErrorCode::InvalidRange,
+                format!("--from must be a finite, non-negative number of seconds, got {start}"),
+            )
+            .into());
+        }
+        if let Some(end) = until
+            && (!end.is_finite() || end <= start)
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidRange,
+                format!("--until ({end}s) must be finite and after --from ({start}s)"),
+            )
+            .into());
+        }
+        Ok(Some(Self { start, end: until }))
+    }
+
+    /// Seconds of a `duration`-long video this window actually covers.
+    pub fn effective_span(&self, duration: f32) -> f32 {
+        (self.end.unwrap_or(duration).min(duration) - self.start).max(0.0)
+    }
 }
 
 fn parse_clock(s: &str) -> Result<f32> {

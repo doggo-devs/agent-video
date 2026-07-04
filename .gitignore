@@ -4,6 +4,7 @@ dist/
 
 ## node
 node_modules/
+bun.lock
 
 ## secrets
 secret.env
@@ -12,6 +13,10 @@ secret.env
 _legacy/
 .codegraph/
 .claude/
+
+## editor (local only)
+.vscode/
+.zed/
 
 ## md
 AGENTS.md

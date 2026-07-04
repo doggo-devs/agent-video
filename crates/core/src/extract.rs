@@ -217,6 +217,27 @@ pub fn stream_range(
         fps,
         cell_min_edge,
         score_edge,
+        Some((start, Some(end))),
+        threads,
+    )
+}
+
+/// Open a streaming extractor from `start` to `end`, or to EOF when `end` is
+/// `None` — the `process --from/--until` window. Timestamps stay absolute.
+pub fn stream_window(
+    input: &Path,
+    fps: f32,
+    cell_min_edge: u32,
+    score_edge: u32,
+    start: f32,
+    end: Option<f32>,
+    threads: Option<NonZeroUsize>,
+) -> Result<FrameStream> {
+    stream_inner(
+        input,
+        fps,
+        cell_min_edge,
+        score_edge,
         Some((start, end)),
         threads,
     )
@@ -297,7 +318,7 @@ fn stream_inner(
     fps: f32,
     cell_min_edge: u32,
     score_edge: u32,
-    range: Option<(f32, f32)>,
+    range: Option<(f32, Option<f32>)>,
     threads: Option<NonZeroUsize>,
 ) -> Result<FrameStream> {
     let rgb_edge = cell_min_edge.max(1);
@@ -308,10 +329,12 @@ fn stream_inner(
 
     let mut cmd = Command::new("ffmpeg");
     apply_thread_cap(&mut cmd, threads);
-    // Seek before -i for speed; -t bounds the duration read.
+    // Seek before -i for speed; -t bounds the duration read (absent = EOF).
     if let Some((start, end)) = range {
         cmd.args(["-ss", &start.to_string()]);
-        cmd.args(["-t", &(end - start).max(0.0).to_string()]);
+        if let Some(end) = end {
+            cmd.args(["-t", &(end - start).max(0.0).to_string()]);
+        }
     }
     // `force_original_aspect_ratio=increase` scales so the shorter edge lands
     // exactly on `pipe_edge`, preserving aspect.

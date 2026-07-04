@@ -209,7 +209,7 @@ fn auto_detect(input: &Path) -> Result<Option<String>> {
 /// exact-name check already found — mirroring the missing-ffprobe downgrade
 /// in [`auto_detect`]. A sidecar that is *found* but unreadable still fails,
 /// in [`read_sidecar`].
-fn find_all_sidecars(input: &Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn find_all_sidecars(input: &Path) -> Vec<std::path::PathBuf> {
     let Some(stem) = input.file_stem().and_then(|s| s.to_str()) else {
         return Vec::new();
     };

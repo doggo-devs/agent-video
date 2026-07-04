@@ -33,7 +33,7 @@ use state::ProcessState;
 
 pub use crate::subtitle::SubtitleSource;
 pub use extract::extract_range;
-pub use range::parse_range;
+pub use range::{Window, parse_range};
 
 /// Default max in-flight chunks (running + queued results awaiting emit).
 pub const DEFAULT_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
@@ -68,6 +68,7 @@ pub enum OutputMode {
 }
 
 /// Run the full `process` pipeline.
+#[allow(clippy::too_many_arguments)]
 pub fn process(
     input: &Path,
     out_dir: &Path,
@@ -76,10 +77,21 @@ pub fn process(
     threads: usize,
     max_in_flight: NonZeroUsize,
     subs: SubtitleSource<'_>,
+    window: Option<Window>,
 ) -> Result<()> {
     validate_input(input)?;
+    // Keyframe strategies pair decoded frames with probed timestamps by
+    // index; a window seek would decode a different frame set and silently
+    // shift every pairing, so the clamp is fixed-fps only.
+    if window.is_some() && cfg.strategy != SampleStrategy::FixedFps {
+        return Err(Error::new(
+            ErrorCode::InvalidRange,
+            "--from/--until require the fixed-fps strategy; drop --strategy or the window",
+        )
+        .into());
+    }
     let keyframe_info = probe_if_needed(input, cfg)?;
-    validate_strategy(cfg, keyframe_info.as_ref())?;
+    validate_strategy(cfg, keyframe_info.as_ref(), window)?;
     // Resolve subtitles before any extraction or output: whether the final
     // outputs can be assembled must be settled before side effects begin, so
     // a subtitle failure cannot leave grids on disk without metadata.
@@ -110,14 +122,35 @@ pub fn process(
     let session = OutputSession::open(out_dir, mode)?;
     match cfg.strategy {
         SampleStrategy::FixedFps => {
-            eprintln!("fixed-fps mode: sampling at {:.1} fps", cfg.base_fps);
-            let stream = extract_frames::stream_frames(
-                input,
-                cfg.base_fps,
-                cfg.min_frame_size,
-                cfg.score_edge,
-                ctx.ffmpeg_threads,
-            )?;
+            let stream = match window {
+                Some(w) => {
+                    eprintln!(
+                        "fixed-fps mode: sampling at {:.1} fps over {:.1}s-{}",
+                        cfg.base_fps,
+                        w.start,
+                        w.end.map_or("end".into(), |e| format!("{e:.1}s"))
+                    );
+                    extract_frames::stream_window(
+                        input,
+                        cfg.base_fps,
+                        cfg.min_frame_size,
+                        cfg.score_edge,
+                        w.start,
+                        w.end,
+                        ctx.ffmpeg_threads,
+                    )?
+                }
+                None => {
+                    eprintln!("fixed-fps mode: sampling at {:.1} fps", cfg.base_fps);
+                    extract_frames::stream_frames(
+                        input,
+                        cfg.base_fps,
+                        cfg.min_frame_size,
+                        cfg.score_edge,
+                        ctx.ffmpeg_threads,
+                    )?
+                }
+            };
             process_stream(&ctx, session, stream)
         }
         SampleStrategy::Keyframes => {
@@ -175,20 +208,43 @@ fn probe_if_needed(input: &Path, cfg: &Config) -> Result<Option<KeyframeInfo>> {
     }
 }
 
-fn validate_strategy(cfg: &Config, info: Option<&KeyframeInfo>) -> Result<()> {
+fn validate_strategy(
+    cfg: &Config,
+    info: Option<&KeyframeInfo>,
+    window: Option<Window>,
+) -> Result<()> {
     use crate::config::StrategyOpts;
 
     match cfg.strategy {
         SampleStrategy::FixedFps => {
-            if let Some(i) = info.filter(|i| i.duration > StrategyOpts::MAX_DURATION_DEFAULT)
-                && !cfg.force_long_video
+            let Some(i) = info else { return Ok(()) };
+            if let Some(w) = window
+                && w.start >= i.duration
             {
-                let hours = i.duration / 3600.0;
+                return Err(Error::new(
+                    ErrorCode::InvalidRange,
+                    format!(
+                        "--from ({:.1}s) is at or past the end of the video ({:.1}s)",
+                        w.start, i.duration
+                    ),
+                )
+                .into());
+            }
+            // The decode-cost guard applies to what is actually decoded: the
+            // window span when clamped, the whole video otherwise.
+            let span = window.map_or(i.duration, |w| w.effective_span(i.duration));
+            if span > StrategyOpts::MAX_DURATION_DEFAULT && !cfg.force_long_video {
+                let hours = span / 3600.0;
+                let what = if window.is_some() {
+                    "window covers"
+                } else {
+                    "video is"
+                };
                 return Err(Error::new(
                     ErrorCode::InputTooLong,
                     format!(
-                        "video is {hours:.1}h (>{:.0}s limit for fixed-fps); \
-                         use --force or --strategy keyframes/adaptive",
+                        "{what} {hours:.1}h (>{:.0}s limit for fixed-fps); \
+                         use --force, --strategy keyframes/adaptive, or a narrower --from/--until",
                         StrategyOpts::MAX_DURATION_DEFAULT
                     ),
                 )
@@ -217,7 +273,7 @@ fn validate_strategy(cfg: &Config, info: Option<&KeyframeInfo>) -> Result<()> {
 /// Reject a missing, unreadable, or non-file input before any external tool
 /// runs, so the harness gets a precise 2xx code instead of a generic ffprobe
 /// failure wrapping the real cause.
-fn validate_input(input: &Path) -> Result<()> {
+pub(crate) fn validate_input(input: &Path) -> Result<()> {
     let meta = fs::metadata(input).map_err(|e| {
         let code = match e.kind() {
             std::io::ErrorKind::NotFound => ErrorCode::InputNotFound,

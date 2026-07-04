@@ -10,7 +10,10 @@
     "src"
   ],
   "scripts": {
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "lint": "biome check .",
+    "lint:fix": "biome check --fix .",
+    "format": "biome format --write ."
   },
   "engines": {
     "bun": ">=1.2"
@@ -22,6 +25,7 @@
     "directory": "packages/harness"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.2",
     "@types/node": "^24",
     "typescript": "^6.0.3"
   },
