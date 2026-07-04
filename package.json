@@ -1,6 +1,10 @@
 {
   "name": "agent-video-monorepo",
   "private": true,
+  "scripts": {
+    "gen:surfaces": "bun scripts/gen-surfaces.ts",
+    "prepare": "git config core.hooksPath .githooks"
+  },
   "workspaces": [
     "packages/*"
   ]

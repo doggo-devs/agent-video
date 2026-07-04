@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Regenerate discovery surfaces from tool/schema.ts before every commit, so
+# committed artifacts can never drift from the single source (ci.yml still
+# enforces this server-side). Wired via `git config core.hooksPath .githooks`,
+# run automatically by the root package.json `prepare` script.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+bun run gen:surfaces >/dev/null
+git add surfaces .agents/plugins/marketplace.json

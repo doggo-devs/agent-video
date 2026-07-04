@@ -43,3 +43,13 @@ jobs:
           printf '#!/bin/sh\necho agent-video 0.0.0-fake\n' > /tmp/fake-core
           chmod +x /tmp/fake-core
           AGENT_VIDEO_BIN=/tmp/fake-core bun src/cli.ts --version
+
+  # Generated discovery surfaces must match tool/schema.ts + the version.
+  surfaces:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun run gen:surfaces
+      # -N stages new files as intent-to-add so the diff also catches them
+      - run: git add -N surfaces .agents && git diff --exit-code surfaces .agents

@@ -158,8 +158,17 @@ jobs:
             agent-video-*.tar.gz
             agent-video-*.zip
 
+  # A tag must never ship stale discovery surfaces; same check as ci.yml.
+  surfaces:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun run gen:surfaces
+      - run: git add -N surfaces .agents && git diff --exit-code surfaces .agents
+
   publish-npm:
-    needs: build
+    needs: [build, surfaces]
     runs-on: ubuntu-latest
     permissions:
       contents: read

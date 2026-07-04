@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "video": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@agent-video/cli",
+        "--mcp"
+      ]
+    }
+  }
+}

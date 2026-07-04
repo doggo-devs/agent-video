@@ -6,6 +6,9 @@
   "bin": {
     "agent-video": "./src/cli.ts"
   },
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "files": [
     "src"
   ],

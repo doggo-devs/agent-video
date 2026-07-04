@@ -1,0 +1,12 @@
+{
+  "name": "agent-video",
+  "plugins": [
+    {
+      "name": "agent-video",
+      "source": {
+        "source": "local",
+        "path": "./surfaces/codex"
+      }
+    }
+  ]
+}

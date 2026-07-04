@@ -35,13 +35,15 @@ next="$major.$minor.$patch"
 sed -i "0,/^version = \"$current\"\$/s//version = \"$next\"/" Cargo.toml
 sed -i "0,/^  \"version\": \"$current\",\$/s//  \"version\": \"$next\",/" \
     packages/harness/package.json
+# Discovery surfaces embed the version (codex plugin manifest, pi package pin).
+bun run gen:surfaces
 # Sync Cargo.lock's own-package entry without touching dependency versions.
 cargo update --workspace --quiet
 # The tagged commit must at least build; catches a lockfile/toml mishap here
 # rather than in the release workflow.
 cargo check --quiet
 
-git add Cargo.toml Cargo.lock packages/harness/package.json
+git add Cargo.toml Cargo.lock packages/harness/package.json surfaces .agents
 git commit -m "Release v$next"
 git tag -a "v$next" -m "Release v$next"
 echo "v$next tagged — publish with: git push --follow-tags"
