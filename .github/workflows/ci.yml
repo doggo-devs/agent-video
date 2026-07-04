@@ -17,3 +17,21 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  harness:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/harness
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      # Smoke: the TS entry point runs directly under bun and the version
+      # intercept reaches a (fake) core binary via the env override.
+      - name: Smoke test CLI
+        run: |
+          printf '#!/bin/sh\necho agent-video 0.0.0-fake\n' > /tmp/fake-core
+          chmod +x /tmp/fake-core
+          AGENT_VIDEO_BIN=/tmp/fake-core bun src/cli.ts --version

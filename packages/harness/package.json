@@ -1,23 +1,28 @@
 {
-  "name": "@agent-video/harness",
+  "name": "@agent-video/cli",
   "version": "0.1.0",
-  "description": "TS strategy layer for agent-video: CLI wrapper, MCP server, tool schemas",
-  "private": true,
+  "description": "Turn a video into VLM-readable grid images — CLI and MCP server",
   "type": "module",
   "bin": {
-    "agent-video": "./dist/cli.js"
+    "agent-video": "./src/cli.ts"
   },
+  "files": [
+    "src"
+  ],
   "scripts": {
-    "build": "tsc",
     "check": "tsc --noEmit"
+  },
+  "engines": {
+    "bun": ">=1.2"
   },
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/durvia/agent-video.git",
+    "url": "git+https://github.com/durvia/agent-video.git",
     "directory": "packages/harness"
   },
   "devDependencies": {
+    "@types/node": "^24",
     "typescript": "^6.0.3"
   }
 }

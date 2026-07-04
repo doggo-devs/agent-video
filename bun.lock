@@ -6,19 +6,24 @@
       "name": "agent-video-monorepo",
     },
     "packages/harness": {
-      "name": "@agent-video/harness",
+      "name": "@agent-video/cli",
       "version": "0.1.0",
       "bin": {
         "agent-video": "./dist/cli.js",
       },
       "devDependencies": {
+        "@types/node": "^24",
         "typescript": "^6.0.3",
       },
     },
   },
   "packages": {
-    "@agent-video/harness": ["@agent-video/harness@workspace:packages/harness"],
+    "@agent-video/cli": ["@agent-video/cli@workspace:packages/harness"],
+
+    "@types/node": ["@types/node@24.13.2", "", { "dependencies": { "undici-types": "~7.18.0" } }, "sha512-fRa09kZTgu8o71KFcDjUFuc7F+dEbZYZmkI0mg5YBTRs0yMKjYHsq/c0urDKeDb+D5qVgXOdFcuu+DZPKOITwA=="],
 
     "typescript": ["typescript@6.0.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw=="],
+
+    "undici-types": ["undici-types@7.18.2", "", {}, "sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w=="],
   }
 }

@@ -29,7 +29,11 @@ use crate::probe::SampleStrategy;
 use crate::types::{Detail, Quality, TimeRange};
 
 #[derive(Parser)]
-#[command(name = "agent-video", about = "Video → VLM-readable grid images")]
+#[command(
+    name = "agent-video",
+    version,
+    about = "Video → VLM-readable grid images"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
