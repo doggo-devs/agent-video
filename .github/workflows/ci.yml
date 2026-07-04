@@ -28,6 +28,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun run check
+      - run: bun test
       # Smoke: the TS entry point runs directly under bun and the version
       # intercept reaches a (fake) core binary via the env override.
       - name: Smoke test CLI

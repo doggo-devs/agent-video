@@ -7,7 +7,7 @@
 //! Runs as TypeScript directly under bun; there is no build step.
 
 import { createRequire } from "node:module";
-import { BinaryNotFoundError, coreOutput, runCore } from "./binary.ts";
+import { BinaryNotFoundError, coreOutput, runCore } from "./core/binary.ts";
 
 const require = createRequire(import.meta.url);
 
@@ -20,14 +20,17 @@ function fail(err: unknown): never {
 }
 
 if (args.includes("--mcp")) {
-  process.stderr.write(
-    "agent-video: MCP server is not implemented yet; track progress at " +
-      "https://github.com/durvia/agent-video\n",
-  );
-  process.exit(2);
-}
+  // Lazy import: keeps plain CLI passthrough free of the MCP dependency
+  // graph. The process stays alive on the stdio transport until the
+  // client closes stdin.
+  const { serveStdio } = await import("./mcp/server.ts");
+  try {
+    await serveStdio();
+  } catch (err) {
+    fail(err);
+  }
+} else if (args.includes("--version") || args.includes("-V")) {
 
-if (args.includes("--version") || args.includes("-V")) {
   const { name, version } = require("../package.json") as {
     name: string;
     version: string;
@@ -43,11 +46,11 @@ if (args.includes("--version") || args.includes("-V")) {
     process.exit(1);
   }
   process.exit(0);
-}
-
-try {
-  process.exit(await runCore(args));
-} catch (err) {
-  if (err instanceof BinaryNotFoundError) fail(err);
-  fail(err);
+} else {
+  try {
+    process.exit(await runCore(args));
+  } catch (err) {
+    if (err instanceof BinaryNotFoundError) fail(err);
+    fail(err);
+  }
 }

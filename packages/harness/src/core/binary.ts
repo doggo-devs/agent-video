@@ -72,6 +72,33 @@ export function runCore(args: readonly string[]): Promise<number> {
   });
 }
 
+/** Captured result of a core run; `stdout` may be tens of MB in --json mode. */
+export interface CoreRun {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Run the core capturing both streams. Never rejects on non-zero exit —
+ * the caller owns the error presentation (MCP results, not process exits).
+ *
+ * @throws BinaryNotFoundError (via resolveBinary) or spawn failures only.
+ */
+export function captureCore(args: readonly string[]): Promise<CoreRun> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(resolveBinary(), args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk));
+    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk));
+    child.once("error", reject);
+    child.once("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
+  });
+}
+
 /**
  * Run the core and capture stdout (trimmed). For small, always-terminating
  * invocations like `--version`; rejects on non-zero exit.
