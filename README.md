@@ -79,3 +79,9 @@ scoring weights, timing, subtitles).
    and edge density; top scorers become key frames.
 3. **Lay out & compose** — frames are packed into a grid within the pixel budget,
    with key frames given larger cells, then rendered to JPEG.
+
+## License
+
+MIT. The embedded timestamp font (Liberation Sans Bold) is licensed under the
+SIL Open Font License 1.1 — see `assets/OFL.txt`. ffmpeg/ffprobe are invoked
+as external executables and are not bundled or linked.

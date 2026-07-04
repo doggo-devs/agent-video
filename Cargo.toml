@@ -2,6 +2,9 @@
 name = "vidgrid-cli"
 version = "0.1.0"
 edition = "2024"
+description = "Turn a video into VLM-readable grid images"
+license = "Apache-2.0"
+repository = "https://github.com/yeshanjun/vidgrid-cli"
 
 [[bin]]
 name = "vidgrid"

@@ -1,5 +1,7 @@
-[build]
 # x86-64-v3 (AVX2/FMA/BMI, ~all CPUs since 2015) vectorizes the convolution and
 # pixel loops: ~39% faster on compute-heavy runs, output unchanged. Override with
-# RUSTFLAGS to target a baseline if distributing to older hardware.
+# RUSTFLAGS to target a baseline if distributing to older hardware. Scoped to
+# x86_64: a global [build] entry would pass this CPU to non-x86 targets
+# (e.g. Apple-silicon builds) and fail.
+[target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=x86-64-v3"]
