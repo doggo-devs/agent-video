@@ -17,7 +17,7 @@ use super::OutputMode;
 /// One run's output-directory lifecycle.
 ///
 /// Run-level contract: the directory always reflects the most recent run that
-/// produced output. Stale vidgrid artifacts are swept lazily, just before the
+/// produced output. Stale agent-video artifacts are swept lazily, just before the
 /// first write — so a run that fails before producing anything leaves the
 /// previous run's outputs intact. Grids and statics are written incrementally
 /// as they finish, and [`OutputSession::commit`] consumes the session and
@@ -70,7 +70,7 @@ impl<'a> OutputSession<'a> {
         }
         for entry in fs::read_dir(self.dir).map_err(|e| self.dir_error("listing", e))? {
             let entry = entry.map_err(|e| self.dir_error("listing", e))?;
-            if entry.file_name().to_str().is_some_and(is_vidgrid_artifact) {
+            if entry.file_name().to_str().is_some_and(is_own_artifact) {
                 fs::remove_file(entry.path()).map_err(|e| self.dir_error("cleaning", e))?;
             }
         }
@@ -117,9 +117,9 @@ impl<'a> OutputSession<'a> {
 
 /// Whether `name` is a file this tool writes into the output directory:
 /// grids, static entries, metadata, subtitles, or their atomic-write temps.
-fn is_vidgrid_artifact(name: &str) -> bool {
+fn is_own_artifact(name: &str) -> bool {
     if let Some(tmp) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) {
-        return is_vidgrid_artifact(tmp);
+        return is_own_artifact(tmp);
     }
     let numbered_jpg = |prefix: &str| {
         name.strip_prefix(prefix)
@@ -205,7 +205,7 @@ mod tests {
             ".grid_001.jpg.tmp",
             ".metadata.json.tmp",
         ] {
-            assert!(is_vidgrid_artifact(own), "{own} is ours");
+            assert!(is_own_artifact(own), "{own} is ours");
         }
         for foreign in [
             "grid_01.jpg",
@@ -215,13 +215,14 @@ mod tests {
             "video.mp4",
             ".hidden",
         ] {
-            assert!(!is_vidgrid_artifact(foreign), "{foreign} is not ours");
+            assert!(!is_own_artifact(foreign), "{foreign} is not ours");
         }
     }
 
     #[test]
     fn sweeps_stale_artifacts_on_first_write_but_keeps_foreign_files() {
-        let dir = std::env::temp_dir().join(format!("vidgrid-sweep-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agent-video-sweep-test-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("create test dir");
         let stale = dir.join("grid_007.jpg");
         let foreign = dir.join("keep.me");
@@ -244,7 +245,8 @@ mod tests {
 
     #[test]
     fn json_session_touches_no_files() {
-        let dir = std::env::temp_dir().join(format!("vidgrid-json-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agent-video-json-test-{}", std::process::id()));
         // The directory is never created: open, write_image, and commit must
         // all stay off the filesystem in JSON mode.
         let session = OutputSession::open(&dir, OutputMode::Json).expect("open session");

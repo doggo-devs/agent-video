@@ -1,4 +1,4 @@
-//! vidgrid CLI entry point.
+//! agent-video CLI entry point.
 //!
 //! Two subcommands: `process` (smart frame selection + grid composition for
 //! short/medium videos) and `extract` (high-density sampling of a time range).
@@ -29,7 +29,7 @@ use crate::probe::SampleStrategy;
 use crate::types::{Detail, Quality, TimeRange};
 
 #[derive(Parser)]
-#[command(name = "vidgrid", about = "Video → VLM-readable grid images")]
+#[command(name = "agent-video", about = "Video → VLM-readable grid images")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

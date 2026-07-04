@@ -1,0 +1,23 @@
+{
+  "name": "@agent-video/harness",
+  "version": "0.1.0",
+  "description": "TS strategy layer for agent-video: CLI wrapper, MCP server, tool schemas",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "agent-video": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/durvia/agent-video.git",
+    "directory": "packages/harness"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}

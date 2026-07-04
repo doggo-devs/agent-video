@@ -191,7 +191,11 @@ fn auto_detect(input: &Path) -> Result<Option<String>> {
 
     // Single embedded stream
     if embedded.len() == 1 {
-        return Ok(Some(extract_embedded(input, 0, "embedded subtitle stream")?));
+        return Ok(Some(extract_embedded(
+            input,
+            0,
+            "embedded subtitle stream",
+        )?));
     }
 
     Ok(None)
@@ -370,11 +374,10 @@ fn extract_embedded(input: &Path, track: usize, what: &str) -> Result<String> {
 
     let text = text.trim().to_string();
     if text.is_empty() {
-        return Err(Error::new(
-            ErrorCode::InputCorrupt,
-            format!("{what} {track} is empty"),
-        )
-        .with_context(ErrorContext::default().with_input(input)));
+        return Err(
+            Error::new(ErrorCode::InputCorrupt, format!("{what} {track} is empty"))
+                .with_context(ErrorContext::default().with_input(input)),
+        );
     }
     Ok(text)
 }
@@ -580,7 +583,7 @@ with continuation
     fn rejects_subtitle_source_with_no_parseable_cues() {
         // A readable file whose content parses to zero cues must fail the
         // run, not resolve into silently empty per-grid subtitles.
-        let dir = std::env::temp_dir().join(format!("vidgrid-nocue-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("agent-video-nocue-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("create test dir");
         let sub = dir.join("broken.srt");
         fs::write(&sub, "this is not SRT\njust prose\n").expect("write test subtitle");
@@ -626,7 +629,7 @@ with continuation
     /// Run `f` with a fresh temp dir containing `files`, cleaning up after.
     fn with_sidecar_dir(tag: &str, files: &[&str], f: impl FnOnce(&Path)) {
         let dir =
-            std::env::temp_dir().join(format!("vidgrid-sidecar-{tag}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("agent-video-sidecar-{tag}-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("create test dir");
         for name in files {
             fs::write(dir.join(name), b"1\n00:00:01,000 --> 00:00:02,000\nx\n")

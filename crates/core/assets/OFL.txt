@@ -1,5 +1,5 @@
 This license applies to assets/font.ttf (Liberation Sans Bold), which is
-embedded into the vidgrid binary for timestamp labels.
+embedded into the agent-video binary for timestamp labels.
 
 Digitized data copyright (c) 2010 Google Corporation
 	with Reserved Font Arimo, Tinos and Cousine.

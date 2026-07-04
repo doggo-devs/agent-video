@@ -1,0 +1,25 @@
+[package]
+name = "agent-video"
+version.workspace = true
+edition.workspace = true
+description = "Turn a video into VLM-readable grid images"
+license.workspace = true
+repository.workspace = true
+# Rust-side README lives one level up, shared across future core crates.
+readme = "../README.md"
+
+[[bin]]
+name = "agent-video"
+path = "src/main.rs"
+
+[dependencies]
+image = "0.25"
+image_hasher = "3"
+imageproc = "0.27"
+ab_glyph = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rayon = "1"
+base64 = "0.22"

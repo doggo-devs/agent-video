@@ -1,1 +1,21 @@
+## runtime
+dist/
 /target
+
+## node
+node_modules/
+
+## secrets
+secret.env
+
+## legacy
+_legacy/
+.codegraph/
+.claude/
+
+## md
+AGENTS.md
+CLAUDE.md
+
+## internal planning
+docs/

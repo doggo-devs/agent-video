@@ -90,7 +90,7 @@ pub fn process(
         builder = builder.num_threads(threads);
     }
     let pool = builder
-        .thread_name(|i| format!("vidgrid-{i}"))
+        .thread_name(|i| format!("agent-video-{i}"))
         .build()
         .context("building rayon thread pool")?;
 

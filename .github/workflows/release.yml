@@ -37,15 +37,15 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           tar -C target/release -czf \
-            "vidgrid-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" vidgrid
+            "agent-video-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" agent-video
       - name: Package (windows)
         if: runner.os == 'Windows'
         run: |
-          Compress-Archive -Path target/release/vidgrid.exe `
-            -DestinationPath "vidgrid-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
+          Compress-Archive -Path target/release/agent-video.exe `
+            -DestinationPath "agent-video-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            vidgrid-*.tar.gz
-            vidgrid-*.zip
+            agent-video-*.tar.gz
+            agent-video-*.zip
