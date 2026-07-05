@@ -1,16 +1,14 @@
-//! ProcessState: the streaming state machine that consumes judged candidate
-//! frames, chunks them by time, and spawns parallel chunk-processing jobs.
+//! ProcessState: the shell around the pure [`Chunker`] core — it consumes
+//! judged candidate frames, lets the chunker turn them into chunk/static
+//! events, and interprets those events against the effectful world: parallel
+//! chunk jobs on the rayon pool and incremental writes through the output
+//! session.
 //!
-//! Time chunks are a throttle, not a floor: a chunk whose surviving frames
-//! cannot fill a grid is merged forward into the next chunk(s), so sparse
-//! content produces fewer, fuller grids instead of one half-empty grid per
-//! chunk.
-//!
-//! Static-stretch detection lives in [`super::stretch`]; this module feeds it
-//! the dedup verdicts and renders qualifying stretches as a single
-//! representative image plus the covered time range instead of empty grids.
+//! The division of labor is deliberate: everything about *where frames go on
+//! the timeline* (chunk keying, sparse-chunk merging, static stretches,
+//! broken-timeline accounting) lives in [`super::chunker`] and is unit-tested
+//! there without a pool or a session; this module owns only the effects.
 
-use std::collections::BTreeMap;
 use std::mem;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
@@ -19,25 +17,20 @@ use anyhow::Result;
 use image::GrayImage;
 
 use crate::config::Config;
-use crate::types::{CandidateFrame, GridMeta, TimeRange, format_ts};
+use crate::types::{CandidateFrame, GridMeta, LayoutKind, TimeRange, format_ts};
 use crate::{compose, layout};
 
 use super::chunk::{GridResult, ProcessChunkEnv, process_chunk};
+use super::chunker::{Chunker, Event};
 use super::jobs::OrderedJobs;
 use super::output::OutputSession;
-use super::stretch::{Stretch, StretchDetector};
+use super::stretch::Stretch;
 
 /// Lower bound for an extraction batch.
 const MIN_EXTRACT_BATCH_FRAMES: usize = 32;
 
 /// Upper bound for an extraction batch.
 const MAX_EXTRACT_BATCH_FRAMES: usize = 240;
-
-/// Unplaceable-timestamp frames (non-finite or going backwards) tolerated
-/// per run before the input's timeline is declared broken. The same shape as
-/// the demux-error cap in [`crate::media`]: bounded badness degrades output,
-/// unbounded badness fails the run.
-const MAX_TS_REGRESSIONS: u32 = 64;
 
 pub struct ProcessState<'a> {
     cfg: &'a Config,
@@ -48,30 +41,13 @@ pub struct ProcessState<'a> {
     /// caller's thread and may block on job completions, so they must never
     /// execute on a pool thread — a single-thread pool would deadlock.
     pool: &'a rayon::ThreadPool,
-    pub(super) env: ProcessChunkEnv,
-    pending: BTreeMap<usize, Vec<CandidateFrame>>,
-    /// Frames from sealed time chunks that have not yet filled a grid. The
-    /// time chunk is a throttle (at most one grid per `chunk_seconds`), not a
-    /// floor: sparse chunks merge forward here until the pool can fill a grid.
-    carry: Vec<CandidateFrame>,
-    /// Grayscale of the previously spawned chunk's last frame — scene-diff
-    /// boundary context, so the next chunk's first frame is scored against its
-    /// true predecessor instead of a hardcoded zero.
-    prev_chunk_tail: Option<GrayImage>,
-    high_water_mark: Option<usize>,
-    /// Timestamp of the last placed frame; frames whose ts falls behind it
-    /// cannot be placed and are skipped (see [`Self::push_judged`]).
-    last_ts: Option<f32>,
-    /// Skipped unplaceable-timestamp frames so far, capped by
-    /// [`MAX_TS_REGRESSIONS`].
-    ts_regressions: u32,
+    env: ProcessChunkEnv,
+    /// The pure chunking core; this shell only interprets its events.
+    chunker: Chunker,
     /// Chunk jobs in flight: assigns chunk indexes, caps buffered chunks at
     /// `max_in_flight`, and hands results back in chunk order.
     jobs: OrderedJobs<Result<GridResult>>,
-    /// Static-stretch detector, fed every dedup verdict in timestamp order.
-    stretches: StretchDetector,
-    pub(super) duration: f32,
-    pub(super) grid_metas: Vec<GridMeta>,
+    grid_metas: Vec<GridMeta>,
     static_seq: usize,
     static_metas: Vec<GridMeta>,
 }
@@ -97,15 +73,8 @@ impl<'a> ProcessState<'a> {
                 hero_scene_diff: cfg.hero_scene_diff(),
                 max_heroes: cfg.max_heroes(),
             },
-            pending: BTreeMap::new(),
-            carry: Vec::new(),
-            prev_chunk_tail: None,
-            high_water_mark: None,
-            last_ts: None,
-            ts_regressions: 0,
+            chunker: Chunker::new(cfg.chunk_seconds(), cfg.base_fps()),
             jobs: OrderedJobs::new(parallelism),
-            stretches: StretchDetector::new(cfg.chunk_seconds()),
-            duration: 0.0,
             grid_metas: Vec::new(),
             static_seq: 0,
             static_metas: Vec::new(),
@@ -116,54 +85,17 @@ impl<'a> ProcessState<'a> {
         self.env.aspect = aspect;
     }
 
-    /// Record one judged frame: a kept frame joins its time chunk, a dropped
-    /// one feeds static-stretch evidence; both extend the observed duration.
-    ///
-    /// Chunk keying, high-water-mark sealing, and static detection all assume
-    /// finite, non-decreasing timestamps. The decode pass emits frames in
-    /// presentation order and the pts→seconds mapping preserves that order,
-    /// so a violation means the input's own timestamps are broken — the frame
-    /// cannot be placed in any chunk and is skipped. More than
-    /// [`MAX_TS_REGRESSIONS`] such frames mean the whole timeline is garbage,
-    /// and the run fails instead of silently mangling chunk boundaries.
+    /// Record one judged frame, interpreting whatever events it seals off.
+    /// Timeline placement and its failure mode (broken timestamps) live in
+    /// [`Chunker::push`].
     pub fn push_judged(&mut self, frame: CandidateFrame, kept: bool) -> Result<()> {
-        if !frame.ts.is_finite() || self.last_ts.is_some_and(|last| frame.ts < last) {
-            self.ts_regressions += 1;
-            if self.ts_regressions > MAX_TS_REGRESSIONS {
-                anyhow::bail!(
-                    "{} frames with unplaceable timestamps (non-finite or backwards, \
-                     last placed {:?}, offending {}); the input's timeline is broken",
-                    self.ts_regressions,
-                    self.last_ts,
-                    frame.ts
-                );
-            }
-            if self.ts_regressions == 1 {
-                eprintln!(
-                    "  warning: skipping frame with unplaceable timestamp {} (last {:?})",
-                    frame.ts, self.last_ts
-                );
-            }
-            return Ok(());
-        }
-        self.last_ts = Some(frame.ts);
-        self.duration = self.duration.max(frame.ts + 1.0 / self.cfg.base_fps());
-        if kept {
-            if let Some(stretch) = self.stretches.note_kept(frame.ts, &frame.rgb) {
-                self.emit_static(stretch)?;
-            }
-            self.push_chunked_frame(frame)
-        } else {
-            self.stretches.note_dropped(frame.ts);
-            Ok(())
-        }
+        let events = self.chunker.push(frame, kept, self.capacity())?;
+        self.handle_events(events)
     }
 
     pub fn finish(mut self) -> Result<(f32, Vec<GridMeta>)> {
-        if let Some(stretch) = self.stretches.finish() {
-            self.emit_static(stretch)?;
-        }
-        self.seal_all()?;
+        let events = self.chunker.finish(self.capacity());
+        self.handle_events(events)?;
         for result in self.jobs.finish()? {
             self.emit_grid(result?)?;
         }
@@ -174,7 +106,23 @@ impl<'a> ProcessState<'a> {
         let mut metas = mem::take(&mut self.grid_metas);
         metas.append(&mut self.static_metas);
         metas.sort_by(|a, b| a.time_range.start().total_cmp(&b.time_range.start()));
-        Ok((self.duration, metas))
+        Ok((self.chunker.duration(), metas))
+    }
+
+    /// Current grid capacity: how many carried frames fill one grid. Cheap
+    /// and derived on demand because `set_aspect` can change it mid-run.
+    fn capacity(&self) -> usize {
+        layout::grid_capacity(&self.env.spec, self.env.aspect)
+    }
+
+    fn handle_events(&mut self, events: Vec<Event>) -> Result<()> {
+        for event in events {
+            match event {
+                Event::Chunk { frames, prev_tail } => self.spawn_chunk(frames, prev_tail)?,
+                Event::Static(stretch) => self.emit_static(stretch)?,
+            }
+        }
+        Ok(())
     }
 
     /// Render and record one static-stretch entry: the last visually-distinct
@@ -195,61 +143,10 @@ impl<'a> ProcessState<'a> {
             time_range: TimeRange::new(start, end).expect("static stretch has start <= end"),
             total_frames: 1,
             key_frames: Vec::new(),
-            layout: "STATIC",
+            layout: LayoutKind::Static,
             subtitles: crate::types::GridSubtitles::Unresolved,
         });
         Ok(())
-    }
-
-    fn push_chunked_frame(&mut self, frame: CandidateFrame) -> Result<()> {
-        let key = (frame.ts / self.cfg.chunk_seconds()).floor() as usize;
-        self.pending.entry(key).or_default().push(frame);
-
-        if let Some(hwm) = self.high_water_mark
-            && key > hwm
-        {
-            self.seal_up_to(hwm)?;
-        }
-        self.high_water_mark = Some(self.high_water_mark.unwrap_or(key).max(key));
-        Ok(())
-    }
-
-    fn seal_up_to(&mut self, seal_key: usize) -> Result<()> {
-        let keys: Vec<usize> = self
-            .pending
-            .keys()
-            .copied()
-            .take_while(|&k| k <= seal_key)
-            .collect();
-        for key in keys {
-            if let Some(chunk) = self.pending.remove(&key) {
-                self.carry.extend(chunk);
-            }
-            // Lazy sealing: only spawn once the pool can fill a grid, so a
-            // sparse chunk merges into the following ones instead of wasting a
-            // half-empty grid. Dense chunks reach capacity alone and behave as
-            // before.
-            if self.carry.len() >= layout::grid_capacity(&self.env.spec, self.env.aspect) {
-                self.spawn_carry()?;
-            }
-        }
-        Ok(())
-    }
-
-    fn seal_all(&mut self) -> Result<()> {
-        self.seal_up_to(usize::MAX)?;
-        // Whatever is left becomes the final (possibly under-full) grid.
-        self.spawn_carry()
-    }
-
-    fn spawn_carry(&mut self) -> Result<()> {
-        if self.carry.is_empty() {
-            return Ok(());
-        }
-        let chunk = mem::take(&mut self.carry);
-        let tail = chunk.last().map(|f| f.gray.clone());
-        let prev_tail = mem::replace(&mut self.prev_chunk_tail, tail);
-        self.spawn_chunk(chunk, prev_tail)
     }
 
     fn spawn_chunk(
@@ -516,7 +413,7 @@ mod tests {
         // stretch gets its own entry, sorted by start time.
         assert_eq!(metas.len(), 2, "merged grid plus static entry");
         let stat = &metas[1];
-        assert_eq!(stat.layout, "STATIC");
+        assert_eq!(stat.layout, LayoutKind::Static);
         assert_eq!(
             (stat.time_range.start(), stat.time_range.end()),
             (1.0, 75.0),
@@ -541,7 +438,7 @@ mod tests {
         let metas = run(&cfg, 2, &frames);
 
         assert_eq!(metas.len(), 2, "grid plus trailing static entry");
-        assert_eq!(metas[1].layout, "STATIC");
+        assert_eq!(metas[1].layout, LayoutKind::Static);
         assert_eq!(
             (metas[1].time_range.start(), metas[1].time_range.end()),
             (1.0, 70.0)
@@ -558,74 +455,9 @@ mod tests {
 
         assert_eq!(metas.len(), 1, "sparse frames merge into one grid");
         assert!(
-            metas.iter().all(|m| m.layout != "STATIC"),
+            metas.iter().all(|m| m.layout != LayoutKind::Static),
             "no static entries without dropped-duplicate evidence"
         );
-    }
-
-    #[test]
-    fn skips_backwards_timestamp_frames() {
-        let cfg = small_grid_config();
-        let pool = pool(2);
-        let session = json_session();
-        let one = NonZeroUsize::new(1).expect("1 is nonzero");
-        let mut state = ProcessState::new(&cfg, &pool, &session, one);
-
-        // 10 → 5 (backwards, skipped) → 11 (placed normally).
-        for (frame, kept) in judge(&cfg, &[(10.0, 0), (5.0, 1), (11.0, 2)]) {
-            state
-                .push_judged(frame, kept)
-                .expect("bounded bad timestamps must not fail the run");
-        }
-        let (_duration, metas) = state.finish().expect("finish");
-
-        assert_eq!(metas.len(), 1);
-        assert_eq!(
-            metas[0].total_frames, 2,
-            "the backwards frame is skipped, not chunked"
-        );
-    }
-
-    #[test]
-    fn skips_non_finite_timestamp_frames() {
-        let cfg = small_grid_config();
-        let pool = pool(2);
-        let session = json_session();
-        let one = NonZeroUsize::new(1).expect("1 is nonzero");
-        let mut state = ProcessState::new(&cfg, &pool, &session, one);
-
-        for (frame, kept) in judge(&cfg, &[(0.0, 0), (f32::NAN, 1), (1.0, 2)]) {
-            state
-                .push_judged(frame, kept)
-                .expect("a NaN timestamp is skipped, not fatal");
-        }
-        let (_duration, metas) = state.finish().expect("finish");
-
-        assert_eq!(metas.len(), 1);
-        assert_eq!(metas[0].total_frames, 2, "the NaN frame is skipped");
-    }
-
-    #[test]
-    fn fails_after_unbounded_backwards_timestamps() {
-        let cfg = small_grid_config();
-        let pool = pool(2);
-        let session = json_session();
-        let one = NonZeroUsize::new(1).expect("1 is nonzero");
-        let mut state = ProcessState::new(&cfg, &pool, &session, one);
-
-        // One good frame, then 65 backwards frames: the 65th regression
-        // exceeds the cap and must fail the run.
-        let mut frames = vec![(1000.0, 0)];
-        frames.extend((0..65).map(|i| (i as f32, i as u32 + 1)));
-        let last = frames.len() - 1;
-        for (i, (frame, kept)) in judge(&cfg, &frames).into_iter().enumerate() {
-            let result = state.push_judged(frame, kept);
-            if i < last {
-                result.expect("regressions within the cap are skipped");
-            } else {
-                result.expect_err("exceeding the regression cap must fail");
-            }
-        }
     }
 
     #[test]

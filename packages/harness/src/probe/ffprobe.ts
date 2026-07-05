@@ -1,7 +1,9 @@
 /**
- * Direct ffprobe adapter
- * Probes direct media URLs (and, as the binary-less dev fallback, local files)
- * via ffprobe on PATH into the model-facing ProbeSummary.
+ * ffprobe adapter
+ * Probes local files and direct media URLs via ffprobe on PATH into the
+ * model-facing ProbeSummary. Local probing runs here (the core binary exposes
+ * no probe subcommand); URL probing reads the container header without
+ * downloading the payload.
  */
 
 import { spawn } from 'node:child_process'

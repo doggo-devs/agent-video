@@ -30,7 +30,7 @@ pub struct CandidateFrame {
     pub rgb: Arc<RgbImage>,
 }
 
-/// A frame after per-competition-set rank normalization; `score` is `0..=100`.
+/// A frame after per-competition-set rank normalization.
 ///
 /// Produced by [`crate::score::score_frames`] at the single scoring boundary.
 #[derive(Debug, Clone)]
@@ -41,26 +41,103 @@ pub struct ScoredFrame {
     pub gray: GrayImage,
     /// Small RGB image pasted onto the grid during composition.
     pub rgb: Arc<RgbImage>,
-    /// Final weighted score in `0..=100`.
-    pub score: f32,
-    /// Raw scene difference from the frame scored immediately before this one
-    /// (mean absolute grayscale difference, `0..=255`). Drives hero detection,
-    /// which needs absolute magnitude where `score` only preserves rank, and
-    /// travels with the frame into global re-ranks (`extract`'s compaction),
-    /// where recomputing it between non-consecutive frames would be noise.
-    pub scene_diff: f32,
+    /// Final weighted score.
+    pub score: Score,
+    /// Raw scene difference from the frame scored immediately before this
+    /// one. Drives hero detection, which needs absolute magnitude where
+    /// `score` only preserves rank, and travels with the frame into global
+    /// re-ranks (`extract`'s compaction), where recomputing it between
+    /// non-consecutive frames would be noise.
+    pub scene_diff: SceneDiff,
+}
+
+/// Rank-normalized frame score: finite and in `0..=100` by construction.
+///
+/// Only the scoring boundary ([`crate::score`]) mints values; everything
+/// downstream (selection, eviction, layout promotion) reads them via
+/// [`Score::get`], so a `-999` or `NaN` score is unrepresentable past that
+/// boundary.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Score(f32);
+
+impl Score {
+    /// Wrap a score, or `None` unless it is a finite value in `0..=100`.
+    pub fn new(v: f32) -> Option<Self> {
+        (v.is_finite() && (0.0..=100.0).contains(&v)).then_some(Self(v))
+    }
+
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+/// Raw scene difference: mean absolute grayscale difference from the frame's
+/// true temporal predecessor, finite and in `0..=255` by construction (the
+/// range a mean of `u8` differences can span).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneDiff(f32);
+
+impl SceneDiff {
+    /// Wrap a difference, or `None` unless it is a finite value in `0..=255`.
+    pub fn new(v: f32) -> Option<Self> {
+        (v.is_finite() && (0.0..=255.0).contains(&v)).then_some(Self(v))
+    }
+
+    pub fn get(self) -> f32 {
+        self.0
+    }
 }
 
 /// An axis-aligned rectangle on the output canvas, in pixels.
+///
+/// Non-degenerate by construction: `w` and `h` are at least 1 and the far
+/// corner (`x + w`, `y + h`) fits in `u32`, so pasting and border drawing
+/// can add coordinates without overflow checks. [`Rect::new`] is the only
+/// door.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Rect {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
 }
 
 impl Rect {
+    /// Construct a rectangle, or `None` when the area would be zero or the
+    /// far corner would leave the `u32` coordinate space.
+    pub fn new(x: u32, y: u32, w: u32, h: u32) -> Option<Self> {
+        (w > 0 && h > 0 && x.checked_add(w).is_some() && y.checked_add(h).is_some())
+            .then_some(Self { x, y, w, h })
+    }
+
+    pub fn x(&self) -> u32 {
+        self.x
+    }
+
+    pub fn y(&self) -> u32 {
+        self.y
+    }
+
+    pub fn w(&self) -> u32 {
+        self.w
+    }
+
+    pub fn h(&self) -> u32 {
+        self.h
+    }
+
+    /// The rectangle mirrored across the main diagonal — the portrait
+    /// transpose layout uses to turn hero rows into hero columns. Validity is
+    /// preserved: swapping the axes of a valid rect cannot invalidate it.
+    pub fn transposed(self) -> Self {
+        Self {
+            x: self.y,
+            y: self.x,
+            w: self.h,
+            h: self.w,
+        }
+    }
+
     /// Returns true if this rectangle shares any interior area with `other`.
     /// Used by layout tests to assert non-overlapping placement.
     #[cfg(test)]
@@ -71,6 +148,29 @@ impl Rect {
         let by2 = other.y + other.h;
         self.x < bx2 && other.x < ax2 && self.y < by2 && other.y < ay2
     }
+}
+
+/// Grid layout template. The hero-count names (UNIFORM / HERO_LEFT /
+/// DUAL_HERO / TOP_STRIP) label composed grids for metadata; STATIC marks a
+/// static stretch collapsed into a single representative image.
+///
+/// Serializes as the SCREAMING_SNAKE_CASE name, so the JSON contract is
+/// byte-identical to the old string constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LayoutKind {
+    Uniform,
+    HeroLeft,
+    DualHero,
+    TopStrip,
+    Static,
+}
+
+/// Role of a key frame inside its grid. Serializes lowercase (`"hero"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GridPosition {
+    Hero,
 }
 
 /// Cell legibility tier: sets the minimum readable cell edge. The canvas edge
@@ -250,7 +350,7 @@ pub struct GridMeta {
     pub time_range: TimeRange,
     pub total_frames: usize,
     pub key_frames: Vec<KeyFrameMeta>,
-    pub layout: &'static str,
+    pub layout: LayoutKind,
     #[serde(skip_serializing_if = "GridSubtitles::is_absent")]
     pub subtitles: GridSubtitles,
 }
@@ -267,7 +367,7 @@ pub struct GridDraft {
     pub time_range: TimeRange,
     pub total_frames: usize,
     pub key_frames: Vec<KeyFrameMeta>,
-    pub layout: &'static str,
+    pub layout: LayoutKind,
 }
 
 impl GridDraft {
@@ -302,7 +402,7 @@ pub fn format_ts(ts: f32) -> String {
 pub struct KeyFrameMeta {
     pub timestamp: String,
     pub score: u32,
-    pub grid_position: &'static str,
+    pub grid_position: GridPosition,
 }
 
 /// Top-level structured output written to `metadata.json`.
@@ -342,6 +442,53 @@ mod tests {
     }
 
     #[test]
+    fn rejects_out_of_range_scores_and_diffs() {
+        for bad in [-0.001, 100.001, f32::NAN, f32::INFINITY] {
+            assert!(Score::new(bad).is_none(), "score {bad} must be rejected");
+        }
+        assert!(Score::new(0.0).is_some());
+        assert!(Score::new(100.0).is_some());
+        for bad in [-1.0, 255.5, f32::NAN, f32::NEG_INFINITY] {
+            assert!(SceneDiff::new(bad).is_none(), "diff {bad} must be rejected");
+        }
+        assert!(SceneDiff::new(255.0).is_some());
+    }
+
+    #[test]
+    fn rejects_degenerate_rects() {
+        assert!(Rect::new(0, 0, 0, 5).is_none(), "zero width");
+        assert!(Rect::new(0, 0, 5, 0).is_none(), "zero height");
+        assert!(
+            Rect::new(u32::MAX, 0, 1, 1).is_none(),
+            "far corner overflows"
+        );
+        assert!(Rect::new(1, 2, 3, 4).is_some());
+    }
+
+    #[test]
+    fn transposes_rect_across_the_diagonal() {
+        let r = Rect::new(1, 2, 3, 4).expect("valid rect").transposed();
+        assert_eq!((r.x(), r.y(), r.w(), r.h()), (2, 1, 4, 3));
+    }
+
+    #[test]
+    fn serializes_layout_and_position_as_legacy_strings() {
+        // The enums replaced string constants; the JSON payload must not move.
+        for (kind, expected) in [
+            (LayoutKind::Uniform, "UNIFORM"),
+            (LayoutKind::HeroLeft, "HERO_LEFT"),
+            (LayoutKind::DualHero, "DUAL_HERO"),
+            (LayoutKind::TopStrip, "TOP_STRIP"),
+            (LayoutKind::Static, "STATIC"),
+        ] {
+            let json = serde_json::to_value(kind).expect("serialize layout kind");
+            assert_eq!(json, expected);
+        }
+        let json = serde_json::to_value(GridPosition::Hero).expect("serialize grid position");
+        assert_eq!(json, "hero");
+    }
+
+    #[test]
     fn serializes_grid_image_under_original_key() {
         // The flattened enum must keep the exact `"file"` / `"base64"` JSON
         // keys, with only one present at a time.
@@ -350,7 +497,7 @@ mod tests {
             time_range: TimeRange::new(0.0, 5.0).expect("valid range"),
             total_frames: 3,
             key_frames: Vec::new(),
-            layout: "UNIFORM",
+            layout: LayoutKind::Uniform,
             subtitles: GridSubtitles::default(),
         };
         let json = serde_json::to_value(&file_meta).expect("serialize file meta");

@@ -7,14 +7,13 @@
 //! memory stays bounded by the batch, not the video.
 
 use std::num::NonZeroUsize;
-use std::path::Path;
 use std::sync::Arc;
 
-use image::imageops::FilterType;
 use image::{GrayImage, RgbImage};
 use rayon::prelude::*;
 
 use crate::media::decode::{FrameSource, SampleSpec};
+use crate::source::Source;
 use crate::types::{CandidateFrame, TimeRange};
 
 pub use crate::media::decode::RgbFrame;
@@ -27,7 +26,7 @@ pub type FrameStream = FrameSource;
 ///
 /// `threads` caps the decoder's thread count (`None` = auto).
 pub fn stream_frames(
-    input: &Path,
+    input: &Source,
     fps: f32,
     cell_min_edge: u32,
     score_edge: u32,
@@ -50,7 +49,7 @@ pub fn stream_frames(
 /// Timestamps produced by the stream are absolute (0-based at the stream
 /// start), not range-relative.
 pub fn stream_range(
-    input: &Path,
+    input: &Source,
     fps: f32,
     cell_min_edge: u32,
     score_edge: u32,
@@ -72,7 +71,7 @@ pub fn stream_range(
 /// Open a streaming extractor from `start` to `end`, or to EOF when `end` is
 /// `None` — the `process --from/--until` window. Timestamps stay absolute.
 pub fn stream_window(
-    input: &Path,
+    input: &Source,
     fps: f32,
     cell_min_edge: u32,
     score_edge: u32,
@@ -96,7 +95,7 @@ pub fn stream_window(
 /// preserves. One decoder emits the merged stream in presentation order, so
 /// downstream monotonicity needs no interleaving choreography.
 pub fn stream_mixed(
-    input: &Path,
+    input: &Source,
     fps: f32,
     fill: Vec<TimeRange>,
     cell_min_edge: u32,
@@ -117,7 +116,7 @@ pub fn stream_mixed(
 /// Each frame carries its own pts — there is no probed timestamp list to
 /// pair against, and no pairing to break.
 pub fn stream_keyframes(
-    input: &Path,
+    input: &Source,
     cell_min_edge: u32,
     score_edge: u32,
     threads: Option<NonZeroUsize>,
@@ -153,16 +152,58 @@ fn candidate_frame_from_rgb(frame: RgbFrame, score_edge: u32) -> CandidateFrame 
     }
 }
 
-/// Downscale RGB to grayscale with shorter edge `min_edge`; no-op if already smaller.
+/// Downscale RGB to grayscale with shorter edge `min_edge`; no-op resize if
+/// already smaller.
 fn to_gray(img: &RgbImage, min_edge: u32) -> GrayImage {
-    let gray = image::imageops::grayscale(img);
-    let (w, h) = gray.dimensions();
+    let (w, h) = img.dimensions();
     let (nw, nh) = target_dims(w, h, min_edge);
     if (nw, nh) == (w, h) {
-        gray
+        image::imageops::grayscale(img)
     } else {
-        image::imageops::resize(&gray, nw, nh, FilterType::Triangle)
+        downscale_to_gray(img, nw, nh)
     }
+}
+
+/// sRGB luma weights per mille-myriad — the same coefficients `image`'s
+/// `grayscale` uses, so the fused path and the no-resize path measure the
+/// same quantity.
+const SRGB_LUMA: [u64; 3] = [2126, 7152, 722];
+const SRGB_LUMA_DIV: u64 = 10_000;
+
+/// Fused box-average luma downscale: one pass over the source, one (small)
+/// allocation for the output.
+///
+/// The scoring convolutions need stable pixel statistics, not resampling
+/// quality, so area averaging is sufficient — and it avoids the full-size
+/// grayscale allocation + full-frame conversion a grayscale-then-resize
+/// pipeline pays on every decoded frame. Requires `nw <= w` and `nh <= h`
+/// with all dimensions non-zero (the strict-downscale path of [`to_gray`]).
+fn downscale_to_gray(img: &RgbImage, nw: u32, nh: u32) -> GrayImage {
+    let (w, h) = img.dimensions();
+    debug_assert!(0 < nw && nw <= w && 0 < nh && nh <= h);
+    let src = img.as_raw();
+    let w = w as u64;
+    let h = h as u64;
+
+    // Floor boundaries partition the source exactly: box (ox, oy) covers
+    // [ox*w/nw, (ox+1)*w/nw) × [oy*h/nh, (oy+1)*h/nh), never empty when
+    // downscaling.
+    let bound = |o: u32, n: u32, len: u64| (o as u64 * len / n as u64) as usize;
+    GrayImage::from_fn(nw, nh, |ox, oy| {
+        let (x0, x1) = (bound(ox, nw, w), bound(ox + 1, nw, w));
+        let (y0, y1) = (bound(oy, nh, h), bound(oy + 1, nh, h));
+        let mut sum = 0u64;
+        for y in y0..y1 {
+            let row = (y * w as usize + x0) * 3;
+            for px in src[row..row + (x1 - x0) * 3].chunks_exact(3) {
+                sum += SRGB_LUMA[0] * px[0] as u64
+                    + SRGB_LUMA[1] * px[1] as u64
+                    + SRGB_LUMA[2] * px[2] as u64;
+            }
+        }
+        let count = ((x1 - x0) * (y1 - y0)) as u64;
+        image::Luma([(sum / (SRGB_LUMA_DIV * count)) as u8])
+    })
 }
 
 /// Aspect-preserving target dimensions for a shorter-edge of `min_edge`.
@@ -197,5 +238,46 @@ mod tests {
         assert_eq!(pipe_edge(256, 512), 512);
         assert_eq!(pipe_edge(512, 256), 512);
         assert_eq!(pipe_edge(0, 0), 1);
+    }
+
+    #[test]
+    fn fused_downscale_matches_grayscale_on_flat_color() {
+        // A constant-color source has one exact luma; the fused path must
+        // agree with `image::imageops::grayscale` on it at any target size.
+        let img = RgbImage::from_pixel(64, 48, image::Rgb([200, 100, 50]));
+        let reference = image::imageops::grayscale(&img).get_pixel(0, 0).0[0];
+
+        let small = downscale_to_gray(&img, 16, 12);
+
+        assert_eq!(small.dimensions(), (16, 12));
+        assert!(small.pixels().all(|p| p.0[0] == reference));
+    }
+
+    #[test]
+    fn fused_downscale_averages_over_the_source_box() {
+        // Left half black, right half white: each output pixel's box lies
+        // entirely in one half, so the averages are exact.
+        let img = RgbImage::from_fn(8, 8, |x, _| {
+            image::Rgb(if x < 4 { [0, 0, 0] } else { [255, 255, 255] })
+        });
+
+        let small = downscale_to_gray(&img, 2, 2);
+
+        assert_eq!(small.get_pixel(0, 0).0[0], 0);
+        assert_eq!(small.get_pixel(1, 1).0[0], 255);
+    }
+
+    #[test]
+    fn fused_downscale_handles_non_divisible_dimensions() {
+        // 7×5 → 3×2: boxes have unequal sizes; boundaries must still
+        // partition the source without slicing out of bounds.
+        let img = RgbImage::from_fn(7, 5, |x, y| {
+            let v = ((x * 37 + y * 91) % 256) as u8;
+            image::Rgb([v, v, v])
+        });
+
+        let small = downscale_to_gray(&img, 3, 2);
+
+        assert_eq!(small.dimensions(), (3, 2));
     }
 }

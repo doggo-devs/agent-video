@@ -5,10 +5,9 @@
 //! `-skip_frame nokey` pass, which had to run the video decoder. Duration
 //! comes from the container header.
 
-use std::path::Path;
-
 use crate::error::{Error, ErrorCode, ErrorContext, Result};
 use crate::media;
+use crate::source::Source;
 use crate::types::TimeRange;
 
 /// Keyframe pts in demux order, verified non-decreasing.
@@ -141,7 +140,7 @@ impl KeyframeInfo {
 }
 
 /// Probe video duration only (container header; no packet scanning).
-pub fn probe_duration(input: &Path) -> Result<f32> {
+pub fn probe_duration(input: &Source) -> Result<f32> {
     let ictx = media::open_input(input)?;
     media::duration_seconds(&ictx, input)
 }
@@ -150,7 +149,7 @@ pub fn probe_duration(input: &Path) -> Result<f32> {
 ///
 /// A single demux pass: every packet of the best video stream is inspected
 /// for the keyframe flag; nothing is decoded.
-pub fn probe_keyframes(input: &Path) -> Result<KeyframeInfo> {
+pub fn probe_keyframes(input: &Source) -> Result<KeyframeInfo> {
     use ffmpeg_next as ffmpeg;
 
     let mut ictx = media::open_input(input)?;
@@ -159,14 +158,21 @@ pub fn probe_keyframes(input: &Path) -> Result<KeyframeInfo> {
 
     let mut timestamps = Vec::new();
     let mut packet = ffmpeg::Packet::empty();
+    let mut read_budget = media::ErrorBudget::new("scanning packets for keyframes");
     loop {
         match packet.read(&mut ictx) {
-            Ok(()) => {}
+            Ok(()) => read_budget.ok(),
             Err(ffmpeg::Error::Eof) => break,
-            // Demux hiccups are skipped here exactly as they are during
-            // decoding; a stream broken enough to matter fails the decode
-            // pass with a coded error.
-            Err(_) => continue,
+            Err(e) => {
+                // Demux hiccups are skipped here exactly as they are during
+                // decoding, behind the same circuit breaker: an input that
+                // fails forever without reaching EOF (e.g. a dropped network
+                // stream) must error out, not spin.
+                read_budget
+                    .fail(e)
+                    .map_err(|err| err.with_input(input.as_path()))?;
+                continue;
+            }
         }
         if packet.stream() != video.index || !packet.is_key() {
             continue;
@@ -191,7 +197,7 @@ pub fn probe_keyframes(input: &Path) -> Result<KeyframeInfo> {
                 nm.index, nm.next, nm.prev
             ),
         )
-        .with_context(ErrorContext::default().with_input(input))
+        .with_context(ErrorContext::default().with_input(input.as_path()))
     })?;
 
     Ok(KeyframeInfo {

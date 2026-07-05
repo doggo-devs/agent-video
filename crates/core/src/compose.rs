@@ -12,7 +12,7 @@ use imageproc::rect::Rect as IpRect;
 use rayon::prelude::*;
 
 use crate::layout::Layout;
-use crate::types::ScoredFrame;
+use crate::types::{Rect, ScoredFrame};
 
 /// Embedded font for timestamp labels — keeps the build a single binary.
 static FONT: LazyLock<FontRef<'static>> = LazyLock::new(|| {
@@ -24,9 +24,9 @@ const HERO_BORDER: Rgb<u8> = Rgb([255, 210, 0]);
 
 /// Render the selected frames onto a single grid image, returning JPEG bytes.
 ///
-/// `frames` and `layout.rects` are index-aligned; rectangles with zero area are
-/// skipped (a frame the packer could not place). `hero_idx` marks which of
-/// `frames` get a highlight border. Each cell shows a `MM:SS` timestamp.
+/// `frames` and `layout.rects` are index-aligned; a `None` cell (a frame the
+/// packer could not place) is skipped. `hero_idx` marks which of `frames` get
+/// a highlight border. Each cell shows a `MM:SS` timestamp.
 pub fn render(
     frames: &[ScoredFrame],
     layout: &Layout,
@@ -48,31 +48,21 @@ pub fn render(
         .par_iter()
         .zip(layout.rects.par_iter())
         .map(|(frame, rect)| {
-            (rect.w > 0 && rect.h > 0)
-                .then(|| image::imageops::resize(&*frame.rgb, rect.w, rect.h, FilterType::Triangle))
+            rect.map(|r| image::imageops::resize(&*frame.rgb, r.w(), r.h(), FilterType::Triangle))
         })
         .collect();
 
     for (i, frame) in frames.iter().enumerate() {
-        let rect = layout.rects[i];
-        let Some(cell) = &cells[i] else {
+        let (Some(rect), Some(cell)) = (layout.rects[i], &cells[i]) else {
             continue;
         };
-        image::imageops::overlay(&mut canvas, cell, rect.x as i64, rect.y as i64);
+        image::imageops::overlay(&mut canvas, cell, rect.x() as i64, rect.y() as i64);
 
         // hero_idx holds at most 3 entries, so a linear check is cheaper than
         // allocating an n-sized lookup table.
         let is_hero = hero_idx.contains(&i);
         if is_hero {
-            draw_border(
-                &mut canvas,
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                HERO_BORDER,
-                hero_border_px,
-            );
+            draw_border(&mut canvas, rect, HERO_BORDER, hero_border_px);
         }
         // Inset the label past the hero border: the label's translucent strip
         // darkens pixels in place and would dim the border's top-left corner.
@@ -80,11 +70,17 @@ pub fn render(
         // wider than the cell is clamped by draw_border, and the label must
         // stay inside its own cell.
         let inset = if is_hero {
-            border_thickness(rect.w, rect.h, hero_border_px)
+            border_thickness(rect.w(), rect.h(), hero_border_px)
         } else {
             0
         };
-        draw_timestamp(&mut canvas, &FONT, rect.x + inset, rect.y + inset, frame.ts);
+        draw_timestamp(
+            &mut canvas,
+            &FONT,
+            rect.x() + inset,
+            rect.y() + inset,
+            frame.ts,
+        );
     }
 
     encode_jpeg(&canvas, jpeg_quality)
@@ -107,10 +103,11 @@ fn border_thickness(w: u32, h: u32, thickness: u32) -> u32 {
 
 /// Draw a `thickness`-px border just inside the given rectangle using four
 /// filled rects. `draw_filled_rect_mut` clips to image bounds automatically.
-fn draw_border(img: &mut RgbImage, x: u32, y: u32, w: u32, h: u32, color: Rgb<u8>, thickness: u32) {
-    if thickness == 0 || w == 0 || h == 0 {
+fn draw_border(img: &mut RgbImage, rect: Rect, color: Rgb<u8>, thickness: u32) {
+    if thickness == 0 {
         return;
     }
+    let (x, y, w, h) = (rect.x(), rect.y(), rect.w(), rect.h());
     let t = border_thickness(w, h, thickness);
     let (xi, yi) = (x as i32, y as i32);
     let mid_h = h.saturating_sub(2 * t);
@@ -168,12 +165,13 @@ mod tests {
     use std::sync::Arc;
 
     fn frame(ts: f32) -> ScoredFrame {
+        use crate::types::{SceneDiff, Score};
         ScoredFrame {
             ts,
             gray: GrayImage::new(1, 1),
             rgb: Arc::new(RgbImage::from_pixel(32, 18, Rgb([100, 120, 140]))),
-            score: 0.0,
-            scene_diff: 0.0,
+            score: Score::new(0.0).expect("zero score is valid"),
+            scene_diff: SceneDiff::new(0.0).expect("zero diff is valid"),
         }
     }
 

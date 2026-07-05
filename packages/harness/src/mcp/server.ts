@@ -13,7 +13,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, type CallToolResult, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 
-import { type CoreRun, captureCore, resolveBinary } from '../core/binary.ts'
+import { type CoreRun, captureCore } from '../core/binary.ts'
 import type { GridMeta, Metadata } from '../core/contract.ts'
 import {
 	type CoreInvocation,
@@ -27,7 +27,6 @@ import {
 import { formatTimestamp } from '../policy/time.ts'
 import { type DownloadPlan, type PendingStore, TokenRegistry, type TranscribePlan } from '../policy/tokens.ts'
 import { decideUrl } from '../policy/url.ts'
-import { probeViaCore } from '../probe/core.ts'
 import { ProbeError, probeLocalFile } from '../probe/ffprobe.ts'
 import { createDirectSource, DownloadError } from '../source/direct.ts'
 import { type ProbedUrl, type ProgressFn, probeUrl, type UrlSource } from '../source/source.ts'
@@ -73,19 +72,11 @@ export interface ServerDeps {
 // Production wiring: real config, disk cache, ffprobe, yt-dlp, core
 export function defaultDeps(): ServerDeps {
 	const config = loadConfig()
-	// local probing goes through `core probe`; direct ffprobe only remains for
-	// binary-less dev setups (AGENT_VIDEO_BIN unset, no platform package)
-	let hasCore = true
-	try {
-		resolveBinary()
-	} catch {
-		hasCore = false
-	}
 	return {
 		config,
 		cache: new Cache(config.cache),
 		tokens: new TokenRegistry(),
-		probeFile: hasCore ? file => probeViaCore(captureCore, file) : probeLocalFile,
+		probeFile: probeLocalFile,
 		sources: [createDirectSource(config), createYtdlpSource(config)],
 		downloads: new DownloadTracker(),
 		whisper: createWhisper(config.transcribe),

@@ -13,7 +13,6 @@
 //! go wrong.
 
 use std::num::NonZeroUsize;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -25,10 +24,13 @@ use ffmpeg_next as ffmpeg;
 use image::RgbImage;
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::source::Source;
 use crate::types::TimeRange;
 
 use super::scale::Rescaler;
-use super::{MAX_READ_ERRORS, VideoStream, best_video_stream, decode_error, open_input};
+use super::{
+    ErrorBudget, MAX_READ_ERRORS, VideoStream, best_video_stream, decode_error, open_input,
+};
 
 /// One sampled RGB frame, already downscaled for composition.
 #[derive(Debug)]
@@ -95,7 +97,7 @@ impl FrameSource {
     /// stream, decoder, and seek failures surface here, synchronously, with
     /// precise error codes; mid-stream failures surface from `next_frame`.
     pub fn open(
-        input: &Path,
+        input: &Source,
         spec: SampleSpec,
         min_edge: u32,
         threads: Option<NonZeroUsize>,
@@ -106,21 +108,29 @@ impl FrameSource {
         // Seek before building the decoder so no flush is needed. Seeking to
         // the latest keyframe at or before the target mirrors `-ss` accurate
         // input seeking: decode from the keyframe, discard until the target
-        // (the tick sampler below does the discarding naturally).
+        // (the tick sampler below does the discarding naturally). `start` is
+        // a logical 0-based timestamp but the unbound seek call speaks the
+        // container's absolute clock, so the timeline projects it back. An
+        // unseekable stream (e.g. HTTP without Range support) degrades to a
+        // sequential read: the sampler's first tick sits at `start`, so
+        // everything before it is decoded and discarded — slower, same output.
         if let SampleSpec::Fps { start, .. } = &spec
             && *start > 0.0
         {
-            let target = (*start as f64 * ffmpeg::ffi::AV_TIME_BASE as f64) as i64;
-            ictx.seek(target, ..target).map_err(|e| {
-                decode_error(&format!("seeking to {start:.2}s"), e).with_input(input)
-            })?;
+            let target = video.timeline.seek_target(*start as f64).as_av_time();
+            if let Err(e) = ictx.seek(target, ..target) {
+                eprintln!(
+                    "warning: cannot seek to {start:.2}s ({e}); \
+                     reading sequentially from the start"
+                );
+            }
         }
 
         let stream = ictx
             .stream(video.index)
             .expect("best stream index is valid");
         let mut codec_ctx = CodecContext::from_parameters(stream.parameters())
-            .map_err(|e| decode_error("reading codec parameters", e).with_input(input))?;
+            .map_err(|e| decode_error("reading codec parameters", e).with_input(input.as_path()))?;
 
         // Frame threading with count 0 = auto-detect cores; an explicit
         // `--threads` caps it. Without this the decoder defaults to a single
@@ -137,7 +147,7 @@ impl FrameSource {
         }
         let decoder = decoder
             .video()
-            .map_err(|e| decode_error("opening video decoder", e).with_input(input))?;
+            .map_err(|e| decode_error("opening video decoder", e).with_input(input.as_path()))?;
 
         let (tx, rx) = sync_channel(CHANNEL_FRAMES);
         let stop = Arc::new(AtomicBool::new(false));
@@ -402,21 +412,18 @@ impl Worker {
 
     fn pump(&mut self) -> Result<()> {
         let mut packet = Packet::empty();
-        let mut read_errors = 0u32;
+        let mut read_budget = ErrorBudget::new("reading packets");
         loop {
             if self.stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
             match packet.read(&mut self.ictx) {
-                Ok(()) => read_errors = 0,
+                Ok(()) => read_budget.ok(),
                 Err(ffmpeg::Error::Eof) => break,
                 Err(e) => {
                     // Transient demux errors are skipped like the CLI does,
                     // but a permanently failing input must not spin forever.
-                    read_errors += 1;
-                    if read_errors > MAX_READ_ERRORS {
-                        return Err(decode_error("reading packets", e));
-                    }
+                    read_budget.fail(e)?;
                     continue;
                 }
             }

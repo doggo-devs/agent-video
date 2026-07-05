@@ -1,8 +1,8 @@
 //! agent-video CLI entry point.
 //!
-//! Three subcommands: `process` (smart frame selection + grid composition),
-//! `extract` (high-density sampling of a time range), and `probe` (media
-//! inspection to machine-readable JSON).
+//! Two subcommands: `process` (smart frame selection + grid composition) and
+//! `extract` (high-density sampling of a time range). Both accept a local file
+//! path or any URL the linked FFmpeg can open.
 
 mod compose;
 mod config;
@@ -13,8 +13,8 @@ mod layout;
 mod media;
 mod pipeline;
 mod probe;
-mod report;
 mod score;
+mod source;
 mod subtitle;
 mod types;
 
@@ -27,6 +27,7 @@ use clap::{Parser, Subcommand, ValueHint};
 use crate::config::{Config, Overrides, StrategyOpts};
 use crate::error::Error;
 use crate::pipeline::parse_range;
+use crate::source::Source;
 use crate::types::TimeRange;
 
 #[derive(Parser)]
@@ -77,23 +78,15 @@ enum Command {
         #[command(flatten)]
         opts: CommonOpts,
     },
-    /// Inspect a video: machine-readable JSON metadata on stdout.
-    Probe {
-        /// Input video file.
-        #[arg(value_hint = ValueHint::FilePath)]
-        input: PathBuf,
-        /// Add keyframe statistics (slower: scans every video packet).
-        #[arg(long)]
-        keyframes: bool,
-    },
 }
 
-/// Input file and output directory, shared by both subcommands.
+/// Input source and output directory, shared by both subcommands.
 #[derive(clap::Args)]
 struct IoArgs {
-    /// Input video file.
-    #[arg(value_hint = ValueHint::FilePath)]
-    input: PathBuf,
+    /// Input video: a local file path, or any URL the linked FFmpeg can open
+    /// (`https://`, `http://`, ...). The bytes are handed verbatim to the
+    /// demuxer; a protocol this build lacks fails with a coded error.
+    input: String,
     /// Output directory.
     #[arg(short, long, value_hint = ValueHint::DirPath)]
     output: PathBuf,
@@ -169,12 +162,11 @@ fn run() -> anyhow::Result<()> {
     let (io, opts) = match &cli.command {
         Command::Process { io, opts, .. } => (io, opts),
         Command::Extract { io, opts, .. } => (io, opts),
-        Command::Probe { input, keyframes } => return report::run(input, *keyframes),
     };
 
     let strategy_opts = match &cli.command {
         Command::Process { strategy, .. } => *strategy,
-        Command::Extract { .. } | Command::Probe { .. } => StrategyOpts::default(),
+        Command::Extract { .. } => StrategyOpts::default(),
     };
 
     let cfg = Config::new(
@@ -197,6 +189,8 @@ fn run() -> anyhow::Result<()> {
         (None, None) => pipeline::SubtitleSource::Auto,
     };
 
+    let source = Source::classify(&io.input);
+
     match &cli.command {
         Command::Process {
             threads,
@@ -209,12 +203,11 @@ fn run() -> anyhow::Result<()> {
             let threads = threads.unwrap_or(0);
             let in_flight = in_flight.unwrap_or(pipeline::DEFAULT_IN_FLIGHT);
             pipeline::process(
-                &io.input, &io.output, &cfg, mode, threads, in_flight, subs, window,
+                &source, &io.output, &cfg, mode, threads, in_flight, subs, window,
             )
         }
         Command::Extract { range, .. } => {
-            pipeline::extract_range(&io.input, &io.output, &cfg, *range, mode, subs)
+            pipeline::extract_range(&source, &io.output, &cfg, *range, mode, subs)
         }
-        Command::Probe { .. } => unreachable!("probe returns before config resolution"),
     }
 }

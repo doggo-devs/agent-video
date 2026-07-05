@@ -29,15 +29,26 @@ pub fn parse_range(s: &str) -> Result<TimeRange> {
 
 /// Absolute attention window for `process` (`--from`/`--until`): decoding is
 /// clamped to it while frame timestamps stay absolute to the file.
+///
+/// By construction (the [`Window::from_args`] door): `start` is finite and
+/// non-negative, and `end`, when present, is finite and after `start`.
 #[derive(Debug, Clone, Copy)]
 pub struct Window {
-    /// Start in seconds.
-    pub start: f32,
-    /// End in seconds; `None` reads to the end of the video.
-    pub end: Option<f32>,
+    start: f32,
+    end: Option<f32>,
 }
 
 impl Window {
+    /// Start in seconds.
+    pub fn start(&self) -> f32 {
+        self.start
+    }
+
+    /// End in seconds; `None` reads to the end of the video.
+    pub fn end(&self) -> Option<f32> {
+        self.end
+    }
+
     /// Build from the CLI flags; `None` when neither is given. Bounds must be
     /// finite, non-negative, and ordered.
     pub fn from_args(from: Option<f32>, until: Option<f32>) -> Result<Option<Self>> {

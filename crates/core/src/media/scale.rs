@@ -22,6 +22,10 @@ pub struct Rescaler {
     ctx: Option<scaling::Context>,
     src_key: Option<(Pixel, u32, u32)>,
     dst: (u32, u32),
+    /// Reused swscale output frame: its geometry is constant between context
+    /// rebuilds, so `run` writes into the same buffer every call instead of
+    /// allocating a fresh AVFrame per decoded frame (the scale hot path).
+    out: ffmpeg::frame::Video,
 }
 
 impl Rescaler {
@@ -31,6 +35,7 @@ impl Rescaler {
             ctx: None,
             src_key: None,
             dst: (0, 0),
+            out: ffmpeg::frame::Video::empty(),
         }
     }
 
@@ -61,16 +66,18 @@ impl Rescaler {
             self.ctx = Some(ctx);
             self.src_key = Some(key);
             self.dst = (dw, dh);
+            // The cached output frame's geometry belongs to the old context;
+            // an empty frame makes `run` allocate one matching the new one.
+            self.out = ffmpeg::frame::Video::empty();
         }
 
-        let mut out = ffmpeg::frame::Video::empty();
         self.ctx
             .as_mut()
             .expect("scaler built above")
-            .run(frame, &mut out)
+            .run(frame, &mut self.out)
             .map_err(|e| Error::new(ErrorCode::DecodeFailed, format!("scaling frame: {e}")))?;
 
-        rgb_image_from_frame(&out, self.dst)
+        rgb_image_from_frame(&self.out, self.dst)
     }
 }
 

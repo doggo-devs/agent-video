@@ -9,6 +9,7 @@
 
 mod candidates;
 mod chunk;
+mod chunker;
 mod extract;
 mod jobs;
 mod output;
@@ -25,6 +26,7 @@ use anyhow::{Context, Result};
 use crate::config::Config;
 use crate::error::{Error, ErrorCode, ErrorContext};
 use crate::probe::{KeyframeInfo, MonotonicTimestamps, SampleStrategy};
+use crate::source::Source;
 use crate::subtitle::Subtitles;
 use crate::types::{GridMeta, TimeRange};
 use crate::{dedup, extract as extract_frames, probe};
@@ -42,7 +44,7 @@ pub const DEFAULT_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
 /// Shared context for one `process` run, threaded through the strategy paths.
 struct RunCtx<'a> {
-    input: &'a Path,
+    input: &'a Source,
     cfg: &'a Config,
     max_in_flight: NonZeroUsize,
     pool: &'a rayon::ThreadPool,
@@ -72,7 +74,7 @@ pub enum OutputMode {
 /// Run the full `process` pipeline.
 #[allow(clippy::too_many_arguments)]
 pub fn process(
-    input: &Path,
+    input: &Source,
     out_dir: &Path,
     cfg: &Config,
     mode: OutputMode,
@@ -128,16 +130,16 @@ pub fn process(
                 eprintln!(
                     "fixed-fps mode: sampling at {:.1} fps over {:.1}s-{}",
                     cfg.base_fps(),
-                    w.start,
-                    w.end.map_or("end".into(), |e| format!("{e:.1}s"))
+                    w.start(),
+                    w.end().map_or("end".into(), |e| format!("{e:.1}s"))
                 );
                 extract_frames::stream_window(
                     input,
                     cfg.base_fps(),
                     cfg.min_frame_size(),
                     cfg.score_edge(),
-                    w.start,
-                    w.end,
+                    w.start(),
+                    w.end(),
                     ctx.ffmpeg_threads,
                 )?
             }
@@ -284,7 +286,7 @@ fn degrade_if_keyframe_poor(
 }
 
 fn probe_if_needed(
-    input: &Path,
+    input: &Source,
     strategy: SampleStrategy,
     cfg: &Config,
 ) -> Result<Option<KeyframeInfo>> {
@@ -316,13 +318,14 @@ fn validate_strategy(
         SampleStrategy::FixedFps => {
             let Some(i) = info else { return Ok(()) };
             if let Some(w) = window
-                && w.start >= i.duration
+                && w.start() >= i.duration
             {
                 return Err(Error::new(
                     ErrorCode::InvalidRange,
                     format!(
                         "--from ({:.1}s) is at or past the end of the video ({:.1}s)",
-                        w.start, i.duration
+                        w.start(),
+                        i.duration
                     ),
                 )
                 .into());
@@ -368,25 +371,30 @@ fn validate_strategy(
     Ok(())
 }
 
-/// Reject a missing, unreadable, or non-file input before any external tool
-/// runs, so the harness gets a precise 2xx code instead of a generic ffprobe
-/// failure wrapping the real cause.
-pub(crate) fn validate_input(input: &Path) -> Result<()> {
-    let meta = fs::metadata(input).map_err(|e| {
+/// Reject a missing, unreadable, or non-file local input before any media
+/// work runs, so the harness gets a precise 2xx code. A remote source skips
+/// this entirely: it has no filesystem entry to stat, and
+/// [`crate::media::open_input`] reports an unreachable host, HTTP error, or
+/// unsupported protocol as its own coded error.
+pub(crate) fn validate_input(input: &Source) -> Result<()> {
+    let Source::Local(path) = input else {
+        return Ok(());
+    };
+    let meta = fs::metadata(path).map_err(|e| {
         let code = match e.kind() {
             std::io::ErrorKind::NotFound => ErrorCode::InputNotFound,
             _ => ErrorCode::InputUnreadable,
         };
-        Error::new(code, format!("cannot open input {}", input.display()))
-            .with_context(ErrorContext::default().with_input(input))
+        Error::new(code, format!("cannot open input {}", path.display()))
+            .with_context(ErrorContext::default().with_input(path))
             .with_source(e)
     })?;
     if meta.is_dir() {
         return Err(Error::new(
             ErrorCode::InputUnreadable,
-            format!("input {} is a directory, not a video file", input.display()),
+            format!("input {} is a directory, not a video file", path.display()),
         )
-        .with_context(ErrorContext::default().with_input(input))
+        .with_context(ErrorContext::default().with_input(path))
         .into());
     }
     Ok(())
@@ -442,13 +450,13 @@ fn process_stream(
 /// README promises "one or more grid images", and a successful exit with
 /// `grids: []` (e.g. ffmpeg exited 0 without emitting a single PPM frame)
 /// would hand callers a fabricated success.
-fn reject_empty_run(input: &Path, metas: &[GridMeta]) -> Result<()> {
+fn reject_empty_run(input: &Source, metas: &[GridMeta]) -> Result<()> {
     if metas.is_empty() {
         return Err(Error::new(
             ErrorCode::NoFramesExtracted,
             "no frames decoded from the video stream; is the input empty or corrupt?",
         )
-        .with_context(ErrorContext::default().with_input(input))
+        .with_context(ErrorContext::default().with_input(input.as_path()))
         .into());
     }
     Ok(())
@@ -487,7 +495,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_input_with_not_found_code() {
-        let err = validate_input(Path::new("definitely_missing_video.mp4"))
+        let err = validate_input(&Source::classify("definitely_missing_video.mp4"))
             .expect_err("missing input must fail");
         let code = err.downcast_ref::<Error>().map(|e| e.code);
         assert_eq!(code, Some(ErrorCode::InputNotFound));
@@ -495,9 +503,17 @@ mod tests {
 
     #[test]
     fn rejects_directory_input_as_unreadable() {
-        let err = validate_input(Path::new(".")).expect_err("directory input must fail");
+        let err = validate_input(&Source::classify(".")).expect_err("directory input must fail");
         let code = err.downcast_ref::<Error>().map(|e| e.code);
         assert_eq!(code, Some(ErrorCode::InputUnreadable));
+    }
+
+    #[test]
+    fn skips_filesystem_validation_for_remote_source() {
+        // A remote source has no filesystem entry to stat; validation must
+        // wave it through and let open report protocol/network failures.
+        validate_input(&Source::classify("https://example.com/missing.mp4"))
+            .expect("remote input skips the filesystem check");
     }
 
     #[test]
@@ -521,7 +537,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_run_with_no_frames_code() {
-        let err = reject_empty_run(Path::new("video.mp4"), &[])
+        let err = reject_empty_run(&Source::classify("video.mp4"), &[])
             .expect_err("zero grids must fail, not write grids: []");
         let code = err.downcast_ref::<Error>().map(|e| e.code);
         assert_eq!(code, Some(ErrorCode::NoFramesExtracted));

@@ -24,15 +24,23 @@ The default build links the system FFmpeg libraries dynamically, so the host
 needs a matching FFmpeg installed at runtime.
 
 For a self-contained release binary with **zero runtime dependencies**, build
-FFmpeg from source and link it statically. Software AV1 decoding additionally
-needs libdav1d (FFmpeg's native AV1 decoder is a hardware-only stub), so use the
-helper script — it builds a static dav1d, then builds with `static-ffmpeg`:
+FFmpeg from source and link it statically (adds static dav1d for software AV1
+and OpenSSL for `https://`):
 
 ```bash
 ./scripts/build-static.sh
-# requires: git, nasm, meson, ninja, pkg-config, a C toolchain; a few minutes
-# on the first build (it compiles dav1d and FFmpeg from source).
+# requires: git, nasm, meson, ninja, pkg-config, perl, a C toolchain
 ```
+
+The static binary still links glibc. For a single-file artifact with no dynamic
+deps, build against musl (needs `musl-tools` + `rustup target add
+x86_64-unknown-linux-musl`):
+
+```bash
+TARGET=x86_64-unknown-linux-musl ./scripts/build-static.sh
+```
+
+TLS uses the system CA store; override with `SSL_CERT_FILE`/`SSL_CERT_DIR`.
 
 The static binary has **no hardware acceleration** — FFmpeg is configured with
 `--disable-autodetect`, so all decoding is pure CPU (dav1d SIMD, dispatched at
@@ -49,6 +57,9 @@ statically compiled FFmpeg matches the same baseline.
 ```bash
 # Smart frame selection + grid composition
 agent-video process video.mp4 -o out/
+
+# Process straight from a URL (any protocol the build's FFmpeg can open)
+agent-video process https://example.com/talk.mp4 -o out/
 
 # Override the canvas edge length
 agent-video process video.mp4 --max-edge 4096 -o out/
@@ -68,6 +79,10 @@ agent-video process video.mp4 -j 4 --in-flight 2 -o out/
 
 Output is written to the directory given by `-o`: one or more `grid_*.jpg` images
 plus a `metadata.json` describing each grid, its time range, and its key frames.
+
+The input may be a local path or any URL the linked FFmpeg can open. `--from`/
+`--until`/`--range` seek by timestamp; over `http(s)://` this needs server Range
+support, else it falls back to a sequential read.
 
 File output streams grids to disk as they finish, so memory stays flat over any
 video length. `--json` instead holds every grid in memory (base64-inline) until

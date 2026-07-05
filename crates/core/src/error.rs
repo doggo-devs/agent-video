@@ -35,6 +35,8 @@ pub enum ErrorCode {
     InputTooLong = 23,
     InsufficientKeyframes = 24,
     NoFramesExtracted = 25,
+    /// The input URL's protocol is not compiled into the linked FFmpeg.
+    ProtocolUnsupported = 26,
 
     // Configuration problems
     InvalidProfile = 30,
@@ -64,6 +66,7 @@ impl ErrorCode {
             ErrorCode::InputTooLong => "INPUT_TOO_LONG",
             ErrorCode::InsufficientKeyframes => "INSUFFICIENT_KEYFRAMES",
             ErrorCode::NoFramesExtracted => "NO_FRAMES_EXTRACTED",
+            ErrorCode::ProtocolUnsupported => "PROTOCOL_UNSUPPORTED",
             ErrorCode::InvalidProfile => "INVALID_PROFILE",
             ErrorCode::InvalidRange => "INVALID_RANGE",
             ErrorCode::AmbiguousSubtitle => "AMBIGUOUS_SUBTITLE",
@@ -77,6 +80,8 @@ impl ErrorCode {
 /// Machine-readable context attached to errors.
 #[derive(Debug, Default, Clone)]
 pub struct ErrorContext {
+    /// The input the error concerns: a local path, or the verbatim URL of a
+    /// remote source (URLs ride in the same `PathBuf`, byte-for-byte).
     pub input_path: Option<PathBuf>,
     pub output_path: Option<PathBuf>,
 }

@@ -13,6 +13,7 @@ use image::GrayImage;
 
 use crate::config::Config;
 use crate::error::{Error, ErrorCode, ErrorContext};
+use crate::source::Source;
 use crate::subtitle::Subtitles;
 use crate::types::{CandidateFrame, CanvasSpec, Metadata, ScoredFrame, TimeRange, format_ts};
 use crate::{compose, dedup, extract, layout, score};
@@ -31,7 +32,7 @@ use super::{OutputMode, SubtitleSource};
 /// `subtitles.txt` is written — the full-video text is not an artifact of a
 /// range extraction.
 pub fn extract_range(
-    input: &Path,
+    input: &Source,
     out_dir: &Path,
     cfg: &Config,
     range: TimeRange,
@@ -138,11 +139,11 @@ pub fn extract_range(
                 format_ts(range.end())
             ),
         )
-        .with_context(ErrorContext::default().with_input(input))
+        .with_context(ErrorContext::default().with_input(input.as_path()))
         .into());
     }
 
-    let scores: Vec<f32> = picked.iter().map(|f| f.score).collect();
+    let scores: Vec<f32> = picked.iter().map(|f| f.score.get()).collect();
     let lay = layout::compute(&scores, &[], aspect, &spec);
     let jpeg = compose::render(&picked, &lay, &[], cfg.jpeg_quality(), cfg.hero_border_px())?;
 
@@ -156,7 +157,7 @@ pub fn extract_range(
     };
 
     let meta = Metadata {
-        source: input.display().to_string(),
+        source: input.to_string(),
         duration: range.end() - range.start(),
         settings: cfg.settings(),
         grids: vec![grid_meta],

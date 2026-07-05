@@ -6,9 +6,10 @@
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=x86-64-v3"]
 
-# The release/distribution build: statically linked FFmpeg + dav1d, zero runtime
-# dependencies. Use `./scripts/build-static.sh` — it builds a static dav1d and
-# puts it on PKG_CONFIG_PATH first, which the `static-ffmpeg` feature needs for
-# `--enable-libdav1d` (software AV1). Running the feature bare (no dav1d on
+# The release/distribution build: statically linked FFmpeg + dav1d + openssl,
+# zero runtime dependencies. Use `./scripts/build-static.sh` — it builds static
+# dav1d and openssl and puts them on PKG_CONFIG_PATH first, which the
+# `static-ffmpeg` feature needs for `--enable-libdav1d` (software AV1) and
+# `--enable-openssl` (https). Running the feature bare (no deps on
 # PKG_CONFIG_PATH) makes FFmpeg's configure fail. Plain `cargo build --release`
 # still links the system FFmpeg dynamically for fast iteration.

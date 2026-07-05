@@ -37,6 +37,14 @@ jobs:
             variant: static
             ffmpeg_cpu: x86-64-v3
             npm_platform: linux-x64
+          # fully-static musl: FFmpeg + dav1d + openssl + libc all linked in,
+          # a single file with no dynamic dependencies. Distributed as an extra
+          # tarball variant; the gnu static build stays the npm default.
+          - os: ubuntu-latest
+            container: rust:1-trixie
+            target: x86_64-unknown-linux-musl
+            variant: static
+            ffmpeg_cpu: x86-64-v3
 
           # --- Linux aarch64 (native arm runner, no cross-compile) --------
           - os: ubuntu-24.04-arm
@@ -88,7 +96,12 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential nasm meson ninja-build pkg-config git
+            build-essential nasm meson ninja-build pkg-config git perl
+      - name: Install musl toolchain + rustup target (Linux, musl)
+        if: contains(matrix.target, 'musl')
+        run: |
+          apt-get install -y --no-install-recommends musl-tools
+          rustup target add ${{ matrix.target }}
       - name: Install FFmpeg dev libs (Linux, dynamic)
         if: runner.os == 'Linux' && matrix.variant == 'dynamic'
         run: |
@@ -109,14 +122,30 @@ jobs:
           key: ${{ matrix.target }}-${{ matrix.variant }}
 
       # --- Build --------------------------------------------------------------
+      # Static builds route through build-static.sh; a musl target sets TARGET
+      # so the C deps compile against musl and cargo cross-builds, landing the
+      # binary under target/<triple>/release instead of target/release.
       - name: Build (static)
         if: matrix.variant == 'static'
         env:
           FFMPEG_TARGET_CPU: ${{ matrix.ffmpeg_cpu }}
+          TARGET: ${{ contains(matrix.target, 'musl') && matrix.target || '' }}
         run: ./scripts/build-static.sh
       - name: Build (dynamic)
         if: matrix.variant == 'dynamic'
         run: cargo build --release
+
+      # Resolve the release output dir: gnu static + dynamic land in
+      # target/release; a cross-built musl target lands in target/<triple>/release.
+      - name: Resolve output dir
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *musl* ]]; then
+            echo "OUT_DIR=target/${{ matrix.target }}/release" >> "$GITHUB_ENV"
+          else
+            echo "OUT_DIR=target/release" >> "$GITHUB_ENV"
+          fi
 
       # --- Package ------------------------------------------------------------
       - name: Package (unix)
@@ -124,7 +153,7 @@ jobs:
         run: |
           suffix=""
           [ "${{ matrix.variant }}" = "static" ] && suffix="-static"
-          tar -C target/release -czf \
+          tar -C "$OUT_DIR" -czf \
             "agent-video-${GITHUB_REF_NAME}-${{ matrix.target }}${suffix}.tar.gz" agent-video
       - name: Package (windows, bundle FFmpeg DLLs)
         if: runner.os == 'Windows'

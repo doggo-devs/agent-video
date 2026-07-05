@@ -19,6 +19,7 @@ const MIN_STATIC_DROPS: usize = 3;
 
 /// A detected static stretch: the scene held still over `[start, end]` and
 /// `rgb` (the kept frame at `start`) stands in for the whole range.
+#[derive(Debug)]
 pub struct Stretch {
     pub start: f32,
     pub end: f32,

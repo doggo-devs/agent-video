@@ -87,8 +87,6 @@ npx -y @agent-video/cli process video.mp4 -o out/
   ranges, key frames, and subtitle text.
 - Single dense grid of a short range:
   \`npx -y @agent-video/cli extract video.mp4 --range 01:23-01:35 -o out/\`
-- Inspect first: \`npx -y @agent-video/cli probe video.mp4\` prints JSON
-  (duration, resolution, subtitle tracks).
 - Sampling/strategy flags: \`npx -y @agent-video/cli process --help\`.
 
 ## URLs

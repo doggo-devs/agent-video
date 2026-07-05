@@ -19,7 +19,7 @@
 use image::GrayImage;
 use rayon::prelude::*;
 
-use crate::types::{CandidateFrame, ScoredFrame};
+use crate::types::{CandidateFrame, SceneDiff, Score, ScoredFrame};
 
 /// Raw per-dimension scores, in their natural (incomparable) units — a scoring
 /// transient, never stored on a frame. `clarity` is a Laplacian variance,
@@ -33,12 +33,13 @@ struct RawScores {
 }
 
 /// Scoring dimension weights, passed from the profile. Weights are relative:
-/// the scoring boundary normalizes by their sum, so only ratios matter and the
-/// final score honors [`ScoredFrame`]'s `0..=100` contract at any scale.
+/// only ratios matter — [`Weights::new`] normalizes them to sum to 1, so the
+/// weighted rank average stays inside [`Score`]'s `0..=100` contract at any
+/// input scale.
 ///
-/// Finite, non-negative, and not all zero by construction — the invariants the
-/// rank-normalization arithmetic in this module depends on live in
-/// [`Weights::new`], not in a caller-side check.
+/// Finite, non-negative, not all zero, and normalized by construction — the
+/// invariants the rank-normalization arithmetic in this module depends on
+/// live here, not in a caller-side check.
 #[derive(Debug, Clone, Copy)]
 pub struct Weights {
     scene: f32,
@@ -57,16 +58,27 @@ impl Weights {
                 ));
             }
         }
-        if scene + clarity + edge <= 0.0 {
+        let total = scene + clarity + edge;
+        if total <= 0.0 {
             return Err(Error::new(
                 ErrorCode::InvalidConfig,
                 "invalid weights: all zero (at least one must be > 0)",
             ));
         }
+        // Individually finite weights can still overflow their sum; a
+        // non-finite total would turn every score into NaN downstream.
+        if !total.is_finite() {
+            return Err(Error::new(
+                ErrorCode::InvalidConfig,
+                format!("invalid weights: sum overflows ({scene} + {clarity} + {edge})"),
+            ));
+        }
+        // Normalize once here so products in rank_normalize cannot overflow
+        // and the weighted average is bounded by the rank range.
         Ok(Self {
-            scene,
-            clarity,
-            edge,
+            scene: scene / total,
+            clarity: clarity / total,
+            edge: edge / total,
         })
     }
 }
@@ -261,10 +273,20 @@ pub fn score_frames(
             ts: f.ts,
             gray: f.gray,
             rgb: f.rgb,
-            score,
-            scene_diff: raw.scene_diff,
+            score: mint_score(score),
+            scene_diff: SceneDiff::new(raw.scene_diff)
+                .expect("mean absolute u8 difference lies in 0..=255"),
         })
         .collect()
+}
+
+/// Wrap a weighted rank average into a [`Score`].
+///
+/// The average is mathematically bounded by `0..=100` (normalized weights ×
+/// percentiles), but float rounding of the products can overshoot the bound
+/// by an ulp; the clamp removes exactly that noise, nothing more.
+fn mint_score(score: f32) -> Score {
+    Score::new(score.clamp(0.0, 100.0)).expect("clamped weighted rank average is finite")
 }
 
 /// Re-rank frames that are NOT temporally consecutive — e.g. per-batch
@@ -287,12 +309,12 @@ pub fn rescore_frames(mut frames: Vec<ScoredFrame>, weights: &Weights) -> Vec<Sc
             } else {
                 0.0
             },
-            scene_diff: f.scene_diff,
+            scene_diff: f.scene_diff.get(),
         })
         .collect();
     let scores = rank_normalize(&raws, weights);
     for (f, score) in frames.iter_mut().zip(scores) {
-        f.score = score;
+        f.score = mint_score(score);
     }
     frames
 }
@@ -403,7 +425,7 @@ pub fn select_top_k(frames: &[ScoredFrame], k: usize, min_gap: f32) -> Vec<usize
         return Vec::new();
     }
     let mut order: Vec<usize> = (0..frames.len()).collect();
-    order.sort_by(|&a, &b| frames[b].score.total_cmp(&frames[a].score));
+    order.sort_by(|&a, &b| frames[b].score.get().total_cmp(&frames[a].score.get()));
 
     let mut chosen: Vec<usize> = Vec::with_capacity(k);
     for &i in &order {
@@ -447,9 +469,14 @@ pub const DEFAULT_HERO_SCENE_DIFF: f32 = 70.0;
 /// `capacity / 4` heroes are placeable).
 pub fn pick_heroes(selected: &[ScoredFrame], max_heroes: usize, scene_diff_min: f32) -> Vec<usize> {
     let mut heroes: Vec<usize> = (0..selected.len())
-        .filter(|&i| selected[i].scene_diff >= scene_diff_min)
+        .filter(|&i| selected[i].scene_diff.get() >= scene_diff_min)
         .collect();
-    heroes.sort_by(|&a, &b| selected[b].scene_diff.total_cmp(&selected[a].scene_diff));
+    heroes.sort_by(|&a, &b| {
+        selected[b]
+            .scene_diff
+            .get()
+            .total_cmp(&selected[a].scene_diff.get())
+    });
     heroes.truncate(max_heroes);
     heroes
 }
@@ -489,15 +516,15 @@ mod tests {
             ts,
             gray: GrayImage::new(1, 1),
             rgb: Arc::new(RgbImage::new(1, 1)),
-            score,
-            scene_diff: 0.0,
+            score: Score::new(score).expect("test score in 0..=100"),
+            scene_diff: SceneDiff::new(0.0).expect("zero diff is valid"),
         }
     }
 
     /// A scored frame carrying only the field hero-picking reads.
     fn with_diff(ts: f32, scene_diff: f32) -> ScoredFrame {
         ScoredFrame {
-            scene_diff,
+            scene_diff: SceneDiff::new(scene_diff).expect("test diff in 0..=255"),
             ..scored(ts, 50.0)
         }
     }
@@ -646,6 +673,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_weights_whose_sum_overflows() {
+        // Each weight is finite, but the sum is not; accepting them would
+        // turn every downstream score into NaN.
+        Weights::new(f32::MAX, f32::MAX, 0.0).expect_err("overflowing sum must be rejected");
+    }
+
+    #[test]
     fn single_frame_scores_full() {
         let weights = Weights {
             scene: 0.40,
@@ -674,11 +708,12 @@ mod tests {
         let rescored = rescore_frames(frames, &weights);
         let best = rescored
             .iter()
-            .max_by(|a, b| a.score.total_cmp(&b.score))
+            .max_by(|a, b| a.score.get().total_cmp(&b.score.get()))
             .expect("non-empty set");
         assert_eq!(best.ts, 60.0, "carried scene_diff decides the winner");
         assert_eq!(
-            best.scene_diff, 90.0,
+            best.scene_diff.get(),
+            90.0,
             "carried raw scene_diff survives the re-rank"
         );
     }
@@ -719,7 +754,7 @@ mod tests {
             with_diff(1.0, 30.0),
             with_diff(2.0, 60.0),
         ];
-        fs[2].score = 99.0;
+        fs[2].score = Score::new(99.0).expect("test score in 0..=100");
         let heroes = pick_heroes(&fs, 3, DEFAULT_HERO_SCENE_DIFF);
         assert!(heroes.is_empty(), "no cut means a uniform grid");
     }

@@ -3,7 +3,9 @@
 use anyhow::Result;
 use image::GrayImage;
 
-use crate::types::{CandidateFrame, GridDraft, KeyFrameMeta, ScoredFrame, TimeRange};
+use crate::types::{
+    CandidateFrame, GridDraft, GridPosition, KeyFrameMeta, LayoutKind, ScoredFrame, TimeRange,
+};
 use crate::{compose, layout, score};
 
 #[derive(Debug)]
@@ -74,7 +76,7 @@ fn evict_for_heroes(
     aspect: f32,
     spec: &crate::types::CanvasSpec,
 ) -> layout::Layout {
-    let scores: Vec<f32> = picked.iter().map(|f| f.score).collect();
+    let scores: Vec<f32> = picked.iter().map(|f| f.score.get()).collect();
     if heroes.is_empty() {
         return layout::compute(&scores, heroes, aspect, spec);
     }
@@ -84,14 +86,14 @@ fn evict_for_heroes(
     let baseline = min_short_edge(&uniform).min(spec.min_cell_edge());
 
     loop {
-        let scores: Vec<f32> = picked.iter().map(|f| f.score).collect();
+        let scores: Vec<f32> = picked.iter().map(|f| f.score.get()).collect();
         let lay = layout::compute(&scores, heroes, aspect, spec);
         if min_short_edge(&lay) >= baseline {
             return lay;
         }
         let Some(victim) = (0..picked.len())
             .filter(|i| !heroes.contains(i))
-            .min_by(|&a, &b| picked[a].score.total_cmp(&picked[b].score))
+            .min_by(|&a, &b| picked[a].score.get().total_cmp(&picked[b].score.get()))
         else {
             // Only heroes left: nothing to trade away.
             return lay;
@@ -105,11 +107,13 @@ fn evict_for_heroes(
     }
 }
 
-/// Shortest cell edge in a layout, `u32::MAX` for an empty one.
+/// Shortest cell edge in a layout, `u32::MAX` for an empty one. A frame the
+/// layout could not place counts as 0 — below any readable floor — so the
+/// eviction loop trades frames away until everything left has a real cell.
 fn min_short_edge(lay: &layout::Layout) -> u32 {
     lay.rects
         .iter()
-        .map(|r| r.w.min(r.h))
+        .map(|r| r.map_or(0, |r| r.w().min(r.h())))
         .min()
         .unwrap_or(u32::MAX)
 }
@@ -131,7 +135,7 @@ pub fn extract_selected(
 pub fn build_grid_draft(
     picked: &[ScoredFrame],
     heroes: &[usize],
-    template: &'static str,
+    template: LayoutKind,
 ) -> GridDraft {
     let (first, last) = (
         picked.first().map(|f| f.ts).unwrap_or(0.0),
@@ -141,8 +145,8 @@ pub fn build_grid_draft(
         .iter()
         .map(|&i| KeyFrameMeta {
             timestamp: crate::types::format_ts(picked[i].ts),
-            score: picked[i].score.round() as u32,
-            grid_position: "hero",
+            score: picked[i].score.get().round() as u32,
+            grid_position: GridPosition::Hero,
         })
         .collect();
     GridDraft {
@@ -167,12 +171,13 @@ mod tests {
     use std::sync::Arc;
 
     fn frame(ts: f32) -> ScoredFrame {
+        use crate::types::{SceneDiff, Score};
         ScoredFrame {
             ts,
             gray: GrayImage::new(1, 1),
             rgb: Arc::new(RgbImage::new(1, 1)),
-            score: 0.0,
-            scene_diff: 0.0,
+            score: Score::new(0.0).expect("zero score is valid"),
+            scene_diff: SceneDiff::new(0.0).expect("zero diff is valid"),
         }
     }
 
@@ -194,7 +199,7 @@ mod tests {
 
     fn scored(ts: f32, score: f32) -> ScoredFrame {
         let mut f = frame(ts);
-        f.score = score;
+        f.score = crate::types::Score::new(score).expect("test score in 0..=100");
         f
     }
 
@@ -217,7 +222,10 @@ mod tests {
         let hero = heroes[0];
         assert!(hero < picked.len(), "hero index stays aligned");
         assert_eq!(picked[hero].ts, 15.0, "hero frame survived eviction");
-        let min_kept = picked.iter().map(|f| f.score).fold(f32::INFINITY, f32::min);
+        let min_kept = picked
+            .iter()
+            .map(|f| f.score.get())
+            .fold(f32::INFINITY, f32::min);
         assert!(min_kept > 0.0, "the weakest frames were the ones evicted");
     }
 

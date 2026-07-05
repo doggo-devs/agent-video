@@ -11,6 +11,7 @@ use std::path::Path;
 
 use crate::error::{Error, ErrorCode, ErrorContext, Result};
 use crate::media;
+use crate::source::Source;
 use crate::types::{GridSubtitles, TimeRange};
 
 /// A single parsed subtitle cue.
@@ -19,6 +20,26 @@ pub struct Cue {
     pub start: f32,
     pub end: f32,
     pub text: String,
+}
+
+impl Cue {
+    /// Build a cue clipped to the visible timeline `[0, ∞)`.
+    ///
+    /// Embedded streams legitimately carry cues placed before the video's
+    /// first frame: edit-list pre-roll (MP4 `elst` negative offsets),
+    /// `-itsoffset`-shifted tracks, and broadcast priming cues. The domain
+    /// rule is a single intersection: a cue ending at or before 0 is not
+    /// content and yields `None`; one straddling 0 is clamped to start at 0,
+    /// which honors the container's intent that its text be on screen when
+    /// the first frame presents. Empty text also yields `None`.
+    pub fn visible(start: f64, end: f64, text: String) -> Option<Cue> {
+        let start = start.max(0.0);
+        (end > start && !text.is_empty()).then_some(Cue {
+            start: start as f32,
+            end: end as f32,
+            text,
+        })
+    }
 }
 
 /// Where subtitles come from, decided at CLI parsing time.
@@ -58,7 +79,7 @@ impl Subtitles {
     /// [`ErrorCode::InputCorrupt`]: every grid's `subtitles` field would be
     /// empty while the run reports success — a corrupt input, not a resolved
     /// one.
-    pub fn resolve(input: &Path, source: SubtitleSource<'_>) -> Result<Option<Self>> {
+    pub fn resolve(input: &Source, source: SubtitleSource<'_>) -> Result<Option<Self>> {
         match source {
             SubtitleSource::File(p) => Ok(Some(Self::from_srt_text(input, extract_from_file(p)?)?)),
             SubtitleSource::Track(t) => Ok(Some(Self::from_cues(media::subtitle::extract_track(
@@ -76,14 +97,14 @@ impl Subtitles {
 
     /// Build from SRT text (explicit file or sidecar), keeping the raw text
     /// as the `subtitles.txt` payload.
-    fn from_srt_text(input: &Path, raw: String) -> Result<Self> {
+    fn from_srt_text(input: &Source, raw: String) -> Result<Self> {
         let cues = parse_srt(&raw);
         if cues.is_empty() {
             return Err(Error::new(
                 ErrorCode::InputCorrupt,
                 "subtitle source contains no parseable SRT cues; is it a valid SRT file?",
             )
-            .with_context(ErrorContext::default().with_input(input)));
+            .with_context(ErrorContext::default().with_input(input.as_path())));
         }
         Ok(Subtitles { raw, cues })
     }
@@ -137,9 +158,14 @@ fn extract_from_file(path: &Path) -> Result<String> {
 /// Extract subtitles with automatic source detection.
 ///
 /// Fails if multiple sources exist (embedded + sidecar, or multiple sidecars/tracks).
-/// Returns `None` when no subtitles are found.
-fn auto_detect(input: &Path) -> Result<Option<AutoSource>> {
-    let sidecars = find_all_sidecars(input);
+/// Returns `None` when no subtitles are found. Sidecar discovery is
+/// local-only: a remote source has no directory to scan, so only its embedded
+/// tracks are considered.
+fn auto_detect(input: &Source) -> Result<Option<AutoSource>> {
+    let sidecars = match input {
+        Source::Local(path) => find_all_sidecars(path),
+        Source::Remote(_) => Vec::new(),
+    };
     let embedded = media::subtitle::list_tracks(input)?;
 
     let total = sidecars.len() + embedded.len();
@@ -186,13 +212,13 @@ fn auto_detect(input: &Path) -> Result<Option<AutoSource>> {
 
 /// Find all sidecar subtitle files alongside the video.
 ///
-/// Best-effort by design: this runs on every auto-detect invocation,
+/// Best-effort by design: this runs on every local auto-detect invocation,
 /// including ones that need no subtitles, so a directory that cannot be
 /// listed (permissions, sandbox) degrades to a warning and whatever the
-/// exact-name check already found — mirroring the missing-ffprobe downgrade
+/// exact-name check already found — mirroring the missing-track downgrade
 /// in [`auto_detect`]. A sidecar that is *found* but unreadable still fails,
 /// in [`read_sidecar`].
-pub(crate) fn find_all_sidecars(input: &Path) -> Vec<std::path::PathBuf> {
+fn find_all_sidecars(input: &Path) -> Vec<std::path::PathBuf> {
     let Some(stem) = input.file_stem().and_then(|s| s.to_str()) else {
         return Vec::new();
     };
@@ -458,6 +484,29 @@ with continuation
     }
 
     #[test]
+    fn drops_cue_ending_before_zero() {
+        // A broadcast priming cue lives entirely before the first video
+        // frame; it is initialization, not content.
+        assert!(Cue::visible(-0.5, -0.1, "prime".into()).is_none());
+        assert!(Cue::visible(-0.5, 0.0, "prime".into()).is_none());
+    }
+
+    #[test]
+    fn clamps_cue_straddling_zero() {
+        // Edit-list pre-roll: the cue must be on screen at the first frame,
+        // so its visible interval starts at 0.
+        let cue = Cue::visible(-0.2, 1.0, "early".into()).expect("straddling cue is visible");
+        assert_eq!(cue.start, 0.0);
+        assert!((cue.end - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rejects_empty_or_inverted_cue() {
+        assert!(Cue::visible(1.0, 2.0, String::new()).is_none());
+        assert!(Cue::visible(2.0, 1.0, "inverted".into()).is_none());
+    }
+
+    #[test]
     fn slices_by_range() {
         let cues = vec![
             Cue {
@@ -491,7 +540,7 @@ with continuation
         let sub = dir.join("broken.srt");
         fs::write(&sub, "this is not SRT\njust prose\n").expect("write test subtitle");
 
-        let err = Subtitles::resolve(Path::new("video.mp4"), SubtitleSource::File(&sub))
+        let err = Subtitles::resolve(&Source::classify("video.mp4"), SubtitleSource::File(&sub))
             .expect_err("unparseable subtitle must fail");
         assert_eq!(err.code, ErrorCode::InputCorrupt);
 

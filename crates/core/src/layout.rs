@@ -12,23 +12,26 @@
 //! transpose the whole scheme: justified columns, heroes on the left.
 //! [`CanvasSpec::edge`] caps the longer canvas edge; row counts are chosen so
 //! the canvas stays roughly square, which maximizes the pixel budget a VLM
-//! actually sees. The template names (UNIFORM / HERO_LEFT / DUAL_HERO /
-//! TOP_STRIP) simply label the hero count for metadata.
+//! actually sees. The template ([`LayoutKind`]) simply labels the hero count
+//! for metadata.
 
 use std::mem;
 
-use crate::types::{CanvasSpec, Rect};
+use crate::types::{CanvasSpec, LayoutKind, Rect};
 
 /// A computed grid: one rectangle per frame (in input order) plus canvas size
 /// and the template name driven by hero count.
 #[derive(Debug, Clone)]
 pub struct Layout {
-    /// Pixel rectangle for each frame, indexed as the input frames were.
-    pub rects: Vec<Rect>,
+    /// Pixel cell per frame, indexed as the input frames were. `None` when
+    /// rounding on an over-packed canvas left the frame no non-degenerate
+    /// cell — composition skips it, and hero eviction treats it as below any
+    /// readable floor. Capacity-driven callers never see it in practice.
+    pub rects: Vec<Option<Rect>>,
     pub canvas_w: u32,
     pub canvas_h: u32,
-    /// Template name for metadata: UNIFORM / HERO_LEFT / DUAL_HERO / TOP_STRIP.
-    pub template: &'static str,
+    /// Template for metadata, named by hero count.
+    pub template: LayoutKind,
 }
 
 /// How many cells fit on the canvas at the minimum readable cell size.
@@ -57,12 +60,12 @@ fn sane_aspect(aspect: f32) -> f32 {
     }
 }
 
-fn template_name(hero_count: usize) -> &'static str {
+fn template_kind(hero_count: usize) -> LayoutKind {
     match hero_count {
-        0 => "UNIFORM",
-        1 => "HERO_LEFT",
-        2 => "DUAL_HERO",
-        _ => "TOP_STRIP",
+        0 => LayoutKind::Uniform,
+        1 => LayoutKind::HeroLeft,
+        2 => LayoutKind::DualHero,
+        _ => LayoutKind::TopStrip,
     }
 }
 
@@ -79,7 +82,7 @@ pub fn compute(scores: &[f32], heroes: &[usize], aspect: f32, spec: &CanvasSpec)
             rects: Vec::new(),
             canvas_w: 0,
             canvas_h: 0,
-            template: "UNIFORM",
+            template: LayoutKind::Uniform,
         };
     }
     if aspect < 1.0 {
@@ -87,8 +90,7 @@ pub fn compute(scores: &[f32], heroes: &[usize], aspect: f32, spec: &CanvasSpec)
         // hero rows become hero columns on the left.
         let mut layout = compute_wide(scores, heroes, 1.0 / aspect, spec);
         for r in &mut layout.rects {
-            mem::swap(&mut r.x, &mut r.y);
-            mem::swap(&mut r.w, &mut r.h);
+            *r = r.map(Rect::transposed);
         }
         mem::swap(&mut layout.canvas_w, &mut layout.canvas_h);
         return layout;
@@ -158,16 +160,10 @@ fn compute_wide(scores: &[f32], heroes: &[usize], a: f32, spec: &CanvasSpec) -> 
     let width = spec.edge() as f32 / height_ratio.max(1.0);
 
     // Cell edges derive from rounded row/column boundaries, so adjacent cells
-    // share exact boundaries and the rows tile the canvas without gaps.
-    let mut rects = vec![
-        Rect {
-            x: 0,
-            y: 0,
-            w: 0,
-            h: 0
-        };
-        n
-    ];
+    // share exact boundaries and the rows tile the canvas without gaps. A
+    // boundary pair that rounds to zero extent yields `None` — Rect cannot
+    // represent a degenerate cell.
+    let mut rects: Vec<Option<Rect>> = vec![None; n];
     let mut y = 0.0_f32;
     for row in &rows {
         let k = row.len() as f32;
@@ -177,12 +173,7 @@ fn compute_wide(scores: &[f32], heroes: &[usize], a: f32, spec: &CanvasSpec) -> 
         for (j, &idx) in row.iter().enumerate() {
             let x0 = (j as f32 * width / k).round() as u32;
             let x1 = ((j + 1) as f32 * width / k).round() as u32;
-            rects[idx] = Rect {
-                x: x0,
-                y: y0,
-                w: x1 - x0,
-                h: y1 - y0,
-            };
+            rects[idx] = Rect::new(x0, y0, x1 - x0, y1 - y0);
         }
         y += row_h;
     }
@@ -191,7 +182,7 @@ fn compute_wide(scores: &[f32], heroes: &[usize], a: f32, spec: &CanvasSpec) -> 
         rects,
         canvas_w: width.round() as u32,
         canvas_h: y.round() as u32,
-        template: template_name(hero_count),
+        template: template_kind(hero_count),
     }
 }
 
@@ -212,23 +203,27 @@ mod tests {
     /// completely — justified layout leaves no filler area by construction.
     fn assert_tiles(layout: &Layout) {
         let mut area = 0_u64;
-        for r in &layout.rects {
-            assert!(r.w > 0 && r.h > 0, "every frame gets a cell: {r:?}");
+        let rects: Vec<Rect> = layout
+            .rects
+            .iter()
+            .map(|r| r.expect("every frame gets a cell"))
+            .collect();
+        for r in &rects {
             assert!(
-                r.x + r.w <= layout.canvas_w && r.y + r.h <= layout.canvas_h,
+                r.x() + r.w() <= layout.canvas_w && r.y() + r.h() <= layout.canvas_h,
                 "rect {r:?} exceeds canvas {}x{}",
                 layout.canvas_w,
                 layout.canvas_h
             );
-            area += u64::from(r.w) * u64::from(r.h);
+            area += u64::from(r.w()) * u64::from(r.h());
         }
-        for i in 0..layout.rects.len() {
-            for j in (i + 1)..layout.rects.len() {
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
                 assert!(
-                    !layout.rects[i].overlaps(&layout.rects[j]),
+                    !rects[i].overlaps(&rects[j]),
                     "overlap: {:?} vs {:?}",
-                    layout.rects[i],
-                    layout.rects[j]
+                    rects[i],
+                    rects[j]
                 );
             }
         }
@@ -242,7 +237,7 @@ mod tests {
     #[test]
     fn lays_out_uniform_landscape() {
         let l = compute(&flat(12), &[], 16.0 / 9.0, &spec());
-        assert_eq!(l.template, "UNIFORM");
+        assert_eq!(l.template, LayoutKind::Uniform);
         assert_eq!(l.rects.len(), 12);
         assert_tiles(&l);
     }
@@ -252,15 +247,21 @@ mod tests {
         let l = compute(&flat(12), &[], 9.0 / 16.0, &spec());
         assert_tiles(&l);
         // Portrait cells are taller than wide.
-        let r = l.rects[0];
-        assert!(r.h > r.w, "portrait cell should be taller than wide: {r:?}");
+        let r = l.rects[0].expect("cell placed");
+        assert!(
+            r.h() > r.w(),
+            "portrait cell should be taller than wide: {r:?}"
+        );
     }
 
     #[test]
     fn landscape_cell_is_wider_than_tall() {
         let l = compute(&flat(12), &[], 16.0 / 9.0, &spec());
-        let r = l.rects[0];
-        assert!(r.w > r.h, "landscape cell should be wider than tall: {r:?}");
+        let r = l.rects[0].expect("cell placed");
+        assert!(
+            r.w() > r.h(),
+            "landscape cell should be wider than tall: {r:?}"
+        );
     }
 
     #[test]
@@ -279,12 +280,12 @@ mod tests {
         let mut scores = vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 90.0];
         scores[0] = 95.0;
         let l = compute(&scores, &[0], 16.0 / 9.0, &spec());
-        assert_eq!(l.template, "HERO_LEFT");
+        assert_eq!(l.template, LayoutKind::HeroLeft);
         assert_tiles(&l);
-        let hero = l.rects[0];
-        let normal = l.rects[1];
+        let hero = l.rects[0].expect("hero placed");
+        let normal = l.rects[1].expect("normal placed");
         assert!(
-            hero.w > normal.w && hero.h > normal.h,
+            hero.w() > normal.w() && hero.h() > normal.h(),
             "hero must be bigger: {hero:?} vs {normal:?}"
         );
     }
@@ -294,21 +295,21 @@ mod tests {
         // A repeated index must occupy one hero slot, not two. HERO_LEFT
         // (single hero) is the correct template.
         let l = compute(&flat(10), &[0, 0], 16.0 / 9.0, &spec());
-        assert_eq!(l.template, "HERO_LEFT");
+        assert_eq!(l.template, LayoutKind::HeroLeft);
         assert_tiles(&l);
     }
 
     #[test]
     fn dual_hero_names_template() {
         let l = compute(&flat(10), &[0, 1], 16.0 / 9.0, &spec());
-        assert_eq!(l.template, "DUAL_HERO");
+        assert_eq!(l.template, LayoutKind::DualHero);
         assert_tiles(&l);
     }
 
     #[test]
     fn three_heroes_make_top_strip() {
         let l = compute(&flat(12), &[0, 1, 2], 16.0 / 9.0, &spec());
-        assert_eq!(l.template, "TOP_STRIP");
+        assert_eq!(l.template, LayoutKind::TopStrip);
         assert_tiles(&l);
     }
 
@@ -317,14 +318,15 @@ mod tests {
         let l = compute(&flat(10), &[0], 9.0 / 16.0, &spec());
         assert_tiles(&l);
         // Hero anchors at the top-left: hero rows transpose to left columns.
-        assert_eq!((l.rects[0].x, l.rects[0].y), (0, 0));
+        let hero = l.rects[0].expect("hero placed");
+        assert_eq!((hero.x(), hero.y()), (0, 0));
     }
 
     #[test]
     fn hero_only_chunk_tiles_without_normals() {
         // Eviction can leave nothing but heroes; rows shrink to fit them.
         let l = compute(&flat(2), &[0, 1], 16.0 / 9.0, &spec());
-        assert_eq!(l.template, "DUAL_HERO");
+        assert_eq!(l.template, LayoutKind::DualHero);
         assert_tiles(&l);
     }
 
@@ -362,7 +364,8 @@ mod tests {
         let l = compute(&flat(1), &[], 1.0, &spec());
         assert_eq!(l.rects.len(), 1);
         assert_tiles(&l);
-        assert_eq!(l.rects[0].w, l.canvas_w);
-        assert_eq!(l.rects[0].h, l.canvas_h);
+        let r = l.rects[0].expect("cell placed");
+        assert_eq!(r.w(), l.canvas_w);
+        assert_eq!(r.h(), l.canvas_h);
     }
 }

@@ -13,14 +13,17 @@ name = "agent-video"
 path = "src/main.rs"
 
 [features]
-# Zero-dependency release build: compile FFmpeg from source at build time and
-# link it statically, so the binary needs no ffmpeg installation at runtime.
-# `build-lib-dav1d` adds `--enable-libdav1d` so software AV1 decoding works
-# (FFmpeg's native AV1 decoder is a hardware-only stub); dav1d must be present
-# as a static lib on PKG_CONFIG_PATH at build time — see scripts/build-static.sh.
-# Requires a C toolchain + nasm + network access on first build. Day-to-day
+# Zero-dependency release build: compile FFmpeg from source and link it
+# statically. `build-lib-dav1d` adds `--enable-libdav1d` (software AV1);
+# `build-lib-openssl` adds `--enable-openssl` (https). Both static libs must be
+# on PKG_CONFIG_PATH at build time — see scripts/build-static.sh. Day-to-day
 # builds link the system FFmpeg via pkg-config instead (fast).
-static-ffmpeg = ["ffmpeg-next/build", "ffmpeg-next/static", "ffmpeg-next/build-lib-dav1d"]
+static-ffmpeg = [
+    "ffmpeg-next/build",
+    "ffmpeg-next/static",
+    "ffmpeg-next/build-lib-dav1d",
+    "ffmpeg-next/build-lib-openssl",
+]
 
 [dependencies]
 ffmpeg-next = { version = "8", default-features = false, features = [
