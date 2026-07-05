@@ -16,20 +16,45 @@
 //! spread over the full range by construction and carry no evidence that
 //! anything actually stood out.
 
+use std::ops::{Index, IndexMut};
+
 use image::GrayImage;
 use rayon::prelude::*;
 
 use crate::types::{CandidateFrame, SceneDiff, Score, ScoredFrame};
 
+/// One scoring dimension. Doubles as the index into [`RawScores`] and the
+/// key of [`Weights::active`], so "which dimensions exist" is stated once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dim {
+    Scene,
+    Clarity,
+    Edge,
+}
+
+impl Dim {
+    const ALL: [Dim; 3] = [Dim::Scene, Dim::Clarity, Dim::Edge];
+}
+
 /// Raw per-dimension scores, in their natural (incomparable) units — a scoring
-/// transient, never stored on a frame. `clarity` is a Laplacian variance,
-/// `edge_density` a Sobel energy mean, `scene_diff` a mean absolute grayscale
-/// difference (0-255) from the previous frame.
+/// transient, never stored on a frame. Indexed by [`Dim`]: `Scene` is a mean
+/// absolute grayscale difference (0-255) from the previous frame, `Clarity` a
+/// Laplacian variance, `Edge` a Sobel energy mean. Slots of inactive
+/// dimensions stay at their zero default and are never read.
 #[derive(Debug, Clone, Copy, Default)]
-struct RawScores {
-    clarity: f32,
-    edge_density: f32,
-    scene_diff: f32,
+struct RawScores([f32; 3]);
+
+impl Index<Dim> for RawScores {
+    type Output = f32;
+    fn index(&self, d: Dim) -> &f32 {
+        &self.0[d as usize]
+    }
+}
+
+impl IndexMut<Dim> for RawScores {
+    fn index_mut(&mut self, d: Dim) -> &mut f32 {
+        &mut self.0[d as usize]
+    }
 }
 
 /// Scoring dimension weights, passed from the profile. Weights are relative:
@@ -37,17 +62,21 @@ struct RawScores {
 /// weighted rank average stays inside [`Score`]'s `0..=100` contract at any
 /// input scale.
 ///
-/// Finite, non-negative, not all zero, and normalized by construction — the
-/// invariants the rank-normalization arithmetic in this module depends on
-/// live here, not in a caller-side check.
+/// A zero input weight is not a value — it is absence: the dimension is
+/// simply not in the active set, so no consumer can forget to skip it (the
+/// old three-named-fields shape required every call site to re-derive
+/// "is this dimension on?" from `w > 0.0`, and one of them didn't).
+/// Invariants — at least one active dimension, every stored weight finite
+/// and strictly positive, actives summing to 1 — live here, not in a
+/// caller-side check.
 #[derive(Debug, Clone, Copy)]
 pub struct Weights {
-    scene: f32,
-    clarity: f32,
-    edge: f32,
+    w: [Option<f32>; 3],
 }
 
 impl Weights {
+    /// Validate and normalize raw profile weights (in `Dim` order:
+    /// scene, clarity, edge). Zero weights become inactive dimensions.
     pub fn new(scene: f32, clarity: f32, edge: f32) -> crate::error::Result<Self> {
         use crate::error::{Error, ErrorCode};
         for (name, w) in [("w_scene", scene), ("w_clarity", clarity), ("w_edge", edge)] {
@@ -76,10 +105,17 @@ impl Weights {
         // Normalize once here so products in rank_normalize cannot overflow
         // and the weighted average is bounded by the rank range.
         Ok(Self {
-            scene: scene / total,
-            clarity: clarity / total,
-            edge: edge / total,
+            w: [scene, clarity, edge].map(|w| (w > 0.0).then(|| w / total)),
         })
+    }
+
+    /// The dimensions that participate in scoring, with their normalized
+    /// weights — the single source of truth every scoring stage iterates.
+    fn active(&self) -> impl Iterator<Item = (Dim, f32)> + '_ {
+        Dim::ALL
+            .into_iter()
+            .zip(self.w)
+            .filter_map(|(d, w)| w.map(|w| (d, w)))
     }
 }
 
@@ -274,7 +310,7 @@ pub fn score_frames(
             gray: f.gray,
             rgb: f.rgb,
             score: mint_score(score),
-            scene_diff: SceneDiff::new(raw.scene_diff)
+            scene_diff: SceneDiff::new(raw[Dim::Scene])
                 .expect("mean absolute u8 difference lies in 0..=255"),
         })
         .collect()
@@ -299,17 +335,20 @@ fn mint_score(score: f32) -> Score {
 /// frame, so recomputing them is exact. Scores are rank-normalized within
 /// this set, consistent with [`score_frames`]'s per-set contract.
 pub fn rescore_frames(mut frames: Vec<ScoredFrame>, weights: &Weights) -> Vec<ScoredFrame> {
-    let (need_clarity, need_edge) = (weights.clarity > 0.0, weights.edge > 0.0);
     let raws: Vec<RawScores> = frames
         .par_iter()
-        .map(|f| RawScores {
-            clarity: if need_clarity { clarity(&f.gray) } else { 0.0 },
-            edge_density: if need_edge {
-                edge_density(&f.gray)
-            } else {
-                0.0
-            },
-            scene_diff: f.scene_diff.get(),
+        .map(|f| {
+            let mut raw = RawScores::default();
+            raw[Dim::Scene] = f.scene_diff.get();
+            for (dim, _) in weights.active() {
+                match dim {
+                    Dim::Clarity => raw[Dim::Clarity] = clarity(&f.gray),
+                    Dim::Edge => raw[Dim::Edge] = edge_density(&f.gray),
+                    // Carried, never recomputed — filled above.
+                    Dim::Scene => {}
+                }
+            }
+            raw
         })
         .collect();
     let scores = rank_normalize(&raws, weights);
@@ -325,42 +364,41 @@ pub fn rescore_frames(mut frames: Vec<ScoredFrame>, weights: &Weights) -> Vec<Sc
 /// (the frame just before this set), else 0; each subsequent frame's is its
 /// difference from the previous frame in the slice.
 ///
-/// Each frame's three dimensions are independent reads (scene_diff reads the
-/// previous frame's grayscale, never mutates it), so the per-frame work runs in
-/// parallel — this is the pipeline's hottest CPU stage. A zero-weight
-/// convolution dimension contributes nothing to the final score, so it is
-/// skipped entirely instead of computed and multiplied by zero. `scene_diff`
-/// is always computed: it is a cheap linear pass, and hero detection reads its
-/// raw magnitude even when its score weight is zero.
+/// Each frame's dimensions are independent reads (scene_diff reads the
+/// previous frame's grayscale, never mutates it), so the per-frame work runs
+/// in parallel — this is the pipeline's hottest CPU stage. Inactive
+/// convolution dimensions are structurally absent from [`Weights::active`],
+/// so their cost is never paid. `scene_diff` is computed unconditionally: it
+/// is a cheap linear pass, and hero detection reads its raw magnitude even
+/// when the dimension is inactive.
 fn compute_raw(
     frames: &[CandidateFrame],
     prev: Option<&GrayImage>,
     weights: &Weights,
 ) -> Vec<RawScores> {
-    let (need_clarity, need_edge) = (weights.clarity > 0.0, weights.edge > 0.0);
     (0..frames.len())
         .into_par_iter()
-        .map(|i| RawScores {
-            clarity: if need_clarity {
-                clarity(&frames[i].gray)
-            } else {
-                0.0
-            },
-            edge_density: if need_edge {
-                edge_density(&frames[i].gray)
-            } else {
-                0.0
-            },
-            scene_diff: match i.checked_sub(1) {
+        .map(|i| {
+            let mut raw = RawScores::default();
+            raw[Dim::Scene] = match i.checked_sub(1) {
                 Some(p) => frame_diff(&frames[i].gray, &frames[p].gray),
                 None => prev.map_or(0.0, |p| frame_diff(&frames[0].gray, p)),
-            },
+            };
+            for (dim, _) in weights.active() {
+                match dim {
+                    Dim::Clarity => raw[Dim::Clarity] = clarity(&frames[i].gray),
+                    Dim::Edge => raw[Dim::Edge] = edge_density(&frames[i].gray),
+                    // Unconditional — filled above.
+                    Dim::Scene => {}
+                }
+            }
+            raw
         })
         .collect()
 }
 
-/// Rank-normalize each raw dimension to `0..=100` within the set, then return
-/// the weighted final score per frame (index-aligned with `raws`).
+/// Rank-normalize each active dimension to `0..=100` within the set, then
+/// return the weighted final score per frame (index-aligned with `raws`).
 ///
 /// For a dimension, the frame with the smallest raw value gets 0, the largest
 /// gets 100, and the rest interpolate linearly by rank position. Ties do not
@@ -369,6 +407,11 @@ fn compute_raw(
 /// set of identical raw values still spreads across `0..=100`. With fewer than
 /// two frames every score is 100 (a single frame is trivially the best of its
 /// set).
+///
+/// Only [`Weights::active`] dimensions are ranked — an inactive dimension
+/// costs neither the sort nor the allocation. Active weights sum to 1 by
+/// [`Weights::new`]'s contract, so the accumulated score stays inside the
+/// rank range without further normalization.
 fn rank_normalize(raws: &[RawScores], weights: &Weights) -> Vec<f32> {
     let n = raws.len();
     if n == 0 {
@@ -378,33 +421,24 @@ fn rank_normalize(raws: &[RawScores], weights: &Weights) -> Vec<f32> {
         return vec![100.0];
     }
 
-    let clarity_rank = rank_to_percentile(raws, |r| r.clarity);
-    let edge_rank = rank_to_percentile(raws, |r| r.edge_density);
-    let scene_rank = rank_to_percentile(raws, |r| r.scene_diff);
-
-    // Normalize by the weight sum so the weighted combination stays inside
-    // the rank range regardless of the scale the caller picked — CLI weights
-    // are only validated as finite and non-negative, not as summing to 1.
-    // Config validation guarantees the sum is positive and finite.
-    let total = weights.scene + weights.clarity + weights.edge;
-    (0..n)
-        .map(|i| {
-            (weights.scene * scene_rank[i]
-                + weights.clarity * clarity_rank[i]
-                + weights.edge * edge_rank[i])
-                / total
-        })
-        .collect()
+    let mut scores = vec![0.0_f32; n];
+    for (dim, w) in weights.active() {
+        let ranks = rank_to_percentile(raws, dim);
+        for (score, rank) in scores.iter_mut().zip(ranks) {
+            *score += w * rank;
+        }
+    }
+    scores
 }
 
-/// Map each raw value (via `key`) to a rank percentile in `0..=100`.
-fn rank_to_percentile(raws: &[RawScores], key: impl Fn(&RawScores) -> f32) -> Vec<f32> {
+/// Map each raw value of `dim` to a rank percentile in `0..=100`.
+fn rank_to_percentile(raws: &[RawScores], dim: Dim) -> Vec<f32> {
     let n = raws.len();
     let mut idx: Vec<usize> = (0..n).collect();
     // Stable sort is load-bearing: tied raw values must map to deterministic
     // percentiles, or selection stops being reproducible across runs. total_cmp
     // matches partial_cmp for finite values but is faster and NaN-safe.
-    idx.sort_by(|&a, &b| key(&raws[a]).total_cmp(&key(&raws[b])));
+    idx.sort_by(|&a, &b| raws[a][dim].total_cmp(&raws[b][dim]));
 
     let mut out = vec![0.0_f32; n];
     let denom = (n - 1) as f32;
@@ -530,11 +564,15 @@ mod tests {
     }
 
     fn raw(clarity: f32, edge: f32, scene: f32) -> RawScores {
-        RawScores {
-            clarity,
-            edge_density: edge,
-            scene_diff: scene,
-        }
+        let mut r = RawScores::default();
+        r[Dim::Clarity] = clarity;
+        r[Dim::Edge] = edge;
+        r[Dim::Scene] = scene;
+        r
+    }
+
+    fn weights(scene: f32, clarity: f32, edge: f32) -> Weights {
+        Weights::new(scene, clarity, edge).expect("valid test weights")
     }
 
     #[test]
@@ -614,21 +652,18 @@ mod tests {
         let black = GrayImage::from_pixel(8, 8, Luma([0]));
         let white = GrayImage::from_pixel(8, 8, Luma([255]));
         let frames = vec![candidate(white.clone()), candidate(white)];
-        let weights = Weights {
-            scene: 1.0,
-            clarity: 0.0,
-            edge: 0.0,
-        };
+        let weights = weights(1.0, 0.0, 0.0);
 
         let no_ctx = compute_raw(&frames, None, &weights);
         let with_ctx = compute_raw(&frames, Some(&black), &weights);
 
-        assert_eq!(no_ctx[0].scene_diff, 0.0, "no predecessor, no diff");
+        assert_eq!(no_ctx[0][Dim::Scene], 0.0, "no predecessor, no diff");
         assert_eq!(
-            with_ctx[0].scene_diff, 255.0,
+            with_ctx[0][Dim::Scene],
+            255.0,
             "boundary transition is scored, not zeroed"
         );
-        assert_eq!(with_ctx[1].scene_diff, 0.0, "interior diffs unchanged");
+        assert_eq!(with_ctx[1][Dim::Scene], 0.0, "interior diffs unchanged");
     }
 
     #[test]
@@ -636,12 +671,7 @@ mod tests {
         // clarity ascending 1,2,3 → percentiles 0,50,100; same for others so
         // the weighted score collapses to those percentiles.
         let raws = vec![raw(1.0, 1.0, 1.0), raw(2.0, 2.0, 2.0), raw(3.0, 3.0, 3.0)];
-        let weights = Weights {
-            scene: 0.40,
-            clarity: 0.35,
-            edge: 0.25,
-        };
-        let scores = rank_normalize(&raws, &weights);
+        let scores = rank_normalize(&raws, &weights(0.40, 0.35, 0.25));
         assert!((scores[0] - 0.0).abs() < 1e-3);
         assert!((scores[1] - 50.0).abs() < 1e-3);
         assert!((scores[2] - 100.0).abs() < 1e-3);
@@ -653,16 +683,8 @@ mod tests {
         // scores must still land in 0..=100 per ScoredFrame's contract, and
         // scaling all weights uniformly must not change any score.
         let raws = vec![raw(1.0, 1.0, 1.0), raw(2.0, 2.0, 2.0), raw(3.0, 3.0, 3.0)];
-        let unit = Weights {
-            scene: 0.5,
-            clarity: 0.0,
-            edge: 0.5,
-        };
-        let scaled = Weights {
-            scene: 100.0,
-            clarity: 0.0,
-            edge: 100.0,
-        };
+        let unit = weights(0.5, 0.0, 0.5);
+        let scaled = weights(100.0, 0.0, 100.0);
         let unit_scores = rank_normalize(&raws, &unit);
         let scaled_scores = rank_normalize(&raws, &scaled);
         assert_eq!(unit_scores, scaled_scores, "only weight ratios matter");
@@ -681,12 +703,25 @@ mod tests {
 
     #[test]
     fn single_frame_scores_full() {
-        let weights = Weights {
-            scene: 0.40,
-            clarity: 0.35,
-            edge: 0.25,
-        };
-        assert_eq!(rank_normalize(&[raw(9.0, 9.0, 9.0)], &weights), vec![100.0]);
+        let w = weights(0.40, 0.35, 0.25);
+        assert_eq!(rank_normalize(&[raw(9.0, 9.0, 9.0)], &w), vec![100.0]);
+    }
+
+    #[test]
+    fn excludes_zero_weight_dimensions_from_the_active_set() {
+        // A zero weight is absence, not a value: the dimension must not
+        // appear in the iteration every scoring stage drives — the ranking
+        // sort for an inactive dimension is structurally unreachable.
+        let w = weights(1.0, 0.0, 3.0);
+        let active: Vec<Dim> = w.active().map(|(d, _)| d).collect();
+        assert_eq!(active, vec![Dim::Scene, Dim::Edge]);
+    }
+
+    #[test]
+    fn normalizes_active_weights_to_unit_sum() {
+        let w = weights(1.0, 0.0, 3.0);
+        let total: f32 = w.active().map(|(_, w)| w).sum();
+        assert!((total - 1.0).abs() < 1e-6, "active weights sum to 1");
     }
 
     #[test]
@@ -695,11 +730,7 @@ mod tests {
         // slice neighbors would yield 0.0 for every frame and the scene
         // dimension would collapse to input-order noise. The carried values
         // (earned against true temporal predecessors) must drive the rank.
-        let weights = Weights {
-            scene: 1.0,
-            clarity: 0.0,
-            edge: 0.0,
-        };
+        let weights = weights(1.0, 0.0, 0.0);
         let frames = vec![
             with_diff(0.0, 10.0),
             with_diff(60.0, 90.0), // strongest real transition
