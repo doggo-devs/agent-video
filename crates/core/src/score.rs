@@ -421,20 +421,22 @@ pub fn select_top_k(frames: &[ScoredFrame], k: usize, min_gap: f32) -> Vec<usize
     chosen
 }
 
-/// Minimum raw `scene_diff` (mean absolute grayscale difference, `0..=255`)
-/// for a selected frame to qualify as a hero.
+/// Default minimum raw `scene_diff` (mean absolute grayscale difference,
+/// `0..=255`) for a selected frame to qualify as a hero.
 ///
 /// Calibrated visually on 1 fps samples of fast-edited real footage: one-second
 /// gaps within the same scene (camera pans, subject motion, animation) stayed
 /// below ~67 while hard cuts clustered above ~70, with a narrow overlap. The
-/// threshold sits at the top of that overlap because the two errors are
+/// default sits at the top of that overlap because the two errors are
 /// asymmetric: a false hero spends ~4 cells of canvas on an ordinary frame,
-/// while a missed cut still shows at normal cell size.
-const HERO_SCENE_DIFF_MIN: f32 = 70.0;
+/// while a missed cut still shows at normal cell size. Content with a
+/// different `scene_diff` distribution tunes this via `--hero-scene-diff`.
+pub const DEFAULT_HERO_SCENE_DIFF: f32 = 70.0;
 
 /// Pick hero frames from an already-selected set: those whose raw scene
-/// difference marks a hard scene change. Returns at most `max_heroes` indices
-/// (into the passed slice), strongest change first.
+/// difference (at least `scene_diff_min`, in `0..=255` units) marks a hard
+/// scene change. Returns at most `max_heroes` indices (into the passed
+/// slice), strongest change first.
 ///
 /// The criterion is an absolute magnitude, not a within-set statistic: rank
 /// normalization spreads scores over `0..=100` by construction, so any
@@ -443,9 +445,9 @@ const HERO_SCENE_DIFF_MIN: f32 = 70.0;
 /// chunks and videos. An empty result means a uniform grid. Callers derive
 /// `max_heroes` from grid capacity (a hero occupies 4 cells, so at most
 /// `capacity / 4` heroes are placeable).
-pub fn pick_heroes(selected: &[ScoredFrame], max_heroes: usize) -> Vec<usize> {
+pub fn pick_heroes(selected: &[ScoredFrame], max_heroes: usize, scene_diff_min: f32) -> Vec<usize> {
     let mut heroes: Vec<usize> = (0..selected.len())
-        .filter(|&i| selected[i].scene_diff >= HERO_SCENE_DIFF_MIN)
+        .filter(|&i| selected[i].scene_diff >= scene_diff_min)
         .collect();
     heroes.sort_by(|&a, &b| selected[b].scene_diff.total_cmp(&selected[a].scene_diff));
     heroes.truncate(max_heroes);
@@ -704,7 +706,7 @@ mod tests {
             with_diff(2.0, 20.0),
             with_diff(3.0, 90.0),
         ];
-        let heroes = pick_heroes(&fs, 3);
+        let heroes = pick_heroes(&fs, 3, DEFAULT_HERO_SCENE_DIFF);
         assert_eq!(heroes, vec![3]);
     }
 
@@ -718,8 +720,20 @@ mod tests {
             with_diff(2.0, 60.0),
         ];
         fs[2].score = 99.0;
-        let heroes = pick_heroes(&fs, 3);
+        let heroes = pick_heroes(&fs, 3, DEFAULT_HERO_SCENE_DIFF);
         assert!(heroes.is_empty(), "no cut means a uniform grid");
+    }
+
+    #[test]
+    fn lowered_threshold_admits_softer_cuts() {
+        // Content whose cuts sit below the default calibration can still
+        // surface heroes via the knob.
+        let fs = vec![with_diff(0.0, 15.0), with_diff(1.0, 65.0)];
+        assert!(
+            pick_heroes(&fs, 3, DEFAULT_HERO_SCENE_DIFF).is_empty(),
+            "65 is same-scene motion at the default threshold"
+        );
+        assert_eq!(pick_heroes(&fs, 3, 60.0), vec![1]);
     }
 
     #[test]
@@ -731,10 +745,15 @@ mod tests {
             with_diff(2.0, 10.0),
             with_diff(3.0, 140.0),
         ];
-        assert_eq!(pick_heroes(&fs, 2), vec![3, 1], "strongest change first");
-        assert_eq!(pick_heroes(&fs, 1), vec![3], "budget keeps the strongest");
+        let t = DEFAULT_HERO_SCENE_DIFF;
+        assert_eq!(pick_heroes(&fs, 2, t), vec![3, 1], "strongest change first");
+        assert_eq!(
+            pick_heroes(&fs, 1, t),
+            vec![3],
+            "budget keeps the strongest"
+        );
         assert!(
-            pick_heroes(&fs, 0).is_empty(),
+            pick_heroes(&fs, 0, t).is_empty(),
             "zero budget means no heroes"
         );
     }

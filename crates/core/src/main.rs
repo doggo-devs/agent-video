@@ -27,7 +27,7 @@ use clap::{Parser, Subcommand, ValueHint};
 use crate::config::{Config, Overrides, StrategyOpts};
 use crate::error::Error;
 use crate::pipeline::parse_range;
-use crate::types::{Detail, Quality, TimeRange};
+use crate::types::TimeRange;
 
 #[derive(Parser)]
 #[command(
@@ -107,13 +107,8 @@ struct CommonOpts {
     /// Canvas edge length in pixels.
     #[arg(long, default_value_t = 2048)]
     max_edge: u32,
-    /// Resolution tier.
-    #[arg(long, value_enum, default_value_t = Quality::Low)]
-    quality: Quality,
-    /// Detail / sampling-density tier.
-    #[arg(long, value_enum, default_value_t = Detail::Standard)]
-    detail: Detail,
-    /// Named profile (balanced, fast, quality, action).
+    /// Named profile (balanced, fast, quality, action); presets tiers and
+    /// tuning knobs, explicit flags still win.
     #[arg(long)]
     profile: Option<String>,
 
@@ -135,6 +130,7 @@ struct CommonOpts {
 }
 
 fn main() -> ExitCode {
+    reset_sigpipe();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -145,6 +141,25 @@ fn main() -> ExitCode {
             eprintln!("error: {e:#}");
             ExitCode::from(code)
         }
+    }
+}
+
+/// Restore the default `SIGPIPE` disposition on Unix.
+///
+/// The Rust runtime installs `SIG_IGN` for `SIGPIPE` before `main` runs. That
+/// makes a write to a closed downstream pipe (e.g. `agent-video ... | head`)
+/// fail with `EPIPE` instead of terminating the process; the failing
+/// `println!`/`eprintln!` then panics, which under this crate's
+/// `panic = "abort"` profile aborts with `SIGABRT` (exit 134) and a core dump.
+/// Resetting to `SIG_DFL` restores the conventional CLI behavior: a closed
+/// pipe kills the process quietly via `SIGPIPE` (exit 141). No-op off Unix.
+fn reset_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: `signal` with `SIG_DFL` merely restores the kernel's default
+    // disposition for a standard signal. It touches no memory we own and is
+    // called once, before any threads are spawned, so there is no data race.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 
@@ -164,8 +179,6 @@ fn run() -> anyhow::Result<()> {
 
     let cfg = Config::new(
         opts.max_edge,
-        opts.quality,
-        opts.detail,
         opts.profile.as_deref(),
         &opts.overrides,
         strategy_opts,

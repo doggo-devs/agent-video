@@ -18,7 +18,7 @@ use ffmpeg_next as ffmpeg;
 use crate::error::{Error, ErrorCode, ErrorContext, Result};
 use crate::subtitle::Cue;
 
-use super::{decode_error, open_input};
+use super::{MAX_READ_ERRORS, decode_error, open_input};
 
 /// Embedded subtitle track info, in subtitle-relative index order.
 #[derive(Debug)]
@@ -89,11 +89,21 @@ pub fn extract_track(input: &Path, track: usize, what: &str) -> Result<Vec<Cue>>
 
     let mut cues = Vec::new();
     let mut packet = Packet::empty();
+    let mut read_errors = 0u32;
     loop {
         match packet.read(&mut ictx) {
-            Ok(()) => {}
+            Ok(()) => read_errors = 0,
             Err(ffmpeg::Error::Eof) => break,
-            Err(_) => continue,
+            Err(e) => {
+                // Transient demux errors are skipped, but a permanently
+                // failing input must not spin forever — same cap as the
+                // frame-decode loop.
+                read_errors += 1;
+                if read_errors > MAX_READ_ERRORS {
+                    return Err(decode_error("reading subtitle packets", e).with_input(input));
+                }
+                continue;
+            }
         }
         if packet.stream() != stream_index {
             continue;

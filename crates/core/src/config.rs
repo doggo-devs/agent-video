@@ -17,6 +17,11 @@ use crate::types::{CanvasSpec, Detail, Quality};
 /// Default dedup sliding window, in kept frames.
 const DEFAULT_DEDUP_WINDOW: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
+/// Default cap on hero frames per grid. A hero occupies ~4 cells, so three
+/// heroes already claim most of a typical grid's emphasis budget; the
+/// effective cap is further bounded by `capacity / 4` at the call site.
+const DEFAULT_MAX_HEROES: usize = 3;
+
 /// Reject a resolved value that would corrupt scoring or sampling arithmetic,
 /// naming the offending field and value.
 fn invalid<T>(field: &str, detail: impl std::fmt::Display) -> crate::error::Result<T> {
@@ -34,7 +39,14 @@ fn invalid<T>(field: &str, detail: impl std::fmt::Display) -> crate::error::Resu
 /// hand-copied mirror to drift in `main.rs`.
 #[derive(Debug, Clone, Default, clap::Args)]
 pub struct Overrides {
-    /// Override base sampling fps.
+    /// Resolution tier: minimum readable cell edge (default: low).
+    #[arg(long, value_enum)]
+    pub quality: Option<Quality>,
+    /// Detail / sampling-density tier: sampling fps (default: standard).
+    #[arg(long, value_enum)]
+    pub detail: Option<Detail>,
+
+    /// Override base sampling fps (finer than --detail; wins over its tier).
     #[arg(long)]
     pub base_fps: Option<f32>,
     /// Override pHash Hamming distance threshold for dedup.
@@ -70,6 +82,14 @@ pub struct Overrides {
     /// Override hero frame border thickness in pixels.
     #[arg(long)]
     pub hero_border_px: Option<u32>,
+
+    /// Override minimum raw scene difference (0-255) for a selected frame to
+    /// qualify as a hero; lower catches softer cuts.
+    #[arg(long)]
+    pub hero_scene_diff: Option<f32>,
+    /// Override max hero frames per grid (0 disables hero emphasis).
+    #[arg(long)]
+    pub max_heroes: Option<usize>,
 }
 
 /// Sampling-strategy options, `process` only: `extract` always samples its
@@ -79,9 +99,12 @@ pub struct Overrides {
 /// and a programmatically-built config cannot disagree.
 #[derive(Debug, Clone, Copy, clap::Args)]
 pub struct StrategyOpts {
-    /// Frame sampling strategy.
-    #[arg(long, value_enum, default_value_t = SampleStrategy::FixedFps)]
-    pub strategy: SampleStrategy,
+    /// Frame sampling strategy [default: adaptive]. When omitted, the default
+    /// is applied leniently: it degrades to fixed-fps on sources with too few
+    /// keyframes. An explicit value is honored strictly — too few keyframes is
+    /// then an error rather than a fall back.
+    #[arg(long, value_enum)]
+    pub strategy: Option<SampleStrategy>,
     /// Gap threshold (seconds) for adaptive sparse region fill.
     #[arg(long, default_value_t = Self::DEFAULT_GAP_THRESHOLD)]
     pub gap_threshold: f32,
@@ -98,6 +121,11 @@ pub struct StrategyOpts {
 }
 
 impl StrategyOpts {
+    /// Strategy used when `--strategy` is omitted. Adaptive samples keyframes
+    /// (dense, deduplicated coverage) and fills only sparse regions at
+    /// fixed-fps, so a bare `process` gets high information density on typical
+    /// edited video while still degrading gracefully on keyframe-poor sources.
+    pub const DEFAULT_STRATEGY: SampleStrategy = SampleStrategy::Adaptive;
     pub const DEFAULT_GAP_THRESHOLD: f32 = 5.0;
     pub const DEFAULT_MIN_KEYFRAMES: usize = 10;
     pub const DEFAULT_MAX_DURATION: f32 = 3600.0;
@@ -106,7 +134,7 @@ impl StrategyOpts {
 impl Default for StrategyOpts {
     fn default() -> Self {
         Self {
-            strategy: SampleStrategy::default(),
+            strategy: None,
             gap_threshold: Self::DEFAULT_GAP_THRESHOLD,
             min_keyframes: Self::DEFAULT_MIN_KEYFRAMES,
             max_duration: Self::DEFAULT_MAX_DURATION,
@@ -202,11 +230,27 @@ struct RenderCfg {
 }
 
 impl RenderCfg {
+    /// Sanity cap on the hero border thickness. Deliberately not derived
+    /// from cell geometry: the justified layout sizes cells from the canvas
+    /// edge and row counts (a cell may land below any fixed floor), and
+    /// `draw_border` already clamps the drawn thickness per cell. The cap's
+    /// one job is to keep the `rect + inset` pixel arithmetic in compose
+    /// overflow-free by construction — canvas coordinates are bounded by
+    /// the JPEG dimension limit, so any small constant suffices; 256 merely
+    /// leaves generous headroom over every plausible border.
+    const MAX_HERO_BORDER_PX: u32 = 256;
+
     fn new(jpeg_quality: u8, hero_border_px: u32) -> crate::error::Result<Self> {
         if !(1..=100).contains(&jpeg_quality) {
             return invalid(
                 "jpeg_quality",
                 format!("{jpeg_quality} (must be in 1..=100)"),
+            );
+        }
+        if hero_border_px > Self::MAX_HERO_BORDER_PX {
+            return invalid(
+                "hero_border_px",
+                format!("{hero_border_px} (must be <= {})", Self::MAX_HERO_BORDER_PX),
             );
         }
         Ok(Self {
@@ -216,11 +260,39 @@ impl RenderCfg {
     }
 }
 
+/// Hero-selection parameters. `scene_diff` is a mean absolute grayscale
+/// difference in `0..=255`; a threshold outside that range would silently
+/// disable heroes (`--max-heroes 0` is the explicit way to do that).
+#[derive(Debug, Clone, Copy)]
+struct HeroCfg {
+    scene_diff_min: f32,
+    max_per_grid: usize,
+}
+
+impl HeroCfg {
+    fn new(scene_diff_min: f32, max_per_grid: usize) -> crate::error::Result<Self> {
+        if !scene_diff_min.is_finite() || !(0.0..=255.0).contains(&scene_diff_min) {
+            return invalid(
+                "hero_scene_diff",
+                format!("{scene_diff_min} (must be finite and in 0..=255)"),
+            );
+        }
+        Ok(Self {
+            scene_diff_min,
+            max_per_grid,
+        })
+    }
+}
+
 /// Resolved strategy parameters; thresholds finite and positive by
 /// construction.
 #[derive(Debug, Clone, Copy)]
 struct StrategyCfg {
     strategy: SampleStrategy,
+    /// True when `--strategy` was given explicitly. Governs the
+    /// insufficient-keyframe response: explicit requests error, defaulted
+    /// ones fall back to fixed-fps.
+    explicit: bool,
     gap_threshold: f32,
     min_keyframes: usize,
     max_duration: f32,
@@ -242,7 +314,8 @@ impl StrategyCfg {
             );
         }
         Ok(Self {
-            strategy: opts.strategy,
+            strategy: opts.strategy.unwrap_or(StrategyOpts::DEFAULT_STRATEGY),
+            explicit: opts.strategy.is_some(),
             gap_threshold: opts.gap_threshold,
             min_keyframes: opts.min_keyframes,
             max_duration: opts.max_duration,
@@ -264,6 +337,7 @@ pub struct Config {
     dedup: DedupCfg,
     weights: Weights,
     render: RenderCfg,
+    hero: HeroCfg,
     strategy: StrategyCfg,
     quality: Quality,
     detail: Detail,
@@ -274,22 +348,33 @@ pub struct Config {
 fn builtin_profile(name: &str) -> Option<Overrides> {
     Some(match name {
         "balanced" => Overrides::default(),
+        // Fast trades density for time: sampling fps dominates decode +
+        // scoring cost. The coarse tier (not a raw base_fps) halves it, so
+        // extract keeps its 3x-densify semantics under this profile.
         "fast" => Overrides {
+            detail: Some(Detail::Coarse),
             chunk_seconds: Some(90.0),
             min_gap: Some(1.0),
             jpeg_quality: Some(85),
             ..Default::default()
         },
         "quality" => Overrides {
+            quality: Some(Quality::High),
             chunk_seconds: Some(45.0),
             min_gap: Some(0.3),
             jpeg_quality: Some(95),
             ..Default::default()
         },
+        // Action targets fast-edited footage: the fine tier (3 fps) so
+        // sampling doesn't skip past cuts, and a hero threshold at the
+        // bottom of the calibrated cut/motion overlap (~67..=70) to flag
+        // softer cuts.
         "action" => Overrides {
+            detail: Some(Detail::Fine),
             w_scene: Some(0.75),
             w_edge: Some(0.25),
             min_gap: Some(0.3),
+            hero_scene_diff: Some(65.0),
             ..Default::default()
         },
         _ => return None,
@@ -299,11 +384,11 @@ fn builtin_profile(name: &str) -> Option<Overrides> {
 impl Config {
     /// Construct config from CLI arguments.
     ///
-    /// Priority: CLI overrides > named profile > detail tier > defaults.
+    /// Priority: CLI overrides > named profile > defaults. The tiers resolve
+    /// through the same chain first; tier-derived values (sampling fps, cell
+    /// floor) then serve as defaults for the finer per-field knobs.
     pub fn new(
         max_edge: u32,
-        quality: Quality,
-        detail: Detail,
         profile: Option<&str>,
         cli: &Overrides,
         strategy_opts: StrategyOpts,
@@ -322,6 +407,18 @@ impl Config {
             },
             None => None,
         };
+
+        // Resolve each field: CLI > profile > default
+        macro_rules! resolve {
+            ($field:ident, $default:expr) => {
+                cli.$field
+                    .or(prof.as_ref().and_then(|p| p.$field))
+                    .unwrap_or($default)
+            };
+        }
+
+        let quality = resolve!(quality, Quality::Low);
+        let detail = resolve!(detail, Detail::Standard);
 
         // Quality tier → cell legibility floor. The canvas edge stays at
         // max_edge regardless: quality trades per-cell size for grid capacity
@@ -346,15 +443,6 @@ impl Config {
             Detail::Fine => 3.0,
         };
 
-        // Resolve each field: CLI > profile > detail/default
-        macro_rules! resolve {
-            ($field:ident, $default:expr) => {
-                cli.$field
-                    .or(prof.as_ref().and_then(|p| p.$field))
-                    .unwrap_or($default)
-            };
-        }
-
         Ok(Self {
             canvas: CanvasSpec::new(max_edge, min_frame_size)?,
             sampling: Sampling::new(
@@ -377,6 +465,10 @@ impl Config {
                 resolve!(w_edge, 0.40),
             )?,
             render: RenderCfg::new(resolve!(jpeg_quality, 92), resolve!(hero_border_px, 4))?,
+            hero: HeroCfg::new(
+                resolve!(hero_scene_diff, crate::score::DEFAULT_HERO_SCENE_DIFF),
+                resolve!(max_heroes, DEFAULT_MAX_HEROES),
+            )?,
             strategy: StrategyCfg::new(strategy_opts)?,
             quality,
             detail,
@@ -439,8 +531,25 @@ impl Config {
         self.render.hero_border_px
     }
 
+    /// Minimum raw `scene_diff` for a frame to qualify as a hero.
+    pub fn hero_scene_diff(&self) -> f32 {
+        self.hero.scene_diff_min
+    }
+
+    /// Cap on hero frames per grid; `0` disables hero emphasis entirely.
+    pub fn max_heroes(&self) -> usize {
+        self.hero.max_per_grid
+    }
+
     pub fn strategy(&self) -> SampleStrategy {
         self.strategy.strategy
+    }
+
+    /// Whether the strategy was requested explicitly (`--strategy`) rather than
+    /// defaulted. An explicit keyframe/adaptive request errors on too few
+    /// keyframes; a defaulted one degrades to fixed-fps instead.
+    pub fn strategy_explicit(&self) -> bool {
+        self.strategy.explicit
     }
 
     pub fn gap_threshold(&self) -> f32 {
@@ -473,14 +582,7 @@ mod tests {
     use super::*;
 
     fn config_with(overrides: Overrides) -> crate::error::Result<Config> {
-        Config::new(
-            2000,
-            Quality::High,
-            Detail::Standard,
-            None,
-            &overrides,
-            StrategyOpts::default(),
-        )
+        Config::new(2000, None, &overrides, StrategyOpts::default())
     }
 
     #[test]
@@ -514,14 +616,11 @@ mod tests {
         // quality high → 512px floor; a 0 or sub-floor canvas cannot hold a
         // single legible cell.
         for max_edge in [0, 511] {
-            let cfg = Config::new(
-                max_edge,
-                Quality::High,
-                Detail::Standard,
-                None,
-                &Overrides::default(),
-                StrategyOpts::default(),
-            );
+            let ov = Overrides {
+                quality: Some(Quality::High),
+                ..Default::default()
+            };
+            let cfg = Config::new(max_edge, None, &ov, StrategyOpts::default());
             assert_eq!(
                 cfg.expect_err("sub-floor canvas rejected").code,
                 ErrorCode::InvalidConfig
@@ -580,6 +679,100 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_hero_border() {
+        let ov = Overrides {
+            hero_border_px: Some(u32::MAX),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_with(ov)
+                .expect_err("oversized hero border rejected")
+                .code,
+            ErrorCode::InvalidConfig
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_hero_scene_diff() {
+        for bad in [f32::NAN, -1.0, 255.1] {
+            let ov = Overrides {
+                hero_scene_diff: Some(bad),
+                ..Default::default()
+            };
+            assert_eq!(
+                config_with(ov)
+                    .expect_err("out-of-range hero_scene_diff rejected")
+                    .code,
+                ErrorCode::InvalidConfig
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_zero_max_heroes_as_disable() {
+        let ov = Overrides {
+            max_heroes: Some(0),
+            ..Default::default()
+        };
+        let cfg = config_with(ov).expect("max_heroes 0 is a valid disable switch");
+        assert_eq!(cfg.max_heroes(), 0);
+    }
+
+    #[test]
+    fn cli_override_beats_profile_value() {
+        let ov = Overrides {
+            hero_scene_diff: Some(80.0),
+            ..Default::default()
+        };
+        let cfg =
+            Config::new(2000, Some("action"), &ov, StrategyOpts::default()).expect("config builds");
+        assert_eq!(cfg.hero_scene_diff(), 80.0, "CLI outranks the profile");
+        assert_eq!(
+            cfg.base_fps(),
+            3.0,
+            "untouched profile fields still apply (action sets the fine tier)"
+        );
+    }
+
+    #[test]
+    fn profile_sets_tiers() {
+        let cfg = Config::new(
+            2000,
+            Some("quality"),
+            &Overrides::default(),
+            StrategyOpts::default(),
+        )
+        .expect("config builds");
+        assert_eq!(cfg.min_frame_size(), 512, "quality profile → high tier");
+
+        let cfg = Config::new(
+            2000,
+            Some("fast"),
+            &Overrides::default(),
+            StrategyOpts::default(),
+        )
+        .expect("config builds");
+        assert_eq!(cfg.base_fps(), 0.5, "fast profile → coarse tier");
+        assert_eq!(
+            cfg.extract_fps(),
+            1.5,
+            "tier-based profile keeps extract's 3x densify semantics"
+        );
+    }
+
+    #[test]
+    fn cli_tier_overrides_profile_tier() {
+        let ov = Overrides {
+            quality: Some(Quality::Low),
+            ..Default::default()
+        };
+        let cfg = Config::new(2000, Some("quality"), &ov, StrategyOpts::default())
+            .expect("config builds");
+        assert_eq!(cfg.min_frame_size(), 256, "explicit --quality low wins");
+        assert_eq!(cfg.jpeg_quality(), 95, "other profile fields still apply");
+    }
+
+    #[test]
     fn rejects_oversized_hash_threshold() {
         let ov = Overrides {
             hash_threshold: Some(65),
@@ -605,14 +798,7 @@ mod tests {
 
     #[test]
     fn rejects_canvas_above_jpeg_dimension_limit() {
-        let cfg = Config::new(
-            65_536,
-            Quality::High,
-            Detail::Standard,
-            None,
-            &Overrides::default(),
-            StrategyOpts::default(),
-        );
+        let cfg = Config::new(65_536, None, &Overrides::default(), StrategyOpts::default());
         assert_eq!(
             cfg.expect_err("over-limit canvas rejected").code,
             ErrorCode::InvalidConfig
@@ -631,14 +817,7 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            let cfg = Config::new(
-                2000,
-                Quality::High,
-                Detail::Standard,
-                None,
-                &Overrides::default(),
-                opts,
-            );
+            let cfg = Config::new(2000, None, &Overrides::default(), opts);
             assert_eq!(
                 cfg.expect_err("invalid strategy opts rejected").code,
                 ErrorCode::InvalidConfig

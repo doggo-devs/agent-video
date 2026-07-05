@@ -84,6 +84,21 @@ fn rgb_image_from_frame(frame: &ffmpeg::frame::Video, (w, h): (u32, u32)) -> Res
     let stride = frame.stride(0);
     let data = frame.data(0);
     let row = w as usize * 3;
+    // swscale allocates this frame itself, so the stride is positive and at
+    // least one row wide. Verify rather than assume: the binding casts the C
+    // linesize to usize, so a negative value would wrap huge and the slicing
+    // below would panic. A coded error keeps a malformed frame an input
+    // problem, not a crash.
+    let needed = (h as usize)
+        .checked_sub(1)
+        .and_then(|rows| rows.checked_mul(stride))
+        .and_then(|off| off.checked_add(row));
+    if stride < row || needed.is_none_or(|n| n > data.len()) {
+        return Err(Error::new(
+            ErrorCode::DecodeFailed,
+            format!("scaled frame has invalid stride {stride} for {w}x{h}"),
+        ));
+    }
     let mut buf = Vec::with_capacity(row * h as usize);
     for y in 0..h as usize {
         let start = y * stride;
@@ -118,6 +133,16 @@ mod tests {
         assert_eq!(fit_min_edge(1920, 1080, 256), (455, 256));
         assert_eq!(fit_min_edge(1080, 1920, 256), (256, 455));
         assert_eq!(fit_min_edge(640, 640, 256), (256, 256));
+    }
+
+    #[test]
+    fn rejects_frame_buffer_smaller_than_target() {
+        // A frame whose real geometry cannot back the claimed target must
+        // fail with a coded error, not panic on slicing.
+        let frame = ffmpeg::frame::Video::new(Pixel::RGB24, 16, 16);
+        let err = rgb_image_from_frame(&frame, (1000, 16))
+            .expect_err("undersized buffer must be rejected");
+        assert_eq!(err.code, ErrorCode::DecodeFailed);
     }
 
     #[test]

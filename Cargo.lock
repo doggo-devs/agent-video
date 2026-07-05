@@ -36,6 +36,7 @@ dependencies = [
  "image",
  "image_hasher",
  "imageproc",
+ "libc",
  "rayon",
  "serde",
  "serde_json",

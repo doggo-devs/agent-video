@@ -57,7 +57,7 @@ impl std::ops::Deref for MonotonicTimestamps {
 /// Sampling strategy for frame extraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum SampleStrategy {
-    /// Fixed-rate sampling at base_fps (current behavior).
+    /// Fixed-rate sampling at base_fps.
     #[default]
     FixedFps,
     /// Sample only I-frames (keyframes).

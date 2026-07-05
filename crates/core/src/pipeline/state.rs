@@ -33,6 +33,12 @@ const MIN_EXTRACT_BATCH_FRAMES: usize = 32;
 /// Upper bound for an extraction batch.
 const MAX_EXTRACT_BATCH_FRAMES: usize = 240;
 
+/// Unplaceable-timestamp frames (non-finite or going backwards) tolerated
+/// per run before the input's timeline is declared broken. The same shape as
+/// the demux-error cap in [`crate::media`]: bounded badness degrades output,
+/// unbounded badness fails the run.
+const MAX_TS_REGRESSIONS: u32 = 64;
+
 pub struct ProcessState<'a> {
     cfg: &'a Config,
     /// The run's output session: incremental grid/static writes go through it,
@@ -53,9 +59,12 @@ pub struct ProcessState<'a> {
     /// true predecessor instead of a hardcoded zero.
     prev_chunk_tail: Option<GrayImage>,
     high_water_mark: Option<usize>,
-    /// Timestamp of the last pushed frame, enforcing the monotonic-arrival
-    /// contract of [`Self::push_rgb`].
+    /// Timestamp of the last placed frame; frames whose ts falls behind it
+    /// cannot be placed and are skipped (see [`Self::push_judged`]).
     last_ts: Option<f32>,
+    /// Skipped unplaceable-timestamp frames so far, capped by
+    /// [`MAX_TS_REGRESSIONS`].
+    ts_regressions: u32,
     /// Chunk jobs in flight: assigns chunk indexes, caps buffered chunks at
     /// `max_in_flight`, and hands results back in chunk order.
     jobs: OrderedJobs<Result<GridResult>>,
@@ -85,12 +94,15 @@ impl<'a> ProcessState<'a> {
                 min_gap_floor: cfg.min_gap(),
                 jpeg_quality: cfg.jpeg_quality(),
                 hero_border_px: cfg.hero_border_px(),
+                hero_scene_diff: cfg.hero_scene_diff(),
+                max_heroes: cfg.max_heroes(),
             },
             pending: BTreeMap::new(),
             carry: Vec::new(),
             prev_chunk_tail: None,
             high_water_mark: None,
             last_ts: None,
+            ts_regressions: 0,
             jobs: OrderedJobs::new(parallelism),
             stretches: StretchDetector::new(cfg.chunk_seconds()),
             duration: 0.0,
@@ -107,22 +119,32 @@ impl<'a> ProcessState<'a> {
     /// Record one judged frame: a kept frame joins its time chunk, a dropped
     /// one feeds static-stretch evidence; both extend the observed duration.
     ///
-    /// Timestamps must be finite and arrive in non-decreasing order: chunk
-    /// keying, high-water-mark sealing, and static detection all assume a
-    /// monotonic stream (the single decode pass emits frames in presentation
-    /// order, so this holds structurally). A violation is rejected here
-    /// rather than silently mixing old frames into the wrong chunk.
+    /// Chunk keying, high-water-mark sealing, and static detection all assume
+    /// finite, non-decreasing timestamps. The decode pass emits frames in
+    /// presentation order and the pts→seconds mapping preserves that order,
+    /// so a violation means the input's own timestamps are broken — the frame
+    /// cannot be placed in any chunk and is skipped. More than
+    /// [`MAX_TS_REGRESSIONS`] such frames mean the whole timeline is garbage,
+    /// and the run fails instead of silently mangling chunk boundaries.
     pub fn push_judged(&mut self, frame: CandidateFrame, kept: bool) -> Result<()> {
-        if !frame.ts.is_finite() {
-            anyhow::bail!("frame timestamp must be finite: got {}", frame.ts);
-        }
-        if let Some(last) = self.last_ts
-            && frame.ts < last
-        {
-            anyhow::bail!(
-                "frame timestamps must be non-decreasing: got {} after {last}",
-                frame.ts
-            );
+        if !frame.ts.is_finite() || self.last_ts.is_some_and(|last| frame.ts < last) {
+            self.ts_regressions += 1;
+            if self.ts_regressions > MAX_TS_REGRESSIONS {
+                anyhow::bail!(
+                    "{} frames with unplaceable timestamps (non-finite or backwards, \
+                     last placed {:?}, offending {}); the input's timeline is broken",
+                    self.ts_regressions,
+                    self.last_ts,
+                    frame.ts
+                );
+            }
+            if self.ts_regressions == 1 {
+                eprintln!(
+                    "  warning: skipping frame with unplaceable timestamp {} (last {:?})",
+                    frame.ts, self.last_ts
+                );
+            }
+            return Ok(());
         }
         self.last_ts = Some(frame.ts);
         self.duration = self.duration.max(frame.ts + 1.0 / self.cfg.base_fps());
@@ -291,24 +313,19 @@ mod tests {
     use crate::{dedup, extract};
     use image::{Rgb, RgbImage};
 
-    /// Config with explicit 60s chunks at 1 fps — the values the tests'
-    /// timestamp math assumes — set through [`Overrides`], the same door the
-    /// CLI uses (Config fields are private by design).
+    /// Config with explicit 60s chunks at 1 fps and the high quality tier
+    /// (512px cell floor) — the values the tests' timestamp and capacity
+    /// math assume — set through [`Overrides`], the same door the CLI uses
+    /// (Config fields are private by design).
     fn config_with_edge(max_edge: u32) -> Config {
         let ov = Overrides {
+            quality: Some(Quality::High),
+            detail: Some(Detail::Standard),
             chunk_seconds: Some(60.0),
             base_fps: Some(1.0),
             ..Default::default()
         };
-        Config::new(
-            max_edge,
-            Quality::High,
-            Detail::Standard,
-            None,
-            &ov,
-            StrategyOpts::default(),
-        )
-        .expect("test config builds")
+        Config::new(max_edge, None, &ov, StrategyOpts::default()).expect("test config builds")
     }
 
     fn base_config() -> Config {
@@ -547,20 +564,68 @@ mod tests {
     }
 
     #[test]
-    fn rejects_backwards_timestamps() {
+    fn skips_backwards_timestamp_frames() {
         let cfg = small_grid_config();
         let pool = pool(2);
         let session = json_session();
         let one = NonZeroUsize::new(1).expect("1 is nonzero");
         let mut state = ProcessState::new(&cfg, &pool, &session, one);
 
-        let mut frames = judge(&cfg, &[(10.0, 0), (5.0, 1)]).into_iter();
-        let (first, kept) = frames.next().expect("two frames judged");
-        state.push_judged(first, kept).expect("first push");
-        let (backwards, kept) = frames.next().expect("two frames judged");
-        state
-            .push_judged(backwards, kept)
-            .expect_err("a timestamp going backwards must be rejected");
+        // 10 → 5 (backwards, skipped) → 11 (placed normally).
+        for (frame, kept) in judge(&cfg, &[(10.0, 0), (5.0, 1), (11.0, 2)]) {
+            state
+                .push_judged(frame, kept)
+                .expect("bounded bad timestamps must not fail the run");
+        }
+        let (_duration, metas) = state.finish().expect("finish");
+
+        assert_eq!(metas.len(), 1);
+        assert_eq!(
+            metas[0].total_frames, 2,
+            "the backwards frame is skipped, not chunked"
+        );
+    }
+
+    #[test]
+    fn skips_non_finite_timestamp_frames() {
+        let cfg = small_grid_config();
+        let pool = pool(2);
+        let session = json_session();
+        let one = NonZeroUsize::new(1).expect("1 is nonzero");
+        let mut state = ProcessState::new(&cfg, &pool, &session, one);
+
+        for (frame, kept) in judge(&cfg, &[(0.0, 0), (f32::NAN, 1), (1.0, 2)]) {
+            state
+                .push_judged(frame, kept)
+                .expect("a NaN timestamp is skipped, not fatal");
+        }
+        let (_duration, metas) = state.finish().expect("finish");
+
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].total_frames, 2, "the NaN frame is skipped");
+    }
+
+    #[test]
+    fn fails_after_unbounded_backwards_timestamps() {
+        let cfg = small_grid_config();
+        let pool = pool(2);
+        let session = json_session();
+        let one = NonZeroUsize::new(1).expect("1 is nonzero");
+        let mut state = ProcessState::new(&cfg, &pool, &session, one);
+
+        // One good frame, then 65 backwards frames: the 65th regression
+        // exceeds the cap and must fail the run.
+        let mut frames = vec![(1000.0, 0)];
+        frames.extend((0..65).map(|i| (i as f32, i as u32 + 1)));
+        let last = frames.len() - 1;
+        for (i, (frame, kept)) in judge(&cfg, &frames).into_iter().enumerate() {
+            let result = state.push_judged(frame, kept);
+            if i < last {
+                result.expect("regressions within the cap are skipped");
+            } else {
+                result.expect_err("exceeding the regression cap must fail");
+            }
+        }
     }
 
     #[test]

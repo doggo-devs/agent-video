@@ -82,18 +82,16 @@ pub fn process(
     window: Option<Window>,
 ) -> Result<()> {
     validate_input(input)?;
-    // Keyframe strategies pair decoded frames with probed timestamps by
-    // index; a window seek would decode a different frame set and silently
-    // shift every pairing, so the clamp is fixed-fps only.
-    if window.is_some() && cfg.strategy() != SampleStrategy::FixedFps {
-        return Err(Error::new(
-            ErrorCode::InvalidRange,
-            "--from/--until require the fixed-fps strategy; drop --strategy or the window",
-        )
-        .into());
-    }
-    let keyframe_info = probe_if_needed(input, cfg)?;
-    validate_strategy(cfg, keyframe_info.as_ref(), window)?;
+    // Resolve the strategy actually executed. Two adjustments can move a
+    // keyframe/adaptive request onto fixed-fps: a window (keyframe pairing
+    // can't survive a seek) and a keyframe-poor source (so a bare `process`
+    // still yields output). Both apply only to a *defaulted* strategy; an
+    // explicit `--strategy` is honored, and validate_strategy rejects it if
+    // the source can't satisfy it.
+    let strategy = resolve_windowed_strategy(cfg, window)?;
+    let keyframe_info = probe_if_needed(input, strategy, cfg)?;
+    let strategy = degrade_if_keyframe_poor(cfg, strategy, keyframe_info.as_ref());
+    validate_strategy(cfg, strategy, keyframe_info.as_ref(), window)?;
     // Resolve subtitles before any extraction or output: whether the final
     // outputs can be assembled must be settled before side effects begin, so
     // a subtitle failure cannot leave grids on disk without metadata.
@@ -124,7 +122,7 @@ pub fn process(
     // Every strategy reduces to a sampling plan executed by one decode pass;
     // the pipeline tail is strategy-agnostic.
     let session = OutputSession::open(out_dir, mode)?;
-    let stream = match cfg.strategy() {
+    let stream = match strategy {
         SampleStrategy::FixedFps => match window {
             Some(w) => {
                 eprintln!(
@@ -233,8 +231,64 @@ fn adaptive_stream(ctx: &RunCtx<'_>, info: &KeyframeInfo) -> Result<extract_fram
     )?)
 }
 
-fn probe_if_needed(input: &Path, cfg: &Config) -> Result<Option<KeyframeInfo>> {
-    match cfg.strategy() {
+/// Resolve the strategy against a window (`--from/--until`).
+///
+/// A window is fixed-fps only: keyframe strategies pair decoded frames with
+/// probed timestamps by index, and a seek shifts every pairing. An explicit
+/// keyframe/adaptive request with a window is a user error; a defaulted one
+/// silently uses fixed-fps.
+fn resolve_windowed_strategy(cfg: &Config, window: Option<Window>) -> Result<SampleStrategy> {
+    let requested = cfg.strategy();
+    if window.is_none() || requested == SampleStrategy::FixedFps {
+        return Ok(requested);
+    }
+    if cfg.strategy_explicit() {
+        return Err(Error::new(
+            ErrorCode::InvalidRange,
+            "--from/--until require the fixed-fps strategy; drop --strategy or the window",
+        )
+        .into());
+    }
+    Ok(SampleStrategy::FixedFps)
+}
+
+/// Degrade a *defaulted* keyframe/adaptive strategy to fixed-fps when the
+/// source has fewer than `min_keyframes`, so a bare `process` always produces
+/// output regardless of keyframe density. An explicit request is left intact
+/// for [`validate_strategy`] to reject with `InsufficientKeyframes`.
+fn degrade_if_keyframe_poor(
+    cfg: &Config,
+    strategy: SampleStrategy,
+    info: Option<&KeyframeInfo>,
+) -> SampleStrategy {
+    if cfg.strategy_explicit()
+        || !matches!(
+            strategy,
+            SampleStrategy::Keyframes | SampleStrategy::Adaptive
+        )
+    {
+        return strategy;
+    }
+    let count = info
+        .expect("keyframe probe runs for keyframe strategies")
+        .count();
+    if count >= cfg.min_keyframes() {
+        return strategy;
+    }
+    eprintln!(
+        "warning: only {count} keyframes (<{} required); \
+         falling back to fixed-fps sampling",
+        cfg.min_keyframes()
+    );
+    SampleStrategy::FixedFps
+}
+
+fn probe_if_needed(
+    input: &Path,
+    strategy: SampleStrategy,
+    cfg: &Config,
+) -> Result<Option<KeyframeInfo>> {
+    match strategy {
         SampleStrategy::FixedFps if cfg.force_long_video() => Ok(None),
         // `.context` keeps the probe's own error code downcastable, so the
         // exit code names the real cause rather than a generic wrapper.
@@ -254,10 +308,11 @@ fn probe_if_needed(input: &Path, cfg: &Config) -> Result<Option<KeyframeInfo>> {
 
 fn validate_strategy(
     cfg: &Config,
+    strategy: SampleStrategy,
     info: Option<&KeyframeInfo>,
     window: Option<Window>,
 ) -> Result<()> {
-    match cfg.strategy() {
+    match strategy {
         SampleStrategy::FixedFps => {
             let Some(i) = info else { return Ok(()) };
             if let Some(w) = window
@@ -487,5 +542,91 @@ mod tests {
     fn keeps_regions_separated_by_long_dense_runs() {
         let regions = vec![tr(0.0, 10.0), tr(30.0, 40.0)];
         assert_eq!(merge_regions(regions.clone(), 5.0), regions);
+    }
+
+    fn cfg_with_strategy(strategy: Option<SampleStrategy>) -> Config {
+        Config::new(
+            2048,
+            None,
+            &crate::config::Overrides::default(),
+            crate::config::StrategyOpts {
+                strategy,
+                ..Default::default()
+            },
+        )
+        .expect("config builds")
+    }
+
+    fn keyframes(count: usize) -> KeyframeInfo {
+        let timestamps = (0..count).map(|i| i as f32).collect();
+        KeyframeInfo {
+            timestamps: MonotonicTimestamps::new(timestamps).expect("monotonic"),
+            duration: count.max(1) as f32,
+        }
+    }
+
+    fn window() -> Option<Window> {
+        Window::from_args(Some(10.0), None).expect("valid window")
+    }
+
+    #[test]
+    fn defaults_to_adaptive_leniently() {
+        let cfg = cfg_with_strategy(None);
+        assert_eq!(cfg.strategy(), SampleStrategy::Adaptive);
+        assert!(
+            !cfg.strategy_explicit(),
+            "omitted --strategy is not explicit"
+        );
+    }
+
+    #[test]
+    fn degrades_defaulted_adaptive_when_keyframe_poor() {
+        let cfg = cfg_with_strategy(None);
+        // 2 < default min_keyframes (10): a bare `process` must still produce
+        // output, so the plan degrades to fixed-fps.
+        let resolved =
+            degrade_if_keyframe_poor(&cfg, SampleStrategy::Adaptive, Some(&keyframes(2)));
+        assert_eq!(resolved, SampleStrategy::FixedFps);
+    }
+
+    #[test]
+    fn keeps_defaulted_adaptive_when_keyframes_sufficient() {
+        let cfg = cfg_with_strategy(None);
+        let resolved =
+            degrade_if_keyframe_poor(&cfg, SampleStrategy::Adaptive, Some(&keyframes(20)));
+        assert_eq!(resolved, SampleStrategy::Adaptive);
+    }
+
+    #[test]
+    fn keeps_explicit_adaptive_when_keyframe_poor() {
+        let cfg = cfg_with_strategy(Some(SampleStrategy::Adaptive));
+        // Explicit request is honored, not degraded; validate_strategy rejects
+        // it with InsufficientKeyframes.
+        let resolved =
+            degrade_if_keyframe_poor(&cfg, SampleStrategy::Adaptive, Some(&keyframes(2)));
+        assert_eq!(resolved, SampleStrategy::Adaptive);
+    }
+
+    #[test]
+    fn degrades_windowed_default_to_fixed_fps() {
+        let cfg = cfg_with_strategy(None);
+        let resolved = resolve_windowed_strategy(&cfg, window()).expect("window resolves");
+        assert_eq!(resolved, SampleStrategy::FixedFps);
+    }
+
+    #[test]
+    fn rejects_windowed_explicit_keyframe_strategy() {
+        let cfg = cfg_with_strategy(Some(SampleStrategy::Adaptive));
+        let err = resolve_windowed_strategy(&cfg, window())
+            .expect_err("explicit adaptive + window must fail");
+        let code = err.downcast_ref::<Error>().map(|e| e.code);
+        assert_eq!(code, Some(ErrorCode::InvalidRange));
+    }
+
+    #[test]
+    fn keeps_strategy_without_window() {
+        let cfg = cfg_with_strategy(None);
+        let resolved = resolve_windowed_strategy(&cfg, None).expect("no window resolves");
+        assert_eq!(resolved, SampleStrategy::Adaptive);
     }
 }

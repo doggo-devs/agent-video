@@ -21,6 +21,8 @@ pub struct ProcessChunkEnv {
     pub min_gap_floor: f32,
     pub jpeg_quality: u8,
     pub hero_border_px: u32,
+    pub hero_scene_diff: f32,
+    pub max_heroes: usize,
 }
 
 /// Score, select, lay out, and compose one chunk into a grid.
@@ -44,8 +46,10 @@ pub fn process_chunk(
     let selected = score::select_top_k(&chunk, capacity, min_gap);
     let mut picked = extract_selected(&mut chunk, selected);
 
-    // A hero occupies ~4 cells of area, so only capacity/4 heroes ever fit.
-    let mut heroes = score::pick_heroes(&picked, (capacity / 4).min(3));
+    // A hero occupies ~4 cells of area, so only capacity/4 heroes ever fit
+    // regardless of the configured cap (which is 0 when heroes are disabled).
+    let hero_budget = (capacity / 4).min(env.max_heroes);
+    let mut heroes = score::pick_heroes(&picked, hero_budget, env.hero_scene_diff);
     let lay = evict_for_heroes(&mut picked, &mut heroes, env.aspect, &env.spec);
 
     let jpeg = compose::render(&picked, &lay, &heroes, env.jpeg_quality, env.hero_border_px)?;

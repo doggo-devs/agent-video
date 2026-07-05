@@ -76,7 +76,14 @@ pub fn render(
         }
         // Inset the label past the hero border: the label's translucent strip
         // darkens pixels in place and would dim the border's top-left corner.
-        let inset = if is_hero { hero_border_px } else { 0 };
+        // Inset by the *drawn* thickness, not the raw config value — a border
+        // wider than the cell is clamped by draw_border, and the label must
+        // stay inside its own cell.
+        let inset = if is_hero {
+            border_thickness(rect.w, rect.h, hero_border_px)
+        } else {
+            0
+        };
         draw_timestamp(&mut canvas, &FONT, rect.x + inset, rect.y + inset, frame.ts);
     }
 
@@ -92,13 +99,19 @@ pub fn render_single(rgb: &RgbImage, ts: f32, jpeg_quality: u8) -> Result<Vec<u8
     encode_jpeg(&canvas, jpeg_quality)
 }
 
+/// Border thickness actually drawn inside a `w`×`h` cell: capped at half of
+/// each edge, so the four border rects never cross the cell's midlines.
+fn border_thickness(w: u32, h: u32, thickness: u32) -> u32 {
+    thickness.min(h.div_ceil(2)).min(w.div_ceil(2))
+}
+
 /// Draw a `thickness`-px border just inside the given rectangle using four
 /// filled rects. `draw_filled_rect_mut` clips to image bounds automatically.
 fn draw_border(img: &mut RgbImage, x: u32, y: u32, w: u32, h: u32, color: Rgb<u8>, thickness: u32) {
     if thickness == 0 || w == 0 || h == 0 {
         return;
     }
-    let t = thickness.min(h.div_ceil(2)).min(w.div_ceil(2));
+    let t = border_thickness(w, h, thickness);
     let (xi, yi) = (x as i32, y as i32);
     let mid_h = h.saturating_sub(2 * t);
 
@@ -162,6 +175,13 @@ mod tests {
             score: 0.0,
             scene_diff: 0.0,
         }
+    }
+
+    #[test]
+    fn clamps_border_thickness_to_half_cell() {
+        assert_eq!(border_thickness(100, 60, 4), 4, "thin border unclamped");
+        assert_eq!(border_thickness(100, 60, 256), 30, "capped at half height");
+        assert_eq!(border_thickness(9, 100, 256), 5, "div_ceil on odd edges");
     }
 
     #[test]

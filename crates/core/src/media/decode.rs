@@ -14,6 +14,8 @@
 
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
@@ -26,7 +28,7 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::types::TimeRange;
 
 use super::scale::Rescaler;
-use super::{VideoStream, best_video_stream, decode_error, open_input};
+use super::{MAX_READ_ERRORS, VideoStream, best_video_stream, decode_error, open_input};
 
 /// One sampled RGB frame, already downscaled for composition.
 #[derive(Debug)]
@@ -71,11 +73,6 @@ pub enum SampleSpec {
 /// at a few small frames.
 const CHANNEL_FRAMES: usize = 8;
 
-/// Consecutive demux read failures tolerated before the stream is declared
-/// broken. The old `PacketIter` retried forever; a cap turns a permanently
-/// failing input into an error instead of a spin loop.
-const MAX_READ_ERRORS: u32 = 64;
-
 /// A stream of sampled frames decoded on a background thread.
 ///
 /// Pull frames with [`FrameSource::next_frame`]; `None` means clean end of
@@ -83,6 +80,9 @@ const MAX_READ_ERRORS: u32 = 64;
 pub struct FrameSource {
     rx: Option<Receiver<std::result::Result<RgbFrame, Error>>>,
     thread: Option<JoinHandle<()>>,
+    /// Set on drop so the worker exits at its next packet-loop iteration
+    /// instead of decoding on until the next sampled frame's failed send.
+    stop: Arc<AtomicBool>,
     aspect: Option<f32>,
     done: bool,
 }
@@ -140,6 +140,8 @@ impl FrameSource {
             .map_err(|e| decode_error("opening video decoder", e).with_input(input))?;
 
         let (tx, rx) = sync_channel(CHANNEL_FRAMES);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
             .name("agent-video-decode".into())
             .spawn(move || {
@@ -156,6 +158,7 @@ impl FrameSource {
                     end,
                     rescaler: Rescaler::new(min_edge),
                     tx,
+                    stop: stop_flag,
                     frames_sent: 0,
                     decode_errors: 0,
                 };
@@ -171,6 +174,7 @@ impl FrameSource {
         Ok(Self {
             rx: Some(rx),
             thread: Some(thread),
+            stop,
             aspect: None,
             done: false,
         })
@@ -215,8 +219,11 @@ impl FrameSource {
 
 impl Drop for FrameSource {
     fn drop(&mut self) {
-        // Dropping the receiver makes the worker's next send fail, which
-        // stops it; then reap the thread.
+        // The flag stops the worker at its next packet-loop iteration;
+        // dropping the receiver additionally unblocks a send in progress.
+        // Together they bound the join wait to one in-flight libav call
+        // instead of however long decoding to the next sampled frame takes.
+        self.stop.store(true, Ordering::Relaxed);
         self.rx = None;
         self.join();
     }
@@ -372,6 +379,8 @@ struct Worker {
     end: Option<f32>,
     rescaler: Rescaler,
     tx: SyncSender<std::result::Result<RgbFrame, Error>>,
+    /// Checked once per packet: the consumer's drop requests an early exit.
+    stop: Arc<AtomicBool>,
     frames_sent: u64,
     decode_errors: u32,
 }
@@ -395,6 +404,9 @@ impl Worker {
         let mut packet = Packet::empty();
         let mut read_errors = 0u32;
         loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             match packet.read(&mut self.ictx) {
                 Ok(()) => read_errors = 0,
                 Err(ffmpeg::Error::Eof) => break,

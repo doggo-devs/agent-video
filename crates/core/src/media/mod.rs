@@ -126,6 +126,12 @@ pub fn duration_seconds(ictx: &ffmpeg::format::context::Input, path: &Path) -> R
     .with_context(ErrorContext::default().with_input(path)))
 }
 
+/// Consecutive demux read failures tolerated before the stream is declared
+/// broken. Shared by frame decoding and subtitle extraction: both loops skip
+/// transient errors, and both must turn a permanently failing input into an
+/// error instead of a spin loop.
+pub(crate) const MAX_READ_ERRORS: u32 = 64;
+
 /// Map a mid-stream libav failure into the pipeline's coded error space.
 pub fn decode_error(context: &str, e: ffmpeg::Error) -> Error {
     let code = match e {
