@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Time range parsing (`extract --range`) and the `process` attention window.
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 
 use crate::error::{Error, ErrorCode};
 use crate::types::TimeRange;
@@ -84,15 +84,28 @@ impl Window {
 
 fn parse_clock(s: &str) -> Result<f32> {
     let parts: Vec<&str> = s.split(':').collect();
+    // Every failure here is a malformed `--range` value: it must carry
+    // ErrorCode::InvalidRange so the harness sees exit code 31, not the
+    // uncoded 1 a bare anyhow error would degrade to.
     let parse = |p: &str| {
-        p.parse::<f32>()
-            .with_context(|| format!("invalid time '{s}'"))
+        p.parse::<f32>().map_err(|_| {
+            anyhow::Error::from(Error::new(
+                ErrorCode::InvalidRange,
+                format!("invalid time '{s}'"),
+            ))
+        })
     };
     let secs = match parts.as_slice() {
         [sec] => parse(sec)?,
         [m, sec] => parse(m)? * 60.0 + parse(sec)?,
         [h, m, sec] => parse(h)? * 3600.0 + parse(m)? * 60.0 + parse(sec)?,
-        _ => bail!("expected MM:SS or seconds, got '{s}'"),
+        _ => {
+            return Err(Error::new(
+                ErrorCode::InvalidRange,
+                format!("expected MM:SS or seconds, got '{s}'"),
+            )
+            .into());
+        }
     };
     // f32::parse accepts NaN/inf and components may be negative or overflow;
     // none of these are valid clock times, and NaN would slip past the
@@ -147,5 +160,19 @@ mod tests {
     fn rejects_overflowing_clock() {
         // Finite components can still overflow f32 when scaled to seconds.
         assert!(parse_range("1e38:0:0-2e38:0:0").is_err());
+    }
+
+    #[test]
+    fn maps_every_parse_failure_to_invalid_range_code() {
+        // main() picks the exit code by downcasting to the coded Error; a
+        // bare anyhow error would degrade InvalidRange(31) to exit 1.
+        for s in ["abc-5", "1:2:3:4-9", "NaN-1", "01:35-01:23", "5"] {
+            let err = parse_range(s).expect_err("malformed range must fail");
+            assert_eq!(
+                err.downcast_ref::<Error>().map(|e| e.code),
+                Some(ErrorCode::InvalidRange),
+                "range '{s}' must carry the InvalidRange code"
+            );
+        }
     }
 }

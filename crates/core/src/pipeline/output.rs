@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::config::Config;
 use crate::error::{Error, ErrorCode, ErrorContext};
@@ -31,13 +31,21 @@ const STAGING_DIR: &str = ".staging.tmp";
 /// last. So at every instant the directory is one of exactly two states: the
 /// previous completed run (any abort before the sweep), or the new run
 /// mid-promotion — already past the point where all its files exist locally
-/// — with `metadata.json` still marking completion. A leftover staging
-/// directory (crash mid-run) is removed on drop and, belt and suspenders, at
-/// the next `open`. Files this tool never writes are left untouched. In JSON
-/// mode the session touches no files at all.
+/// — with `metadata.json` still marking completion. Once the sweep begins,
+/// staging is the only complete copy of the new run, so from that point on
+/// no failure path deletes it: a promotion that dies half-way leaves every
+/// remaining file in staging for recovery. A leftover staging directory
+/// (crash mid-run, or a failed promotion) is removed on drop — unless it is
+/// that sole copy — and, belt and suspenders, at the next `open`, where the
+/// rerun rebuilds everything anyway. Files this tool never writes are left
+/// untouched. In JSON mode the session touches no files at all.
 pub struct OutputSession<'a> {
     dir: &'a Path,
     sink: Sink,
+    /// Set at the commit's point of no return, just before the sweep: from
+    /// then on the staging directory holds the only complete copy of the new
+    /// run, and [`Drop`] must preserve it instead of cleaning it up.
+    preserve_staging: bool,
 }
 
 /// Where emitted images go: a staging directory awaiting promotion, or
@@ -66,7 +74,11 @@ impl<'a> OutputSession<'a> {
                 Sink::Files { staging }
             }
         };
-        Ok(Self { dir, sink })
+        Ok(Self {
+            dir,
+            sink,
+            preserve_staging: false,
+        })
     }
 
     /// Emit one image artifact (grid or static entry) and return its metadata
@@ -100,16 +112,39 @@ impl<'a> OutputSession<'a> {
     /// 3. staged files are renamed into place, `metadata.json` last — its
     ///    presence keeps marking a completed run;
     /// 4. the staging directory is removed.
-    pub fn commit(self, meta: &Metadata, subtitles_txt: Option<&str>) -> Result<()> {
-        let json = serde_json::to_string_pretty(meta).context("serializing metadata")?;
+    ///
+    /// Steps 2–3 are past the point of no return: staging is the only
+    /// complete copy of the new run, so a failure there preserves it (the
+    /// error names the location) instead of letting drop-cleanup destroy it.
+    pub fn commit(mut self, meta: &Metadata, subtitles_txt: Option<&str>) -> Result<()> {
+        let json = serde_json::to_string_pretty(meta).map_err(|e| {
+            Error::new(
+                ErrorCode::OutputWriteFailed,
+                format!("serializing metadata: {e}"),
+            )
+            .with_source(e)
+        })?;
         match &self.sink {
             Sink::Files { staging } => {
+                let staging = staging.clone();
                 if let Some(text) = subtitles_txt {
-                    write_file(staging, "subtitles.txt", text.as_bytes())?;
+                    write_file(&staging, "subtitles.txt", text.as_bytes())?;
                 }
-                write_file(staging, "metadata.json", json.as_bytes())?;
-                self.sweep_stale()?;
-                self.promote(staging)?;
+                write_file(&staging, "metadata.json", json.as_bytes())?;
+                // Point of no return: the sweep destroys the previous run,
+                // making staging the only complete copy of the new one. From
+                // here Drop must not remove it, or a half-done promotion
+                // would leave the directory without metadata *and* destroy
+                // the files that could complete it.
+                self.preserve_staging = true;
+                let preserved = |e: anyhow::Error| {
+                    e.context(format!(
+                        "the completed run is preserved in {}; re-running rebuilds it",
+                        staging.display()
+                    ))
+                };
+                self.sweep_stale().map_err(preserved)?;
+                self.promote(&staging).map_err(preserved)?;
                 eprintln!(
                     "wrote {} grid(s) to {}",
                     meta.grids.len(),
@@ -178,7 +213,12 @@ impl Drop for OutputSession<'_> {
     /// Best-effort cleanup of the staging directory when the run aborts
     /// before `commit` (which removes it itself; this remove then finds
     /// nothing). The previous run's artifacts are untouched either way.
+    /// Once the commit passed its point of no return, staging is the only
+    /// complete copy of the new run and is preserved instead.
     fn drop(&mut self) {
+        if self.preserve_staging {
+            return;
+        }
         if let Sink::Files { staging } = &self.sink {
             let _ = fs::remove_dir_all(staging);
         }
@@ -353,6 +393,45 @@ mod tests {
             "partial new output never reaches the directory"
         );
         assert!(!dir.join(STAGING_DIR).exists(), "staging cleaned on drop");
+        fs::remove_dir_all(&dir).expect("cleanup test dir");
+    }
+
+    /// Force the promotion renames to fail (read-only output dir) after the
+    /// staged writes succeeded: the sweep has already run, so staging is the
+    /// only complete copy and must survive both the error and the drop.
+    #[cfg(unix)]
+    #[test]
+    fn failed_promotion_preserves_the_staged_run() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("promote-fail");
+        fs::create_dir_all(&dir).expect("create test dir");
+        let session = OutputSession::open(&dir, OutputMode::Files).expect("open session");
+        session.emit_image("grid_001.jpg", b"new").expect("write");
+
+        // Staging keeps its own permissions, so writes into it still work;
+        // only renames into the read-only parent fail.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).expect("make dir read-only");
+        let result = session.commit(&committed_meta(), None);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("restore permissions");
+
+        let Err(err) = result else {
+            // Running as root bypasses the permission gate; nothing to observe.
+            fs::remove_dir_all(&dir).expect("cleanup test dir");
+            return;
+        };
+        assert!(
+            dir.join(STAGING_DIR).join("metadata.json").exists(),
+            "staging survives as the only complete copy of the run"
+        );
+        assert!(
+            dir.join(STAGING_DIR).join("grid_001.jpg").exists(),
+            "unpromoted grids stay in staging"
+        );
+        assert!(
+            format!("{err:#}").contains("preserved"),
+            "error points at the preserved staging: {err:#}"
+        );
         fs::remove_dir_all(&dir).expect("cleanup test dir");
     }
 

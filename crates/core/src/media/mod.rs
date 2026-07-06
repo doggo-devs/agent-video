@@ -16,7 +16,8 @@ pub mod decode;
 mod scale;
 pub mod subtitle;
 
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
 
 use ffmpeg_next as ffmpeg;
 
@@ -48,19 +49,42 @@ pub fn init() {
 /// HTTP error, non-media payload) stays an input-decade error.
 pub fn open_input(source: &Source) -> Result<ffmpeg::format::context::Input> {
     init();
-    ffmpeg::format::input(source.as_path()).map_err(|e| {
-        let err = match e {
-            ffmpeg::Error::ProtocolNotFound => Error::new(
-                ErrorCode::ProtocolUnsupported,
-                format!("cannot open {source}: {e} (not compiled into this build's FFmpeg)"),
-            ),
-            _ => Error::new(
-                ErrorCode::InputCorrupt,
-                format!("cannot open {source} as a media container: {e}"),
-            ),
-        };
-        err.with_context(ErrorContext::default().with_input(source.as_path()))
-    })
+    ffmpeg::format::input(source.as_path()).map_err(|e| open_error(source, e))
+}
+
+/// Like [`open_input`], but wires `stop` into libav's interrupt callback:
+/// raising the flag makes any blocking I/O inside the returned context —
+/// the open itself, seeks, and every subsequent packet read — return
+/// `AVERROR_EXIT` instead of blocking until the operation completes. This is
+/// what bounds a consumer's shutdown on a stalled source (dead network peer,
+/// hung pipe), where a plain read would never return and a joining thread
+/// would hang with it.
+pub fn open_input_interruptible(
+    source: &Source,
+    stop: Arc<AtomicBool>,
+) -> Result<ffmpeg::format::context::Input> {
+    init();
+    // ffmpeg-next boxes the closure and never reclaims it (the callback must
+    // stay valid for the context's whole lifetime and the wrapper has no
+    // teardown hook): a few leaked bytes per open, bounded by the handful of
+    // opens a run performs.
+    ffmpeg::format::input_with_interrupt(source.as_path(), move || stop.load(Ordering::Relaxed))
+        .map_err(|e| open_error(source, e))
+}
+
+/// Map a container-open failure into the pipeline's coded error space.
+fn open_error(source: &Source, e: ffmpeg::Error) -> Error {
+    let err = match e {
+        ffmpeg::Error::ProtocolNotFound => Error::new(
+            ErrorCode::ProtocolUnsupported,
+            format!("cannot open {source}: {e} (not compiled into this build's FFmpeg)"),
+        ),
+        _ => Error::new(
+            ErrorCode::InputCorrupt,
+            format!("cannot open {source} as a media container: {e}"),
+        ),
+    };
+    err.with_context(ErrorContext::default().with_input(source.as_path()))
 }
 
 /// The presentation clock of one opened container: origin at the best video

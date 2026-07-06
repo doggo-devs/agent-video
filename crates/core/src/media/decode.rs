@@ -30,7 +30,8 @@ use crate::types::TimeRange;
 
 use super::scale::Rescaler;
 use super::{
-    ErrorBudget, MAX_READ_ERRORS, VideoStream, best_video_stream, decode_error, open_input,
+    ErrorBudget, MAX_READ_ERRORS, VideoStream, best_video_stream, decode_error,
+    open_input_interruptible,
 };
 
 /// One sampled RGB frame, already downscaled for composition.
@@ -85,6 +86,9 @@ pub struct FrameSource {
     thread: Option<JoinHandle<()>>,
     /// Set on drop so the worker exits at its next packet-loop iteration
     /// instead of decoding on until the next sampled frame's failed send.
+    /// Also wired into libav's interrupt callback at open, so a packet read
+    /// blocked inside a libav C call (stalled network source, hung pipe)
+    /// aborts with `AVERROR_EXIT` instead of blocking the join forever.
     stop: Arc<AtomicBool>,
     aspect: Option<f32>,
     done: bool,
@@ -103,7 +107,11 @@ impl FrameSource {
         min_edge: u32,
         threads: Option<NonZeroUsize>,
     ) -> Result<Self> {
-        let mut ictx = open_input(input)?;
+        // The stop flag exists before the container: it rides into libav as
+        // the interrupt callback, making every blocking I/O call inside this
+        // context — open, seek, packet reads — abort once the flag is up.
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut ictx = open_input_interruptible(input, Arc::clone(&stop))?;
         let video = best_video_stream(&ictx, input)?;
 
         // Seek before building the decoder so no flush is needed. Seeking to
@@ -151,7 +159,6 @@ impl FrameSource {
             .map_err(|e| decode_error("opening video decoder", e).with_input(input.as_path()))?;
 
         let (tx, rx) = sync_channel(CHANNEL_FRAMES);
-        let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
             .name("agent-video-decode".into())
@@ -230,10 +237,12 @@ impl FrameSource {
 
 impl Drop for FrameSource {
     fn drop(&mut self) {
-        // The flag stops the worker at its next packet-loop iteration;
-        // dropping the receiver additionally unblocks a send in progress.
-        // Together they bound the join wait to one in-flight libav call
-        // instead of however long decoding to the next sampled frame takes.
+        // The flag stops the worker at its next packet-loop iteration and,
+        // via the interrupt callback registered at open, aborts a packet
+        // read currently blocked inside libav; dropping the receiver
+        // additionally unblocks a send in progress. Together they bound the
+        // join wait to the interrupt-check granularity of one libav call —
+        // even on a source that will never deliver another byte.
         self.stop.store(true, Ordering::Relaxed);
         self.rx = None;
         self.join();
@@ -421,6 +430,9 @@ impl Worker {
             match packet.read(&mut self.ictx) {
                 Ok(()) => read_budget.ok(),
                 Err(ffmpeg::Error::Eof) => break,
+                // The interrupt callback tripped mid-read: the consumer
+                // dropped us and this is a requested stop, not a failure.
+                Err(ffmpeg::Error::Exit) => return Ok(()),
                 Err(e) => {
                     // Transient demux errors are skipped like the CLI does,
                     // but a permanently failing input must not spin forever.

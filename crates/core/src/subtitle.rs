@@ -75,19 +75,29 @@ pub struct Subtitles {
 
 impl Subtitles {
     /// Resolve subtitles from the given source. Returns `Ok(None)` only on
-    /// the [`SubtitleSource::Auto`] path, when no source exists. A source
-    /// that yields text but no parseable SRT cues fails with
-    /// [`ErrorCode::InputCorrupt`]: every grid's `subtitles` field would be
-    /// empty while the run reports success — a corrupt input, not a resolved
-    /// one.
+    /// the [`SubtitleSource::Auto`] path: when no source exists, or when the
+    /// single embedded track turns out to hold no text cues — a legal
+    /// container state that degrades to running without subtitles. An
+    /// *explicitly requested* source that yields no cues fails with
+    /// [`ErrorCode::InputCorrupt`] instead: every grid's `subtitles` field
+    /// would be empty while the run reports success — not what the user
+    /// asked for.
     pub fn resolve(input: &Source, source: SubtitleSource<'_>) -> Result<Option<Self>> {
         match source {
             SubtitleSource::File(p) => Ok(Some(Self::from_srt_text(input, extract_from_file(p)?)?)),
-            SubtitleSource::Track(t) => Ok(Some(Self::from_cues(media::subtitle::extract_track(
-                input,
-                t,
-                "subtitle track",
-            )?))),
+            SubtitleSource::Track(t) => {
+                let cues = media::subtitle::extract_track(input, t, "subtitle track")?;
+                if cues.is_empty() {
+                    // The user named this track; silently empty metadata
+                    // would betray that explicit request.
+                    return Err(Error::new(
+                        ErrorCode::InputCorrupt,
+                        format!("subtitle track {t} contains no text cues"),
+                    )
+                    .with_context(ErrorContext::default().with_input(input.as_path())));
+                }
+                Ok(Some(Self::from_cues(cues)))
+            }
             SubtitleSource::Auto => match auto_detect(input)? {
                 Some(AutoSource::Sidecar(text)) => Ok(Some(Self::from_srt_text(input, text)?)),
                 Some(AutoSource::Embedded(cues)) => Ok(Some(Self::from_cues(cues))),
@@ -111,7 +121,8 @@ impl Subtitles {
     }
 
     /// Build from decoded embedded cues; the `subtitles.txt` payload is
-    /// rendered back to SRT (the extractor guarantees at least one cue).
+    /// rendered back to SRT. Callers guarantee at least one cue — both
+    /// resolution paths reject or degrade on an empty extraction first.
     fn from_cues(cues: Vec<Cue>) -> Self {
         Subtitles {
             raw: media::subtitle::cues_to_srt(&cues),
@@ -201,11 +212,19 @@ fn auto_detect(input: &Source) -> Result<Option<AutoSource>> {
 
     // Single embedded stream
     if embedded.len() == 1 {
-        return Ok(Some(AutoSource::Embedded(media::subtitle::extract_track(
-            input,
-            0,
-            "embedded subtitle stream",
-        )?)));
+        let cues = media::subtitle::extract_track(input, 0, "embedded subtitle stream")?;
+        if cues.is_empty() {
+            // A present-but-empty text track is a legal container state,
+            // not corruption; nobody asked for this track by name, so the
+            // auto path degrades to "no subtitles" the same way a container
+            // without subtitle streams does.
+            eprintln!(
+                "warning: the embedded subtitle stream contains no text cues; \
+                 continuing without subtitles"
+            );
+            return Ok(None);
+        }
+        return Ok(Some(AutoSource::Embedded(cues)));
     }
 
     Ok(None)

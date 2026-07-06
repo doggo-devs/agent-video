@@ -55,6 +55,11 @@ pub fn list_tracks(input: &Source) -> Result<Vec<EmbeddedTrack>> {
 /// `what` names the source in errors — "subtitle track" for an explicit
 /// `--subtitle-track`, "embedded subtitle stream" when auto-detection picked
 /// it.
+///
+/// The returned list may be empty: a present-but-empty text track is a legal
+/// container state, and whether emptiness is fatal is the caller's policy
+/// (an explicitly requested track fails the run; auto-detection degrades to
+/// running without subtitles).
 pub fn extract_track(input: &Source, track: usize, what: &str) -> Result<Vec<Cue>> {
     let mut ictx = open_input(input)?;
 
@@ -120,7 +125,7 @@ pub fn extract_track(input: &Source, track: usize, what: &str) -> Result<Vec<Cue
 
         let mut sub = AvSubtitle::new();
         // A packet that fails to decode or decodes to nothing is skipped;
-        // wholesale failure surfaces as zero cues below.
+        // wholesale failure surfaces as zero cues, judged by the caller.
         let Ok(true) = decoder.decode(&packet, &mut sub) else {
             continue;
         };
@@ -142,7 +147,7 @@ pub fn extract_track(input: &Source, track: usize, what: &str) -> Result<Vec<Cue
                     // A truncated event line carries no recoverable text;
                     // leaking its metadata fields as cue text would be
                     // worse than dropping it. A wholly corrupt track
-                    // surfaces as the zero-cues error below.
+                    // surfaces as zero cues, judged by the caller.
                     AssLine::Malformed => {}
                 },
                 Rect::Bitmap(_) => {
@@ -167,13 +172,6 @@ pub fn extract_track(input: &Source, track: usize, what: &str) -> Result<Vec<Cue
         }
     }
 
-    if cues.is_empty() {
-        return Err(Error::new(
-            ErrorCode::InputCorrupt,
-            format!("{what} {track} contains no text cues"),
-        )
-        .with_context(ErrorContext::default().with_input(input.as_path())));
-    }
     Ok(cues)
 }
 
