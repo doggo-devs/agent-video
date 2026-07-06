@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! ProcessState: the shell around the pure [`Chunker`] core — it consumes
 //! judged candidate frames, lets the chunker turn them into chunk/static
 //! events, and interprets those events against the effectful world: parallel

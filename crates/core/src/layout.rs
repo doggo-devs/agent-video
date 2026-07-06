@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Grid geometry. Pure calculation — no image operations.
 //!
 //! The layout is justified: frames are partitioned into rows, every row spans

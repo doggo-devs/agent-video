@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Pipeline orchestration: extract → dedup → chunk → (per-chunk) score → select
 //! → layout → compose, then write grids, `metadata.json`, and subtitles.
 //!

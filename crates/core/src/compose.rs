@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Grid composition: paste resized frames onto a canvas, draw timestamp labels
 //! and hero highlight borders, encode as JPEG.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Frame rescaling via libswscale: decoded native-format frames to small RGB
 //! images sized for grid composition.
 //!

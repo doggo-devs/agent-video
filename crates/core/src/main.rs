@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! agent-video CLI entry point.
 //!
 //! Two subcommands: `process` (smart frame selection + grid composition) and

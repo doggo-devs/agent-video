@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bounded fan-out to a rayon pool with results delivered in spawn order.
 //!
 //! [`OrderedJobs`] assigns each job a sequence number, runs it on the caller's

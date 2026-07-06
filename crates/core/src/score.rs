@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Frame scoring, rank normalization, and selection.
 //!
 //! Three raw dimensions are computed per frame in their natural (incomparable)

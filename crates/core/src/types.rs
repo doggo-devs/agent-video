@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Public data types shared across the pipeline.
 //!
 //! The central design constraint lives here: neither frame type holds a

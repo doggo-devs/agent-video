@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Frame extraction: sampled, pre-scaled RGB frames from the in-process
 //! decoder.
 //!

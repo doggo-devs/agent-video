@@ -1,0 +1,12 @@
+agent-video
+Copyright 2026 yeshanjun and durvia
+
+This product includes software developed at
+https://github.com/durvia/agent-video
+
+---
+
+This software links against FFmpeg libraries (libavformat, libavcodec,
+libavutil, libswscale) which are licensed under the GNU Lesser General
+Public License v2.1 or later (LGPL-2.1-or-later).
+See https://ffmpeg.org/legal.html

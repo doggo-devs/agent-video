@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Embedded subtitle extraction via the in-process subtitle decoder.
 //!
 //! Replaces two subprocess round-trips (an ffprobe stream scan and an ffmpeg

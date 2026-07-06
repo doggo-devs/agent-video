@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Pure chunking state machine: judged frames in, chunk/static events out.
 //!
 //! Owns everything about placing frames on the timeline — time-chunk keying,

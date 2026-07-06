@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Unified runtime configuration.
 //!
 //! Parse, don't validate: [`Config`] is a bundle of domain groups whose

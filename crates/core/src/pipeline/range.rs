@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Time range parsing (`extract --range`) and the `process` attention window.
 
 use anyhow::{Context, Result, bail};

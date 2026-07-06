@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Input source classification: local filesystem path vs protocol URL.
 //!
 //! [`Source::classify`] is the single entry point, applied once at the CLI

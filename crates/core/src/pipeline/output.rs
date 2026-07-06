@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Output writing: the per-run output session, staged-commit file lifecycle,
 //! and metadata assembly.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The single boundary to the in-process FFmpeg libraries (libavformat,
 //! libavcodec, libswscale) via `ffmpeg-next`.
 //!

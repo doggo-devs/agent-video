@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Structured error types with codes for programmatic handling.
 //!
 //! The harness layer receives [`Error`] with a machine-readable [`ErrorCode`]

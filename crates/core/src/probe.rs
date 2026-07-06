@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Video metadata probing via the in-process demuxer.
 //!
 //! Keyframe timestamps come from a packet-level scan (`packet.is_key()`)

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Perceptual-hash deduplication.
 //!
 //! Frames sampled at a fixed fps often repeat near-identically (static shots,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Subtitle resolution: embedded streams via the in-process decoder, or
 //! external sidecar files.
 //!

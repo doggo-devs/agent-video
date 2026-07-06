@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! In-process frame decoding: a dedicated decode thread feeding a bounded
 //! channel of small RGB frames.
 //!

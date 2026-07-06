@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The shared sampling front half of both pipelines: decoded frames in,
 //! judged candidates out.
 //!

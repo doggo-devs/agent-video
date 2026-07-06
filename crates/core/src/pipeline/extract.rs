@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The `extract` CLI subcommand: high-density sampling of a single time range
 //! into one equal-cell grid, frames in time order (no hero emphasis).
 //!

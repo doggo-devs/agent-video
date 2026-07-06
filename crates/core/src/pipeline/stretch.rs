@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Static-stretch detection over the dedup verdict stream.
 //!
 //! Dedup collapses an unchanging scene into a long gap between kept frames.
