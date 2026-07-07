@@ -41,8 +41,7 @@ pub fn process_chunk(
 ) -> Result<GridResult> {
     let mut chunk = score::score_frames(chunk, &env.weights, prev_tail.as_ref());
 
-    // grid_capacity is a cheap pure function; deriving it here keeps the env
-    // free of values that could drift from their inputs.
+    // Derived here rather than stored in env, so it cannot drift from inputs.
     let capacity = layout::grid_capacity(&env.spec, env.aspect);
     let span = chunk_span(&chunk);
     let min_gap = (0.5 * span / capacity as f32).max(env.min_gap_floor);

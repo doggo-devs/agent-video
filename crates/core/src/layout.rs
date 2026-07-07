@@ -87,8 +87,8 @@ pub fn compute(scores: &[f32], heroes: &[usize], aspect: f32, spec: &CanvasSpec)
         };
     }
     if aspect < 1.0 {
-        // Portrait: lay out transposed (wide cells), then swap the axes so
-        // hero rows become hero columns on the left.
+        // Portrait: lay out transposed, then swap axes so hero rows become
+        // hero columns on the left.
         let mut layout = compute_wide(scores, heroes, 1.0 / aspect, spec);
         for r in &mut layout.rects {
             *r = r.map(Rect::transposed);
@@ -103,8 +103,7 @@ pub fn compute(scores: &[f32], heroes: &[usize], aspect: f32, spec: &CanvasSpec)
 fn compute_wide(scores: &[f32], heroes: &[usize], a: f32, spec: &CanvasSpec) -> Layout {
     let n = scores.len();
 
-    // Mark hero frames, deduplicating: a caller may pass the same index twice,
-    // which must not occupy two hero slots.
+    // Dedup: a repeated index must not occupy two hero slots.
     let mut is_hero = vec![false; n];
     let mut hero_list: Vec<usize> = Vec::new();
     for &h in heroes {
@@ -115,16 +114,14 @@ fn compute_wide(scores: &[f32], heroes: &[usize], a: f32, spec: &CanvasSpec) -> 
     }
     let hero_count = hero_list.len();
 
-    // Cells per normal row, sized so the canvas is roughly square: a hero is
-    // worth ~4 normal cells of area (2× per edge), hence the weighted demand.
+    // Cells per row for a roughly-square canvas; a hero is worth ~4 normal
+    // cells of area (2× per edge), hence the weighted demand.
     let weighted = (n - hero_count) + 4 * hero_count;
     let c = ((weighted as f32 / a).sqrt().round() as usize).max(1);
     let k_hero = c.div_ceil(2);
 
-    // Hero rows first (time order within rows), in groups of k_hero. A short
-    // last group is topped up with the best-scored normals so the row still
-    // spans the full width; leftover deficit (no normals left) just makes the
-    // row's cells wider — justified either way.
+    // Hero rows first, in groups of k_hero; a short last group is topped up
+    // with the best-scored normals to span the full width.
     hero_list.sort_unstable();
     let mut rows: Vec<Vec<usize>> = hero_list.chunks(k_hero).map(<[usize]>::to_vec).collect();
     let mut in_hero_row = is_hero;
@@ -141,8 +138,7 @@ fn compute_wide(scores: &[f32], heroes: &[usize], a: f32, spec: &CanvasSpec) -> 
         }
     }
 
-    // Remaining frames in time order, split into rows as evenly as possible
-    // (sizes differ by at most one) so no row degenerates into a lone giant.
+    // Remaining frames split into evenly-sized rows (differ by at most one).
     let normals: Vec<usize> = (0..n).filter(|&i| !in_hero_row[i]).collect();
     if !normals.is_empty() {
         let row_count = normals.len().div_ceil(c);
@@ -155,15 +151,12 @@ fn compute_wide(scores: &[f32], heroes: &[usize], a: f32, spec: &CanvasSpec) -> 
         }
     }
 
-    // Pixel sizing: row height = width / (cells × a). Cap the longer canvas
-    // edge at spec.edge.
+    // Pixel sizing: row height = width / (cells × a), longer edge capped at spec.edge.
     let height_ratio: f32 = rows.iter().map(|row| 1.0 / (row.len() as f32 * a)).sum();
     let width = spec.edge() as f32 / height_ratio.max(1.0);
 
-    // Cell edges derive from rounded row/column boundaries, so adjacent cells
-    // share exact boundaries and the rows tile the canvas without gaps. A
-    // boundary pair that rounds to zero extent yields `None` — Rect cannot
-    // represent a degenerate cell.
+    // Cell edges derive from shared rounded boundaries so rows tile without
+    // gaps; a zero-extent boundary pair yields `None` (no degenerate Rect).
     let mut rects: Vec<Option<Rect>> = vec![None; n];
     let mut y = 0.0_f32;
     for row in &rows {

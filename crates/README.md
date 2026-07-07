@@ -24,12 +24,11 @@ The default build links the system FFmpeg libraries dynamically, so the host
 needs a matching FFmpeg installed at runtime.
 
 For a self-contained release binary with **zero runtime dependencies**, build
-FFmpeg from source and link it statically (adds static dav1d for software AV1
-and OpenSSL for `https://`):
+FFmpeg from source and link it statically (adds static dav1d for software AV1):
 
 ```bash
 ./scripts/build-static.sh
-# requires: git, nasm, meson, ninja, pkg-config, perl, a C toolchain
+# requires: git, nasm, meson, ninja, pkg-config, a C toolchain
 ```
 
 The static binary still links glibc. For a single-file artifact with no dynamic
@@ -40,7 +39,11 @@ x86_64-unknown-linux-musl`):
 TARGET=x86_64-unknown-linux-musl ./scripts/build-static.sh
 ```
 
-TLS uses the system CA store; override with `SSL_CERT_FILE`/`SSL_CERT_DIR`.
+The static build has **no TLS backend**: `https://` inputs to `process`/
+`extract` fail with `PROTOCOL_UNSUPPORTED`. This is deliberate — URL sources
+go through the harness downloader (rustls, CA roots compiled in), so the MCP
+path is unaffected; for direct CLI use, download the file first. Dynamic
+builds keep whatever protocols the system FFmpeg provides.
 
 The static binary has **no hardware acceleration** — FFmpeg is configured with
 `--disable-autodetect`, so all decoding is pure CPU (dav1d SIMD, dispatched at
@@ -58,7 +61,8 @@ statically compiled FFmpeg matches the same baseline.
 # Smart frame selection + grid composition
 agent-video process video.mp4 -o out/
 
-# Process straight from a URL (any protocol the build's FFmpeg can open)
+# Process straight from a URL (any protocol the build's FFmpeg can open;
+# static builds have no TLS — download first or use the MCP path)
 agent-video process https://example.com/talk.mp4 -o out/
 
 # Override the canvas edge length

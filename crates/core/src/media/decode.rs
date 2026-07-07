@@ -107,22 +107,16 @@ impl FrameSource {
         min_edge: u32,
         threads: Option<NonZeroUsize>,
     ) -> Result<Self> {
-        // The stop flag exists before the container: it rides into libav as
-        // the interrupt callback, making every blocking I/O call inside this
-        // context — open, seek, packet reads — abort once the flag is up.
+        // Built before the container so it can ride into libav's interrupt
+        // callback, arming every blocking I/O call in this context.
         let stop = Arc::new(AtomicBool::new(false));
         let mut ictx = open_input_interruptible(input, Arc::clone(&stop))?;
         let video = best_video_stream(&ictx, input)?;
 
-        // Seek before building the decoder so no flush is needed. Seeking to
-        // the latest keyframe at or before the target mirrors `-ss` accurate
-        // input seeking: decode from the keyframe, discard until the target
-        // (the tick sampler below does the discarding naturally). `start` is
-        // a logical 0-based timestamp but the unbound seek call speaks the
-        // container's absolute clock, so the timeline projects it back. An
-        // unseekable stream (e.g. HTTP without Range support) degrades to a
-        // sequential read: the sampler's first tick sits at `start`, so
-        // everything before it is decoded and discarded — slower, same output.
+        // Seek before building the decoder so no flush is needed. The seek
+        // speaks the container's absolute clock, so the logical 0-based
+        // `start` is projected through the timeline. An unseekable stream
+        // degrades to a decode-and-discard up to the sampler's first tick.
         if let SampleSpec::Fps { start, .. } = &spec
             && *start > 0.0
         {
@@ -141,17 +135,15 @@ impl FrameSource {
         let mut codec_ctx = CodecContext::from_parameters(stream.parameters())
             .map_err(|e| decode_error("reading codec parameters", e).with_input(input.as_path()))?;
 
-        // Frame threading with count 0 = auto-detect cores; an explicit
-        // `--threads` caps it. Without this the decoder defaults to a single
-        // thread — the ffmpeg CLI always configures threading, so must we.
+        // Count 0 = auto-detect cores. Without explicit threading the decoder
+        // defaults to a single thread, unlike the ffmpeg CLI.
         let mut tc = threading::Config::count(threads.map_or(0, NonZeroUsize::get));
         tc.kind = threading::Type::Frame;
         codec_ctx.set_threading(tc);
 
         let mut decoder = codec_ctx.decoder();
         if matches!(spec, SampleSpec::Keyframes) {
-            // Belt and suspenders with the packet-level filter in the pump:
-            // the decoder also skips anything that is not a keyframe.
+            // Redundant with the packet gate in the pump: also skip non-key.
             decoder.skip_frame(Discard::NonKey);
         }
         let decoder = decoder
@@ -237,11 +229,9 @@ impl FrameSource {
 
 impl Drop for FrameSource {
     fn drop(&mut self) {
-        // The flag stops the worker at its next packet-loop iteration and,
-        // via the interrupt callback registered at open, aborts a packet
-        // read currently blocked inside libav; dropping the receiver
-        // additionally unblocks a send in progress. Together they bound the
-        // join wait to the interrupt-check granularity of one libav call —
+        // The flag stops the worker at its next loop iteration and aborts a
+        // packet read blocked inside libav (interrupt callback); dropping the
+        // receiver unblocks a send in progress. Together they bound the join
         // even on a source that will never deliver another byte.
         self.stop.store(true, Ordering::Relaxed);
         self.rx = None;
@@ -261,9 +251,8 @@ struct Tick {
 
 impl Tick {
     fn wants(&mut self, ts: f32) -> bool {
-        // A sliver of tolerance absorbs float noise in pts arithmetic
-        // (a frame at 0.999999 owns the 1.0 tick); anything larger
-        // would visibly shift the sampling instants.
+        // A sliver of tolerance absorbs float noise in pts arithmetic;
+        // anything larger would visibly shift the sampling instants.
         let eps = self.step * 1e-3;
         if ts + eps < self.next {
             return false;
@@ -368,12 +357,10 @@ impl PacketGate {
                 if packet.is_key() {
                     return true;
                 }
-                // pts (dts fallback) places the packet on the timeline. A
-                // non-key packet without either cannot be placed and is
-                // dropped — the sampler could not emit its frame anyway.
                 // B-frame reordering jitters pts only within a GOP, never
-                // across the keyframe that opens the next fill range, so a
-                // forward-only cursor is safe.
+                // across the keyframe opening the next fill range, so the
+                // forward-only cursor is safe. A packet with no pts/dts
+                // cannot be placed and is dropped.
                 let Some(pts) = packet.pts().or(packet.dts()) else {
                     return false;
                 };
@@ -414,7 +401,6 @@ enum Flow {
 impl Worker {
     fn run(&mut self) {
         if let Err(e) = self.pump() {
-            // The consumer may already be gone; nothing to do then.
             let _ = self.tx.send(Err(e));
         }
         // Dropping tx (with self) closes the channel = clean EOF marker.
@@ -430,12 +416,9 @@ impl Worker {
             match packet.read(&mut self.ictx) {
                 Ok(()) => read_budget.ok(),
                 Err(ffmpeg::Error::Eof) => break,
-                // The interrupt callback tripped mid-read: the consumer
-                // dropped us and this is a requested stop, not a failure.
+                // Interrupt callback tripped: a requested stop, not a failure.
                 Err(ffmpeg::Error::Exit) => return Ok(()),
                 Err(e) => {
-                    // Transient demux errors are skipped like the CLI does,
-                    // but a permanently failing input must not spin forever.
                     read_budget.fail(e)?;
                     continue;
                 }
@@ -448,8 +431,7 @@ impl Worker {
             }
 
             if let Err(e) = self.decoder.send_packet(&packet) {
-                // A corrupt packet is the input's fault, not a reason to
-                // abandon the rest of the stream — the CLI keeps going too.
+                // A corrupt packet does not abandon the rest of the stream.
                 self.decode_errors += 1;
                 if self.decode_errors > MAX_READ_ERRORS {
                     return Err(decode_error("decoding video packet", e));
@@ -461,12 +443,9 @@ impl Worker {
             }
         }
 
-        // Flush delayed frames out of the decoder.
         let _ = self.decoder.send_eof();
         self.drain()?;
 
-        // Decoding produced nothing and errors piled up: report the cause
-        // instead of a silent empty stream.
         if self.frames_sent == 0 && self.decode_errors > 0 {
             return Err(Error::new(
                 ErrorCode::DecodeFailed,
@@ -494,8 +473,7 @@ impl Worker {
                 Err(e) => return Err(decode_error("receiving decoded frame", e)),
             }
 
-            // best-effort timestamp falls back to pts; a frame with neither
-            // cannot be placed on the timeline and is skipped.
+            // best-effort timestamp, pts fallback; neither = unplaceable, skip.
             let Some(pts) = frame.timestamp().or(frame.pts()) else {
                 continue;
             };
@@ -511,7 +489,6 @@ impl Worker {
 
             let rgb = self.rescaler.rgb(&frame)?;
             if self.tx.send(Ok(RgbFrame { ts, rgb })).is_err() {
-                // Receiver dropped: the consumer is done with us.
                 return Ok(Flow::Stop);
             }
             self.frames_sent += 1;

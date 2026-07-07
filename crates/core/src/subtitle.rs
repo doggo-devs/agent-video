@@ -88,8 +88,6 @@ impl Subtitles {
             SubtitleSource::Track(t) => {
                 let cues = media::subtitle::extract_track(input, t, "subtitle track")?;
                 if cues.is_empty() {
-                    // The user named this track; silently empty metadata
-                    // would betray that explicit request.
                     return Err(Error::new(
                         ErrorCode::InputCorrupt,
                         format!("subtitle track {t} contains no text cues"),
@@ -175,7 +173,7 @@ fn extract_from_file(path: &Path) -> Result<String> {
 /// tracks are considered.
 fn auto_detect(input: &Source) -> Result<Option<AutoSource>> {
     let sidecars = match input {
-        Source::Local(path) => find_all_sidecars(path),
+        Source::Local(path) => find_sidecars(path),
         Source::Remote(_) => Vec::new(),
     };
     let embedded = media::subtitle::list_tracks(input)?;
@@ -199,7 +197,6 @@ fn auto_detect(input: &Source) -> Result<Option<AutoSource>> {
         ));
     }
 
-    // Single sidecar
     if let Some(path) = sidecars.into_iter().next() {
         return match read_sidecar(&path)? {
             Some(content) => Ok(Some(AutoSource::Sidecar(content))),
@@ -210,14 +207,11 @@ fn auto_detect(input: &Source) -> Result<Option<AutoSource>> {
         };
     }
 
-    // Single embedded stream
     if embedded.len() == 1 {
         let cues = media::subtitle::extract_track(input, 0, "embedded subtitle stream")?;
         if cues.is_empty() {
-            // A present-but-empty text track is a legal container state,
-            // not corruption; nobody asked for this track by name, so the
-            // auto path degrades to "no subtitles" the same way a container
-            // without subtitle streams does.
+            // A present-but-empty text track is a legal container state, not
+            // corruption; unrequested, the auto path degrades to no subtitles.
             eprintln!(
                 "warning: the embedded subtitle stream contains no text cues; \
                  continuing without subtitles"
@@ -230,7 +224,15 @@ fn auto_detect(input: &Source) -> Result<Option<AutoSource>> {
     Ok(None)
 }
 
-/// Find all sidecar subtitle files alongside the video.
+/// Sidecar subtitle extensions [`find_sidecars`] discovers.
+///
+/// This is the auto-detection contract: anything advertising "subtitles
+/// available" for a file (the harness probe) must derive from this list,
+/// not restate it — a format core cannot read must never be promised.
+pub const SIDECAR_SUBTITLE_EXTS: &[&str] = &["srt"];
+
+/// Find all sidecar subtitle files alongside the video: `video.<ext>` and
+/// `video.*.<ext>` for every extension in [`SIDECAR_SUBTITLE_EXTS`].
 ///
 /// Best-effort by design: this runs on every local auto-detect invocation,
 /// including ones that need no subtitles, so a directory that cannot be
@@ -238,7 +240,7 @@ fn auto_detect(input: &Source) -> Result<Option<AutoSource>> {
 /// exact-name check already found — mirroring the missing-track downgrade
 /// in [`auto_detect`]. A sidecar that is *found* but unreadable still fails,
 /// in [`read_sidecar`].
-fn find_all_sidecars(input: &Path) -> Vec<std::path::PathBuf> {
+pub fn find_sidecars(input: &Path) -> Vec<std::path::PathBuf> {
     let Some(stem) = input.file_stem().and_then(|s| s.to_str()) else {
         return Vec::new();
     };
@@ -248,14 +250,14 @@ fn find_all_sidecars(input: &Path) -> Vec<std::path::PathBuf> {
 
     let mut results = Vec::new();
 
-    // Check exact match: video.srt — a direct stat, so it works even when the
-    // directory below cannot be listed.
-    let exact = parent.join(format!("{stem}.srt"));
-    if exact.is_file() {
-        results.push(exact);
+    // Direct stats, so exact names resolve even when the directory can't be listed.
+    for ext in SIDECAR_SUBTITLE_EXTS {
+        let exact = parent.join(format!("{stem}.{ext}"));
+        if exact.is_file() {
+            results.push(exact);
+        }
     }
 
-    // Check pattern: video.*.srt (e.g. video.zh.srt)
     let entries = match fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(e) => {
@@ -278,12 +280,15 @@ fn find_all_sidecars(input: &Path) -> Vec<std::path::PathBuf> {
         };
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // The stem must be followed by a literal `.`, or `video2.srt` would be
-        // claimed as a sidecar of `video.mp4`. `rest.len() > 4` excludes the
-        // exact `video.srt` (already collected above) where rest is just ".srt".
-        let is_pattern_match = name
-            .strip_prefix(stem)
-            .is_some_and(|rest| rest.starts_with('.') && rest.ends_with(".srt") && rest.len() > 4);
+        // Require a literal `.` after the stem (else `video2.srt` matches
+        // `video.mp4`); `rest.len() > suffix` excludes the exact-name case above.
+        let is_pattern_match = name.strip_prefix(stem).is_some_and(|rest| {
+            rest.starts_with('.')
+                && SIDECAR_SUBTITLE_EXTS.iter().any(|ext| {
+                    let suffix = format!(".{ext}");
+                    rest.ends_with(&suffix) && rest.len() > suffix.len()
+                })
+        });
         if is_pattern_match {
             results.push(entry.path());
         }
@@ -333,9 +338,8 @@ fn read_sidecar(path: &Path) -> Result<Option<String>> {
 
 /// Parse SRT text into a list of cues.
 fn parse_srt(srt: &str) -> Vec<Cue> {
-    // Windows subtitle editors commonly write a UTF-8 BOM. It is not
-    // whitespace, so left in place it makes the first index line fail the
-    // digit check and silently drops the first cue.
+    // Windows editors write a UTF-8 BOM; left in, it fails the first index
+    // line's digit check and silently drops the first cue.
     let srt = srt.trim_start_matches('\u{feff}');
     let mut cues = Vec::new();
     let mut lines = srt.lines();
@@ -346,9 +350,8 @@ fn parse_srt(srt: &str) -> Vec<Cue> {
             continue;
         }
 
-        // The numeric cue index is optional: some tools emit cues that start
-        // directly with the timestamp line, and requiring an index would
-        // silently parse such files to zero cues.
+        // The numeric cue index is optional: some tools emit cues starting
+        // directly with the timestamp line.
         let ts_line = if trimmed.contains("-->") {
             trimmed
         } else if trimmed.chars().all(|c| c.is_ascii_digit()) {
@@ -360,12 +363,10 @@ fn parse_srt(srt: &str) -> Vec<Cue> {
             continue;
         };
 
-        // Parse timestamp line: "00:00:01,234 --> 00:00:04,567"
         let Some((start, end)) = parse_timestamp_line(ts_line) else {
             continue;
         };
 
-        // Collect text lines until blank line
         let mut text_lines = Vec::new();
         for line in lines.by_ref() {
             if line.trim().is_empty() {
@@ -449,8 +450,6 @@ with continuation
 
     #[test]
     fn parses_srt_without_cue_indexes() {
-        // Some tools emit SRT whose cues start directly with the timestamp
-        // line; the numeric index is optional.
         let srt = "00:00:01,000 --> 00:00:03,500\nHello world\n\n\
                    00:00:04,000 --> 00:00:06,000\nSecond\n";
         let cues = parse_srt(srt);
@@ -553,8 +552,6 @@ with continuation
 
     #[test]
     fn rejects_subtitle_source_with_no_parseable_cues() {
-        // A readable file whose content parses to zero cues must fail the
-        // run, not resolve into silently empty per-grid subtitles.
         let dir = std::env::temp_dir().join(format!("agent-video-nocue-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("create test dir");
         let sub = dir.join("broken.srt");
@@ -576,9 +573,8 @@ with continuation
 
     #[test]
     fn maps_unreadable_sidecar_to_coded_error() {
-        // A directory cannot be read as a file and is not NotFound: the
-        // auto-detect path must fail with the same structured code an explicit
-        // --subtitle path gets, not an uncoded exit-1 error.
+        // A directory is neither a readable file nor NotFound; it must still
+        // map to a structured code, not an uncoded exit-1.
         let err = read_sidecar(Path::new(".")).expect_err("directory read must fail");
         assert_eq!(err.code, ErrorCode::InputUnreadable);
     }
@@ -601,7 +597,7 @@ with continuation
         // `video2.srt` shares the prefix but is not `video.srt` or
         // `video.<tag>.srt`; claiming it would attach another video's subtitles.
         with_sidecar_dir("prefix", &["video2.srt"], |dir| {
-            let found = find_all_sidecars(&dir.join("video.mp4"));
+            let found = find_sidecars(&dir.join("video.mp4"));
             assert!(found.is_empty(), "video2.srt is not a sidecar: {found:?}");
         });
     }
@@ -609,7 +605,7 @@ with continuation
     #[test]
     fn finds_exact_and_language_tagged_sidecars() {
         with_sidecar_dir("tagged", &["video.srt", "video.zh.srt"], |dir| {
-            let found = find_all_sidecars(&dir.join("video.mp4"));
+            let found = find_sidecars(&dir.join("video.mp4"));
             let mut names: Vec<_> = found
                 .iter()
                 .map(|p| {
@@ -626,8 +622,7 @@ with continuation
 
     #[test]
     fn scans_current_dir_for_bare_filename() {
-        // A bare filename's parent is the empty path; scanning must fall back
-        // to `.` instead of handing read_dir an unreadable "".
+        // A bare filename's parent is the empty path; scan `.` instead.
         assert_eq!(sidecar_dir(Path::new("video.mp4")), Some(Path::new(".")));
     }
 

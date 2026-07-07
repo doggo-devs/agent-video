@@ -84,9 +84,8 @@ impl Window {
 
 fn parse_clock(s: &str) -> Result<f32> {
     let parts: Vec<&str> = s.split(':').collect();
-    // Every failure here is a malformed `--range` value: it must carry
-    // ErrorCode::InvalidRange so the harness sees exit code 31, not the
-    // uncoded 1 a bare anyhow error would degrade to.
+    // Malformed `--range` must carry InvalidRange (exit 31), not the uncoded
+    // exit 1 a bare anyhow error would degrade to.
     let parse = |p: &str| {
         p.parse::<f32>().map_err(|_| {
             anyhow::Error::from(Error::new(
@@ -107,9 +106,8 @@ fn parse_clock(s: &str) -> Result<f32> {
             .into());
         }
     };
-    // f32::parse accepts NaN/inf and components may be negative or overflow;
-    // none of these are valid clock times, and NaN would slip past the
-    // `end <= start` ordering check below.
+    // f32::parse accepts NaN/inf; none are valid clock times, and NaN would
+    // slip past the ordering check below.
     if !secs.is_finite() || secs < 0.0 {
         return Err(Error::new(
             ErrorCode::InvalidRange,

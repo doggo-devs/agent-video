@@ -175,7 +175,7 @@ impl Chunker {
         {
             self.seal_up_to(hwm, capacity, events);
         }
-        self.high_water_mark = Some(self.high_water_mark.unwrap_or(key).max(key));
+        self.high_water_mark = Some(self.high_water_mark.map_or(key, |hwm| hwm.max(key)));
     }
 
     fn seal_up_to(&mut self, seal_key: usize, capacity: usize, events: &mut Vec<Event>) {
@@ -189,10 +189,8 @@ impl Chunker {
             if let Some(chunk) = self.pending.remove(&key) {
                 self.carry.extend(chunk);
             }
-            // Lazy sealing: only emit once the carry can fill a grid, so a
-            // sparse chunk merges into the following ones instead of wasting a
-            // half-empty grid. Dense chunks reach capacity alone and behave as
-            // before.
+            // Lazy sealing: emit only once the carry can fill a grid, so a
+            // sparse chunk merges forward instead of wasting a half-empty grid.
             if self.carry.len() >= capacity {
                 self.emit_carry(events);
             }

@@ -114,14 +114,12 @@ impl KeyframeInfo {
             regions.push(TimeRange::new(start, end).expect("monotonic timestamps form a range"));
         };
 
-        // Gap before first keyframe
         if let Some(&first) = self.timestamps.first()
             && first > threshold
         {
             push(0.0, first);
         }
 
-        // Gaps between keyframes
         for window in self.timestamps.windows(2) {
             let gap = window[1] - window[0];
             if gap > threshold {
@@ -129,7 +127,6 @@ impl KeyframeInfo {
             }
         }
 
-        // Gap after last keyframe
         if let Some(&last) = self.timestamps.last()
             && self.duration - last > threshold
         {

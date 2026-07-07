@@ -16,7 +16,7 @@ If the host supports MCP servers, register the stdio server and call the
 `video` tool — grid images arrive directly in context:
 
 ```json
-{ "mcpServers": { "video": { "command": "npx", "args": ["-y", "@agent-video/cli", "--mcp"] } } }
+{ "mcpServers": { "video": { "command": "npx", "args": ["-y", "@agent-video/cli", "mcp"] } } }
 ```
 
 Protocol — the response always tells you what to do next:
@@ -36,7 +36,7 @@ Refining parameters:
 - `from` — Window start: seconds (83) or timestamp ("1:23", "1:02:03"). Omit to start from the beginning.
 - `until` — Window end, same formats. Omit to go to the end of the video.
 - `look` — How to look: overview (fast triage), detailed (miss nothing), read_text (few large frames to read on-screen text/UI), track_motion (dense small frames for fast action). Subtitle text always rides along in metadata regardless; this only affects frame size/density. Omit for a balanced default.
-- `raw` — Expert escape hatch: verbatim agent-video core CLI arguments starting with the subcommand, e.g. "process --strategy keyframes --base-fps 0.2". Mutually exclusive with from/until/look. Input/output plumbing is injected by the server.
+- `raw` — Expert escape hatch: verbatim agent-video core CLI arguments starting with the subcommand, e.g. "process --strategy keyframes --base-fps 0.2". Mutually exclusive with from/until/look/strategy. Input/output plumbing is injected by the server.
 
 ## Bash path (no MCP client)
 

@@ -1,18 +1,32 @@
 #!/usr/bin/env bun
 /**
  * Surface generator: serializes the tool face into discovery artifacts.
- * SKILL.md, Codex plugin, Pi extension, and the marketplace manifest are all
- * derived from the harness tool/schema.ts + package.json; run via `bun run gen:surfaces`.
+ * SKILL.md, Codex plugin, and the marketplace manifest derive from
+ * surfaces/video.schema.json — the golden copy of the Rust schema
+ * (`crates/harness/src/schema.rs`), kept current by the
+ * `pinned_surface_schema_is_current` test. Run via `bun run gen:surfaces`.
  */
 
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { VIDEO_INPUT_SCHEMA, VIDEO_TOOL_DESCRIPTION } from '../packages/harness/src/tool/schema.ts'
 
 const require = createRequire(import.meta.url)
 const { version } = require('../packages/harness/package.json') as { version: string }
+
+interface SchemaProp {
+	description: string
+	enum?: readonly string[]
+	anyOf?: readonly unknown[]
+}
+
+const { description: VIDEO_TOOL_DESCRIPTION, inputSchema: VIDEO_INPUT_SCHEMA } = require(
+	'../surfaces/video.schema.json'
+) as {
+	description: string
+	inputSchema: { properties: Record<string, SchemaProp>; required: readonly string[] }
+}
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const REPO_URL = 'https://github.com/durvia/agent-video'
@@ -30,7 +44,11 @@ function emitJson(rel: string, body: unknown): void {
 }
 
 const props = VIDEO_INPUT_SCHEMA.properties
-const desc = (key: keyof typeof props): string => props[key].description
+const desc = (key: string): string => {
+	const p = props[key]
+	if (p === undefined) throw new Error(`schema property ${key} disappeared`)
+	return p.description
+}
 
 // ── SKILL.md ──
 
@@ -52,7 +70,7 @@ If the host supports MCP servers, register the stdio server and call the
 \`video\` tool — grid images arrive directly in context:
 
 \`\`\`json
-{ "mcpServers": { "video": { "command": "npx", "args": ["-y", "@agent-video/cli", "--mcp"] } } }
+{ "mcpServers": { "video": { "command": "npx", "args": ["-y", "@agent-video/cli", "mcp"] } } }
 \`\`\`
 
 Protocol — the response always tells you what to do next:
@@ -98,7 +116,7 @@ handled by the server. On the bash path, fetch the file yourself first
 
 // ── Codex plugin ──
 
-const mcpJson = { mcpServers: { video: { command: 'npx', args: ['-y', '@agent-video/cli', '--mcp'] } } }
+const mcpJson = { mcpServers: { video: { command: 'npx', args: ['-y', '@agent-video/cli', 'mcp'] } } }
 
 const pluginJson = {
 	name: 'agent-video',
@@ -117,18 +135,13 @@ const marketplaceJson = {
 }
 
 // ── Pi extension ──
-// pi's ToolDefinition takes a TypeBox `parameters` schema, so the generator
-// emits builder calls; descriptions come verbatim from VIDEO_INPUT_SCHEMA.
-
-interface SchemaProp {
-	description: string
-	enum?: readonly string[]
-	anyOf?: readonly unknown[]
-}
+// The extension itself (surfaces/pi/extensions/video.ts) is committed code —
+// a thin MCP stdio client worth reviewing by hand. Only the schema-derived
+// data module and the package manifest are generated.
 
 function typeboxOf(p: SchemaProp): string {
 	const opts = `{ description: ${JSON.stringify(p.description)} }`
-	if (p.enum) return `Type.Union([${p.enum.map(v => `Type.Literal(${JSON.stringify(v)})`).join(', ')}], ${opts})`
+	if (p.enum) return `StringEnum(${JSON.stringify(p.enum)} as const, ${opts})`
 	// the only anyOf in the schema is the seconds-or-timestamp union
 	if (p.anyOf) return `Type.Union([Type.String(), Type.Number()], ${opts})`
 	return `Type.String(${opts})`
@@ -137,72 +150,47 @@ function typeboxOf(p: SchemaProp): string {
 const required: readonly string[] = VIDEO_INPUT_SCHEMA.required
 const paramLines = Object.entries(props)
 	.map(([key, p]) => {
-		const t = typeboxOf(p as SchemaProp)
+		const t = typeboxOf(p)
 		return `\t\t${key}: ${required.includes(key) ? t : `Type.Optional(${t})`},`
 	})
 	.join('\n')
 
-const piIndexTs = `/**
- * Pi extension: registers the \`video\` tool natively over the harness.
+const piSchemaTs = `/**
+ * Schema data for the pi \`video\` tool, derived from the Rust tool schema.
  * ${GENERATED}
  */
 
-import { defaultDeps, handleVideoCall } from '@agent-video/cli'
-import { Type } from '@sinclair/typebox'
+import { StringEnum } from '@earendil-works/pi-ai'
+import { Type } from 'typebox'
 
-type Text = { type: 'text'; text: string }
-type Image = { type: 'image'; data: string; mimeType: string }
-type Block = Text | Image
+export const TOOL_DESCRIPTION = ${JSON.stringify(VIDEO_TOOL_DESCRIPTION)}
 
-// minimal structural slice of pi's ExtensionAPI; no dependency on pi's packages just for a type
-interface PiApi {
-	registerTool(tool: {
-		name: string
-		label: string
-		description: string
-		parameters: ReturnType<typeof Type.Object>
-		execute(
-			toolCallId: string,
-			params: Record<string, unknown>,
-			signal: AbortSignal | undefined,
-			onUpdate: ((update: { content: Block[] }) => void) | undefined
-		): Promise<{ content: Block[]; isError?: boolean }>
-	}): void
-}
+export const PROMPT_SNIPPET = 'Watch a video (local path or URL) as timestamped frame grids'
 
-const parameters = Type.Object(
+export const PARAMETERS = Type.Object(
 	{
 ${paramLines}
 	},
 	{ additionalProperties: false }
 )
-
-export default function (pi: PiApi) {
-	const deps = defaultDeps()
-	pi.registerTool({
-		name: 'video',
-		label: 'Video',
-		description: ${JSON.stringify(VIDEO_TOOL_DESCRIPTION)},
-		parameters,
-		async execute(_toolCallId, params, _signal, onUpdate) {
-			const result = await handleVideoCall(params, deps, (_progress, _total, message) => {
-				if (message !== undefined) onUpdate?.({ content: [{ type: 'text', text: message }] })
-			})
-			const content = result.content.filter((b): b is Block => b.type === 'text' || b.type === 'image')
-			return { content, isError: result.isError === true }
-		},
-	})
-}
 `
 
 const piPackageJson = {
-	name: '@agent-video/pi-extension',
-	private: true,
+	name: '@agent-video/pi',
 	version,
 	description: VIDEO_TOOL_DESCRIPTION,
+	license: 'MIT',
+	repository: { type: 'git', url: `git+${REPO_URL}.git`, directory: 'surfaces/pi' },
+	// Pulls the exact-pinned platform binaries via @agent-video/cli's
+	// optionalDependencies; pi runs `npm install` on package install.
 	dependencies: { '@agent-video/cli': version },
-	// bundled by pi itself; npm >=7 installs it standalone for manual copies
-	peerDependencies: { '@sinclair/typebox': '*' },
+	// Bundled by pi itself; never shipped in this tarball.
+	peerDependencies: {
+		'@earendil-works/pi-ai': '*',
+		'@earendil-works/pi-coding-agent': '*',
+		typebox: '*',
+	},
+	files: ['extensions', 'lib'],
 }
 
 // ── write everything ──
@@ -211,6 +199,6 @@ emit('surfaces/skill/agent-video/SKILL.md', skillMd)
 emit('surfaces/codex/skills/agent-video/SKILL.md', skillMd)
 emitJson('surfaces/codex/.codex-plugin/plugin.json', pluginJson)
 emitJson('surfaces/codex/.mcp.json', mcpJson)
-emit('surfaces/pi/agent-video/index.ts', piIndexTs)
-emitJson('surfaces/pi/agent-video/package.json', piPackageJson)
+emit('surfaces/pi/lib/schema.ts', piSchemaTs)
+emitJson('surfaces/pi/package.json', piPackageJson)
 emitJson('.agents/plugins/marketplace.json', marketplaceJson)

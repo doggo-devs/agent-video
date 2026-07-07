@@ -25,24 +25,26 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
-  harness:
+  # The npm package is a pure distribution shell around the Rust binary;
+  # smoke-test binary resolution and arg passthrough under plain node.
+  cli-stub:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: packages/harness
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile
-      - run: bun run check
-      - run: bun test
-      # Smoke: the TS entry point runs directly under bun and the version
-      # intercept reaches a (fake) core binary via the env override.
-      - name: Smoke test CLI
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Smoke test CLI stub
         run: |
-          printf '#!/bin/sh\necho agent-video 0.0.0-fake\n' > /tmp/fake-core
+          printf '#!/bin/sh\necho agent-video 0.0.0-fake "$@"\n' > /tmp/fake-core
           chmod +x /tmp/fake-core
-          AGENT_VIDEO_BIN=/tmp/fake-core bun src/cli.ts --version
+          out="$(AGENT_VIDEO_BIN=/tmp/fake-core node packages/harness/cli.mjs --version)"
+          echo "$out" | grep -q "agent-video 0.0.0-fake --version"
+          # Missing platform package must fail with the install hint, not a stack trace.
+          if node packages/harness/cli.mjs --version 2>err.log; then
+            echo "expected failure without a platform package" >&2; exit 1
+          fi
+          grep -q "core binary not found" err.log
 
   # Generated discovery surfaces must match tool/schema.ts + the version.
   surfaces:

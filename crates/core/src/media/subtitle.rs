@@ -68,7 +68,6 @@ pub fn extract_track(input: &Source, track: usize, what: &str) -> Result<Vec<Cue
     // containers whose streams do not start at 0 (broadcast TS captures).
     let timeline = Timeline::from_input(&ictx);
 
-    // Resolve the subtitle-relative index to a global stream index.
     let (stream_index, time_base, parameters) = {
         let mut subtitle_streams = ictx.streams().filter(|s| {
             CodecContext::from_parameters(s.parameters())
@@ -90,9 +89,8 @@ pub fn extract_track(input: &Source, track: usize, what: &str) -> Result<Vec<Cue
         )
     };
 
-    // Learn the track's event-line field count before the parameters are
-    // consumed by the decoder; non-ASS tracks fall back to the canonical
-    // libavcodec layout.
+    // Learn the field count before the decoder consumes the parameters;
+    // non-ASS tracks fall back to the canonical libavcodec layout.
     let schema = AssSchema::from_extradata(codec_extradata(&parameters));
 
     let codec_ctx = CodecContext::from_parameters(parameters).map_err(|e| {
@@ -110,9 +108,6 @@ pub fn extract_track(input: &Source, track: usize, what: &str) -> Result<Vec<Cue
             Ok(()) => read_budget.ok(),
             Err(ffmpeg::Error::Eof) => break,
             Err(e) => {
-                // Transient demux errors are skipped, but a permanently
-                // failing input must not spin forever — same cap as the
-                // frame-decode loop.
                 read_budget
                     .fail(e)
                     .map_err(|err| err.with_input(input.as_path()))?;
@@ -124,8 +119,6 @@ pub fn extract_track(input: &Source, track: usize, what: &str) -> Result<Vec<Cue
         }
 
         let mut sub = AvSubtitle::new();
-        // A packet that fails to decode or decodes to nothing is skipped;
-        // wholesale failure surfaces as zero cues, judged by the caller.
         let Ok(true) = decoder.decode(&packet, &mut sub) else {
             continue;
         };
@@ -144,10 +137,6 @@ pub fn extract_track(input: &Source, track: usize, what: &str) -> Result<Vec<Cue
                 Rect::Ass(a) => match schema.classify(a.get()) {
                     AssLine::Event(text) => lines.push(strip_ass_markup(text)),
                     AssLine::PlainText(text) => lines.push(text.to_string()),
-                    // A truncated event line carries no recoverable text;
-                    // leaking its metadata fields as cue text would be
-                    // worse than dropping it. A wholly corrupt track
-                    // surfaces as zero cues, judged by the caller.
                     AssLine::Malformed => {}
                 },
                 Rect::Bitmap(_) => {
@@ -164,9 +153,8 @@ pub fn extract_track(input: &Source, track: usize, what: &str) -> Result<Vec<Cue
             }
         }
         let text = lines.join(" ").trim().to_string();
-        // Cues placed before the video's first frame (edit-list pre-roll,
-        // itsoffset shifts, priming cues) are clipped or dropped here, by
-        // the cue's own visibility rule.
+        // Cues before the video's first frame (edit-list pre-roll, priming
+        // cues) are clipped or dropped by the cue's own visibility rule.
         if let Some(cue) = Cue::visible(start, end, text) {
             cues.push(cue);
         }
@@ -381,9 +369,8 @@ pub fn cues_to_srt(cues: &[Cue]) -> String {
 }
 
 fn srt_timestamp(secs: f32) -> String {
-    // Cue::visible guarantees start >= 0, so no clamp is needed here — a
-    // negative value reaching this point would be a bug worth surfacing,
-    // not masking.
+    // Cue::visible guarantees start >= 0, so no clamp is needed — a negative
+    // value here would be a bug worth surfacing, not masking.
     let ms_total = (secs as f64 * 1000.0).round() as u64;
     let (h, rem) = (ms_total / 3_600_000, ms_total % 3_600_000);
     let (m, rem) = (rem / 60_000, rem % 60_000);

@@ -18,6 +18,10 @@ use crate::types::{CanvasSpec, Detail, Quality};
 /// Default dedup sliding window, in kept frames.
 const DEFAULT_DEDUP_WINDOW: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
+/// Default chunk length in seconds when neither `--chunk-seconds` nor a
+/// profile provides one.
+pub const DEFAULT_CHUNK_SECONDS: f32 = 60.0;
+
 /// Default cap on hero frames per grid. A hero occupies ~4 cells, so three
 /// heroes already claim most of a typical grid's emphasis budget; the
 /// effective cap is further bounded by `capacity / 4` at the call site.
@@ -349,9 +353,7 @@ pub struct Config {
 fn builtin_profile(name: &str) -> Option<Overrides> {
     Some(match name {
         "balanced" => Overrides::default(),
-        // Fast trades density for time: sampling fps dominates decode +
-        // scoring cost. The coarse tier (not a raw base_fps) halves it, so
-        // extract keeps its 3x-densify semantics under this profile.
+        // Coarse tier (not raw base_fps) so extract keeps its 3x-densify semantics.
         "fast" => Overrides {
             detail: Some(Detail::Coarse),
             chunk_seconds: Some(90.0),
@@ -366,10 +368,8 @@ fn builtin_profile(name: &str) -> Option<Overrides> {
             jpeg_quality: Some(95),
             ..Default::default()
         },
-        // Action targets fast-edited footage: the fine tier (3 fps) so
-        // sampling doesn't skip past cuts, and a hero threshold at the
-        // bottom of the calibrated cut/motion overlap (~67..=70) to flag
-        // softer cuts.
+        // Fine tier to catch fast cuts; hero threshold at the bottom of the
+        // calibrated cut/motion overlap (~67..=70) to flag softer cuts.
         "action" => Overrides {
             detail: Some(Detail::Fine),
             w_scene: Some(0.75),
@@ -380,6 +380,21 @@ fn builtin_profile(name: &str) -> Option<Overrides> {
         },
         _ => return None,
     })
+}
+
+/// The chunk length (seconds) a run with `--profile <name>` resolves to,
+/// absent an explicit `--chunk-seconds` override.
+///
+/// Routed through the same profile table [`Config::new`] resolves against,
+/// so consumers predicting grid counts (the harness budget gate divides the
+/// covered span by this value) cannot drift from what a run will actually
+/// do. An unknown name resolves to the default — `Config::new` is where it
+/// becomes an error.
+pub fn default_chunk_seconds(profile: Option<&str>) -> f32 {
+    profile
+        .and_then(builtin_profile)
+        .and_then(|p| p.chunk_seconds)
+        .unwrap_or(DEFAULT_CHUNK_SECONDS)
 }
 
 impl Config {
@@ -409,7 +424,6 @@ impl Config {
             None => None,
         };
 
-        // Resolve each field: CLI > profile > default
         macro_rules! resolve {
             ($field:ident, $default:expr) => {
                 cli.$field
@@ -421,23 +435,16 @@ impl Config {
         let quality = resolve!(quality, Quality::Low);
         let detail = resolve!(detail, Detail::Standard);
 
-        // Quality tier → cell legibility floor. The canvas edge stays at
-        // max_edge regardless: quality trades per-cell size for grid capacity
-        // (capacity ∝ (edge / min_frame_size)²), so lower quality packs more
-        // frames onto the same canvas instead of shrinking the output image.
-        // Extraction pre-scales to this same edge, so cells at the floor are
-        // rendered 1:1 with no upscaling.
+        // Quality trades per-cell size for grid capacity at a fixed canvas edge,
+        // not output size; extraction pre-scales to this floor (cells render 1:1).
         let min_frame_size = match quality {
             Quality::Low => 256,
             Quality::Medium => 384,
             Quality::High => 512,
         };
 
-        // Detail tier → sampling density only. The dedup threshold is a
-        // candidate-pruning knob, not a density knob: tying it to detail made
-        // fine mode (3 fps, meant to catch subtle changes) dedup the most
-        // aggressively, silently merging small text/UI diffs that no later
-        // stage can recover. Density is handled by fps + NMS + capacity.
+        // Detail drives sampling density only; dedup stays detail-independent so
+        // fine mode doesn't merge the subtle diffs it exists to catch.
         let detail_fps = match detail {
             Detail::Coarse => 0.5,
             Detail::Standard => 1.0,
@@ -449,7 +456,7 @@ impl Config {
             sampling: Sampling::new(
                 resolve!(base_fps, detail_fps),
                 resolve!(base_fps, detail_fps * 3.0),
-                resolve!(chunk_seconds, 60.0),
+                resolve!(chunk_seconds, DEFAULT_CHUNK_SECONDS),
                 resolve!(min_gap, 0.5),
                 resolve!(score_edge, 256),
             )?,
@@ -457,9 +464,8 @@ impl Config {
                 resolve!(hash_threshold, 8),
                 resolve!(dedup_window, DEFAULT_DEDUP_WINDOW),
             )?,
-            // Clarity defaults to 0: Laplacian variance and Sobel energy are
-            // both high-frequency measures, so a nonzero clarity weight
-            // double-counts texture. It stays available as an override knob.
+            // Clarity defaults to 0: it double-counts the texture Sobel edge
+            // energy already measures. Available as an override knob.
             weights: Weights::new(
                 resolve!(w_scene, 0.60),
                 resolve!(w_clarity, 0.0),
@@ -587,11 +593,6 @@ mod tests {
     }
 
     #[test]
-    fn accepts_default_overrides() {
-        assert!(config_with(Overrides::default()).is_ok());
-    }
-
-    #[test]
     fn extract_fps_defaults_to_triple_detail_fps() {
         let cfg = config_with(Overrides::default()).expect("default config builds");
         assert_eq!(cfg.base_fps(), 1.0, "standard detail samples at 1 fps");
@@ -614,8 +615,7 @@ mod tests {
 
     #[test]
     fn rejects_canvas_below_cell_floor() {
-        // quality high → 512px floor; a 0 or sub-floor canvas cannot hold a
-        // single legible cell.
+        // quality high → 512px floor.
         for max_edge in [0, 511] {
             let ov = Overrides {
                 quality: Some(Quality::High),
@@ -771,6 +771,30 @@ mod tests {
             .expect("config builds");
         assert_eq!(cfg.min_frame_size(), 256, "explicit --quality low wins");
         assert_eq!(cfg.jpeg_quality(), 95, "other profile fields still apply");
+    }
+
+    #[test]
+    fn default_chunk_seconds_matches_every_profile_resolution() {
+        for profile in [
+            None,
+            Some("balanced"),
+            Some("fast"),
+            Some("quality"),
+            Some("action"),
+        ] {
+            let cfg = Config::new(
+                2000,
+                profile,
+                &Overrides::default(),
+                StrategyOpts::default(),
+            )
+            .expect("config builds");
+            assert_eq!(
+                cfg.chunk_seconds(),
+                default_chunk_seconds(profile),
+                "profile {profile:?} prediction drifted from resolution"
+            );
+        }
     }
 
     #[test]

@@ -11,7 +11,8 @@ use crate::config::Config;
 use crate::error::{Error, ErrorCode, ErrorContext};
 use crate::source::Source;
 use crate::subtitle::Subtitles;
-use crate::types::{GridImage, GridMeta, Metadata};
+use crate::types::{GridImage, GridMeta};
+use crate::wire;
 
 use super::OutputMode;
 
@@ -116,7 +117,7 @@ impl<'a> OutputSession<'a> {
     /// Steps 2–3 are past the point of no return: staging is the only
     /// complete copy of the new run, so a failure there preserves it (the
     /// error names the location) instead of letting drop-cleanup destroy it.
-    pub fn commit(mut self, meta: &Metadata, subtitles_txt: Option<&str>) -> Result<()> {
+    pub fn commit(mut self, meta: &wire::Metadata, subtitles_txt: Option<&str>) -> Result<()> {
         let json = serde_json::to_string_pretty(meta).map_err(|e| {
             Error::new(
                 ErrorCode::OutputWriteFailed,
@@ -132,10 +133,8 @@ impl<'a> OutputSession<'a> {
                 }
                 write_file(&staging, "metadata.json", json.as_bytes())?;
                 // Point of no return: the sweep destroys the previous run,
-                // making staging the only complete copy of the new one. From
-                // here Drop must not remove it, or a half-done promotion
-                // would leave the directory without metadata *and* destroy
-                // the files that could complete it.
+                // making staging the only complete copy. Drop must preserve
+                // it from here on.
                 self.preserve_staging = true;
                 let preserved = |e: anyhow::Error| {
                     e.context(format!(
@@ -262,11 +261,12 @@ pub fn write_outputs(
         };
     }
 
-    let meta = Metadata {
+    let meta = wire::Metadata {
         source: input.to_string(),
         duration,
+        range: None,
         settings: cfg.settings(),
-        grids: grid_metas,
+        grids: grid_metas.into_iter().map(Into::into).collect(),
     };
 
     session.commit(&meta, subs.map(Subtitles::raw))
@@ -294,10 +294,11 @@ mod tests {
         dir
     }
 
-    fn committed_meta() -> Metadata {
-        Metadata {
+    fn committed_meta() -> wire::Metadata {
+        wire::Metadata {
             source: "test.mp4".into(),
             duration: 1.0,
+            range: None,
             settings: crate::types::Settings {
                 max_edge: 2048,
                 quality: crate::types::Quality::High,

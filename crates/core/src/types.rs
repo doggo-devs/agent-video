@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use image::{GrayImage, RgbImage};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A sampled frame before scoring: what extract, dedup, and chunking carry.
 ///
@@ -157,7 +157,7 @@ impl Rect {
 ///
 /// Serializes as the SCREAMING_SNAKE_CASE name, so the JSON contract is
 /// byte-identical to the old string constants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum LayoutKind {
     Uniform,
@@ -167,17 +167,39 @@ pub enum LayoutKind {
     Static,
 }
 
+impl LayoutKind {
+    /// The wire name, identical to the serialized form (locked by test).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LayoutKind::Uniform => "UNIFORM",
+            LayoutKind::HeroLeft => "HERO_LEFT",
+            LayoutKind::DualHero => "DUAL_HERO",
+            LayoutKind::TopStrip => "TOP_STRIP",
+            LayoutKind::Static => "STATIC",
+        }
+    }
+}
+
 /// Role of a key frame inside its grid. Serializes lowercase (`"hero"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GridPosition {
     Hero,
 }
 
+impl GridPosition {
+    /// The wire name, identical to the serialized form (locked by test).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GridPosition::Hero => "hero",
+        }
+    }
+}
+
 /// Cell legibility tier: sets the minimum readable cell edge. The canvas edge
 /// is fixed by `max_edge`, so lower quality packs more (smaller) frames onto
 /// the same canvas.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Quality {
     Low,
@@ -186,7 +208,7 @@ pub enum Quality {
 }
 
 /// Detail tier: controls sampling fps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Detail {
     Coarse,
@@ -213,9 +235,8 @@ pub struct CanvasSpec {
 impl CanvasSpec {
     pub fn new(edge: u32, min_cell_edge: u32) -> crate::error::Result<Self> {
         use crate::error::{Error, ErrorCode};
-        // The canvas must hold at least one cell at the quality tier's
-        // legibility floor; anything smaller (down to --max-edge 0) would
-        // still "succeed" as a degenerate, unreadable image.
+        // Reject a canvas too small for one legible cell (would "succeed" as a
+        // degenerate, unreadable image).
         if edge < min_cell_edge.max(1) {
             return Err(Error::new(
                 ErrorCode::InvalidConfig,
@@ -225,9 +246,8 @@ impl CanvasSpec {
                 ),
             ));
         }
-        // The canvas allocation is sized directly from this value; without a
-        // cap, an oversized flag burns the full pipeline before JPEG encoding
-        // rejects the dimensions (or the allocation aborts first).
+        // Cap before the pipeline allocates from this value; JPEG encoding
+        // would reject the dimensions only at the very end.
         if edge > MAX_CANVAS_EDGE {
             return Err(Error::new(
                 ErrorCode::InvalidConfig,
@@ -252,7 +272,8 @@ impl CanvasSpec {
 }
 
 /// A closed time range in seconds; `start <= end` and both finite by
-/// construction. Serializes as `"MM:SS-MM:SS"` (`H:MM:SS` past an hour).
+/// construction. Displays as `"MM:SS-MM:SS"` (`H:MM:SS` past an hour) —
+/// the form the wire contract carries.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimeRange {
     start: f32,
@@ -280,13 +301,9 @@ impl TimeRange {
     }
 }
 
-impl Serialize for TimeRange {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!(
-            "{}-{}",
-            format_ts(self.start),
-            format_ts(self.end)
-        ))
+impl std::fmt::Display for TimeRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", format_ts(self.start), format_ts(self.end))
     }
 }
 
@@ -295,8 +312,8 @@ impl Serialize for TimeRange {
 ///
 /// Serialized externally tagged, so a single-variant value becomes a
 /// single-entry map (`{"file": …}` / `{"base64": …}`) that flattens into
-/// [`GridMeta`] under the original key.
-#[derive(Debug, Clone, Serialize)]
+/// [`crate::wire::Grid`] under the original key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GridImage {
     File(String),
@@ -308,8 +325,8 @@ pub enum GridImage {
 /// The states a bare `Option<String>` collapsed — "resolution never ran",
 /// "the run has no subtitle source", and "a source exists but no cue overlaps
 /// this range" — are distinct constructors here, so downstream code can tell
-/// "not found" from "not looked for" by type. The JSON contract is unchanged:
-/// only [`GridSubtitles::Text`] serializes, under the same `subtitles` key.
+/// "not found" from "not looked for" by type. On the wire only
+/// [`GridSubtitles::Text`] survives, as [`crate::wire::Grid::subtitles`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum GridSubtitles {
     /// Subtitle resolution has not run for this grid yet (worker drafts,
@@ -324,35 +341,15 @@ pub enum GridSubtitles {
     Text(String),
 }
 
-impl GridSubtitles {
-    /// Whether serialization omits the field — every state except `Text`.
-    pub fn is_absent(&self) -> bool {
-        !matches!(self, Self::Text(_))
-    }
-}
-
-impl Serialize for GridSubtitles {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Text(t) => s.serialize_str(t),
-            // Reached only without `skip_serializing_if`; the absent states
-            // have no textual payload to expose.
-            _ => s.serialize_none(),
-        }
-    }
-}
-
-/// Metadata for one rendered grid image.
-#[derive(Debug, Clone, Serialize)]
+/// Metadata for one rendered grid image; converts into [`crate::wire::Grid`]
+/// at the output boundary.
+#[derive(Debug, Clone)]
 pub struct GridMeta {
-    #[serde(flatten)]
     pub image: GridImage,
-    /// Time range as "MM:SS-MM:SS" ("H:MM:SS" past an hour) for JSON output.
     pub time_range: TimeRange,
     pub total_frames: usize,
     pub key_frames: Vec<KeyFrameMeta>,
     pub layout: LayoutKind,
-    #[serde(skip_serializing_if = "GridSubtitles::is_absent")]
     pub subtitles: GridSubtitles,
 }
 
@@ -399,24 +396,15 @@ pub fn format_ts(ts: f32) -> String {
 }
 
 /// Metadata for a single key (hero) frame inside a grid.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyFrameMeta {
     pub timestamp: String,
     pub score: u32,
     pub grid_position: GridPosition,
 }
 
-/// Top-level structured output written to `metadata.json`.
-#[derive(Debug, Clone, Serialize)]
-pub struct Metadata {
-    pub source: String,
-    pub duration: f32,
-    pub settings: Settings,
-    pub grids: Vec<GridMeta>,
-}
-
-/// The resolved settings echoed back into `metadata.json`.
-#[derive(Debug, Clone, Copy, Serialize)]
+/// The resolved settings echoed back into the output document.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Settings {
     pub max_edge: u32,
     pub quality: Quality,
@@ -474,7 +462,7 @@ mod tests {
 
     #[test]
     fn serializes_layout_and_position_as_legacy_strings() {
-        // The enums replaced string constants; the JSON payload must not move.
+        // JSON payload must not move from the legacy string constants.
         for (kind, expected) in [
             (LayoutKind::Uniform, "UNIFORM"),
             (LayoutKind::HeroLeft, "HERO_LEFT"),
@@ -484,33 +472,18 @@ mod tests {
         ] {
             let json = serde_json::to_value(kind).expect("serialize layout kind");
             assert_eq!(json, expected);
+            assert_eq!(kind.as_str(), expected, "as_str mirrors the wire name");
         }
         let json = serde_json::to_value(GridPosition::Hero).expect("serialize grid position");
         assert_eq!(json, "hero");
+        assert_eq!(GridPosition::Hero.as_str(), "hero");
     }
 
     #[test]
-    fn serializes_grid_image_under_original_key() {
-        // The flattened enum must keep the exact `"file"` / `"base64"` JSON
-        // keys, with only one present at a time.
-        let file_meta = GridMeta {
-            image: GridImage::File("grid_001.jpg".into()),
-            time_range: TimeRange::new(0.0, 5.0).expect("valid range"),
-            total_frames: 3,
-            key_frames: Vec::new(),
-            layout: LayoutKind::Uniform,
-            subtitles: GridSubtitles::default(),
-        };
-        let json = serde_json::to_value(&file_meta).expect("serialize file meta");
-        assert_eq!(json["file"], "grid_001.jpg");
-        assert!(json.get("base64").is_none(), "file variant omits base64");
-
-        let b64_meta = GridMeta {
-            image: GridImage::Base64("QUJD".into()),
-            ..file_meta
-        };
-        let json = serde_json::to_value(&b64_meta).expect("serialize base64 meta");
-        assert_eq!(json["base64"], "QUJD");
-        assert!(json.get("file").is_none(), "base64 variant omits file");
+    fn displays_time_range_as_wire_string() {
+        let range = TimeRange::new(0.0, 90.0).expect("valid range");
+        assert_eq!(range.to_string(), "00:00-01:30");
+        let long = TimeRange::new(3600.0, 5025.0).expect("valid range");
+        assert_eq!(long.to_string(), "1:00:00-1:23:45");
     }
 }

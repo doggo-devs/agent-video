@@ -56,6 +56,30 @@ impl ErrorCode {
         self as u8
     }
 
+    /// Recover the code from a child process's exit status — the inverse of
+    /// [`exit_code`](Self::exit_code). `None` for uncoded exits (1: bugs and
+    /// panics, 2: CLI usage) and anything outside the assigned decades.
+    pub fn from_exit_code(code: u8) -> Option<Self> {
+        let known = [
+            ErrorCode::DecoderMissing,
+            ErrorCode::DecodeFailed,
+            ErrorCode::InputNotFound,
+            ErrorCode::InputUnreadable,
+            ErrorCode::InputCorrupt,
+            ErrorCode::InputTooLong,
+            ErrorCode::InsufficientKeyframes,
+            ErrorCode::NoFramesExtracted,
+            ErrorCode::ProtocolUnsupported,
+            ErrorCode::InvalidProfile,
+            ErrorCode::InvalidRange,
+            ErrorCode::AmbiguousSubtitle,
+            ErrorCode::InvalidConfig,
+            ErrorCode::OutputDirCreate,
+            ErrorCode::OutputWriteFailed,
+        ];
+        known.into_iter().find(|c| c.exit_code() == code)
+    }
+
     /// Short identifier for logs.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -170,6 +194,31 @@ mod tests {
         assert_eq!(ErrorCode::InputNotFound.exit_code(), 20);
         assert_eq!(ErrorCode::InvalidProfile.exit_code(), 30);
         assert_eq!(ErrorCode::OutputDirCreate.exit_code(), 40);
+    }
+
+    #[test]
+    fn exit_codes_round_trip_through_from_exit_code() {
+        for code in [
+            ErrorCode::DecoderMissing,
+            ErrorCode::DecodeFailed,
+            ErrorCode::InputNotFound,
+            ErrorCode::InputUnreadable,
+            ErrorCode::InputCorrupt,
+            ErrorCode::InputTooLong,
+            ErrorCode::InsufficientKeyframes,
+            ErrorCode::NoFramesExtracted,
+            ErrorCode::ProtocolUnsupported,
+            ErrorCode::InvalidProfile,
+            ErrorCode::InvalidRange,
+            ErrorCode::AmbiguousSubtitle,
+            ErrorCode::InvalidConfig,
+            ErrorCode::OutputDirCreate,
+            ErrorCode::OutputWriteFailed,
+        ] {
+            assert_eq!(ErrorCode::from_exit_code(code.exit_code()), Some(code));
+        }
+        assert_eq!(ErrorCode::from_exit_code(1), None, "uncoded exit");
+        assert_eq!(ErrorCode::from_exit_code(2), None, "CLI usage exit");
     }
 
     #[test]

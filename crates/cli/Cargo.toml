@@ -1,0 +1,33 @@
+[package]
+name = "agent-video"
+version.workspace = true
+edition.workspace = true
+description = "Turn a video into VLM-readable grid images"
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+
+[[bin]]
+name = "agent-video"
+path = "src/main.rs"
+
+[features]
+# Pass-throughs so one `-p agent-video --features …` invocation configures
+# the whole binary; the member crates own the actual wiring.
+static-ffmpeg = ["agent-video-core/static-ffmpeg"]
+whisper-metal = ["agent-video-harness/whisper-metal"]
+whisper-coreml = ["agent-video-harness/whisper-coreml"]
+whisper-cuda = ["agent-video-harness/whisper-cuda"]
+whisper-vulkan = ["agent-video-harness/whisper-vulkan"]
+
+[dependencies]
+agent-video-core = { path = "../core" }
+agent-video-harness = { path = "../harness" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[target.'cfg(unix)'.dependencies]
+# Restore SIGPIPE to SIG_DFL at startup: the Rust runtime installs SIG_IGN,
+# which turns a closed downstream pipe (e.g. `| head`) into an EPIPE panic
+# under `panic = "abort"` instead of a clean signal termination.
+libc = "0.2"

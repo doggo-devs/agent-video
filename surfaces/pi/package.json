@@ -1,0 +1,23 @@
+{
+  "name": "@agent-video/pi",
+  "version": "0.1.0",
+  "description": "Watch a video (local path or URL) as VLM-readable frame grids with timestamps and subtitles. Call with just `source` first: short videos run immediately, everything else answers with metadata and copyable next calls.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/durvia/agent-video.git",
+    "directory": "surfaces/pi"
+  },
+  "dependencies": {
+    "@agent-video/cli": "0.1.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "files": [
+    "extensions",
+    "lib"
+  ]
+}

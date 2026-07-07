@@ -37,7 +37,7 @@ jobs:
             variant: static
             ffmpeg_cpu: x86-64-v3
             npm_platform: linux-x64
-          # fully-static musl: FFmpeg + dav1d + openssl + libc all linked in,
+          # fully-static musl: FFmpeg + dav1d + libc all linked in,
           # a single file with no dynamic dependencies. Distributed as an extra
           # tarball variant; the gnu static build stays the npm default.
           - os: ubuntu-latest
@@ -226,8 +226,8 @@ jobs:
 
       # After the platform packages: the CLI exact-pins them, and the pins
       # are injected here rather than committed so local installs never
-      # depend on published versions existing. Ships TS source (bun runs it
-      # directly), so no install or build before publish.
+      # depend on published versions existing. The CLI is a pure
+      # distribution shell (one .mjs), so no install or build before publish.
       - name: Publish CLI
         working-directory: packages/harness
         env:
@@ -238,3 +238,11 @@ jobs:
             npm pkg set "optionalDependencies.@agent-video/$platform=$version"
           done
           npm publish --provenance --access public
+
+      # The pi package (thin MCP client extension) pins @agent-video/cli at
+      # the same version via gen-surfaces, so it publishes last.
+      - name: Publish pi package
+        working-directory: surfaces/pi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public

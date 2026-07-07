@@ -102,8 +102,8 @@ impl<'a> ProcessState<'a> {
         }
 
         // Interleave static entries with grids by start time. Both lists are
-        // already time-ascending; a static range starts inside the grid that
-        // holds its representative, so it sorts right after that grid.
+        // time-ascending; a static range starts inside its grid, so the
+        // stable sort keeps it right after that grid.
         let mut metas = mem::take(&mut self.grid_metas);
         metas.append(&mut self.static_metas);
         metas.sort_by(|a, b| a.time_range.start().total_cmp(&b.time_range.start()));
@@ -155,10 +155,9 @@ impl<'a> ProcessState<'a> {
         chunk: Vec<CandidateFrame>,
         prev_tail: Option<GrayImage>,
     ) -> Result<()> {
-        // `jobs` enforces the in-flight cap at this spawn boundary: one
-        // extraction batch can seal several chunks in a row, so waiting for
-        // room here (rather than once per pushed frame) is what actually
-        // bounds buffered chunks.
+        // `jobs` enforces the in-flight cap here: one batch can seal several
+        // chunks, so waiting for room at the spawn boundary is what bounds
+        // buffered chunks.
         let env = self.env;
         let results = self.jobs.spawn(self.pool, move |ci| {
             panic::catch_unwind(AssertUnwindSafe(|| {

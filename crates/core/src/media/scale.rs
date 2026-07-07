@@ -67,8 +67,7 @@ impl Rescaler {
             self.ctx = Some(ctx);
             self.src_key = Some(key);
             self.dst = (dw, dh);
-            // The cached output frame's geometry belongs to the old context;
-            // an empty frame makes `run` allocate one matching the new one.
+            // Reset: the cached frame's geometry belongs to the old context.
             self.out = ffmpeg::frame::Video::empty();
         }
 
@@ -92,11 +91,9 @@ fn rgb_image_from_frame(frame: &ffmpeg::frame::Video, (w, h): (u32, u32)) -> Res
     let stride = frame.stride(0);
     let data = frame.data(0);
     let row = w as usize * 3;
-    // swscale allocates this frame itself, so the stride is positive and at
-    // least one row wide. Verify rather than assume: the binding casts the C
-    // linesize to usize, so a negative value would wrap huge and the slicing
-    // below would panic. A coded error keeps a malformed frame an input
-    // problem, not a crash.
+    // The binding casts the C linesize to usize, so a negative stride would
+    // wrap huge and panic the slicing below. Verify rather than assume: a
+    // coded error keeps a malformed frame an input problem, not a crash.
     let needed = (h as usize)
         .checked_sub(1)
         .and_then(|rows| rows.checked_mul(stride))

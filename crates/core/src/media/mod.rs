@@ -12,6 +12,7 @@
 //! with an ffmpeg frame stream by index — a whole class of misattribution
 //! failures that this module makes unrepresentable.
 
+pub mod audio;
 pub mod decode;
 mod scale;
 pub mod subtitle;
@@ -32,8 +33,8 @@ use crate::source::Source;
 pub fn init() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        // init() registers everything; failure here means a broken FFmpeg
-        // installation, which every later call would also report.
+        // Failure here means a broken FFmpeg install, which every later call
+        // would also report.
         let _ = ffmpeg::init();
         ffmpeg::log::set_level(ffmpeg::log::Level::Error);
     });
@@ -64,10 +65,8 @@ pub fn open_input_interruptible(
     stop: Arc<AtomicBool>,
 ) -> Result<ffmpeg::format::context::Input> {
     init();
-    // ffmpeg-next boxes the closure and never reclaims it (the callback must
-    // stay valid for the context's whole lifetime and the wrapper has no
-    // teardown hook): a few leaked bytes per open, bounded by the handful of
-    // opens a run performs.
+    // ffmpeg-next boxes the closure and never reclaims it (no teardown hook):
+    // a few leaked bytes per open, bounded by the handful a run performs.
     ffmpeg::format::input_with_interrupt(source.as_path(), move || stop.load(Ordering::Relaxed))
         .map_err(|e| open_error(source, e))
 }
@@ -227,6 +226,95 @@ pub fn duration_seconds(ictx: &ffmpeg::format::context::Input, source: &Source) 
         "the container reports no duration (fragmented or raw stream?)",
     )
     .with_context(ErrorContext::default().with_input(source.as_path())))
+}
+
+/// Container-level facts for the probe surface: dimensions, duration,
+/// container name, and subtitle tracks. Reading this decodes no pixels —
+/// it is all header data, cheap even over http(s).
+#[derive(Debug, Clone)]
+pub struct MediaSummary {
+    /// Seconds, from the container header.
+    pub duration: f32,
+    pub width: u32,
+    pub height: u32,
+    /// Demuxer name, a comma-list like `mov,mp4,m4a,3gp,3g2,mj2`.
+    pub container: String,
+    pub subtitle_tracks: Vec<SubtitleTrackSummary>,
+}
+
+/// One embedded subtitle stream, as the probe surface reports it.
+#[derive(Debug, Clone)]
+pub struct SubtitleTrackSummary {
+    /// Language tag from stream metadata, when present.
+    pub language: Option<String>,
+    /// Codec name, e.g. `subrip`, `ass`, `hdmv_pgs_subtitle`.
+    pub codec: String,
+}
+
+/// Summarize an already-open container; see [`MediaSummary`].
+///
+/// Fails when the container has no video stream with usable dimensions or
+/// reports no duration — the callers' contract is "this is a watchable
+/// video", so both are input-decade errors.
+pub fn summarize_input(
+    ictx: &ffmpeg::format::context::Input,
+    source: &Source,
+) -> Result<MediaSummary> {
+    use ffmpeg::codec::context::Context as CodecContext;
+
+    let duration = duration_seconds(ictx, source)?;
+
+    let stream = ictx
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::InputCorrupt,
+                "no video stream found — is this actually a video file?",
+            )
+            .with_input(source.as_path())
+        })?;
+    // Distinct failures stay distinct: unreadable codec parameters are an
+    // input problem, a missing decoder is an environment problem — neither
+    // may be misreported as "not a video file".
+    let video = CodecContext::from_parameters(stream.parameters())
+        .map_err(|e| {
+            decode_error("reading video stream parameters", e).with_input(source.as_path())
+        })?
+        .decoder()
+        .video()
+        .map_err(|e| decode_error("opening the video decoder", e).with_input(source.as_path()))?;
+    if video.width() == 0 || video.height() == 0 {
+        return Err(Error::new(
+            ErrorCode::InputCorrupt,
+            "the video stream reports no dimensions",
+        )
+        .with_input(source.as_path()));
+    }
+
+    let subtitle_tracks = ictx
+        .streams()
+        .filter_map(|s| {
+            let ctx = CodecContext::from_parameters(s.parameters()).ok()?;
+            (ctx.medium() == ffmpeg::media::Type::Subtitle).then(|| SubtitleTrackSummary {
+                language: s
+                    .metadata()
+                    .get("language")
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(String::from),
+                codec: ctx.id().name().to_string(),
+            })
+        })
+        .collect();
+
+    Ok(MediaSummary {
+        duration,
+        width: video.width(),
+        height: video.height(),
+        container: ictx.format().name().to_string(),
+        subtitle_tracks,
+    })
 }
 
 /// Consecutive demux read failures tolerated before the stream is declared

@@ -697,8 +697,7 @@ mod tests {
 
     #[test]
     fn rejects_weights_whose_sum_overflows() {
-        // Each weight is finite, but the sum is not; accepting them would
-        // turn every downstream score into NaN.
+        // Finite weights, non-finite sum — would NaN every downstream score.
         Weights::new(f32::MAX, f32::MAX, 0.0).expect_err("overflowing sum must be rejected");
     }
 
@@ -710,9 +709,8 @@ mod tests {
 
     #[test]
     fn excludes_zero_weight_dimensions_from_the_active_set() {
-        // A zero weight is absence, not a value: the dimension must not
-        // appear in the iteration every scoring stage drives — the ranking
-        // sort for an inactive dimension is structurally unreachable.
+        // A zero weight is absence: the dimension must not appear in the
+        // iteration every scoring stage drives.
         let w = weights(1.0, 0.0, 3.0);
         let active: Vec<Dim> = w.active().map(|(d, _)| d).collect();
         assert_eq!(active, vec![Dim::Scene, Dim::Edge]);
@@ -793,8 +791,6 @@ mod tests {
 
     #[test]
     fn lowered_threshold_admits_softer_cuts() {
-        // Content whose cuts sit below the default calibration can still
-        // surface heroes via the knob.
         let fs = vec![with_diff(0.0, 15.0), with_diff(1.0, 65.0)];
         assert!(
             pick_heroes(&fs, 3, DEFAULT_HERO_SCENE_DIFF).is_empty(),

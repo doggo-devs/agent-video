@@ -1,0 +1,209 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Wire shapes of one `video` call: argument coercion on the way in, result
+//! rendering on the way out.
+//!
+//! The core JSON is read through [`agent_video_core::wire`] — the same types
+//! the child process serialized, so producer and consumer cannot drift.
+
+use rmcp::model::{CallToolResult, ContentBlock};
+
+use crate::fault::Fault;
+use crate::plan::format_bytes;
+use crate::schema::{LOOKS, Look, STRATEGIES, Strategy, TimeValue, VideoArgs, VideoBody};
+use agent_video_core::types::{GridImage, format_ts};
+
+/// The document core's `--json` mode emits; one definition for both sides.
+pub(super) use agent_video_core::wire::Metadata as CoreMetadata;
+
+// ── argument coercion ──
+// Clients do not reliably enforce additionalProperties; coerce defensively.
+
+/// Argument names accepted by `coerce_args`, derived from the published
+/// input schema — the whitelist cannot drift from what `tools/list`
+/// advertises, because it *is* what `tools/list` advertises.
+fn valid_arg_names() -> &'static [String] {
+    use std::sync::OnceLock;
+    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        crate::schema::video_input_schema()["properties"]
+            .as_object()
+            .expect("video_input_schema properties is an object by construction")
+            .keys()
+            .cloned()
+            .collect()
+    })
+}
+
+pub(super) fn coerce_args(
+    raw: &serde_json::Map<String, serde_json::Value>,
+) -> Result<VideoArgs, Fault> {
+    let valid = valid_arg_names();
+    for key in raw.keys() {
+        if !valid.iter().any(|name| name == key) {
+            return Err(Fault::bad_input(format!(
+                "unknown argument \"{key}\"; valid: {}",
+                valid.join(", ")
+            )));
+        }
+    }
+    let source = match raw.get("source") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
+        _ => {
+            return Err(Fault::bad_input(
+                r#"source must be a non-empty string, e.g. {"source": "/videos/talk.mp4"}"#,
+            ));
+        }
+    };
+    let time = |key: &str, example: &str| -> Result<Option<TimeValue>, Fault> {
+        match raw.get(key) {
+            None => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(TimeValue::Text(s.clone()))),
+            Some(v) if v.is_number() => Ok(Some(TimeValue::Number(v.as_f64().unwrap_or_default()))),
+            Some(_) => Err(Fault::bad_input(format!(
+                "{key} must be seconds or a timestamp string, e.g. {example}"
+            ))),
+        }
+    };
+    let from = time("from", r#"{"from": "1:23"}"#)?;
+    let until = time("until", r#"{"until": 300}"#)?;
+    let look = match raw.get("look") {
+        None => None,
+        Some(v) => Some(serde_json::from_value::<Look>(v.clone()).map_err(|_| {
+            Fault::bad_input(format!(
+                r#"look must be one of {}, e.g. {{"look": "overview"}}"#,
+                LOOKS.join(", ")
+            ))
+        })?),
+    };
+    let strategy = match raw.get("strategy") {
+        None => None,
+        Some(v) => Some(serde_json::from_value::<Strategy>(v.clone()).map_err(|_| {
+            Fault::bad_input(format!(
+                r#"strategy must be one of {}, e.g. {{"strategy": "uniform"}}"#,
+                STRATEGIES.join(", ")
+            ))
+        })?),
+    };
+    let string = |key: &str, message: &str| -> Result<Option<String>, Fault> {
+        match raw.get(key) {
+            None => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(Fault::bad_input(message)),
+        }
+    };
+    let raw_arg = string(
+        "raw",
+        r#"raw must be a string of core CLI arguments, e.g. {"raw": "process --strategy keyframes"}"#,
+    )?;
+    let confirm = string(
+        "confirm",
+        "confirm must be a string token echoed from a previous response",
+    )?;
+    Ok(VideoArgs {
+        source,
+        from,
+        until,
+        look,
+        strategy,
+        raw: raw_arg,
+        confirm,
+    })
+}
+
+pub(super) fn is_url(source: &str) -> bool {
+    let lower = source.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+// ── result rendering ──
+
+pub(super) fn failed(fault: &Fault) -> CallToolResult {
+    let body = VideoBody::Failed {
+        error: fault.message.clone(),
+        kind: fault.kind,
+    };
+    let text = serde_json::to_string(&body).expect("VideoBody serializes");
+    CallToolResult::error(vec![ContentBlock::text(text)])
+}
+
+pub(super) fn json_result(body: &VideoBody) -> CallToolResult {
+    let text = serde_json::to_string_pretty(body).expect("VideoBody serializes");
+    CallToolResult::success(vec![ContentBlock::text(text)])
+}
+
+/// One text block for all grids: ranges, key frames, subtitles, notices.
+fn describe_grids(meta: &CoreMetadata, notices: &[String]) -> String {
+    let mut lines: Vec<String> = notices.iter().map(|n| format!("note: {n}")).collect();
+    // A `range` marks an extract: its `duration` is the segment's span, not
+    // the video's total — present it as such.
+    lines.push(match meta.range {
+        Some((start, end)) => format!(
+            "{}: segment {}-{}, {} grid(s) below, read top-left to bottom-right.",
+            meta.source,
+            format_ts(start),
+            format_ts(end),
+            meta.grids.len()
+        ),
+        None => format!(
+            "{}: {}, {} grid(s) below, read top-left to bottom-right.",
+            meta.source,
+            format_ts(meta.duration),
+            meta.grids.len()
+        ),
+    });
+    for (i, grid) in meta.grids.iter().enumerate() {
+        lines.push(String::new());
+        lines.push(format!(
+            "[grid {}/{}] {} · layout {} · {} frames",
+            i + 1,
+            meta.grids.len(),
+            grid.time_range,
+            grid.layout.as_str(),
+            grid.total_frames
+        ));
+        if !grid.key_frames.is_empty() {
+            let keys: Vec<String> = grid
+                .key_frames
+                .iter()
+                .map(|k| format!("{} @{}", k.timestamp, k.grid_position.as_str()))
+                .collect();
+            lines.push(format!("  key frames (bordered): {}", keys.join(", ")));
+        }
+        if let Some(subs) = &grid.subtitles
+            && !subs.is_empty()
+        {
+            lines.push("  subtitles:".to_string());
+            for line in subs.split('\n') {
+                lines.push(format!("    {line}"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Render a parsed core document: one text block, then the grid images.
+/// Takes the document by value so base64 payloads move instead of clone.
+pub(super) fn ready_result(meta: CoreMetadata, notices: &[String]) -> CallToolResult {
+    let mut content = vec![ContentBlock::text(describe_grids(&meta, notices))];
+    for grid in meta.grids {
+        if let GridImage::Base64(b64) = grid.image {
+            content.push(ContentBlock::image(b64, "image/jpeg"));
+        }
+    }
+    CallToolResult::success(content)
+}
+
+/// Render a still-running download from a progress snapshot.
+pub(super) fn pending_result(downloaded: u64, total: Option<u64>) -> CallToolResult {
+    let total_text = total
+        .map(|t| format!(" / {}", format_bytes(t)))
+        .unwrap_or_default();
+    json_result(&VideoBody::Pending {
+        message: format!(
+            "Download in progress: {}{total_text} so far. It continues in the background — \
+             call again with just the same source to check on it; the result is served once it \
+             finishes. Repeat any from/until/look after that.",
+            format_bytes(downloaded)
+        ),
+    })
+}

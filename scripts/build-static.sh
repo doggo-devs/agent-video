@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Build a fully static, zero-dependency agent-video.
 #
-# FFmpeg is compiled and linked statically. Two capabilities need libs it does
-# not bundle: software AV1 (libdav1d) and https (OpenSSL). This builds both as
-# static libs, exposes them via pkg-config, then builds with `static-ffmpeg` so
-# FFmpeg's configure picks up --enable-libdav1d + --enable-openssl. No hwaccel
-# (--disable-autodetect); TLS uses the system CA store at runtime.
+# FFmpeg is compiled and linked statically. One capability needs a lib it does
+# not bundle: software AV1 (libdav1d). This builds it as a static lib, exposes
+# it via pkg-config, then builds with `static-ffmpeg` so FFmpeg's configure
+# picks up --enable-libdav1d. No hwaccel (--disable-autodetect) and no TLS
+# backend: URL downloads happen in the harness (rustls), FFmpeg only opens
+# local files.
 #
-# Requirements: git, nasm, meson, ninja, pkg-config, perl, a C toolchain.
+# Requirements: git, nasm, meson, ninja, pkg-config, a C toolchain.
 # For a musl target, also musl-tools + the rustup target.
 #
 # Environment knobs:
 #   DAV1D_VERSION      dav1d git tag                     (default: 1.5.3)
-#   OPENSSL_VERSION    openssl git tag                   (default: openssl-3.5.1)
 #   DEPS_PREFIX        static-lib install prefix
 #                      (default: target/static-deps-<libc>)
 #   TARGET             Rust target triple. A *-musl triple cross-builds the C
@@ -23,7 +23,6 @@
 set -euo pipefail
 
 DAV1D_VERSION="${DAV1D_VERSION:-1.5.3}"
-OPENSSL_VERSION="${OPENSSL_VERSION:-openssl-3.5.1}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${TARGET:-}"
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
@@ -68,41 +67,11 @@ else
   trap - EXIT
 fi
 
-# --- 2. Build OpenSSL as a static library (skip if already present) ----------
-# libssl + libcrypto only; no apps, no docs, no shared objects. `no-module`
-# keeps the provider .so out so nothing needs to be found at runtime.
-if [ -f "$PREFIX/lib/libssl.a" ] && [ -f "$PREFIX/lib/libcrypto.a" ]; then
-  echo ">> reusing openssl static libs at $PREFIX/lib"
-else
-  echo ">> building openssl $OPENSSL_VERSION (static, $LIBC) into $PREFIX"
-  work="$(mktemp -d)"
-  trap 'rm -rf "$work"' EXIT
-  git clone --depth 1 --branch "$OPENSSL_VERSION" \
-    https://github.com/openssl/openssl.git "$work/src"
-  (
-    cd "$work/src"
-    # Configure auto-detects the platform from CC; --libdir=lib matches the
-    # pkgconfig path FFmpeg's configure searches.
-    ./Configure \
-      --prefix="$PREFIX" \
-      --libdir=lib \
-      no-shared \
-      no-module \
-      no-tests \
-      no-docs
-    make -j"$JOBS"
-    # install_sw: libs + headers only, no man pages, no default cert store.
-    make install_sw
-  )
-  rm -rf "$work"
-  trap - EXIT
-fi
-
-# --- 3. Point FFmpeg's configure (via pkg-config) at the static deps ---------
+# --- 2. Point FFmpeg's configure (via pkg-config) at the static deps ---------
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 export PKG_CONFIG_ALL_STATIC=1
 
-# --- 4. Optionally pin the FFmpeg C baseline for distributable artifacts ------
+# --- 3. Optionally pin the FFmpeg C baseline for distributable artifacts ------
 # ffmpeg-sys-next hard-codes `-march=native` for host builds. A later -march on
 # the compiler line wins, so a thin CC wrapper that appends the desired baseline
 # neutralizes it without patching the crate. The wrapper also carries any
@@ -119,7 +88,7 @@ EOF
   echo ">> pinning FFmpeg C baseline to -march=$FFMPEG_TARGET_CPU (via $real_cc)"
 fi
 
-# --- 5. musl link flags ------------------------------------------------------
+# --- 4. musl link flags ------------------------------------------------------
 # Env RUSTFLAGS replaces .cargo/config.toml's cfg rustflags wholesale, so a musl
 # build must restate both: link-self-contained=no (reuse the distro musl) and
 # the CPU baseline (kept in sync with FFMPEG_TARGET_CPU).
@@ -130,8 +99,8 @@ if [[ "$TARGET" == *musl* ]]; then
   export "CARGO_TARGET_${triple_upper}_RUSTFLAGS=$musl_rustflags"
 fi
 
-# --- 6. Build ----------------------------------------------------------------
+# --- 5. Build ----------------------------------------------------------------
 target_args=()
 [ -n "$TARGET" ] && target_args=(--target "$TARGET")
-echo ">> cargo build --release --features static-ffmpeg ${target_args[*]}"
-exec cargo build --release --features static-ffmpeg "${target_args[@]}" "$@"
+echo ">> cargo build --release -p agent-video --features static-ffmpeg ${target_args[*]}"
+exec cargo build --release -p agent-video --features static-ffmpeg "${target_args[@]}" "$@"

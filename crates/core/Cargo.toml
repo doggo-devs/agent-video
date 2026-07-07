@@ -1,28 +1,24 @@
 [package]
-name = "agent-video"
+name = "agent-video-core"
 version.workspace = true
 edition.workspace = true
-description = "Turn a video into VLM-readable grid images"
+description = "Turn a video into VLM-readable grid images — media kernel"
 license.workspace = true
 repository.workspace = true
-# Rust-side README lives one level up, shared across future core crates.
 readme = "../README.md"
-
-[[bin]]
-name = "agent-video"
-path = "src/main.rs"
 
 [features]
 # Zero-dependency release build: compile FFmpeg from source and link it
-# statically. `build-lib-dav1d` adds `--enable-libdav1d` (software AV1);
-# `build-lib-openssl` adds `--enable-openssl` (https). Both static libs must be
-# on PKG_CONFIG_PATH at build time — see scripts/build-static.sh. Day-to-day
-# builds link the system FFmpeg via pkg-config instead (fast).
+# statically. `build-lib-dav1d` adds `--enable-libdav1d` (software AV1); the
+# static lib must be on PKG_CONFIG_PATH at build time — see
+# scripts/build-static.sh. No TLS backend: URL downloads happen in the harness
+# (rustls), so FFmpeg only ever opens local files; a direct `https://` input
+# fails with PROTOCOL_UNSUPPORTED. Day-to-day builds link the system FFmpeg
+# via pkg-config instead (fast).
 static-ffmpeg = [
     "ffmpeg-next/build",
     "ffmpeg-next/static",
     "ffmpeg-next/build-lib-dav1d",
-    "ffmpeg-next/build-lib-openssl",
 ]
 
 [dependencies]
@@ -30,6 +26,7 @@ ffmpeg-next = { version = "8", default-features = false, features = [
     "codec",
     "format",
     "software-scaling",
+    "software-resampling",
 ] }
 image = "0.25"
 image_hasher = "3"
@@ -41,9 +38,3 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 rayon = "1"
 base64 = "0.22"
-
-[target.'cfg(unix)'.dependencies]
-# Restore SIGPIPE to SIG_DFL at startup: the Rust runtime installs SIG_IGN,
-# which turns a closed downstream pipe (e.g. `| head`) into an EPIPE panic
-# under `panic = "abort"` instead of a clean signal termination.
-libc = "0.2"

@@ -16,8 +16,8 @@ use crate::config::Config;
 use crate::error::{Error, ErrorCode, ErrorContext};
 use crate::source::Source;
 use crate::subtitle::Subtitles;
-use crate::types::{CandidateFrame, CanvasSpec, Metadata, ScoredFrame, TimeRange, format_ts};
-use crate::{compose, dedup, extract, layout, score};
+use crate::types::{CandidateFrame, CanvasSpec, ScoredFrame, TimeRange, format_ts};
+use crate::{compose, dedup, extract, layout, score, wire};
 
 use super::candidates::CandidateStream;
 use super::chunk::{build_grid_draft, extract_selected};
@@ -41,9 +41,8 @@ pub fn extract_range(
     subs: SubtitleSource<'_>,
 ) -> Result<()> {
     super::validate_input(input)?;
-    // Resolve subtitles before the expensive sampling/scoring pass: subtitle
-    // errors (ambiguous sources, unreadable files) should fail fast, not
-    // after all the CPU and IO have been spent.
+    // Before the expensive sampling pass: subtitle errors must fail fast,
+    // not after all the CPU and IO have been spent.
     let subs = Subtitles::resolve(input, subs)?;
     let session = OutputSession::open(out_dir, mode)?;
 
@@ -98,10 +97,9 @@ pub fn extract_range(
                 aspect,
                 cfg.min_gap(),
             );
-            // Bound memory over arbitrarily long ranges: once per-batch winners
-            // pile up to several grids' worth, re-rank them as one set and keep
-            // the top `capacity`. Rank normalization is per-competition-set, so
-            // this periodic compaction is consistent with the final pass.
+            // Bound memory over long ranges: once winners pile up to several
+            // grids' worth, re-rank as one set and keep the top `capacity`.
+            // Rank normalization is per-set, consistent with the final pass.
             let capacity = layout::grid_capacity(&spec, aspect);
             if candidates.len() >= 4 * capacity {
                 candidates = select_capacity(candidates, capacity, &weights, cfg.min_gap());
@@ -128,9 +126,8 @@ pub fn extract_range(
         select_capacity(candidates, capacity, &weights, cfg.min_gap())
     };
 
-    // An empty selection means the range yielded nothing (e.g. it lies past
-    // the end of the video). Rendering an empty grid and reporting success
-    // would hand the caller a fabricated artifact; fail with a code instead.
+    // An empty selection (range past the end of the video) must not render
+    // an empty grid and report success — fail with a code instead.
     if picked.is_empty() {
         return Err(Error::new(
             ErrorCode::NoFramesExtracted,
@@ -157,15 +154,17 @@ pub fn extract_range(
         None => crate::types::GridSubtitles::NoSource,
     };
 
-    let meta = Metadata {
+    // `duration` carries the harvested span; `range` marks the document as
+    // an extract, so consumers cannot mistake the span for a total duration.
+    let meta = wire::Metadata {
         source: input.to_string(),
-        duration: range.end() - range.start(),
+        duration: range.duration(),
+        range: Some((range.start(), range.end())),
         settings: cfg.settings(),
-        grids: vec![grid_meta],
+        grids: vec![grid_meta.into()],
     };
 
-    // No subtitles.txt: the range-sliced cues already travel in the metadata
-    // (see the fn docs for the extract output contract).
+    // No subtitles.txt: the range-sliced cues already travel in the metadata.
     session.commit(&meta, None)?;
 
     Ok(())

@@ -85,19 +85,15 @@ pub fn process(
     window: Option<Window>,
 ) -> Result<()> {
     validate_input(input)?;
-    // Resolve the strategy actually executed. Two adjustments can move a
-    // keyframe/adaptive request onto fixed-fps: a window (keyframe pairing
-    // can't survive a seek) and a keyframe-poor source (so a bare `process`
-    // still yields output). Both apply only to a *defaulted* strategy; an
-    // explicit `--strategy` is honored, and validate_strategy rejects it if
-    // the source can't satisfy it.
+    // Two adjustments can move a defaulted keyframe/adaptive request onto
+    // fixed-fps: a window (pairing can't survive a seek) and a keyframe-poor
+    // source. An explicit --strategy is honored and validated instead.
     let strategy = resolve_windowed_strategy(cfg, window)?;
     let keyframe_info = probe_if_needed(input, strategy, cfg)?;
     let strategy = degrade_if_keyframe_poor(cfg, strategy, keyframe_info.as_ref());
     validate_strategy(cfg, strategy, keyframe_info.as_ref(), window)?;
-    // Resolve subtitles before any extraction or output: whether the final
-    // outputs can be assembled must be settled before side effects begin, so
-    // a subtitle failure cannot leave grids on disk without metadata.
+    // Before any side effect: a subtitle failure must not leave grids on
+    // disk without metadata.
     let subs = Subtitles::resolve(input, subs)?;
 
     let mut builder = rayon::ThreadPoolBuilder::new();
@@ -109,10 +105,9 @@ pub fn process(
         .build()
         .context("building rayon thread pool")?;
 
-    // The orchestrator stays on the calling thread and blocks on the result
-    // channel; only worker jobs run on the pool. Running the orchestrator
-    // inside the pool would deadlock a single-thread pool: the drain loop
-    // would block the one thread the spawned chunk jobs need.
+    // The orchestrator stays on the calling thread; only worker jobs run on
+    // the pool. Inside the pool it would deadlock a single-thread pool — the
+    // drain loop would block the one thread the chunk jobs need.
     let ctx = RunCtx {
         input,
         cfg,
@@ -122,8 +117,7 @@ pub fn process(
         subs,
         probed_duration: keyframe_info.as_ref().map(|i| i.duration),
     };
-    // Every strategy reduces to a sampling plan executed by one decode pass;
-    // the pipeline tail is strategy-agnostic.
+    // Every strategy reduces to one decode pass; the tail is shared.
     let session = OutputSession::open(out_dir, mode)?;
     let stream = match strategy {
         SampleStrategy::FixedFps => match window {
@@ -198,9 +192,8 @@ fn adaptive_stream(ctx: &RunCtx<'_>, info: &KeyframeInfo) -> Result<extract_fram
         cfg.gap_threshold()
     );
 
-    // When sparse regions dominate the timeline, the mixed plan decodes
-    // nearly every packet anyway and its keyframe pass contributes little; a
-    // plain fixed-fps stream covers the same ground with uniform sampling.
+    // When sparse regions dominate, the mixed plan decodes nearly every
+    // packet anyway; a plain fixed-fps pass covers the same ground.
     let covered: f32 = fill.iter().map(TimeRange::duration).sum();
     if covered > 0.5 * info.duration {
         eprintln!(
@@ -511,8 +504,7 @@ mod tests {
 
     #[test]
     fn skips_filesystem_validation_for_remote_source() {
-        // A remote source has no filesystem entry to stat; validation must
-        // wave it through and let open report protocol/network failures.
+        // Validation waves it through; open reports protocol/network failures.
         validate_input(&Source::classify("https://example.com/missing.mp4"))
             .expect("remote input skips the filesystem check");
     }
@@ -617,8 +609,6 @@ mod tests {
     #[test]
     fn keeps_explicit_adaptive_when_keyframe_poor() {
         let cfg = cfg_with_strategy(Some(SampleStrategy::Adaptive));
-        // Explicit request is honored, not degraded; validate_strategy rejects
-        // it with InsufficientKeyframes.
         let resolved =
             degrade_if_keyframe_poor(&cfg, SampleStrategy::Adaptive, Some(&keyframes(2)));
         assert_eq!(resolved, SampleStrategy::Adaptive);
