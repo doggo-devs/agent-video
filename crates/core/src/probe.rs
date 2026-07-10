@@ -55,7 +55,8 @@ impl std::ops::Deref for MonotonicTimestamps {
 }
 
 /// Sampling strategy for frame extraction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum SampleStrategy {
     /// Fixed-rate sampling at base_fps.
     #[default]

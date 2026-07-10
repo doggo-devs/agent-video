@@ -22,6 +22,7 @@ enum JobEvent {
 /// Write half of one job, owned by its download thread. Dropping it without
 /// settling (a panic unwound the thread) is visible to the next poll as an
 /// abandoned job.
+#[derive(Debug)]
 pub struct JobReporter(mpsc::Sender<JobEvent>);
 
 impl JobReporter {
@@ -107,6 +108,24 @@ pub enum Poll {
     Abandoned,
 }
 
+/// Outcome of claiming a key's download slot ([`Tracker::admit`]), decided
+/// in one critical section — there is no check-then-insert window, so two
+/// concurrent confirms for the same URL admit exactly one writer.
+#[derive(Debug)]
+pub enum Admission {
+    /// This caller won the slot and owns the job; the reporter is the only
+    /// way to speak into it.
+    Started(JobReporter),
+    /// A live job already holds the slot; a snapshot for rendering.
+    Running { downloaded: u64, total: Option<u64> },
+    /// The previous job for this key finished unobserved; its response,
+    /// handed out exactly once instead of a fresh start — re-running a
+    /// successful keep download would duplicate the user's file, and a
+    /// stored failure tells the caller what actually happened. The slot is
+    /// cleared: the next admission starts fresh.
+    Settled(CallToolResult),
+}
+
 /// In-flight downloads for one MCP session.
 #[derive(Default)]
 pub struct Tracker {
@@ -115,12 +134,33 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    /// Register a job; returns the reporter its download thread speaks
-    /// through.
-    pub fn start(&self, key: &str) -> JobReporter {
+    /// Claim the slot for `key`: fold the existing job first (settled →
+    /// hand its response out, dead or stalled → evict), then insert a fresh
+    /// job if the slot is free. The liveness check and the insertion share
+    /// one critical section, so the loser of a concurrent double confirm
+    /// sees `Running` instead of spawning a second download.
+    pub fn admit(&self, key: &str, stall_limit: Duration) -> Admission {
+        let mut jobs = self.lock();
+        if let Some(slot) = jobs.get_mut(key) {
+            match slot.fold() {
+                Fold::Settled(result) => {
+                    jobs.remove(key);
+                    return Admission::Settled(result);
+                }
+                // Dead or wedged: nothing to hand out; claim the slot anew.
+                Fold::Dead => {}
+                Fold::Live if slot.last_progress.elapsed() > stall_limit => {}
+                Fold::Live => {
+                    return Admission::Running {
+                        downloaded: slot.downloaded,
+                        total: slot.total,
+                    };
+                }
+            }
+        }
         let (tx, rx) = mpsc::channel();
-        self.lock().insert(key.to_string(), JobSlot::new(rx));
-        JobReporter(tx)
+        jobs.insert(key.to_string(), JobSlot::new(rx));
+        Admission::Started(JobReporter(tx))
     }
 
     /// Resolve one poll: settled beats dead beats stalled beats running,
@@ -182,6 +222,14 @@ mod tests {
         CallToolResult::success(vec![ContentBlock::text("done")])
     }
 
+    /// Claim a vacant slot; the tests below own the invariant that it is.
+    fn start(tracker: &Tracker, key: &str) -> JobReporter {
+        match tracker.admit(key, LIMIT) {
+            Admission::Started(reporter) => reporter,
+            other => panic!("slot must be vacant, got {other:?}"),
+        }
+    }
+
     #[test]
     fn polls_vacant_without_a_job() {
         let tracker = Tracker::default();
@@ -191,7 +239,7 @@ mod tests {
     #[test]
     fn polls_running_with_live_progress() {
         let tracker = Tracker::default();
-        let reporter = tracker.start("k");
+        let reporter = start(&tracker, "k");
         reporter.progress(512, Some(1024));
         let Poll::Running { downloaded, total } = tracker.poll("k", LIMIT) else {
             panic!("job is live");
@@ -202,7 +250,7 @@ mod tests {
     #[test]
     fn keeps_known_total_when_a_report_omits_it() {
         let tracker = Tracker::default();
-        let reporter = tracker.start("k");
+        let reporter = start(&tracker, "k");
         reporter.progress(512, Some(1024));
         reporter.progress(600, None);
         let Poll::Running { downloaded, total } = tracker.poll("k", LIMIT) else {
@@ -214,7 +262,7 @@ mod tests {
     #[test]
     fn hands_out_settled_response_exactly_once() {
         let tracker = Tracker::default();
-        let reporter = tracker.start("k");
+        let reporter = start(&tracker, "k");
         reporter.settle(settled_result());
         assert!(matches!(tracker.poll("k", LIMIT), Poll::Settled(_)));
         assert!(
@@ -226,7 +274,7 @@ mod tests {
     #[test]
     fn abandons_stalled_jobs_and_clears_the_slot() {
         let tracker = Tracker::default();
-        let _reporter = tracker.start("k");
+        let _reporter = start(&tracker, "k");
         tracker.age("k", Duration::from_secs(120));
         assert!(matches!(
             tracker.poll("k", Duration::from_secs(60)),
@@ -241,7 +289,7 @@ mod tests {
     #[test]
     fn abandons_a_job_whose_reporter_died_unsettled() {
         let tracker = Tracker::default();
-        let reporter = tracker.start("k");
+        let reporter = start(&tracker, "k");
         drop(reporter); // the download thread panicked
         assert!(matches!(tracker.poll("k", LIMIT), Poll::Abandoned));
         assert!(
@@ -255,7 +303,7 @@ mod tests {
         // Settled result queued against a stalled clock: the finished
         // download wins, clock staleness is irrelevant.
         let tracker = Tracker::default();
-        let reporter = tracker.start("k");
+        let reporter = start(&tracker, "k");
         tracker.age("k", Duration::from_secs(120));
         reporter.settle(settled_result());
         assert!(matches!(
@@ -268,7 +316,7 @@ mod tests {
     fn settled_beats_a_dead_reporter() {
         // The queued result must win over the disconnect that follows it.
         let tracker = Tracker::default();
-        let reporter = tracker.start("k");
+        let reporter = start(&tracker, "k");
         reporter.settle(settled_result());
         assert!(matches!(tracker.poll("k", LIMIT), Poll::Settled(_)));
     }
@@ -276,9 +324,87 @@ mod tests {
     #[test]
     fn clear_drops_job_unread() {
         let tracker = Tracker::default();
-        let reporter = tracker.start("k");
+        let reporter = start(&tracker, "k");
         reporter.settle(settled_result());
         tracker.clear("k");
         assert!(matches!(tracker.poll("k", LIMIT), Poll::Vacant));
+    }
+
+    #[test]
+    fn admits_exactly_one_writer_under_contention() {
+        use std::sync::{Arc, Barrier};
+        let tracker = Arc::new(Tracker::default());
+        let barrier = Arc::new(Barrier::new(2));
+        let admissions: Vec<Admission> = [(); 2]
+            .map(|()| {
+                let tracker = Arc::clone(&tracker);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    tracker.admit("k", LIMIT)
+                })
+            })
+            .into_iter()
+            .map(|t| t.join().expect("admit does not panic"))
+            .collect();
+        let started = admissions
+            .iter()
+            .filter(|a| matches!(a, Admission::Started(_)))
+            .count();
+        assert_eq!(started, 1, "one writer wins the slot");
+        assert_eq!(admissions.len(), 2);
+        assert!(
+            admissions
+                .iter()
+                .any(|a| matches!(a, Admission::Running { .. })),
+            "the loser observes the winner's live job"
+        );
+    }
+
+    #[test]
+    fn admission_over_a_live_job_reports_running() {
+        let tracker = Tracker::default();
+        let reporter = start(&tracker, "k");
+        reporter.progress(512, Some(1024));
+        let Admission::Running { downloaded, total } = tracker.admit("k", LIMIT) else {
+            panic!("live job must not be displaced");
+        };
+        assert_eq!((downloaded, total), (512, Some(1024)));
+    }
+
+    #[test]
+    fn admission_hands_out_an_unobserved_settled_response() {
+        let tracker = Tracker::default();
+        let reporter = start(&tracker, "k");
+        reporter.settle(settled_result());
+        assert!(matches!(tracker.admit("k", LIMIT), Admission::Settled(_)));
+        assert!(
+            matches!(tracker.admit("k", LIMIT), Admission::Started(_)),
+            "handed out once; the slot is free again"
+        );
+    }
+
+    #[test]
+    fn admission_displaces_a_dead_job() {
+        let tracker = Tracker::default();
+        drop(start(&tracker, "k")); // the download thread panicked
+        assert!(
+            matches!(tracker.admit("k", LIMIT), Admission::Started(_)),
+            "a dead job must not block retries"
+        );
+    }
+
+    #[test]
+    fn admission_displaces_a_stalled_job() {
+        let tracker = Tracker::default();
+        let _reporter = start(&tracker, "k");
+        tracker.age("k", Duration::from_secs(120));
+        assert!(
+            matches!(
+                tracker.admit("k", Duration::from_secs(60)),
+                Admission::Started(_)
+            ),
+            "a wedged job must not block retries"
+        );
     }
 }

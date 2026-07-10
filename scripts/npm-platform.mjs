@@ -3,7 +3,7 @@
 // the prebuilt core binary. The harness resolves these via optionalDependencies.
 //
 // Usage: node scripts/npm-platform.mjs <platform> <version> <binary> <out-dir>
-//   platform  one of: linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64
+//   platform  one of: linux-x64 linux-arm64 darwin-arm64 win32-x64
 //   version   package version, must match the core crate version
 //   binary    path to the built agent-video[.exe], or a directory holding it
 //             plus any runtime libraries (win32 bundles the FFmpeg DLLs)
@@ -22,7 +22,6 @@ import { join } from "node:path";
 const PLATFORMS = {
   "linux-x64": { os: "linux", cpu: "x64" },
   "linux-arm64": { os: "linux", cpu: "arm64" },
-  "darwin-x64": { os: "darwin", cpu: "x64" },
   "darwin-arm64": { os: "darwin", cpu: "arm64" },
   "win32-x64": { os: "win32", cpu: "x64" },
 };
@@ -48,7 +47,7 @@ writeFileSync(
       name: `@agent-video/${platform}`,
       version,
       description: `agent-video core binary for ${spec.os} ${spec.cpu}`,
-      license: "MIT",
+      license: "Apache-2.0",
       repository: {
         type: "git",
         url: "git+https://github.com/durvia/agent-video.git",

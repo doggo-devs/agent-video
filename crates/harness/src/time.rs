@@ -53,7 +53,6 @@ fn parse_int(s: &str) -> Option<f64> {
 
 /// `\d+(\.\d+)?`, optionally constrained under 60 (`[0-5]?\d`).
 fn parse_seconds(s: &str, under_60: bool) -> Option<f64> {
-    let whole = s.split('.').next()?;
     let (int_part, frac) = match s.split_once('.') {
         Some((i, f)) => (i, Some(f)),
         None => (s, None),
@@ -62,7 +61,7 @@ fn parse_seconds(s: &str, under_60: bool) -> Option<f64> {
     if let Some(f) = frac {
         parse_int(f)?;
     }
-    if under_60 && (whole.len() > 2 || whole.parse::<u32>().ok()? > 59) {
+    if under_60 && (int_part.len() > 2 || int_part.parse::<u32>().ok()? > 59) {
         return None;
     }
     s.parse().ok()

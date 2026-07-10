@@ -124,7 +124,7 @@ const pluginJson = {
 	description: VIDEO_TOOL_DESCRIPTION,
 	homepage: REPO_URL,
 	repository: REPO_URL,
-	license: 'MIT',
+	license: 'Apache-2.0',
 	skills: './skills/',
 	mcpServers: './.mcp.json',
 }
@@ -179,7 +179,7 @@ const piPackageJson = {
 	name: '@agent-video/pi',
 	version,
 	description: VIDEO_TOOL_DESCRIPTION,
-	license: 'MIT',
+	license: 'Apache-2.0',
 	repository: { type: 'git', url: `git+${REPO_URL}.git`, directory: 'surfaces/pi' },
 	// Pulls the exact-pinned platform binaries via @agent-video/cli's
 	// optionalDependencies; pi runs `npm install` on package install.

@@ -39,6 +39,13 @@ const LARGE_V3: Pin = Pin {
     bytes: 3_095_033_483,
 };
 
+const LARGE_V3_TURBO: Pin = Pin {
+    filename: "ggml-large-v3-turbo.bin",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+    sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+    bytes: 1_624_555_275,
+};
+
 const SILERO_VAD: Pin = Pin {
     filename: VAD_FILENAME,
     url: "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin",
@@ -74,11 +81,12 @@ pub fn install_whisper(cfg: &Config, override_model: Option<&str>) -> Result<(),
     let model = match override_model {
         Some("medium") => WhisperModel::Medium,
         Some("large-v3") => WhisperModel::LargeV3,
+        Some("large-v3-turbo") => WhisperModel::LargeV3Turbo,
         Some(other) => {
             return Err(InstallError(format!(
                 "unknown model '{other}': install-whisper provisions the pinned models \
-                 (medium, large-v3); a self-supplied ggml file needs no installation — point \
-                 whisper.model at it"
+                 (medium, large-v3, large-v3-turbo); a self-supplied ggml file needs no \
+                 installation — point whisper.model at it"
             )));
         }
         None => cfg.whisper.model.clone(),
@@ -86,20 +94,43 @@ pub fn install_whisper(cfg: &Config, override_model: Option<&str>) -> Result<(),
     let pin = match &model {
         WhisperModel::Medium => MEDIUM,
         WhisperModel::LargeV3 => LARGE_V3,
+        WhisperModel::LargeV3Turbo => LARGE_V3_TURBO,
         WhisperModel::File(p) => {
             return Err(InstallError(format!(
                 "whisper.model points at a self-supplied file ({}); nothing to install — pass \
-                 --model medium|large-v3 to provision a pinned model instead",
+                 --model medium|large-v3|large-v3-turbo to provision a pinned model instead",
                 p.display()
             )));
         }
     };
     debug_assert_eq!(Some(pin.filename), model_filename(&model));
 
+    sweep_stale_parts(&cfg.paths.models);
     for pin in [pin, SILERO_VAD] {
         provision(&cfg.paths.models, &pin)?;
     }
     Ok(())
+}
+
+/// Remove leftover `*.part` files before provisioning.
+///
+/// `install-whisper` is the sole writer of the models directory and runs
+/// single-threaded to completion, so any partial file present at entry is
+/// the debris of a prior run that was killed mid-download (SIGKILL, power
+/// loss) — never a live transfer. The normal error path already unlinks its
+/// own `.part`; this collects only what a hard kill leaked. Best-effort: a
+/// directory that does not exist yet, or a file we cannot unlink, is skipped.
+fn sweep_stale_parts(models_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(models_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "part") && std::fs::remove_file(&path).is_ok()
+        {
+            eprintln!("removed stale partial download {}", path.display());
+        }
+    }
 }
 
 /// Fetch one pinned artifact unless a verified copy already exists.
@@ -227,9 +258,35 @@ mod tests {
     }
 
     #[test]
+    fn sweeps_stale_part_files_but_keeps_finished_weights() {
+        let dir = std::env::temp_dir().join(format!("av-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("ggml-medium.bin.part"), b"partial").expect("write part");
+        std::fs::write(dir.join("ggml-medium.bin"), b"whole").expect("write bin");
+
+        sweep_stale_parts(&dir);
+
+        assert!(
+            !dir.join("ggml-medium.bin.part").exists(),
+            "the killed-run partial is collected"
+        );
+        assert!(
+            dir.join("ggml-medium.bin").exists(),
+            "a finished weight file is untouched"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn sweep_tolerates_missing_directory() {
+        // First-ever install: the models dir does not exist yet.
+        sweep_stale_parts(Path::new("/nonexistent/av-models-xyz"));
+    }
+
+    #[test]
     fn rejects_unknown_model_override() {
         let err = install_whisper(&cfg(), Some("base")).expect_err("not a pinned model");
-        assert!(err.0.contains("medium, large-v3"), "{err}");
+        assert!(err.0.contains("medium, large-v3, large-v3-turbo"), "{err}");
     }
 
     #[test]

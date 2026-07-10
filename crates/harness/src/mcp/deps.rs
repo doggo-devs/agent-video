@@ -5,13 +5,13 @@
 //! token registry, download tracker — behind capability traits so tests swap
 //! in fakes without touching the call flow.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::fault::Fault;
-use crate::fetch::{self, DownloadIo, ProgressFn, SourceInfo};
+use crate::fetch::{self, DownloadIo, Downloaded, ProgressFn, SourceInfo};
 use crate::mcp::core_run::{CoreRunner, SelfSpawn};
 use crate::mcp::tracker::Tracker;
 use crate::probe::probe_local_file;
@@ -37,7 +37,7 @@ pub trait UrlFetcher: Send + Sync {
         io: DownloadIo<'_>,
         cfg: &Config,
         progress: ProgressFn<'_>,
-    ) -> Result<PathBuf, Fault>;
+    ) -> Result<Downloaded, Fault>;
 }
 
 /// Transcription capability; absence degrades to an install hint.
@@ -49,7 +49,7 @@ pub trait Whisper: Send + Sync {
         file: &Path,
         out_srt: &Path,
         on_step: &mut dyn FnMut(&str),
-    ) -> Result<(), Fault>;
+    ) -> Result<transcribe::Transcribed, Fault>;
 }
 
 struct RealProber;
@@ -75,7 +75,7 @@ impl UrlFetcher for RealFetcher {
         io: DownloadIo<'_>,
         cfg: &Config,
         progress: ProgressFn<'_>,
-    ) -> Result<PathBuf, Fault> {
+    ) -> Result<Downloaded, Fault> {
         // Re-vet at execution time: consent may be redeemed long after the
         // probe, and DNS may have moved underneath the plan.
         let vetted =
@@ -88,7 +88,7 @@ struct RealWhisper;
 
 impl Whisper for RealWhisper {
     fn available(&self, cfg: &Config) -> bool {
-        transcribe::model_path(cfg).is_file()
+        transcribe::available(cfg)
     }
 
     fn transcribe(
@@ -97,7 +97,7 @@ impl Whisper for RealWhisper {
         file: &Path,
         out_srt: &Path,
         on_step: &mut dyn FnMut(&str),
-    ) -> Result<(), Fault> {
+    ) -> Result<transcribe::Transcribed, Fault> {
         transcribe::transcribe(cfg, file, out_srt, on_step)
     }
 }

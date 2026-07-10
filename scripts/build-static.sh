@@ -91,11 +91,16 @@ fi
 # --- 4. musl link flags ------------------------------------------------------
 # Env RUSTFLAGS replaces .cargo/config.toml's cfg rustflags wholesale, so a musl
 # build must restate both: link-self-contained=no (reuse the distro musl) and
-# the CPU baseline (kept in sync with FFMPEG_TARGET_CPU).
+# the CPU baseline. The baseline is restated only on x86_64, where the gcc
+# -march value (x86-64-v3) doubles as a valid rustc target-cpu; aarch64 -march
+# values like armv8-a are not rustc CPU names, and rustc's default `generic`
+# already is the armv8-a baseline.
 if [[ "$TARGET" == *musl* ]]; then
   triple_upper="$(echo "${TARGET//-/_}" | tr '[:lower:]' '[:upper:]')"
   musl_rustflags="-C link-self-contained=no"
-  [ -n "${FFMPEG_TARGET_CPU:-}" ] && musl_rustflags="$musl_rustflags -C target-cpu=$FFMPEG_TARGET_CPU"
+  if [[ -n "${FFMPEG_TARGET_CPU:-}" && "$TARGET" == x86_64* ]]; then
+    musl_rustflags="$musl_rustflags -C target-cpu=$FFMPEG_TARGET_CPU"
+  fi
   export "CARGO_TARGET_${triple_upper}_RUSTFLAGS=$musl_rustflags"
 fi
 

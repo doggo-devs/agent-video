@@ -32,14 +32,20 @@ const RECIPE_VERSION: u32 = 1;
 
 /// Cache identity of one analysis rip: the URL plus every knob that shapes
 /// the downloaded bytes (`download.analysis_max_height`, the recipe logic
-/// version). Same URL, different recipe ⇒ different cache entry, so a
-/// config change can never serve stale bytes as a hit.
+/// version, whether cookies are in play — a member-only stream and the
+/// anonymous fallback are different bytes). Same URL, different recipe ⇒
+/// different cache entry, so a config change can never serve stale bytes
+/// as a hit.
 ///
 /// Not the in-flight job key: the tracker dedupes by [`url_key`] alone —
 /// "a download for this URL is running" is URL identity, not byte identity.
 pub fn rip_key(url: &str, cfg: &Config) -> String {
+    let auth = match crate::cookies::mode(&cfg.cookies) {
+        crate::cookies::CookieMode::Anonymous => "",
+        _ => "-auth",
+    };
     format!(
-        "{}-h{}r{RECIPE_VERSION}",
+        "{}-h{}r{RECIPE_VERSION}{auth}",
         url_key(url),
         cfg.download.analysis_max_height
     )
@@ -78,6 +84,16 @@ pub struct SourceInfo {
 
 /// Byte-level progress callback; total is set when the server reveals it.
 pub type ProgressFn<'a> = &'a mut (dyn FnMut(u64, Option<u64>) + Send);
+
+/// A completed download: the final media path plus an optional degradation
+/// note. The note reports best-effort side work that failed without
+/// invalidating the media — e.g. subtitles that could not be fetched or
+/// converted — so the caller can inform the model instead of failing.
+#[derive(Debug, Clone)]
+pub struct Downloaded {
+    pub path: PathBuf,
+    pub warning: Option<String>,
+}
 
 /// Walk the source chain: a direct media link claims the URL first,
 /// anything it cannot open goes to yt-dlp.
@@ -124,7 +140,7 @@ pub enum DownloadIo<'a> {
 }
 
 /// Execute a redeemed download plan; dispatches on the recipe's source.
-/// Returns the final media path.
+/// Returns the final media path plus any degradation note.
 ///
 /// `url` is the caller's fresh vetting of `plan.url` — consent may be
 /// redeemed long after the probe that built the plan, so the egress check
@@ -135,7 +151,7 @@ pub fn download(
     io: DownloadIo<'_>,
     cfg: &Config,
     progress: ProgressFn<'_>,
-) -> Result<PathBuf, Fault> {
+) -> Result<Downloaded, Fault> {
     match &plan.recipe {
         Recipe::Direct(recipe) => direct::download(url, recipe, io, cfg, progress),
         Recipe::Ytdlp(recipe) => ytdlp::download(url, recipe, io, cfg, progress),
@@ -170,6 +186,21 @@ mod tests {
             before,
             rip_key(url, &cfg),
             "a different recipe must be a different cache entry"
+        );
+    }
+
+    #[test]
+    fn rip_key_changes_when_cookies_are_in_play() {
+        let dirs = test_dirs(Path::new("/home/u"));
+        let mut cfg = default_config(&dirs);
+        let url = "https://example.com/v";
+        let anonymous = rip_key(url, &cfg);
+
+        cfg.cookies.from_browser = Some("firefox".to_string());
+        assert_ne!(
+            anonymous,
+            rip_key(url, &cfg),
+            "an authenticated rip must never answer for an anonymous one"
         );
     }
 }

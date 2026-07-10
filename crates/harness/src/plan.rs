@@ -11,7 +11,7 @@ use super::look::preset_for;
 use super::raw::{RawSubcommand, parse_raw};
 use super::schema::{Look, ProbeSummary, RecommendedCall, Strategy, VideoArgs};
 use super::time::{ArgError, Window, resolve_window};
-use super::tokens::{DownloadPlan, Offer, PendingAction, Token, Tokens, TranscribePlan};
+use super::tokens::{DownloadPlan, Offer, PendingAction, Token, Tokens};
 use agent_video_core::types::format_ts;
 
 /// A fully-decided core run; the server injects source and I/O flags.
@@ -49,10 +49,6 @@ pub enum Decision {
         plan: DownloadPlan,
         notices: Vec<String>,
     },
-    Transcribe {
-        plan: TranscribePlan,
-        notices: Vec<String>,
-    },
     Plan(PlanDecision),
     /// Consent required: the offers carry both the model-facing token list
     /// and the actions to register — the caller commits them on render.
@@ -81,7 +77,7 @@ pub fn decide(args: &VideoArgs, probe: &ProbeSummary, cfg: &Config) -> Decision 
 /// Redeem a consent token: a lookup against the pending store, no probe
 /// needed (a URL source may not exist locally until its download runs).
 pub fn redeem(args: &VideoArgs, store: &Tokens) -> Decision {
-    if args.raw.is_some() || args.has_intent() {
+    if args.raw.is_some() || args.has_intent() || args.transcribe == Some(true) {
         return Decision::Reject {
             message: "confirm must be passed alone (with source): it authorizes exactly the \
                       pending plan, nothing else"
@@ -92,8 +88,9 @@ pub fn redeem(args: &VideoArgs, store: &Tokens) -> Decision {
     let Some(action) = store.take(&args.source, &token) else {
         return Decision::Reject {
             message: format!(
-                "token \"{token}\" is unknown or stale for this source. Tokens are single-use \
-                 and bound to the latest plan; call again without confirm to get a fresh one."
+                "token \"{token}\" is unknown or stale for this source. Tokens stay valid \
+                 until a newer plan replaces them; call again without confirm to see the \
+                 current plan and its tokens."
             ),
         };
     };
@@ -104,7 +101,6 @@ pub fn redeem(args: &VideoArgs, store: &Tokens) -> Decision {
             notices,
         },
         PendingAction::Download(plan) => Decision::Download { plan, notices },
-        PendingAction::Transcribe(plan) => Decision::Transcribe { plan, notices },
     }
 }
 

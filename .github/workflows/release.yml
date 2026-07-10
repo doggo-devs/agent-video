@@ -19,32 +19,29 @@ jobs:
       fail-fast: false
       matrix:
         # `npm_platform` marks the variant that feeds the @agent-video/<platform>
-        # npm package: static on Linux (self-contained is the point of npm
-        # installs), dynamic elsewhere. Release tarballs ship every variant —
-        # dynamic without a suffix, static with `-static`.
+        # npm package: fully-static musl on Linux (self-contained is the point
+        # of npm installs, and musl removes any glibc floor), dynamic elsewhere.
+        # Release tarballs ship every variant — dynamic without a suffix,
+        # static with `-static`.
         include:
           # --- Linux x86_64 -----------------------------------------------
-          # dynamic: links the system FFmpeg; runs on hosts with a matching
-          # FFmpeg major installed (the trixie build env determines the soname).
+          # dynamic: the GPU-capable variant — system FFmpeg (hwaccel decode)
+          # + Vulkan whisper with a runtime device probe. Runs on hosts with
+          # a matching FFmpeg major installed (the trixie build env
+          # determines the soname).
           - os: ubuntu-latest
             container: rust:1-trixie
             target: x86_64-unknown-linux-gnu
             variant: dynamic
-          # static: self-contained, software AV1 via bundled dav1d, no hwaccel.
-          - os: ubuntu-latest
-            container: rust:1-trixie
-            target: x86_64-unknown-linux-gnu
-            variant: static
-            ffmpeg_cpu: x86-64-v3
-            npm_platform: linux-x64
-          # fully-static musl: FFmpeg + dav1d + libc all linked in,
-          # a single file with no dynamic dependencies. Distributed as an extra
-          # tarball variant; the gnu static build stays the npm default.
+          # fully-static musl: FFmpeg + dav1d + libc all linked in — a single
+          # file with no dynamic dependencies, loadable on any Linux.
+          # Software AV1 via bundled dav1d, no hwaccel.
           - os: ubuntu-latest
             container: rust:1-trixie
             target: x86_64-unknown-linux-musl
             variant: static
             ffmpeg_cpu: x86-64-v3
+            npm_platform: linux-x64
 
           # --- Linux aarch64 (native arm runner, no cross-compile) --------
           - os: ubuntu-24.04-arm
@@ -53,26 +50,24 @@ jobs:
             variant: dynamic
           - os: ubuntu-24.04-arm
             container: rust:1-trixie
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             variant: static
             ffmpeg_cpu: armv8-a
             npm_platform: linux-arm64
 
-          # --- macOS x86_64 (dynamic; requires `brew install ffmpeg`) ------
-          - os: macos-15-intel
-            container: ""
-            target: x86_64-apple-darwin
-            variant: dynamic
-            npm_platform: darwin-x64
-
-          # --- macOS aarch64 (dynamic; requires `brew install ffmpeg`) -----
+          # --- macOS aarch64 (dynamic; requires `brew install ffmpeg`).
+          # Metal whisper is compiled in: the framework is ambient on Apple
+          # Silicon, so local transcription costs no portability. -----------
           - os: macos-latest
             container: ""
             target: aarch64-apple-darwin
             variant: dynamic
             npm_platform: darwin-arm64
 
-          # --- Windows x86_64 (dynamic; FFmpeg DLLs bundled) ---------------
+          # --- Windows x86_64 (dynamic; FFmpeg DLLs bundled). Vulkan
+          # whisper is compiled in with the loader (vulkan-1.dll) bundled
+          # beside the exe, so the binary starts on driverless hosts and
+          # the runtime probe decides. -------------------------------------
           - os: windows-latest
             container: ""
             target: x86_64-pc-windows-msvc
@@ -102,12 +97,16 @@ jobs:
         run: |
           apt-get install -y --no-install-recommends musl-tools
           rustup target add ${{ matrix.target }}
-      - name: Install FFmpeg dev libs (Linux, dynamic)
+      # Dynamic Linux builds also compile whisper-vulkan: cmake + Vulkan
+      # headers + glslc for the whisper.cpp build; libvulkan1 provides the
+      # loader that gets bundled into the tarball at package time.
+      - name: Install build deps (Linux, dynamic)
         if: runner.os == 'Linux' && matrix.variant == 'dynamic'
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev pkg-config
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev pkg-config \
+            cmake libvulkan-dev glslc libvulkan1
       - name: Install FFmpeg (macOS)
         if: runner.os == 'macOS'
         run: brew install ffmpeg pkg-config
@@ -116,6 +115,17 @@ jobs:
         run: |
           vcpkg install ffmpeg[avcodec,avformat,avutil,swscale]:x64-windows
           "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+      # LunarG SDK: headers + glslc for the whisper.cpp Vulkan build, and the
+      # redistributable loader that gets bundled at package time.
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        env:
+          VULKAN_VERSION: 1.4.313.2
+        run: |
+          curl.exe -o "$env:RUNNER_TEMP\vulkan-sdk.exe" -L `
+            "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          & "$env:RUNNER_TEMP\vulkan-sdk.exe" --accept-licenses --default-answer --confirm-command install
+          "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION" >> $env:GITHUB_ENV
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -131,12 +141,27 @@ jobs:
           FFMPEG_TARGET_CPU: ${{ matrix.ffmpeg_cpu }}
           TARGET: ${{ contains(matrix.target, 'musl') && matrix.target || '' }}
         run: ./scripts/build-static.sh
-      - name: Build (dynamic)
-        if: matrix.variant == 'dynamic'
-        run: cargo build --release
+      # Dynamic Linux is the GPU-capable variant. The $ORIGIN rpath lets the
+      # tarball carry libvulkan.so.1 next to the binary, so it starts even on
+      # hosts without a loader — the runtime probe, not the dynamic linker,
+      # decides whether the GPU path is taken.
+      - name: Build (dynamic, Linux)
+        if: matrix.variant == 'dynamic' && runner.os == 'Linux'
+        env:
+          # Env RUSTFLAGS replaces .cargo/config.toml's cfg rustflags, so the
+          # x86-64-v3 baseline must be restated alongside the rpath.
+          RUSTFLAGS: -C link-arg=-Wl,-rpath,$ORIGIN${{ contains(matrix.target, 'x86_64') && ' -C target-cpu=x86-64-v3' || '' }}
+        run: cargo build --release --features whisper-vulkan
+      - name: Build (dynamic, macOS)
+        if: matrix.variant == 'dynamic' && runner.os == 'macOS'
+        run: cargo build --release --features whisper-metal
+      - name: Build (dynamic, Windows)
+        if: matrix.variant == 'dynamic' && runner.os == 'Windows'
+        run: cargo build --release --features whisper-vulkan
 
-      # Resolve the release output dir: gnu static + dynamic land in
-      # target/release; a cross-built musl target lands in target/<triple>/release.
+      # Resolve the release output dir: native (dynamic gnu) builds land in
+      # target/release; a musl build passes --target and lands in
+      # target/<triple>/release.
       - name: Resolve output dir
         if: runner.os != 'Windows'
         shell: bash
@@ -153,15 +178,27 @@ jobs:
         run: |
           suffix=""
           [ "${{ matrix.variant }}" = "static" ] && suffix="-static"
+          files="agent-video"
+          # The Linux GPU variant ships the Vulkan loader beside the binary
+          # (found via its $ORIGIN rpath): the tarball must start — probe,
+          # then fall back to the API route — on loaderless hosts too.
+          if [ "${{ runner.os }}" = "Linux" ] && [ "${{ matrix.variant }}" = "dynamic" ]; then
+            cp /usr/lib/*/libvulkan.so.1 "$OUT_DIR/"
+            files="$files libvulkan.so.1"
+          fi
           tar -C "$OUT_DIR" -czf \
-            "agent-video-${GITHUB_REF_NAME}-${{ matrix.target }}${suffix}.tar.gz" agent-video
-      - name: Package (windows, bundle FFmpeg DLLs)
+            "agent-video-${GITHUB_REF_NAME}-${{ matrix.target }}${suffix}.tar.gz" $files
+      - name: Package (windows, bundle FFmpeg DLLs + Vulkan loader)
         if: runner.os == 'Windows'
         run: |
           $stage = "stage/agent-video"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item target/release/agent-video.exe $stage
           Copy-Item "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\*.dll" $stage
+          # The exe dir is first in the DLL search order — the loader ships
+          # there so the binary starts on hosts without GPU drivers, leaving
+          # the local-vs-API decision to the runtime probe.
+          Copy-Item "$env:VULKAN_SDK\runtime\x64\vulkan-1.dll" $stage
           Compress-Archive -Path "$stage/*" `
             -DestinationPath "agent-video-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
 
@@ -172,7 +209,7 @@ jobs:
         if: matrix.npm_platform != '' && runner.os != 'Windows'
         with:
           name: bin-${{ matrix.npm_platform }}
-          path: target/release/agent-video
+          path: ${{ env.OUT_DIR }}/agent-video
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: matrix.npm_platform != '' && runner.os == 'Windows'
@@ -218,7 +255,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          for platform in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+          for platform in linux-x64 linux-arm64 darwin-arm64 win32-x64; do
             node scripts/npm-platform.mjs "$platform" "$version" \
               "artifacts/bin-$platform" "dist/$platform"
             npm publish "dist/$platform" --provenance --access public
@@ -234,7 +271,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          for platform in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+          for platform in linux-x64 linux-arm64 darwin-arm64 win32-x64; do
             npm pkg set "optionalDependencies.@agent-video/$platform=$version"
           done
           npm publish --provenance --access public

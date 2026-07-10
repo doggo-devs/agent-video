@@ -105,6 +105,15 @@ impl ServerHandler for VideoServer {
 /// Boot the stdio MCP server with production deps; blocks until the client
 /// disconnects. Owns the process's only tokio runtime.
 pub fn serve_stdio() -> anyhow::Result<()> {
+    // stderr is safe: MCP transport is on stdin/stdout.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("agent_video_harness=info")),
+        )
+        .init();
+
     let dirs = BaseDirs::detect();
     let config = load_config(&dirs)?;
     let deps = Arc::new(ServerDeps::production(config));
@@ -112,6 +121,7 @@ pub fn serve_stdio() -> anyhow::Result<()> {
     let _ = deps.cache.evict(SystemTime::now());
     // Route whisper.cpp/ggml logs into `log` (silent without a logger)
     // instead of stderr, keeping transcription quiet on the transport.
+    #[cfg(feature = "whisper-local")]
     whisper_rs::install_logging_hooks();
 
     let runtime = tokio::runtime::Runtime::new()?;

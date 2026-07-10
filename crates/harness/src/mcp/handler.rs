@@ -14,21 +14,23 @@ use std::time::{Duration, SystemTime};
 use rmcp::model::CallToolResult;
 
 use super::deps::{Notifier, ServerDeps};
-use super::tracker::Poll;
+use super::tracker::{Admission, Poll};
 use super::wire::{
     CoreMetadata, coerce_args, failed, is_url, json_result, pending_result, ready_result,
 };
 use crate::cache::url_key;
 use crate::fault::{Fault, FaultKind};
-use crate::fetch::{DownloadIo, ProgressFn, rip_key};
+use crate::fetch::{DownloadIo, Downloaded, ProgressFn, rip_key};
 use crate::identity::{ContentId, fingerprint_file};
 use crate::plan::{
     CoreInvocation, Decision, PlanDecision, decide, format_bytes, plan_response, redeem, size_label,
 };
 use crate::schema::OfferedToken;
 use crate::schema::{ProbeSummary, RecommendedCall, VideoArgs, VideoBody};
-use crate::tokens::{Dest, DownloadPlan, PendingAction, Token, TranscribePlan};
+use crate::tokens::{Dest, DownloadPlan};
+use crate::transcribe;
 use crate::url_policy::decide_url;
+use agent_video_core::types::format_ts;
 
 // ── probe with cache ──
 
@@ -88,7 +90,7 @@ fn cached_probe(file: &Path, deps: &ServerDeps) -> Result<(ProbeSummary, Content
     };
     if deps
         .cache
-        .find_transcript(&fp.id, &deps.config.whisper.model.cache_id())
+        .find_transcript(&fp.id, &transcribe::transcript_id(&deps.config))
         .is_some()
     {
         probe.subtitles.push("transcript (whisper)".to_string());
@@ -135,6 +137,12 @@ pub fn handle_video_call(
         return render_decision(&args, decision, None, Vec::new(), deps, notify);
     }
 
+    // Transcription is an explicit request, not a consent dance: the
+    // argument itself is the intent.
+    if args.transcribe == Some(true) {
+        return transcribe_flow(&args, deps, notify);
+    }
+
     if is_url(&args.source) {
         return match deps
             .cache
@@ -162,13 +170,13 @@ fn local_flow(
     deps: &Arc<ServerDeps>,
     notify: &Notifier,
 ) -> CallToolResult {
-    let (probe, fingerprint) = match cached_probe(media_path, deps) {
+    let (probe, _) = match cached_probe(media_path, deps) {
         Ok(v) => v,
         Err(e) => return failed(&e),
     };
     let mut decision = decide(args, &probe, &deps.config);
     if let Decision::Plan(plan) = &mut decision {
-        offer_transcription(&args.source, media_path, &fingerprint, plan, deps);
+        offer_transcription(&args.source, plan, deps);
     }
     render_decision(
         args,
@@ -180,39 +188,26 @@ fn local_flow(
     )
 }
 
-/// Subtitle-less plans grow a transcribe offer (or an install hint).
-fn offer_transcription(
-    source: &str,
-    media_path: &Path,
-    fingerprint: &ContentId,
-    plan: &mut PlanDecision,
-    deps: &ServerDeps,
-) {
+/// Subtitle-less plans grow a transcribe recommendation (or an install hint).
+fn offer_transcription(source: &str, plan: &mut PlanDecision, deps: &ServerDeps) {
     if !plan.probe.subtitles.is_empty() {
         return;
     }
     if deps.whisper.available(&deps.config) {
-        deps.tokens.offer_one(
-            source,
-            Token::new("transcribe"),
-            PendingAction::Transcribe(TranscribePlan {
-                file: media_path.to_path_buf(),
-                fingerprint: fingerprint.clone(),
-            }),
-        );
         plan.recommended_calls.push(RecommendedCall {
             call: VideoArgs {
-                confirm: Some("transcribe".to_string()),
+                transcribe: Some(true),
                 ..VideoArgs::bare(source)
             },
-            note: "no subtitles found — generate a whisper transcript locally (CPU-bound, can \
-                   take minutes); it then rides along with every grid"
+            note: "no subtitles found — generate a whisper transcript; it then rides \
+                   along with every grid"
                 .to_string(),
         });
     } else {
         plan.guidance.push_str(
-            " No subtitles found and no whisper model installed — run `agent-video \
-             install-whisper` to enable transcription.",
+            " No subtitles found and no whisper transcription available — set \
+             WHISPER_API_KEY for API transcription, or compile with a GPU feature and run \
+             `agent-video install-whisper` for local inference.",
         );
     }
 }
@@ -284,7 +279,6 @@ fn render_decision(
             run_invocation(&resolved, &invocation, &all, deps)
         }
         Decision::Download { plan, .. } => execute_download(&args.source, plan, deps, notify),
-        Decision::Transcribe { plan, .. } => execute_transcribe(&args.source, &plan, deps, notify),
     }
 }
 
@@ -299,22 +293,17 @@ fn resolve_media(source: &str, deps: &ServerDeps) -> Option<PathBuf> {
 
 // ── core invocation ──
 
-/// `-o` is mandatory in the core CLI but never touched in `--json` mode.
-fn unused_out_dir() -> PathBuf {
-    std::env::temp_dir().join("agent-video-json-unused")
-}
-
 fn run_invocation(
     media_path: &Path,
     invocation: &CoreInvocation,
     notices: &[String],
     deps: &ServerDeps,
 ) -> CallToolResult {
+    // `--json` (pushed below) selects the stdout sink; no `-o` exists in
+    // that mode.
     let mut args: Vec<String> = vec![
         invocation.subcommand.as_str().to_string(),
         media_path.to_string_lossy().into_owned(),
-        "--output".to_string(),
-        unused_out_dir().to_string_lossy().into_owned(),
     ];
     if let Some((start, end)) = invocation.window {
         args.extend([
@@ -328,7 +317,7 @@ fn run_invocation(
     let subtitle = invocation.subtitle.clone().or_else(|| {
         let fp = fingerprint_file(media_path).ok()?;
         deps.cache
-            .find_transcript(&fp.id, &deps.config.whisper.model.cache_id())
+            .find_transcript(&fp.id, &transcribe::transcript_id(&deps.config))
     });
     if let Some(subtitle) = subtitle {
         args.extend([
@@ -385,36 +374,80 @@ fn core_exit_kind(exit: super::core_run::CoreExit) -> FaultKind {
 
 // ── transcription execution ──
 
-/// Run whisper against local media; answer with the refreshed plan.
-fn execute_transcribe(
-    source: &str,
-    plan: &TranscribePlan,
-    deps: &Arc<ServerDeps>,
-    notify: &Notifier,
-) -> CallToolResult {
-    let out = deps
-        .cache
-        .transcript_path(&plan.fingerprint, &deps.config.whisper.model.cache_id());
-    let mut step = 0.0f64;
-    let notify = Arc::clone(notify);
-    let result = deps
-        .whisper
-        .transcribe(&deps.config, &plan.file, &out, &mut |message| {
-            step += 1.0;
-            notify(step, None, message.to_string());
-        });
-    if let Err(e) = result {
-        return failed(&e);
+/// The `transcribe: true` flow: resolve local media, reuse a cached
+/// transcript, else run whisper; answer with the refreshed plan.
+fn transcribe_flow(args: &VideoArgs, deps: &Arc<ServerDeps>, notify: &Notifier) -> CallToolResult {
+    if args.raw.is_some() || args.has_intent() {
+        return failed(&Fault::bad_input(
+            "transcribe must be passed alone (with source); once the transcript exists it \
+             rides along with every grid call automatically",
+        ));
     }
-    let (probe, _) = match cached_probe(&plan.file, deps) {
+    let Some(media) = resolve_media(&args.source, deps) else {
+        return failed(&Fault::bad_input(
+            "transcription needs local media, and this URL has no cached rip. Call with just \
+             the URL first, confirm a download, then repeat with transcribe.",
+        ));
+    };
+    if !deps.whisper.available(&deps.config) {
+        return failed(&Fault::environment(
+            "no whisper transcription available — set WHISPER_API_KEY for API transcription, \
+             or compile with a GPU feature and run `agent-video install-whisper` for local \
+             inference",
+        ));
+    }
+    let fingerprint = match fingerprint_file(&media) {
+        Ok(fp) => fp.id,
+        Err(e) => {
+            return failed(&Fault::bad_input(format!(
+                "cannot read {}: {e}",
+                media.display()
+            )));
+        }
+    };
+    let transcript_id = transcribe::transcript_id(&deps.config);
+    let mut decoded_seconds: Option<f64> = None;
+    if deps
+        .cache
+        .find_transcript(&fingerprint, &transcript_id)
+        .is_none()
+    {
+        let out = deps.cache.transcript_path(&fingerprint, &transcript_id);
+        let mut step = 0.0f64;
+        let notify = Arc::clone(notify);
+        let result = deps
+            .whisper
+            .transcribe(&deps.config, &media, &out, &mut |message| {
+                step += 1.0;
+                notify(step, None, message.to_string());
+            });
+        match result {
+            Ok(outcome) => decoded_seconds = Some(outcome.audio_seconds),
+            Err(e) => return failed(&e),
+        }
+    }
+    let (probe, _) = match cached_probe(&media, deps) {
         Ok(v) => v,
         Err(e) => return failed(&e),
     };
-    let next = plan_response(source, &probe, &deps.config);
+    // Honesty over silence: a transcript that stops mid-video says so.
+    let truncation_note = decoded_seconds
+        .filter(|&a| crate::probe::materially_truncated(a, probe.duration))
+        .map(|a| {
+            format!(
+                "Warning: only {} of audio decoded for a {} video — the transcript stops \
+                 there; the source's audio track is likely truncated or corrupt. ",
+                format_ts(a as f32),
+                format_ts(probe.duration as f32)
+            )
+        })
+        .unwrap_or_default();
+    let next = plan_response(&args.source, &probe, &deps.config);
     json_result(&VideoBody::Plan {
         probe: next.probe,
         guidance: format!(
-            "Transcript generated and cached — it rides along with every grid from now on. {}",
+            "{truncation_note}Transcript ready and cached — it rides along with every grid \
+             from now on. {}",
             next.guidance
         ),
         recommended_calls: next.recommended_calls,
@@ -437,8 +470,22 @@ fn execute_download(
     deps: &Arc<ServerDeps>,
     notify: &Notifier,
 ) -> CallToolResult {
+    // Idempotent redemption: a re-confirmed analysis download serves the
+    // rip that already landed instead of fetching it again.
+    if plan.dest == Dest::Cache
+        && let Some(cached) = deps.cache.find_download(&rip_key(&plan.url, &deps.config))
+    {
+        return analysis_response(source, &cached, None, deps);
+    }
     let key = url_key(source);
-    let reporter = deps.downloads.start(&key);
+    // Claim the slot atomically: a concurrent confirm for the same URL
+    // must observe this job instead of spawning a second downloader into
+    // the same cache entry.
+    let reporter = match deps.downloads.admit(&key, DOWNLOAD_ABANDON_LIMIT) {
+        Admission::Started(reporter) => reporter,
+        Admission::Running { downloaded, total } => return pending_result(downloaded, total),
+        Admission::Settled(result) => return result,
+    };
     let (tx, rx) = std::sync::mpsc::channel::<CallToolResult>();
     {
         let deps = Arc::clone(deps);
@@ -480,73 +527,148 @@ fn execute_download(
     }
 }
 
-/// The blocking download flow: fetch, respond, sweep; known errors become
-/// `Failed`.
+/// The blocking download flow: fetch, verify coverage, respond, sweep;
+/// known errors become `Failed`.
 fn perform_download(
     source: &str,
     plan: &DownloadPlan,
     deps: &Arc<ServerDeps>,
     progress: ProgressFn<'_>,
 ) -> CallToolResult {
-    let downloaded = match plan.dest {
-        Dest::Cache => deps
-            .cache
-            .ensure_downloads_dir()
-            .map_err(|e| Fault::environment(format!("cannot create the downloads directory: {e}")))
-            .and_then(|dir| {
-                let key = rip_key(&plan.url, &deps.config);
-                deps.fetcher.download(
-                    plan,
-                    DownloadIo::Cache { dir, key: &key },
-                    &deps.config,
-                    progress,
-                )
-            }),
-        Dest::Keep => std::fs::create_dir_all(&deps.config.paths.keep)
-            .map_err(|e| {
-                Fault::environment(format!(
-                    "cannot create {}: {e}",
-                    deps.config.paths.keep.display()
-                ))
-            })
-            .and_then(|()| {
-                deps.fetcher.download(
-                    plan,
-                    DownloadIo::Keep {
-                        dir: &deps.config.paths.keep,
-                    },
-                    &deps.config,
-                    progress,
-                )
-            }),
+    let fetch = |progress: ProgressFn<'_>| -> Result<Downloaded, Fault> {
+        match plan.dest {
+            Dest::Cache => deps
+                .cache
+                .ensure_downloads_dir()
+                .map_err(|e| {
+                    Fault::environment(format!("cannot create the downloads directory: {e}"))
+                })
+                .and_then(|dir| {
+                    let key = rip_key(&plan.url, &deps.config);
+                    deps.fetcher.download(
+                        plan,
+                        DownloadIo::Cache { dir, key: &key },
+                        &deps.config,
+                        progress,
+                    )
+                }),
+            Dest::Keep => std::fs::create_dir_all(&deps.config.paths.keep)
+                .map_err(|e| {
+                    Fault::environment(format!(
+                        "cannot create {}: {e}",
+                        deps.config.paths.keep.display()
+                    ))
+                })
+                .and_then(|()| {
+                    deps.fetcher.download(
+                        plan,
+                        DownloadIo::Keep {
+                            dir: &deps.config.paths.keep,
+                        },
+                        &deps.config,
+                        progress,
+                    )
+                }),
+        }
     };
-    let filepath = match downloaded {
-        Ok(p) => p,
+    let Downloaded {
+        mut path,
+        mut warning,
+    } = match fetch(&mut *progress) {
+        Ok(d) => d,
         Err(e) => return failed(&e),
     };
+    // A container whose tracks stop early was served truncated (an expired
+    // CDN session, a flaky segment fetch). Caching it would pin the URL to
+    // a silently broken rip, so verify before answering.
+    if let Some(issue) = crate::probe::coverage_shortfall(&path) {
+        match plan.dest {
+            // One fresh attempt: a new fetch gets a new CDN session, which
+            // heals most truncations. The retry adopts over the same cache
+            // names, so a failed retry keeps the first copy.
+            Dest::Cache => match fetch(&mut *progress) {
+                Ok(retried) => match crate::probe::coverage_shortfall(&retried.path) {
+                    None => {
+                        path = retried.path;
+                        warning = retried.warning;
+                    }
+                    Some(issue) => {
+                        path = retried.path;
+                        warning = join_warning(
+                            retried.warning,
+                            format!(
+                                "{issue} even after a fresh retry — the source itself serves \
+                                 a truncated stream; grids and transcription stop where the \
+                                 tracks end"
+                            ),
+                        );
+                    }
+                },
+                Err(_) => {
+                    warning = join_warning(
+                        warning,
+                        format!(
+                            "{issue}, and a fresh retry failed — keeping this copy; grids \
+                             and transcription stop where the tracks end"
+                        ),
+                    );
+                }
+            },
+            // Keep files belong to the user: report, never second-guess.
+            Dest::Keep => {
+                warning = join_warning(
+                    warning,
+                    format!("{issue} — the source may have served a truncated stream"),
+                );
+            }
+        }
+    }
     // Sweep before building the response, which describes files on disk. The
     // rip that just landed survives via the eviction grace window.
     let _ = deps.cache.evict(SystemTime::now());
     match plan.dest {
-        Dest::Cache => analysis_response(source, &filepath, deps),
-        Dest::Keep => keep_response(&filepath, deps),
+        Dest::Cache => analysis_response(source, &path, warning.as_deref(), deps),
+        Dest::Keep => keep_response(&path, warning.as_deref(), deps),
     }
 }
 
+/// Append a degradation note to an optional existing warning.
+fn join_warning(existing: Option<String>, note: String) -> Option<String> {
+    Some(match existing {
+        Some(w) => format!("{w}; {note}"),
+        None => note,
+    })
+}
+
+/// Prefix for a degraded-but-successful download: the note leads the
+/// guidance so the model sees what is missing (and why) before the next
+/// steps, instead of retrying a download that already succeeded.
+fn warning_prefix(warning: Option<&str>) -> String {
+    warning
+        .map(|w| format!("Warning: {w}\n"))
+        .unwrap_or_default()
+}
+
 /// Analysis rip landed in the evictable cache; answer with the next plan.
-fn analysis_response(source: &str, filepath: &Path, deps: &Arc<ServerDeps>) -> CallToolResult {
-    let (probe, fingerprint) = match cached_probe(filepath, deps) {
+fn analysis_response(
+    source: &str,
+    filepath: &Path,
+    warning: Option<&str>,
+    deps: &Arc<ServerDeps>,
+) -> CallToolResult {
+    let (probe, _) = match cached_probe(filepath, deps) {
         Ok(v) => v,
         Err(e) => return failed(&e),
     };
     let mut next = plan_response(source, &probe, &deps.config);
     next.guidance = format!(
-        "Analysis rip downloaded ({}, cached, evictable). The URL now resolves to it \
+        "{}Analysis rip downloaded ({}, cached, evictable). The URL now resolves to it \
          automatically. {}",
+        warning_prefix(warning),
         size_label(probe.size_bytes),
         next.guidance
     );
-    offer_transcription(source, filepath, &fingerprint, &mut next, deps);
+    offer_transcription(source, &mut next, deps);
     json_result(&VideoBody::Plan {
         probe: next.probe,
         guidance: next.guidance,
@@ -555,7 +677,7 @@ fn analysis_response(source: &str, filepath: &Path, deps: &Arc<ServerDeps>) -> C
 }
 
 /// Full-quality download landed in the keep dir; the file belongs to the user.
-fn keep_response(filepath: &Path, deps: &Arc<ServerDeps>) -> CallToolResult {
+fn keep_response(filepath: &Path, warning: Option<&str>, deps: &Arc<ServerDeps>) -> CallToolResult {
     let (probe, _) = match cached_probe(filepath, deps) {
         Ok(v) => v,
         Err(e) => return failed(&e),
@@ -563,10 +685,11 @@ fn keep_response(filepath: &Path, deps: &Arc<ServerDeps>) -> CallToolResult {
     let size = size_label(probe.size_bytes);
     json_result(&VideoBody::Plan {
         guidance: format!(
-            "Saved to {} ({size}). This file belongs to the user: hand the path over if they \
+            "{}Saved to {} ({size}). This file belongs to the user: hand the path over if they \
              want to watch it, and they may move or rename it freely. To analyze it, call \
              again with the (possibly moved) path as source — probe results are keyed by \
              content, so a move stays a cache hit.",
+            warning_prefix(warning),
             filepath.display()
         ),
         probe,
@@ -581,11 +704,11 @@ fn keep_response(filepath: &Path, deps: &Arc<ServerDeps>) -> CallToolResult {
 mod tests {
     use super::*;
     use crate::config::{Config, default_config, test_dirs};
-    use crate::fetch::{DownloadOption, Recipe, SourceInfo, direct::DirectRecipe};
+    use crate::fetch::{DownloadOption, Downloaded, Recipe, SourceInfo, direct::DirectRecipe};
     use crate::mcp::core_run::{CoreRun, CoreRunner};
     use crate::mcp::deps::{FileProber, UrlFetcher, Whisper, null_notifier};
     use crate::mcp::tracker::Tracker;
-    use crate::tokens::Tokens;
+    use crate::tokens::{Token, Tokens};
     use rmcp::model::ContentBlock;
     use std::io::Write as _;
     use std::sync::Mutex;
@@ -624,9 +747,44 @@ mod tests {
         }
     }
 
+    impl<T: UrlFetcher> UrlFetcher for Arc<T> {
+        fn probe_url(&self, url: &str, cfg: &Config) -> Result<SourceInfo, Fault> {
+            (**self).probe_url(url, cfg)
+        }
+
+        fn download(
+            &self,
+            plan: &DownloadPlan,
+            io: DownloadIo<'_>,
+            cfg: &Config,
+            progress: ProgressFn<'_>,
+        ) -> Result<Downloaded, Fault> {
+            (**self).download(plan, io, cfg, progress)
+        }
+    }
+
+    impl<T: Whisper> Whisper for Arc<T> {
+        fn available(&self, cfg: &Config) -> bool {
+            (**self).available(cfg)
+        }
+
+        fn transcribe(
+            &self,
+            cfg: &Config,
+            file: &Path,
+            out_srt: &Path,
+            on_step: &mut dyn FnMut(&str),
+        ) -> Result<crate::transcribe::Transcribed, Fault> {
+            (**self).transcribe(cfg, file, out_srt, on_step)
+        }
+    }
+
     struct FakeWhisper {
         available: bool,
         calls: Mutex<u32>,
+        /// Decoded-audio seconds the fake reports; `INFINITY` = "covers
+        /// everything", so only truncation tests set a finite value.
+        audio_seconds: Mutex<f64>,
     }
 
     impl Whisper for FakeWhisper {
@@ -640,12 +798,14 @@ mod tests {
             _file: &Path,
             out_srt: &Path,
             on_step: &mut dyn FnMut(&str),
-        ) -> Result<(), Fault> {
+        ) -> Result<crate::transcribe::Transcribed, Fault> {
             *self.calls.lock().expect("calls") += 1;
             on_step("transcribing");
             std::fs::create_dir_all(out_srt.parent().expect("parent")).expect("transcripts dir");
             std::fs::write(out_srt, "1\n00:00:00,000 --> 00:00:01,000\nhi\n\n").expect("write srt");
-            Ok(())
+            Ok(crate::transcribe::Transcribed {
+                audio_seconds: *self.audio_seconds.lock().expect("audio_seconds"),
+            })
         }
     }
 
@@ -654,6 +814,8 @@ mod tests {
     struct FakeFetcher {
         info: SourceInfo,
         gate: Option<Mutex<Receiver<()>>>,
+        warning: Option<String>,
+        downloads: Mutex<u32>,
     }
 
     impl UrlFetcher for FakeFetcher {
@@ -667,7 +829,8 @@ mod tests {
             io: DownloadIo<'_>,
             _cfg: &Config,
             progress: ProgressFn<'_>,
-        ) -> Result<PathBuf, Fault> {
+        ) -> Result<Downloaded, Fault> {
+            *self.downloads.lock().expect("downloads") += 1;
             if let Some(gate) = &self.gate {
                 progress(1024, Some(4096));
                 gate.lock()
@@ -682,7 +845,10 @@ mod tests {
             let mut f = std::fs::File::create(&dest).expect("create download");
             f.write_all(b"fake video bytes").expect("write");
             progress(16, Some(16));
-            Ok(dest)
+            Ok(Downloaded {
+                path: dest,
+                warning: self.warning.clone(),
+            })
         }
     }
 
@@ -735,6 +901,8 @@ mod tests {
         deps: Arc<ServerDeps>,
         dir: PathBuf,
         core: Arc<FakeCore>,
+        fetcher: Arc<FakeFetcher>,
+        whisper: Arc<FakeWhisper>,
     }
 
     fn env(probe_summary: ProbeSummary, whisper_available: bool) -> TestEnv {
@@ -747,6 +915,8 @@ mod tests {
                     options: vec![analysis_option()],
                 },
                 gate: None,
+                warning: None,
+                downloads: Mutex::new(0),
             },
         )
     }
@@ -773,20 +943,29 @@ mod tests {
             stdout: core_json(),
             calls: Mutex::new(Vec::new()),
         });
+        let fetcher = Arc::new(fetcher);
+        let whisper = Arc::new(FakeWhisper {
+            available: whisper_available,
+            calls: Mutex::new(0),
+            audio_seconds: Mutex::new(f64::INFINITY),
+        });
         let deps = Arc::new(ServerDeps {
             cache,
             tokens: Tokens::default(),
             downloads: Tracker::default(),
             prober: Box::new(FakeProber(probe_summary)),
-            fetcher: Box::new(fetcher),
-            whisper: Box::new(FakeWhisper {
-                available: whisper_available,
-                calls: Mutex::new(0),
-            }),
+            fetcher: Box::new(Arc::clone(&fetcher)),
+            whisper: Box::new(Arc::clone(&whisper)),
             core: Box::new(Arc::clone(&core)),
             config,
         });
-        TestEnv { deps, dir, core }
+        TestEnv {
+            deps,
+            dir,
+            core,
+            fetcher,
+            whisper,
+        }
     }
 
     fn analysis_option() -> DownloadOption {
@@ -851,7 +1030,11 @@ mod tests {
         assert!(parse_probe_doc(&bare).is_none(), "unversioned doc misses");
 
         let doc = render_probe_doc(&probe(90.0, vec![])).expect("renders");
-        let future = doc.replacen("\"v\":1", "\"v\":2", 1);
+        let future = doc.replacen(
+            &format!("\"v\":{PROBE_DOC_VERSION}"),
+            &format!("\"v\":{}", PROBE_DOC_VERSION + 1),
+            1,
+        );
         assert_ne!(doc, future, "version tag must be present to rewrite");
         assert!(parse_probe_doc(&future).is_none(), "future version misses");
     }
@@ -926,7 +1109,7 @@ mod tests {
             .as_array()
             .expect("recommended calls");
         assert!(
-            calls.iter().any(|c| c["call"]["confirm"] == "transcribe"),
+            calls.iter().any(|c| c["call"]["transcribe"] == true),
             "{body}"
         );
     }
@@ -946,24 +1129,21 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_transcribe_runs_whisper_and_rides_along() {
+    fn transcribe_arg_runs_whisper_and_rides_along() {
         let env = env(probe(3600.0, vec![]), true);
         let file = media_file(&env, "talk.mp4");
         let source = file.to_string_lossy().into_owned();
 
-        let plan = body_of(&call(&env, serde_json::json!({"source": source})));
-        assert_eq!(plan["status"], "plan");
-
         let after = body_of(&call(
             &env,
-            serde_json::json!({"source": source, "confirm": "transcribe"}),
+            serde_json::json!({"source": source, "transcribe": true}),
         ));
         assert_eq!(after["status"], "plan", "{after}");
         assert!(
             after["guidance"]
                 .as_str()
                 .expect("guidance")
-                .contains("Transcript generated"),
+                .contains("Transcript ready"),
             "{after}"
         );
         assert!(
@@ -986,6 +1166,164 @@ mod tests {
         assert!(
             last.iter().any(|a| a == "--subtitle"),
             "transcript must ride along: {last:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_transcribe_reuses_cached_transcript() {
+        let env = env(probe(3600.0, vec![]), true);
+        let file = media_file(&env, "talk.mp4");
+        let source = file.to_string_lossy().into_owned();
+
+        let first = body_of(&call(
+            &env,
+            serde_json::json!({"source": source, "transcribe": true}),
+        ));
+        assert_eq!(first["status"], "plan", "{first}");
+        let again = body_of(&call(
+            &env,
+            serde_json::json!({"source": source, "transcribe": true}),
+        ));
+        assert_eq!(again["status"], "plan", "{again}");
+        assert_eq!(
+            *env.whisper.calls.lock().expect("calls"),
+            1,
+            "second transcribe must hit the transcript cache"
+        );
+    }
+
+    #[test]
+    fn truncated_audio_warns_in_transcribe_guidance() {
+        let env = env(probe(437.0, vec![]), true);
+        *env.whisper.audio_seconds.lock().expect("audio_seconds") = 49.0;
+        let file = media_file(&env, "trunc.mp4");
+        let body = body_of(&call(
+            &env,
+            serde_json::json!({"source": file, "transcribe": true}),
+        ));
+        assert_eq!(body["status"], "plan", "{body}");
+        let guidance = body["guidance"].as_str().expect("guidance");
+        assert!(
+            guidance.starts_with("Warning: only 00:49"),
+            "truncation leads the guidance: {guidance}"
+        );
+        assert!(guidance.contains("Transcript ready"), "{guidance}");
+    }
+
+    #[test]
+    fn transcribe_with_intent_rejects() {
+        let env = env(probe(90.0, vec![]), true);
+        let file = media_file(&env, "v.mp4");
+        let r = call(
+            &env,
+            serde_json::json!({"source": file, "transcribe": true, "look": "overview"}),
+        );
+        let body = body_of(&r);
+        assert_eq!(body["kind"], "bad_input", "{body}");
+        assert!(
+            body["error"].as_str().expect("error").contains("alone"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn transcribe_without_whisper_reports_environment() {
+        let env = env(probe(90.0, vec![]), false);
+        let file = media_file(&env, "v.mp4");
+        let r = call(
+            &env,
+            serde_json::json!({"source": file, "transcribe": true}),
+        );
+        let body = body_of(&r);
+        assert_eq!(body["kind"], "environment", "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error")
+                .contains("install-whisper"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn transcribe_on_undownloaded_url_rejects() {
+        let env = env(probe(90.0, vec![]), true);
+        let r = call(
+            &env,
+            serde_json::json!({"source": "https://example.com/v.mp4", "transcribe": true}),
+        );
+        let body = body_of(&r);
+        assert_eq!(body["kind"], "bad_input", "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error")
+                .contains("confirm a download"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn reconfirmed_download_serves_cached_rip_without_refetch() {
+        let env = env(probe(90.0, vec![]), false);
+        let url = "https://example.com/v.mp4";
+
+        let offer = body_of(&call(&env, serde_json::json!({"source": url})));
+        assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let done = body_of(&call(
+            &env,
+            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+        ));
+        assert_eq!(done["status"], "plan", "{done}");
+
+        // The token survives redemption; echoing it again must not refetch.
+        let again = body_of(&call(
+            &env,
+            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+        ));
+        assert_eq!(again["status"], "plan", "{again}");
+        assert_eq!(
+            *env.fetcher.downloads.lock().expect("downloads"),
+            1,
+            "re-confirmation must serve the cached rip"
+        );
+    }
+
+    #[test]
+    fn surfaces_download_warning_before_guidance() {
+        // A degraded download (media landed, subtitles did not) must inform
+        // the model instead of failing or staying silent.
+        let env = env_with_fetcher(
+            probe(90.0, vec![]),
+            false,
+            FakeFetcher {
+                info: SourceInfo {
+                    headline: "A video.".to_string(),
+                    options: vec![analysis_option()],
+                },
+                gate: None,
+                warning: Some("subtitles could not be fetched (login required)".to_string()),
+                downloads: Mutex::new(0),
+            },
+        );
+        let url = "https://example.com/v.mp4";
+
+        let offer = body_of(&call(&env, serde_json::json!({"source": url})));
+        assert_eq!(offer["status"], "confirm_required", "{offer}");
+
+        let done = body_of(&call(
+            &env,
+            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+        ));
+        assert_eq!(done["status"], "plan", "{done}");
+        let guidance = done["guidance"].as_str().expect("guidance");
+        assert!(
+            guidance.starts_with("Warning: subtitles could not be fetched"),
+            "warning leads the guidance: {guidance}"
+        );
+        assert!(
+            guidance.contains("Analysis rip downloaded"),
+            "success text still follows: {guidance}"
         );
     }
 
@@ -1032,6 +1370,8 @@ mod tests {
                     options: vec![analysis_option()],
                 },
                 gate: Some(Mutex::new(gate)),
+                warning: None,
+                downloads: Mutex::new(0),
             },
         );
         // Shortest representable grace window keeps the test fast.
@@ -1086,6 +1426,8 @@ mod tests {
                     options: vec![analysis_option()],
                 },
                 gate: Some(Mutex::new(gate)),
+                warning: None,
+                downloads: Mutex::new(0),
             },
         );
         Arc::get_mut(&mut env.deps)

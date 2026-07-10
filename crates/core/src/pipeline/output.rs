@@ -14,7 +14,7 @@ use crate::subtitle::Subtitles;
 use crate::types::{GridImage, GridMeta};
 use crate::wire;
 
-use super::OutputMode;
+use super::OutputSink;
 
 /// Name of the staging directory inside the output directory. Starts with a
 /// dot so [`is_own_artifact`]'s tmp-prefix rule never mistakes it for a
@@ -41,19 +41,18 @@ const STAGING_DIR: &str = ".staging.tmp";
 /// rerun rebuilds everything anyway. Files this tool never writes are left
 /// untouched. In JSON mode the session touches no files at all.
 pub struct OutputSession<'a> {
-    dir: &'a Path,
-    sink: Sink,
+    sink: Sink<'a>,
     /// Set at the commit's point of no return, just before the sweep: from
     /// then on the staging directory holds the only complete copy of the new
     /// run, and [`Drop`] must preserve it instead of cleaning it up.
     preserve_staging: bool,
 }
 
-/// Where emitted images go: a staging directory awaiting promotion, or
-/// base64 blobs in the JSON payload. The one-of is structural: a JSON
-/// session has no staging path to misuse.
-enum Sink {
-    Files { staging: PathBuf },
+/// Where emitted images go: a staging directory awaiting promotion into its
+/// output directory, or base64 blobs in the JSON payload. The one-of is
+/// structural: a JSON session has no directory or staging path to misuse.
+enum Sink<'a> {
+    Files { dir: &'a Path, staging: PathBuf },
     Json,
 }
 
@@ -61,10 +60,10 @@ impl<'a> OutputSession<'a> {
     /// Open the session: create the output and staging directories so an
     /// unwritable destination fails before any frame work. A staging
     /// directory left behind by a crashed run is discarded here.
-    pub fn open(dir: &'a Path, mode: OutputMode) -> Result<Self> {
-        let sink = match mode {
-            OutputMode::Json => Sink::Json,
-            OutputMode::Files => {
+    pub fn open(sink: OutputSink<'a>) -> Result<Self> {
+        let sink = match sink {
+            OutputSink::JsonStdout => Sink::Json,
+            OutputSink::Files(dir) => {
                 let staging = dir.join(STAGING_DIR);
                 fs::create_dir_all(dir).map_err(|e| dir_error(dir, "creating", e))?;
                 if staging.exists() {
@@ -72,11 +71,10 @@ impl<'a> OutputSession<'a> {
                         .map_err(|e| dir_error(dir, "clearing stale staging in", e))?;
                 }
                 fs::create_dir(&staging).map_err(|e| dir_error(dir, "creating staging in", e))?;
-                Sink::Files { staging }
+                Sink::Files { dir, staging }
             }
         };
         Ok(Self {
-            dir,
             sink,
             preserve_staging: false,
         })
@@ -90,7 +88,7 @@ impl<'a> OutputSession<'a> {
     /// lives here, so no worker needs to know the output mode exists.
     pub fn emit_image(&self, name: &str, jpeg: &[u8]) -> Result<GridImage> {
         match &self.sink {
-            Sink::Files { staging } => {
+            Sink::Files { staging, .. } => {
                 write_file(staging, name, jpeg)?;
                 Ok(GridImage::File(name.to_string()))
             }
@@ -126,8 +124,8 @@ impl<'a> OutputSession<'a> {
             .with_source(e)
         })?;
         match &self.sink {
-            Sink::Files { staging } => {
-                let staging = staging.clone();
+            Sink::Files { dir, staging } => {
+                let (dir, staging) = (*dir, staging.clone());
                 if let Some(text) = subtitles_txt {
                     write_file(&staging, "subtitles.txt", text.as_bytes())?;
                 }
@@ -142,61 +140,55 @@ impl<'a> OutputSession<'a> {
                         staging.display()
                     ))
                 };
-                self.sweep_stale().map_err(preserved)?;
-                self.promote(&staging).map_err(preserved)?;
-                eprintln!(
-                    "wrote {} grid(s) to {}",
-                    meta.grids.len(),
-                    self.dir.display()
-                );
+                sweep_stale(dir).map_err(preserved)?;
+                promote(dir, &staging).map_err(preserved)?;
+                eprintln!("wrote {} grid(s) to {}", meta.grids.len(), dir.display());
             }
             Sink::Json => println!("{json}"),
         }
         Ok(())
     }
+}
 
-    /// Remove artifacts left by a previous run. Without the sweep, re-running
-    /// with settings that produce fewer grids leaves stale `grid_*.jpg` files
-    /// that the new `metadata.json` no longer lists.
-    fn sweep_stale(&self) -> Result<()> {
-        for entry in fs::read_dir(self.dir).map_err(|e| dir_error(self.dir, "listing", e))? {
-            let entry = entry.map_err(|e| dir_error(self.dir, "listing", e))?;
-            let is_file = entry.file_type().is_ok_and(|t| t.is_file());
-            if is_file && entry.file_name().to_str().is_some_and(is_own_artifact) {
-                fs::remove_file(entry.path()).map_err(|e| dir_error(self.dir, "cleaning", e))?;
-            }
+/// Remove artifacts left by a previous run. Without the sweep, re-running
+/// with settings that produce fewer grids leaves stale `grid_*.jpg` files
+/// that the new `metadata.json` no longer lists.
+fn sweep_stale(dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(dir).map_err(|e| dir_error(dir, "listing", e))? {
+        let entry = entry.map_err(|e| dir_error(dir, "listing", e))?;
+        let is_file = entry.file_type().is_ok_and(|t| t.is_file());
+        if is_file && entry.file_name().to_str().is_some_and(is_own_artifact) {
+            fs::remove_file(entry.path()).map_err(|e| dir_error(dir, "cleaning", e))?;
         }
-        Ok(())
     }
+    Ok(())
+}
 
-    /// Rename every staged file into the output directory, `metadata.json`
-    /// strictly last, then remove the (now empty) staging directory.
-    fn promote(&self, staging: &Path) -> Result<()> {
-        let mut names: Vec<String> = Vec::new();
-        for entry in
-            fs::read_dir(staging).map_err(|e| dir_error(self.dir, "listing staging in", e))?
-        {
-            let entry = entry.map_err(|e| dir_error(self.dir, "listing staging in", e))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            names.push(name);
-        }
-        // Completion-marker ordering: metadata.json must be the last rename.
-        names.sort_unstable_by_key(|n| n == "metadata.json");
-        for name in &names {
-            let from = staging.join(name);
-            let to = self.dir.join(name);
-            fs::rename(&from, &to).map_err(|e| {
-                Error::new(
-                    ErrorCode::OutputWriteFailed,
-                    format!("finalizing {name}: {e}"),
-                )
-                .with_context(ErrorContext::default().with_output(&to))
-                .with_source(e)
-            })?;
-        }
-        fs::remove_dir(staging).map_err(|e| dir_error(self.dir, "removing staging in", e))?;
-        Ok(())
+/// Rename every staged file into the output directory, `metadata.json`
+/// strictly last, then remove the (now empty) staging directory.
+fn promote(dir: &Path, staging: &Path) -> Result<()> {
+    let mut names: Vec<String> = Vec::new();
+    for entry in fs::read_dir(staging).map_err(|e| dir_error(dir, "listing staging in", e))? {
+        let entry = entry.map_err(|e| dir_error(dir, "listing staging in", e))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        names.push(name);
     }
+    // Completion-marker ordering: metadata.json must be the last rename.
+    names.sort_unstable_by_key(|n| n == "metadata.json");
+    for name in &names {
+        let from = staging.join(name);
+        let to = dir.join(name);
+        fs::rename(&from, &to).map_err(|e| {
+            Error::new(
+                ErrorCode::OutputWriteFailed,
+                format!("finalizing {name}: {e}"),
+            )
+            .with_context(ErrorContext::default().with_output(&to))
+            .with_source(e)
+        })?;
+    }
+    fs::remove_dir(staging).map_err(|e| dir_error(dir, "removing staging in", e))?;
+    Ok(())
 }
 
 fn dir_error(dir: &Path, what: &str, e: std::io::Error) -> Error {
@@ -218,7 +210,7 @@ impl Drop for OutputSession<'_> {
         if self.preserve_staging {
             return;
         }
-        if let Sink::Files { staging } = &self.sink {
+        if let Sink::Files { staging, .. } = &self.sink {
             let _ = fs::remove_dir_all(staging);
         }
     }
@@ -344,7 +336,7 @@ mod tests {
         fs::write(&stale, b"old").expect("write stale grid");
         fs::write(&foreign, b"user data").expect("write foreign file");
 
-        let session = OutputSession::open(&dir, OutputMode::Files).expect("open session");
+        let session = OutputSession::open(OutputSink::Files(&dir)).expect("open session");
         let image = session.emit_image("grid_001.jpg", b"new").expect("write");
         assert!(
             matches!(image, GridImage::File(name) if name == "grid_001.jpg"),
@@ -382,7 +374,7 @@ mod tests {
         fs::write(&old_meta, b"{}").expect("write old metadata");
 
         {
-            let session = OutputSession::open(&dir, OutputMode::Files).expect("open session");
+            let session = OutputSession::open(OutputSink::Files(&dir)).expect("open session");
             session.emit_image("grid_001.jpg", b"new").expect("write");
             // Dropped without commit: the run aborted mid-flight.
         }
@@ -407,7 +399,7 @@ mod tests {
 
         let dir = test_dir("promote-fail");
         fs::create_dir_all(&dir).expect("create test dir");
-        let session = OutputSession::open(&dir, OutputMode::Files).expect("open session");
+        let session = OutputSession::open(OutputSink::Files(&dir)).expect("open session");
         session.emit_image("grid_001.jpg", b"new").expect("write");
 
         // Staging keeps its own permissions, so writes into it still work;
@@ -444,7 +436,7 @@ mod tests {
             .expect("create leftover staging");
         fs::write(&leftover, b"half-written").expect("write leftover");
 
-        let session = OutputSession::open(&dir, OutputMode::Files).expect("open session");
+        let session = OutputSession::open(OutputSink::Files(&dir)).expect("open session");
 
         assert!(
             !leftover.exists(),
@@ -459,7 +451,7 @@ mod tests {
         let dir = test_dir("json");
         // The directory is never created: open, emit_image, and commit must
         // all stay off the filesystem in JSON mode.
-        let session = OutputSession::open(&dir, OutputMode::Json).expect("open session");
+        let session = OutputSession::open(OutputSink::JsonStdout).expect("open session");
         let image = session
             .emit_image("grid_001.jpg", b"jpeg")
             .expect("emit touches no files");

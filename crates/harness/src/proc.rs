@@ -100,6 +100,27 @@ pub fn kill_tree(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Interrupt `child` — and, on Unix, the process group it leads — with
+/// SIGINT first, giving cleanup duties `grace` to finish: yt-dlp's
+/// KeyboardInterrupt path saves rotated cookies back to its jar and ffmpeg
+/// finalizes its container. A child still alive past the grace is taken
+/// down by [`kill_tree`]. Non-Unix has no group signal: hard kill at once.
+pub fn kill_tree_graceful(child: &mut Child, grace: Duration) {
+    #[cfg(unix)]
+    {
+        // SAFETY: as in [`kill_tree`] — a plain FFI signal send; the child
+        // is not yet reaped (`&mut Child` excludes a concurrent wait), so
+        // its pid/pgid cannot have been recycled.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGINT);
+        }
+        // On expiry `wait_with_deadline` escalates to [`kill_tree`] itself.
+        let _ = wait_with_deadline(child, grace);
+    }
+    #[cfg(not(unix))]
+    kill_tree(child);
+}
+
 /// Read a pipe to EOF on a detached thread, keeping at most
 /// [`CAPTURE_LIMIT`] bytes, and deliver the capture over a channel. The
 /// thread is deliberately not joined: a receiver that gives up (see
@@ -212,6 +233,33 @@ mod tests {
             start.elapsed() < Duration::from_secs(8),
             "the straggler must not pin the call past the drain grace"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graceful_kill_lets_the_child_run_its_int_trap() {
+        // Models yt-dlp's KeyboardInterrupt cleanup (cookie jar save): the
+        // trap must run to completion before the process dies.
+        let dir = std::env::temp_dir().join(format!("av-proc-int-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let marker = dir.join("saved");
+        let _ = std::fs::remove_file(&marker);
+        let mut child = isolate_group(Command::new("sh").args([
+            "-c",
+            &format!(
+                "trap 'echo done > {}; exit 0' INT; sleep 30",
+                marker.display()
+            ),
+        ]))
+        .spawn()
+        .expect("spawn sh");
+        // Let sh install the trap before the signal arrives.
+        std::thread::sleep(Duration::from_millis(200));
+
+        kill_tree_graceful(&mut child, Duration::from_secs(5));
+
+        assert!(marker.is_file(), "the INT trap must have run");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

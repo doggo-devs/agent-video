@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! agent-video CLI entry point.
 //!
-//! Four subcommands: `process` (smart frame selection + grid composition),
+//! Five subcommands: `process` (smart frame selection + grid composition),
 //! `extract` (high-density sampling of a time range), `mcp` (the stdio MCP
-//! server exposing the `video` tool), and `install-whisper` (provision
-//! transcription weights). `process`/`extract` accept a local file path or
-//! any URL the linked FFmpeg can open.
+//! server exposing the `video` tool), `install-whisper` (provision
+//! transcription weights), and `cookie` (manage the jar for login-gated
+//! sites). `process`/`extract` accept a local file path or any URL the
+//! linked FFmpeg can open.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -78,6 +79,81 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Manage the cookie jar used for login-gated sites (yt-dlp sources).
+    Cookie {
+        #[command(subcommand)]
+        action: CookieAction,
+    },
+    /// Hidden child side of the crash-isolated GPU probe: enumerate the
+    /// named backend's devices and answer via the exit status (0 = a
+    /// usable device exists). Runs in a disposable process because ggml's
+    /// failure paths can abort; the parent reads only the exit code.
+    #[command(hide = true)]
+    ProbeGpu { backend: String },
+}
+
+#[derive(Subcommand)]
+enum CookieAction {
+    /// Merge a Netscape-format cookie export into the jar. Tip: export
+    /// from a private browsing session and close it afterwards, or the
+    /// live browser keeps rotating the cookies out from under the export.
+    Import {
+        /// Path to a `cookies.txt` exported from a logged-in browser.
+        #[arg(value_hint = ValueHint::FilePath)]
+        file: PathBuf,
+    },
+    /// Show the active cookie mode and the jar's domains.
+    Status,
+    /// Remove all cookies, or one domain's (including its subdomains).
+    Clear {
+        #[arg(long)]
+        domain: Option<String>,
+    },
+}
+
+/// Run one `cookie` action against the loaded config.
+fn run_cookie(action: &CookieAction) -> anyhow::Result<()> {
+    let dirs = harness::config::BaseDirs::detect();
+    let cfg = harness::config::load_config(&dirs)?;
+    match action {
+        CookieAction::Import { file } => {
+            let report = harness::cookies::import(&cfg.cookies, file)?;
+            println!(
+                "imported {} cookie(s); the jar now holds {} across all sites",
+                report.imported, report.total
+            );
+            if cfg.cookies.from_browser.is_some() {
+                println!(
+                    "note: cookies.from_browser is set in config.toml and takes \
+                     precedence over the jar"
+                );
+            }
+        }
+        CookieAction::Status => {
+            match harness::cookies::mode(&cfg.cookies) {
+                harness::cookies::CookieMode::Browser(b) => {
+                    println!("mode: --cookies-from-browser {b} (live read at every spawn)");
+                }
+                harness::cookies::CookieMode::Jar(path) => {
+                    println!("mode: jar at {}", path.display());
+                }
+                harness::cookies::CookieMode::Anonymous => {
+                    println!(
+                        "mode: anonymous — import a jar with `agent-video cookie import` \
+                         or set cookies.from_browser in config.toml"
+                    );
+                }
+            }
+            for (domain, count) in harness::cookies::status(&cfg.cookies)? {
+                println!("  {domain}: {count} cookie(s)");
+            }
+        }
+        CookieAction::Clear { domain } => {
+            let removed = harness::cookies::clear(&cfg.cookies, domain.as_deref())?;
+            println!("removed {removed} cookie(s)");
+        }
+    }
+    Ok(())
 }
 
 /// Input source and output directory, shared by both subcommands.
@@ -87,9 +163,16 @@ struct IoArgs {
     /// (`https://`, `http://`, ...). The bytes are handed verbatim to the
     /// demuxer; a protocol this build lacks fails with a coded error.
     input: String,
-    /// Output directory.
-    #[arg(short, long, value_hint = ValueHint::DirPath)]
-    output: PathBuf,
+    /// Output directory. Required unless `--json` selects stdout — the two
+    /// destinations are mutually exclusive, so a run names exactly one sink.
+    #[arg(
+        short,
+        long,
+        value_hint = ValueHint::DirPath,
+        required_unless_present = "json",
+        conflicts_with = "json"
+    )]
+    output: Option<PathBuf>,
 }
 
 /// Options shared by both subcommands. The parameter overrides live directly
@@ -146,6 +229,9 @@ fn exit_code_of(e: &anyhow::Error) -> u8 {
     if let Some(err) = e.downcast_ref::<harness::install::InstallError>() {
         return err.exit_code();
     }
+    if let Some(err) = e.downcast_ref::<harness::cookies::CookieError>() {
+        return err.exit_code();
+    }
     1
 }
 
@@ -190,6 +276,12 @@ fn run() -> anyhow::Result<()> {
             harness::install::install_whisper(&cfg, model.as_deref())?;
             return Ok(());
         }
+        Command::Cookie { action } => return run_cookie(action),
+        Command::ProbeGpu { backend } => {
+            // The parent reads only the exit status; bypass the error
+            // plumbing and its exit-code conventions entirely.
+            std::process::exit(harness::gpu::probe_child(backend));
+        }
     };
 
     let strategy_opts = match &cli.command {
@@ -204,10 +296,10 @@ fn run() -> anyhow::Result<()> {
         strategy_opts,
     )?;
 
-    let mode = if opts.json {
-        pipeline::OutputMode::Json
-    } else {
-        pipeline::OutputMode::Files
+    // clap guarantees exactly one destination: `-o` xor `--json`.
+    let sink = match &io.output {
+        Some(dir) => pipeline::OutputSink::Files(dir),
+        None => pipeline::OutputSink::JsonStdout,
     };
 
     // clap's `conflicts_with` guarantees the flags are mutually exclusive.
@@ -230,13 +322,16 @@ fn run() -> anyhow::Result<()> {
             let window = pipeline::Window::from_args(*from, *until)?;
             let threads = threads.unwrap_or(0);
             let in_flight = in_flight.unwrap_or(pipeline::DEFAULT_IN_FLIGHT);
-            pipeline::process(
-                &source, &io.output, &cfg, mode, threads, in_flight, subs, window,
-            )
+            pipeline::process(&source, sink, &cfg, threads, in_flight, subs, window)
         }
         Command::Extract { range, .. } => {
-            pipeline::extract_range(&source, &io.output, &cfg, *range, mode, subs)
+            pipeline::extract_range(&source, sink, &cfg, *range, subs)
         }
-        Command::Mcp | Command::InstallWhisper { .. } => unreachable!("handled above"),
+        Command::Mcp
+        | Command::InstallWhisper { .. }
+        | Command::Cookie { .. }
+        | Command::ProbeGpu { .. } => {
+            unreachable!("handled above")
+        }
     }
 }

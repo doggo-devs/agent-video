@@ -63,22 +63,24 @@ struct RunCtx<'a> {
     probed_duration: Option<f32>,
 }
 
-/// Output mode: write files or JSON to stdout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputMode {
-    /// Write grid images and metadata.json to disk.
-    Files,
-    /// Output JSON with embedded base64 images to stdout.
-    Json,
+/// Where a run's artifacts land. The output directory exists only in the
+/// files variant, so "JSON mode plus a dummy directory" is unrepresentable
+/// — no caller ever has to invent a path it promises not to use.
+#[derive(Debug, Clone, Copy)]
+pub enum OutputSink<'a> {
+    /// Grid images and `metadata.json` under this directory.
+    Files(&'a Path),
+    /// One JSON document with base64-inline images on stdout; the
+    /// filesystem is never touched.
+    JsonStdout,
 }
 
 /// Run the full `process` pipeline.
 #[allow(clippy::too_many_arguments)]
 pub fn process(
     input: &Source,
-    out_dir: &Path,
+    sink: OutputSink<'_>,
     cfg: &Config,
-    mode: OutputMode,
     threads: usize,
     max_in_flight: NonZeroUsize,
     subs: SubtitleSource<'_>,
@@ -118,7 +120,7 @@ pub fn process(
         probed_duration: keyframe_info.as_ref().map(|i| i.duration),
     };
     // Every strategy reduces to one decode pass; the tail is shared.
-    let session = OutputSession::open(out_dir, mode)?;
+    let session = OutputSession::open(sink)?;
     let stream = match strategy {
         SampleStrategy::FixedFps => match window {
             Some(w) => {

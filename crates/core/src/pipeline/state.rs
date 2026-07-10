@@ -278,7 +278,7 @@ mod tests {
 
     /// A JSON-mode session for tests: opening it touches no files.
     fn json_session() -> OutputSession<'static> {
-        OutputSession::open(std::path::Path::new("out"), super::super::OutputMode::Json)
+        OutputSession::open(super::super::OutputSink::JsonStdout)
             .expect("json session opens without touching disk")
     }
 

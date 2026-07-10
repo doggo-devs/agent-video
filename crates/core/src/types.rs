@@ -199,7 +199,8 @@ impl GridPosition {
 /// Cell legibility tier: sets the minimum readable cell edge. The canvas edge
 /// is fixed by `max_edge`, so lower quality packs more (smaller) frames onto
 /// the same canvas.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "lowercase")]
 pub enum Quality {
     Low,
@@ -208,7 +209,8 @@ pub enum Quality {
 }
 
 /// Detail tier: controls sampling fps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "lowercase")]
 pub enum Detail {
     Coarse,

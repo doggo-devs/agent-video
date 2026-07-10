@@ -6,6 +6,7 @@
 //! mtime is the LRU clock, disk is the index — no manifest to corrupt.
 
 use std::fs;
+use std::fs::File;
 use std::io::ErrorKind;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -166,7 +167,7 @@ impl Cache {
             let fresh = now
                 .duration_since(f.mtime)
                 .is_ok_and(|age| age < EVICT_GRACE);
-            if fresh || fs::remove_file(&f.path).is_err() {
+            if fresh || !remove_if_unbumped(f) {
                 continue;
             }
             total -= f.size;
@@ -222,7 +223,19 @@ fn touch(p: &Path) {
     });
 }
 
-use std::fs::File;
+/// Remove `f` only if its mtime is still the one the sweep ranked it by: a
+/// concurrent [`touch`] (another process's cache hit) moves the mtime
+/// forward and vetoes the deletion. The re-check-to-unlink window that
+/// remains is accepted: on Unix an open reader keeps the unlinked file
+/// readable, so the worst case is a re-download, never corruption. A veto
+/// keeps the file counting toward the budget, consistent with the honest
+/// accounting above.
+fn remove_if_unbumped(f: &Stat) -> bool {
+    fs::metadata(&f.path)
+        .and_then(|m| m.modified())
+        .is_ok_and(|mtime| mtime == f.mtime)
+        && fs::remove_file(&f.path).is_ok()
+}
 
 struct Stat {
     path: PathBuf,
@@ -370,6 +383,45 @@ mod tests {
         assert_eq!(removed, vec![aged.clone()]);
         assert!(fresh.exists(), "files inside the grace window survive");
         assert!(part.exists(), "in-flight .part files are never LRU entries");
+    }
+
+    #[test]
+    fn eviction_vetoes_a_file_touched_after_ranking() {
+        // Models the cross-process race: another server's cache hit bumps
+        // the mtime between the sweep's listing and the unlink. The stale
+        // stat must not authorize the deletion.
+        let (cache, _dir) = cache(1024);
+        let dir = cache.ensure_downloads_dir().expect("mkdir").to_path_buf();
+        let p = dir.join("hit.mp4");
+        std::fs::write(&p, b"xxxx").expect("write");
+        let past = SystemTime::now() - Duration::from_secs(3600);
+        File::options()
+            .append(true)
+            .open(&p)
+            .and_then(|f| f.set_modified(past))
+            .expect("age the file");
+        let stale = Stat {
+            path: p.clone(),
+            size: 4,
+            mtime: past,
+        };
+        touch(&p); // the concurrent cache hit
+
+        assert!(!remove_if_unbumped(&stale), "bumped mtime vetoes");
+        assert!(p.exists(), "the just-used file survives");
+
+        let current = fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        assert!(
+            remove_if_unbumped(&Stat {
+                path: p.clone(),
+                size: 4,
+                mtime: current,
+            }),
+            "an unbumped ranking still deletes"
+        );
+        assert!(!p.exists());
     }
 
     #[test]

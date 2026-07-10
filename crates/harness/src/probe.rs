@@ -17,9 +17,46 @@ use crate::fault::Fault;
 use agent_video_core::media;
 use agent_video_core::source::Source;
 use agent_video_core::subtitle::find_sidecars;
+use agent_video_core::types::format_ts;
 
 /// How long an over-http probe may hang before we call it a non-file.
 pub const URL_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Short container label from libav's demuxer name, which is a comma-list
+/// of aliases (`mov,mp4,m4a,3gp,3g2,mj2`). This is what the model sees in
+/// [`ProbeSummary::container`] *and* the extension a downloaded rip gets,
+/// so every arm yields an ext-shaped token; unrecognizable input falls
+/// back to `mp4`, the safest default for direct media links.
+pub(crate) fn container_label(demuxer: &str) -> String {
+    let first = demuxer.split(',').next().unwrap_or("").trim();
+    match first {
+        "matroska" => "mkv",
+        "webm" => "webm",
+        "mov" | "mp4" => "mp4",
+        "mpegts" => "ts",
+        "avi" => "avi",
+        "flv" => "flv",
+        "asf" => "wmv",
+        "ogg" => "ogg",
+        other if is_ext_shaped(other) => other,
+        _ => "mp4",
+    }
+    .to_string()
+}
+
+/// `[a-z0-9]{2,5}` — plausible as a file extension.
+pub(crate) fn is_ext_shaped(s: &str) -> bool {
+    (2..=5).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Model-facing seconds: the f32 probe value widens into f64 with a tail
+/// of noise digits (406.037353515625); centiseconds are already finer than
+/// any frame the tool samples, and the noise only wastes model tokens.
+fn round_centis(seconds: f32) -> f64 {
+    (f64::from(seconds) * 100.0).round() / 100.0
+}
 
 /// Arms `stop` after `timeout` unless dropped first. Dropping the guard
 /// disconnects the channel, waking the deadline thread immediately — so a
@@ -78,13 +115,40 @@ pub fn probe_local_file(file: &Path) -> Result<ProbeSummary, Fault> {
     let summary = media::summarize_input(&ictx, &source)?;
     let sidecars = scan_sidecars(file);
     Ok(ProbeSummary {
-        duration: f64::from(summary.duration),
+        duration: round_centis(summary.duration),
         width: summary.width,
         height: summary.height,
         size_bytes: size,
-        container: Some(summary.container.clone()),
+        container: Some(container_label(&summary.container)),
         subtitles: describe_subtitles(&summary, &sidecars),
     })
+}
+
+/// Whether a track covering `track_s` of a `container_s`-long timeline is
+/// materially truncated: more than 10 s missing *and* under 90% coverage.
+/// The absolute bound ignores trailing-silence jitter on long videos, the
+/// relative one keeps short videos from tripping on it.
+pub(crate) fn materially_truncated(track_s: f64, container_s: f64) -> bool {
+    container_s - track_s > 10.0 && track_s < container_s * 0.9
+}
+
+/// Post-download integrity: name the track that covers materially less of
+/// the timeline than the container claims, if any. `None` also when the
+/// file cannot be probed — integrity has its own verdicts elsewhere.
+pub fn coverage_shortfall(file: &Path) -> Option<String> {
+    let source = Source::classify(&file.to_string_lossy());
+    let coverage = media::stream_coverage(&source).ok()?;
+    let check = |name: &str, seconds: Option<f64>| -> Option<String> {
+        let s = seconds?;
+        materially_truncated(s, coverage.container_seconds).then(|| {
+            format!(
+                "the {name} track covers only {} of the {} timeline",
+                format_ts(s as f32),
+                format_ts(coverage.container_seconds as f32)
+            )
+        })
+    };
+    check("audio", coverage.audio_seconds).or_else(|| check("video", coverage.video_seconds))
 }
 
 /// Probe a direct media URL over http(s): the demuxer reads the container
@@ -102,11 +166,11 @@ pub fn probe_media_url(url: &str) -> Result<ProbeSummary, Fault> {
     let ictx = media::open_input_interruptible(&source, stop)?;
     let summary = media::summarize_input(&ictx, &source)?;
     Ok(ProbeSummary {
-        duration: f64::from(summary.duration),
+        duration: round_centis(summary.duration),
         width: summary.width,
         height: summary.height,
         size_bytes: None,
-        container: Some(summary.container.clone()),
+        container: Some(container_label(&summary.container)),
         subtitles: describe_subtitles(&summary, &[]),
     })
 }
@@ -114,6 +178,32 @@ pub fn probe_media_url(url: &str) -> Result<ProbeSummary, Fault> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labels_demuxer_alias_lists_with_one_name() {
+        assert_eq!(container_label("mov,mp4,m4a,3gp,3g2,mj2"), "mp4");
+        assert_eq!(container_label("matroska,webm"), "mkv");
+        assert_eq!(container_label("asf"), "wmv");
+        assert_eq!(container_label("avi"), "avi");
+        assert_eq!(container_label("weird_thing"), "mp4");
+        assert_eq!(container_label(""), "mp4");
+    }
+
+    #[test]
+    fn container_label_is_idempotent() {
+        // Cached probe docs may re-enter through this mapping; a label must
+        // map to itself.
+        for raw in ["mov,mp4,m4a,3gp,3g2,mj2", "matroska,webm", "mpegts"] {
+            let once = container_label(raw);
+            assert_eq!(container_label(&once), once, "{raw}");
+        }
+    }
+
+    #[test]
+    fn rounds_duration_to_centiseconds() {
+        assert_eq!(round_centis(406.03735_f32), 406.04);
+        assert_eq!(round_centis(90.0_f32), 90.0);
+    }
 
     #[test]
     fn advertises_only_what_core_discovers() {
@@ -137,6 +227,26 @@ mod tests {
         let mut found = scan_sidecars(&video);
         found.sort();
         assert_eq!(found, ["talk.srt".to_string(), "talk.zh.srt".to_string()]);
+    }
+
+    #[test]
+    fn flags_materially_truncated_tracks_only() {
+        assert!(
+            materially_truncated(50.0, 437.0),
+            "50s of 437s is truncated"
+        );
+        assert!(
+            !materially_truncated(430.0, 437.0),
+            "a 7s shortfall is trailing-silence jitter"
+        );
+        assert!(
+            !materially_truncated(55.0, 60.0),
+            "short videos need the absolute bound"
+        );
+        assert!(
+            !materially_truncated(500.0, 437.0),
+            "longer than the container is not truncation"
+        );
     }
 
     #[test]

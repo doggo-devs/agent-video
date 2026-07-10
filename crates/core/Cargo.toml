@@ -8,6 +8,11 @@ repository.workspace = true
 readme = "../README.md"
 
 [features]
+# CLI argument surface: derives `clap::Args`/`ValueEnum` on the config
+# override structs so the CLI flags and the override fields stay one
+# declaration. Off by default — a library consumer gets a clap-free core;
+# the CLI crate turns it on.
+clap = ["dep:clap"]
 # Zero-dependency release build: compile FFmpeg from source and link it
 # statically. `build-lib-dav1d` adds `--enable-libdav1d` (software AV1); the
 # static lib must be on PKG_CONFIG_PATH at build time — see
@@ -34,7 +39,7 @@ imageproc = "0.27"
 ab_glyph = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 anyhow = "1"
 rayon = "1"
 base64 = "0.22"

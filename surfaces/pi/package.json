@@ -1,8 +1,8 @@
 {
   "name": "@agent-video/pi",
   "version": "0.1.0",
-  "description": "Watch a video (local path or URL) as VLM-readable frame grids with timestamps and subtitles. Call with just `source` first: short videos run immediately, everything else answers with metadata and copyable next calls.",
-  "license": "MIT",
+  "description": "Watch a video (local path or URL) as VLM-readable frame grids with timestamps and subtitles, or transcribe its audio with `transcribe: true`. Call with just `source` first: short videos run immediately, everything else answers with metadata and copyable next calls.",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/durvia/agent-video.git",

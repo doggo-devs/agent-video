@@ -14,16 +14,25 @@ jobs:
         with:
           components: rustfmt, clippy
       # The crate links FFmpeg via pkg-config, so the dev libraries and headers
-      # must be present to compile the tests and clippy targets.
+      # must be present to compile the tests and clippy targets. Vulkan headers
+      # + glslc compile the whisper-vulkan feature (below); cmake is on the
+      # runner image already.
       - name: Install FFmpeg dev libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev pkg-config
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev pkg-config \
+            libvulkan-dev glslc
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # The release GPU variant ships `whisper-vulkan`; its feature-gated code
+      # (gpu probe, local route) must compile and pass on every push, not be
+      # discovered broken at tag time. The runner has no GPU: the probe-driven
+      # tests use injected fakes, and nothing enumerates a real device.
+      - run: cargo clippy -p agent-video-harness --all-targets --features whisper-vulkan -- -D warnings
+      - run: cargo test -p agent-video-harness --features whisper-vulkan
 
   # The npm package is a pure distribution shell around the Rust binary;
   # smoke-test binary resolution and arg passthrough under plain node.

@@ -44,6 +44,18 @@ pub struct Config {
     pub download: DownloadCfg,
     pub budget: BudgetCfg,
     pub network: NetworkCfg,
+    pub cookies: CookiesCfg,
+    pub subtitles: SubtitlesCfg,
+}
+
+/// Subtitle sidecar policy; consumed by the yt-dlp source when electing
+/// the one promoted sidecar from a multi-language download.
+#[derive(Debug, Clone)]
+pub struct SubtitlesCfg {
+    /// Language preference for the election: prefix-matched (`"en"` claims
+    /// `"en-US"`), first hit wins, no hit falls back to the first
+    /// candidate. Never empty — validation refuses an empty list.
+    pub preferred_langs: Vec<String>,
 }
 
 /// The three path roles, kept distinct.
@@ -66,7 +78,23 @@ pub struct CacheCfg {
 #[derive(Debug, Clone)]
 pub struct WhisperCfg {
     pub model: WhisperModel,
-    pub backend: Backend,
+    /// Explicit backend pin; `None` auto-detects from compiled features.
+    /// Pinning a backend commits to local inference: a missing model is
+    /// then an error, never a silent fallback to the API (see
+    /// [`crate::transcribe::Route::resolve`]).
+    pub backend: Option<Backend>,
+    /// API key for remote transcription (Groq / OpenAI-compatible).
+    /// [`load_config`] lets `WHISPER_API_KEY` override the file value, so
+    /// past load time this field is the resolved answer — nothing reads
+    /// the environment afterwards.
+    pub api_key: Option<String>,
+    /// API endpoint URL. Defaults to Groq.
+    pub api_url: String,
+}
+
+impl WhisperCfg {
+    /// Default Groq Whisper endpoint.
+    pub const DEFAULT_API_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -76,6 +104,9 @@ pub struct DownloadCfg {
     /// Analysis rips are capped at this frame height (grid quality ceiling).
     pub analysis_max_height: NonZeroU32,
     /// How long a confirmed download may block the call before detaching.
+    /// Generous by default: for an agent, one blocked call is cheaper than
+    /// a chain of pending polls — each poll costs a full model round trip.
+    /// Pending remains the fallback for genuinely long downloads.
     pub sync_wait_seconds: NonZeroU32,
 }
 
@@ -86,6 +117,41 @@ pub struct NetworkCfg {
     /// otherwise non-global addresses. Off by default: a model-supplied
     /// URL must not be able to reach internal services (SSRF).
     pub allow_private_hosts: bool,
+}
+
+/// Cookie forwarding for login-gated sites; consumed by the yt-dlp source
+/// ([`crate::fetch::ytdlp`]). Acquisition is always explicit — a config key
+/// or `agent-video cookie import` — never an implicit browser read during a
+/// tool call.
+#[derive(Debug, Clone)]
+pub struct CookiesCfg {
+    /// `--cookies-from-browser` value (e.g. `"firefox"`,
+    /// `"chrome:Profile 1"`): read cookies live from this browser's store
+    /// at every yt-dlp spawn. Set = wins over the jar.
+    pub from_browser: Option<String>,
+    /// Canonical Netscape jar maintained by `agent-video cookie import`;
+    /// used when the file exists and `from_browser` is unset.
+    pub jar: PathBuf,
+}
+
+/// Browsers yt-dlp can extract cookies from; the config value's base name
+/// (before any `:profile` / `+keyring` suffix) must be one of these.
+const KNOWN_BROWSERS: &[&str] = &[
+    "brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale",
+];
+
+fn parse_from_browser(value: &str) -> Result<String, ConfigError> {
+    let base = value
+        .split([':', '+'])
+        .next()
+        .expect("split yields at least one item");
+    if !KNOWN_BROWSERS.contains(&base) {
+        return Err(ConfigError(format!(
+            "cookies.from_browser must start with one of {} — got '{value}'",
+            KNOWN_BROWSERS.join(", ")
+        )));
+    }
+    Ok(value.to_string())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -102,6 +168,7 @@ pub struct BudgetCfg {
 pub enum WhisperModel {
     Medium,
     LargeV3,
+    LargeV3Turbo,
     File(PathBuf),
 }
 
@@ -110,6 +177,7 @@ impl WhisperModel {
         match s {
             "medium" => WhisperModel::Medium,
             "large-v3" => WhisperModel::LargeV3,
+            "large-v3-turbo" => WhisperModel::LargeV3Turbo,
             other => WhisperModel::File(PathBuf::from(other)),
         }
     }
@@ -125,6 +193,7 @@ impl WhisperModel {
         match self {
             WhisperModel::Medium => "medium".to_string(),
             WhisperModel::LargeV3 => "large-v3".to_string(),
+            WhisperModel::LargeV3Turbo => "large-v3-turbo".to_string(),
             WhisperModel::File(p) => {
                 let digest = Sha256::digest(p.as_os_str().as_encoded_bytes());
                 format!("file-{}", crate::identity::hex(&digest[..8]))
@@ -133,12 +202,12 @@ impl WhisperModel {
     }
 }
 
-/// Whisper compute backend, selectable among compiled-in backends only:
-/// an uncompiled backend cannot be lit up at runtime, so naming one is a
-/// config error, not a fallback.
+/// Whisper hardware-accelerated backend. CPU-only inference is not
+/// supported — transcription requires a compiled-in GPU backend.
+/// Builds without any `whisper-*` feature simply do not offer
+/// transcription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    Cpu,
     Metal,
     Coreml,
     Cuda,
@@ -147,24 +216,13 @@ pub enum Backend {
 
 impl Backend {
     fn parse(s: &str) -> Result<Self, ConfigError> {
-        let all = [
-            ("cpu", Backend::Cpu, true),
-            ("metal", Backend::Metal, cfg!(feature = "whisper-metal")),
-            ("coreml", Backend::Coreml, cfg!(feature = "whisper-coreml")),
-            ("cuda", Backend::Cuda, cfg!(feature = "whisper-cuda")),
-            ("vulkan", Backend::Vulkan, cfg!(feature = "whisper-vulkan")),
-        ];
-        let Some(&(_, backend, compiled)) = all.iter().find(|(name, ..)| *name == s) else {
+        let Some(backend) = Backend::from_name(s) else {
             return Err(ConfigError(format!(
-                "whisper.backend must be one of cpu, metal, coreml, cuda, vulkan — got '{s}'"
+                "whisper.backend must be one of metal, coreml, cuda, vulkan — got '{s}'"
             )));
         };
-        if !compiled {
-            let available: Vec<&str> = all
-                .iter()
-                .filter(|&&(_, _, c)| c)
-                .map(|&(name, ..)| name)
-                .collect();
+        if !Self::compiled().contains(&backend) {
+            let available: Vec<&str> = Self::compiled().iter().map(|b| b.name()).collect();
             return Err(ConfigError(format!(
                 "whisper.backend '{s}' is not compiled into this build; available: {}",
                 available.join(", ")
@@ -173,9 +231,49 @@ impl Backend {
         Ok(backend)
     }
 
-    /// Whether whisper should attempt GPU offload.
-    pub fn use_gpu(self) -> bool {
-        self != Backend::Cpu
+    /// Canonical lowercase name, as accepted by `whisper.backend` and the
+    /// hidden `probe-gpu` subcommand.
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Metal => "metal",
+            Backend::Coreml => "coreml",
+            Backend::Cuda => "cuda",
+            Backend::Vulkan => "vulkan",
+        }
+    }
+
+    /// Parse a canonical name, without the compiled-in check.
+    pub fn from_name(s: &str) -> Option<Self> {
+        [
+            Backend::Metal,
+            Backend::Coreml,
+            Backend::Cuda,
+            Backend::Vulkan,
+        ]
+        .into_iter()
+        .find(|b| b.name() == s)
+    }
+
+    /// Whether device presence must be probed at runtime
+    /// ([`crate::gpu::device_available`]). Metal/CoreML are ambient on
+    /// Apple hardware; CUDA/Vulkan depend on loaders, drivers, and devices
+    /// that may be absent on the machine running this build.
+    pub fn needs_probe(self) -> bool {
+        matches!(self, Backend::Cuda | Backend::Vulkan)
+    }
+
+    /// All backends compiled into this build, in preference order.
+    pub fn compiled() -> &'static [Backend] {
+        &[
+            #[cfg(feature = "whisper-metal")]
+            Backend::Metal,
+            #[cfg(feature = "whisper-coreml")]
+            Backend::Coreml,
+            #[cfg(feature = "whisper-cuda")]
+            Backend::Cuda,
+            #[cfg(feature = "whisper-vulkan")]
+            Backend::Vulkan,
+        ]
     }
 }
 
@@ -196,6 +294,10 @@ struct FileConfig {
     budget: FileBudget,
     #[serde(default)]
     network: FileNetwork,
+    #[serde(default)]
+    cookies: FileCookies,
+    #[serde(default)]
+    subtitles: FileSubtitles,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -217,6 +319,8 @@ struct FileCache {
 struct FileWhisper {
     model: Option<String>,
     backend: Option<String>,
+    api_key: Option<String>,
+    api_url: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -238,6 +342,18 @@ struct FileBudget {
 #[serde(deny_unknown_fields)]
 struct FileNetwork {
     allow_private_hosts: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileCookies {
+    from_browser: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileSubtitles {
+    preferred_langs: Option<Vec<String>>,
 }
 
 // ── loading ──
@@ -289,13 +405,15 @@ pub fn default_config(dirs: &BaseDirs) -> Config {
             max_bytes: nz64(10 * GIB),
         },
         whisper: WhisperCfg {
-            model: WhisperModel::Medium,
-            backend: Backend::Cpu,
+            model: WhisperModel::LargeV3Turbo,
+            backend: None,
+            api_key: None,
+            api_url: WhisperCfg::DEFAULT_API_URL.to_string(),
         },
         download: DownloadCfg {
             max_bytes: nz64(2 * GIB),
             analysis_max_height: nz32(480),
-            sync_wait_seconds: nz32(20),
+            sync_wait_seconds: nz32(90),
         },
         budget: BudgetCfg {
             auto_run: nz32(2),
@@ -304,18 +422,33 @@ pub fn default_config(dirs: &BaseDirs) -> Config {
         network: NetworkCfg {
             allow_private_hosts: false,
         },
+        cookies: CookiesCfg {
+            from_browser: None,
+            jar: dirs.config.join("agent-video/cookies.txt"),
+        },
+        subtitles: SubtitlesCfg {
+            preferred_langs: vec!["en".to_string(), "zh".to_string()],
+        },
     }
 }
 
-/// Load configuration: defaults ← `config.toml` (when present).
+/// Load configuration: defaults ← `config.toml` (when present) ← env.
 pub fn load_config(dirs: &BaseDirs) -> Result<Config, ConfigError> {
     let file = config_file_path(dirs);
-    match std::fs::read_to_string(&file) {
+    let mut cfg = match std::fs::read_to_string(&file) {
         Ok(text) => parse_config(&text, dirs)
-            .map_err(|e| ConfigError(format!("{}: {}", file.display(), e.0))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(default_config(dirs)),
-        Err(e) => Err(ConfigError(format!("cannot read {}: {e}", file.display()))),
+            .map_err(|e| ConfigError(format!("{}: {}", file.display(), e.0)))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_config(dirs),
+        Err(e) => return Err(ConfigError(format!("cannot read {}: {e}", file.display()))),
+    };
+    // Env overrides land here, once: past load time the config is plain
+    // data, and no answer derived from it drifts with the environment.
+    if let Ok(key) = std::env::var("WHISPER_API_KEY")
+        && !key.is_empty()
+    {
+        cfg.whisper.api_key = Some(key);
     }
+    Ok(cfg)
 }
 
 /// Parse a `config.toml` document over the defaults for `dirs`.
@@ -376,6 +509,19 @@ pub fn parse_config(text: &str, dirs: &BaseDirs) -> Result<Config, ConfigError> 
     if let Some(v) = file.network.allow_private_hosts {
         cfg.network.allow_private_hosts = v;
     }
+    if let Some(v) = file.cookies.from_browser {
+        cfg.cookies.from_browser = Some(parse_from_browser(&v)?);
+    }
+    if let Some(langs) = file.subtitles.preferred_langs {
+        if langs.is_empty() || langs.iter().any(|l| l.is_empty()) {
+            return Err(ConfigError(
+                "subtitles.preferred_langs must be a non-empty list of non-empty language \
+                 prefixes"
+                    .into(),
+            ));
+        }
+        cfg.subtitles.preferred_langs = langs;
+    }
 
     if let Some(m) = file.whisper.model {
         if m.is_empty() {
@@ -390,7 +536,13 @@ pub fn parse_config(text: &str, dirs: &BaseDirs) -> Result<Config, ConfigError> 
         };
     }
     if let Some(b) = file.whisper.backend {
-        cfg.whisper.backend = Backend::parse(&b)?;
+        cfg.whisper.backend = Some(Backend::parse(&b)?);
+    }
+    if let Some(k) = file.whisper.api_key {
+        cfg.whisper.api_key = Some(k);
+    }
+    if let Some(u) = file.whisper.api_url {
+        cfg.whisper.api_url = u;
     }
 
     Ok(cfg)
@@ -438,8 +590,8 @@ mod tests {
         assert_eq!(cfg.budget.max.get(), 8);
         assert_eq!(cfg.download.max_bytes.get(), 2 * GIB);
         assert_eq!(cfg.download.analysis_max_height.get(), 480);
-        assert_eq!(cfg.whisper.model, WhisperModel::Medium);
-        assert_eq!(cfg.whisper.backend, Backend::Cpu);
+        assert_eq!(cfg.whisper.model, WhisperModel::LargeV3Turbo);
+        assert_eq!(cfg.whisper.backend, None);
         assert!(
             !cfg.network.allow_private_hosts,
             "private destinations are blocked by default"
@@ -523,6 +675,7 @@ mod tests {
         let ids = [
             WhisperModel::Medium.cache_id(),
             WhisperModel::LargeV3.cache_id(),
+            WhisperModel::LargeV3Turbo.cache_id(),
             WhisperModel::File(PathBuf::from("/a/ggml.bin")).cache_id(),
             WhisperModel::File(PathBuf::from("/b/ggml.bin")).cache_id(),
         ];
@@ -535,6 +688,50 @@ mod tests {
                 assert_ne!(id, other, "distinct models must key distinct entries");
             }
         }
+    }
+
+    #[test]
+    fn subtitle_preference_defaults_and_overrides() {
+        let cfg = default_config(&dirs());
+        assert_eq!(cfg.subtitles.preferred_langs, ["en", "zh"]);
+
+        let cfg = parse_config("[subtitles]\npreferred_langs = [\"ja\", \"en\"]\n", &dirs())
+            .expect("valid");
+        assert_eq!(cfg.subtitles.preferred_langs, ["ja", "en"]);
+    }
+
+    #[test]
+    fn rejects_empty_subtitle_preference() {
+        let err = parse_config("[subtitles]\npreferred_langs = []\n", &dirs())
+            .expect_err("empty list is invalid");
+        assert!(err.0.contains("preferred_langs"), "names the key: {err}");
+    }
+
+    #[test]
+    fn cookies_default_to_anonymous_with_a_config_dir_jar() {
+        let cfg = default_config(&dirs());
+        assert_eq!(cfg.cookies.from_browser, None);
+        assert_eq!(
+            cfg.cookies.jar,
+            Path::new("/home/u/config-base/agent-video/cookies.txt")
+        );
+    }
+
+    #[test]
+    fn accepts_a_known_browser_with_profile_suffix() {
+        let cfg = parse_config("[cookies]\nfrom_browser = \"chrome:Profile 1\"\n", &dirs())
+            .expect("valid");
+        assert_eq!(
+            cfg.cookies.from_browser.as_deref(),
+            Some("chrome:Profile 1")
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_browser() {
+        let err = parse_config("[cookies]\nfrom_browser = \"netscape\"\n", &dirs())
+            .expect_err("unknown browser");
+        assert!(err.0.contains("netscape"), "names the value: {err}");
     }
 
     #[test]

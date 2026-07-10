@@ -6,18 +6,19 @@
 import { StringEnum } from '@earendil-works/pi-ai'
 import { Type } from 'typebox'
 
-export const TOOL_DESCRIPTION = "Watch a video (local path or URL) as VLM-readable frame grids with timestamps and subtitles. Call with just `source` first: short videos run immediately, everything else answers with metadata and copyable next calls."
+export const TOOL_DESCRIPTION = "Watch a video (local path or URL) as VLM-readable frame grids with timestamps and subtitles, or transcribe its audio with `transcribe: true`. Call with just `source` first: short videos run immediately, everything else answers with metadata and copyable next calls."
 
 export const PROMPT_SNIPPET = 'Watch a video (local path or URL) as timestamped frame grids'
 
 export const PARAMETERS = Type.Object(
 	{
-		confirm: Type.Optional(Type.String({ description: "Echo a consent token issued by a previous response to authorize the pending action. Tokens are single-use and bound to the latest plan; pass confirm alone with source." })),
+		confirm: Type.Optional(Type.String({ description: "Echo a consent token issued by a previous response to authorize the pending action. Tokens stay valid until a newer plan for the same source replaces them; pass confirm alone with source." })),
 		from: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Window start: seconds (83) or timestamp (\"1:23\", \"1:02:03\"). Omit to start from the beginning." })),
 		look: Type.Optional(StringEnum(["overview","detailed","read_text","track_motion"] as const, { description: "How to look: overview (fast triage), detailed (miss nothing), read_text (few large frames to read on-screen text/UI), track_motion (dense small frames for fast action). Subtitle text always rides along in metadata regardless; this only affects frame size/density. Omit for a balanced default." })),
 		raw: Type.Optional(Type.String({ description: "Expert escape hatch: verbatim agent-video core CLI arguments starting with the subcommand, e.g. \"process --strategy keyframes --base-fps 0.2\". Mutually exclusive with from/until/look/strategy. Input/output plumbing is injected by the server." })),
 		source: Type.String({ description: "Local video file path or URL. Call with only `source` first; the response tells you what to do next." }),
 		strategy: Type.Optional(StringEnum(["adaptive","keyframes","uniform"] as const, { description: "Which moments become frames: adaptive (default: keyframes plus fill in sparse stretches, right for most footage), keyframes (cheapest scan, frames land on cuts — triage for edited footage, blind to changes inside static shots), uniform (evenly spaced in time — use when keyframes mislead: screen recordings, slides, long static takes). Orthogonal to look, which sets frame size/density." })),
+		transcribe: Type.Optional(Type.String({ description: "Set true (alone with source) to generate a whisper transcript of the audio; it is cached and rides along with every grid afterwards. Needs local media: for a URL, download it first (bare call, then confirm), then repeat with transcribe." })),
 		until: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Window end, same formats. Omit to go to the end of the video." })),
 	},
 	{ additionalProperties: false }

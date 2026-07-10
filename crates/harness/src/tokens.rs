@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Consent token registry, in-memory for one MCP stdio session.
 //!
-//! A token only authorizes the plan and source it was issued for; redeeming
-//! any token consumes the whole offer, so every token is single-use and
-//! bound to the latest plan.
+//! A token only authorizes the plan and source it was issued for. Redemption
+//! is idempotent: an offer stays redeemable until a newer plan for the same
+//! source replaces it, so a failed or repeated attempt never strands the
+//! model with a stale token. The executed actions are idempotent themselves
+//! (a re-confirmed download serves the cached rip), which is what makes
+//! re-redemption safe.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 use super::fetch::Recipe;
-use super::identity::ContentId;
 use super::plan::CoreInvocation;
 
 /// A consent token, echoed verbatim by the model to authorize a plan.
@@ -64,20 +65,11 @@ pub struct DownloadPlan {
     pub estimated_bytes: Option<u64>,
 }
 
-/// A transcription decision: the media is local by probe time.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TranscribePlan {
-    pub file: PathBuf,
-    /// Content identity keying the cached transcript.
-    pub fingerprint: ContentId,
-}
-
 /// The action authorized once a token is redeemed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PendingAction {
     Core(CoreInvocation),
     Download(DownloadPlan),
-    Transcribe(TranscribePlan),
 }
 
 /// Pending offers keyed by source, behind the one lock that guards them;
@@ -95,18 +87,11 @@ impl Tokens {
         self.lock().insert(key.to_string(), entry);
     }
 
-    /// Register a single-token offer for `key`.
-    pub fn offer_one(&self, key: &str, token: Token, action: PendingAction) {
-        self.lock()
-            .insert(key.to_string(), HashMap::from([(token, action)]));
-    }
-
-    /// Redeem: return the action and consume the whole offer, else `None`.
+    /// Redeem: return the authorized action, else `None`. The offer set
+    /// survives — only a newer `commit` for the same key invalidates it —
+    /// so retries after a failed execution redeem the same token again.
     pub fn take(&self, key: &str, token: &Token) -> Option<PendingAction> {
-        let mut pending = self.lock();
-        let action = pending.get(key)?.get(token)?.clone();
-        pending.remove(key);
-        Some(action)
+        Some(self.lock().get(key)?.get(token)?.clone())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, HashMap<Token, PendingAction>>> {
@@ -138,24 +123,24 @@ mod tests {
     }
 
     #[test]
-    fn redeems_offered_token_once() {
+    fn redeemed_token_stays_valid_for_retries() {
         let reg = Tokens::default();
-        reg.offer_one("src", Token::new("t1"), core_action(1));
+        reg.commit("src", vec![offer("t1", 1)]);
         assert!(reg.take("src", &Token::new("t1")).is_some());
         assert!(
-            reg.take("src", &Token::new("t1")).is_none(),
-            "tokens are single-use"
+            reg.take("src", &Token::new("t1")).is_some(),
+            "a failed execution must be retryable with the same token"
         );
     }
 
     #[test]
-    fn redeeming_consumes_sibling_offers() {
+    fn sibling_offers_survive_redemption() {
         let reg = Tokens::default();
         reg.commit("src", vec![offer("a", 1), offer("b", 2)]);
         assert!(reg.take("src", &Token::new("a")).is_some());
         assert!(
-            reg.take("src", &Token::new("b")).is_none(),
-            "whole offer is consumed"
+            reg.take("src", &Token::new("b")).is_some(),
+            "picking one tier must not strand the others"
         );
     }
 

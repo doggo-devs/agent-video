@@ -1,10 +1,10 @@
 {
-  "description": "Watch a video (local path or URL) as VLM-readable frame grids with timestamps and subtitles. Call with just `source` first: short videos run immediately, everything else answers with metadata and copyable next calls.",
+  "description": "Watch a video (local path or URL) as VLM-readable frame grids with timestamps and subtitles, or transcribe its audio with `transcribe: true`. Call with just `source` first: short videos run immediately, everything else answers with metadata and copyable next calls.",
   "inputSchema": {
     "additionalProperties": false,
     "properties": {
       "confirm": {
-        "description": "Echo a consent token issued by a previous response to authorize the pending action. Tokens are single-use and bound to the latest plan; pass confirm alone with source.",
+        "description": "Echo a consent token issued by a previous response to authorize the pending action. Tokens stay valid until a newer plan for the same source replaces them; pass confirm alone with source.",
         "type": "string"
       },
       "from": {
@@ -44,6 +44,10 @@
           "uniform"
         ],
         "type": "string"
+      },
+      "transcribe": {
+        "description": "Set true (alone with source) to generate a whisper transcript of the audio; it is cached and rides along with every grid afterwards. Needs local media: for a URL, download it first (bare call, then confirm), then repeat with transcribe.",
+        "type": "boolean"
       },
       "until": {
         "anyOf": [

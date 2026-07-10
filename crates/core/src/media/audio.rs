@@ -50,68 +50,119 @@ pub fn decode_audio_16k_mono(source: &Source) -> Result<Vec<f32>> {
         decoder.set_channel_layout(ChannelLayout::default(decoder.channels() as i32));
     }
 
-    let mut resampler = resampling::Context::get(
-        decoder.format(),
-        decoder.channel_layout(),
-        decoder.rate(),
-        Sample::F32(Type::Packed),
-        ChannelLayout::MONO,
-        WHISPER_SAMPLE_RATE,
-    )
-    .map_err(|e| super::decode_error("configuring audio resampler", e))?;
+    let mut sink = MonoSink::new(decoder.format(), decoder.channel_layout(), decoder.rate())
+        .map_err(|e| super::decode_error("configuring audio resampler", e))?;
 
     let mut samples: Vec<f32> = Vec::new();
-    let mut budget = ErrorBudget::new("reading audio packets");
-    let in_rate = decoder.rate();
-
-    let sink = |resampler: &mut resampling::Context,
-                decoded: &frame::Audio,
-                samples: &mut Vec<f32>|
-     -> Result<()> {
-        let capacity = scaled_capacity(decoded.samples(), in_rate);
-        let mut out = frame::Audio::new(Sample::F32(Type::Packed), capacity, ChannelLayout::MONO);
-        resampler
-            .run(decoded, &mut out)
-            .map_err(|e| super::decode_error("resampling audio", e))?;
-        append_samples(&out, samples);
-        Ok(())
-    };
+    let mut budget = ErrorBudget::new("decoding audio packets");
 
     let mut decoded = frame::Audio::empty();
     for (stream, packet) in ictx.packets() {
         if stream.index() != stream_index {
             continue;
         }
-        match decoder.send_packet(&packet) {
-            Ok(()) => budget.ok(),
-            Err(e) => {
-                budget.fail(e)?;
-                continue;
-            }
+        if let Err(e) = decoder.send_packet(&packet) {
+            budget.fail(e)?;
+            continue;
         }
         while decoder.receive_frame(&mut decoded).is_ok() {
-            sink(&mut resampler, &decoded, &mut samples)?;
+            match sink.push(&mut decoded, &mut samples) {
+                Ok(()) => budget.ok(),
+                Err(e) => budget.fail(e)?,
+            }
         }
     }
 
     let _ = decoder.send_eof();
     while decoder.receive_frame(&mut decoded).is_ok() {
-        sink(&mut resampler, &decoded, &mut samples)?;
-    }
-
-    // Drain the resampler's internal buffer.
-    loop {
-        let mut out = frame::Audio::new(Sample::F32(Type::Packed), 4096, ChannelLayout::MONO);
-        let delay = resampler
-            .flush(&mut out)
-            .map_err(|e| super::decode_error("flushing audio resampler", e))?;
-        append_samples(&out, &mut samples);
-        if delay.is_none() || out.samples() == 0 {
-            break;
+        match sink.push(&mut decoded, &mut samples) {
+            Ok(()) => budget.ok(),
+            Err(e) => budget.fail(e)?,
         }
     }
 
+    sink.drain(&mut samples)
+        .map_err(|e| super::decode_error("flushing audio resampler", e))?;
+
     Ok(samples)
+}
+
+/// Streaming converter to 16 kHz mono f32 that follows mid-stream input
+/// parameter changes.
+///
+/// A decoder's header parameters are a prediction, not a contract: HE-AAC
+/// SBR doubles the rate after the first frame, DASH splices can change the
+/// layout, and a decoder recovering from bitstream corruption may emit a
+/// frame with nonsense parameters. A fixed swresample context answers all
+/// of those with `AVERROR_INPUT_CHANGED` and would kill the stream; this
+/// sink instead reconfigures for coherent changes and reports garbage
+/// frames as per-frame errors the caller's [`ErrorBudget`] can absorb.
+struct MonoSink {
+    ctx: resampling::Context,
+    format: Sample,
+    layout: ChannelLayout,
+    rate: u32,
+}
+
+impl MonoSink {
+    fn new(
+        format: Sample,
+        layout: ChannelLayout,
+        rate: u32,
+    ) -> std::result::Result<Self, ffmpeg::Error> {
+        let ctx = resampling::Context::get(
+            format,
+            layout,
+            rate,
+            Sample::F32(Type::Packed),
+            ChannelLayout::MONO,
+            WHISPER_SAMPLE_RATE,
+        )?;
+        Ok(MonoSink {
+            ctx,
+            format,
+            layout,
+            rate,
+        })
+    }
+
+    /// Feed one decoded frame. `Err` marks this frame as unusable (decoder
+    /// garbage after corruption) — the stream itself may continue.
+    fn push(
+        &mut self,
+        frame: &mut frame::Audio,
+        samples: &mut Vec<f32>,
+    ) -> std::result::Result<(), ffmpeg::Error> {
+        if frame.channel_layout().is_empty() {
+            frame.set_channel_layout(ChannelLayout::default(frame.channels() as i32));
+        }
+        let params = (frame.format(), frame.channel_layout().bits(), frame.rate());
+        if params != (self.format, self.layout.bits(), self.rate) {
+            // Coherent parameters reconfigure; incoherent ones (a 17-channel
+            // frame out of a stereo stream) fail context creation and are
+            // charged to the caller's error budget.
+            let next = MonoSink::new(frame.format(), frame.channel_layout(), frame.rate())?;
+            self.drain(samples)?;
+            *self = next;
+        }
+        let capacity = scaled_capacity(frame.samples(), self.rate);
+        let mut out = frame::Audio::new(Sample::F32(Type::Packed), capacity, ChannelLayout::MONO);
+        self.ctx.run(frame, &mut out)?;
+        append_samples(&out, samples);
+        Ok(())
+    }
+
+    /// Drain the resampler's internal carry-over into `samples`.
+    fn drain(&mut self, samples: &mut Vec<f32>) -> std::result::Result<(), ffmpeg::Error> {
+        loop {
+            let mut out = frame::Audio::new(Sample::F32(Type::Packed), 4096, ChannelLayout::MONO);
+            let delay = self.ctx.flush(&mut out)?;
+            append_samples(&out, samples);
+            if delay.is_none() || out.samples() == 0 {
+                return Ok(());
+            }
+        }
+    }
 }
 
 /// Output-frame capacity for `n` input samples at `in_rate`, with headroom

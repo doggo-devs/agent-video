@@ -228,6 +228,41 @@ pub fn duration_seconds(ictx: &ffmpeg::format::context::Input, source: &Source) 
     .with_context(ErrorContext::default().with_input(source.as_path())))
 }
 
+/// Per-track timeline coverage, for post-download integrity checks.
+///
+/// A truncated download often keeps a valid container header — the muxer
+/// wrote the *claimed* duration — while a track's own duration records
+/// where its samples actually stop. Comparing the two exposes a served-
+/// truncated stream without decoding a single frame.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamCoverage {
+    pub container_seconds: f64,
+    /// Best audio stream's own duration; `None` = no stream or no duration.
+    pub audio_seconds: Option<f64>,
+    /// Best video stream's own duration; `None` = no stream or no duration.
+    pub video_seconds: Option<f64>,
+}
+
+/// Read [`StreamCoverage`] from a container header.
+pub fn stream_coverage(source: &Source) -> Result<StreamCoverage> {
+    let ictx = open_input(source)?;
+    let container_seconds = f64::from(duration_seconds(&ictx, source)?);
+    let track = |ty: ffmpeg::media::Type| -> Option<f64> {
+        let stream = ictx.streams().best(ty)?;
+        let d = stream.duration();
+        if d <= 0 {
+            return None;
+        }
+        let tb = stream.time_base();
+        Some(d as f64 * tb.numerator() as f64 / tb.denominator() as f64)
+    };
+    Ok(StreamCoverage {
+        container_seconds,
+        audio_seconds: track(ffmpeg::media::Type::Audio),
+        video_seconds: track(ffmpeg::media::Type::Video),
+    })
+}
+
 /// Container-level facts for the probe surface: dimensions, duration,
 /// container name, and subtitle tracks. Reading this decodes no pixels —
 /// it is all header data, cheap even over http(s).

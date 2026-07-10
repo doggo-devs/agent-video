@@ -8,15 +8,14 @@ repository.workspace = true
 readme = "../README.md"
 
 [features]
-# Whisper GPU backends are compile-time opt-ins: linking one adds a load-time
-# dependency on the GPU runtime, so a host lacking it fails to exec before any
-# `use_gpu` fallback could run. The default build is CPU-only. macOS release
-# builds add metal+coreml (the frameworks are always present, so the fallback
-# genuinely works there); other platforms' GPU builds are deliberate choices.
-whisper-metal = ["whisper-rs/metal"]
-whisper-coreml = ["whisper-rs/coreml"]
-whisper-cuda = ["whisper-rs/cuda"]
-whisper-vulkan = ["whisper-rs/vulkan"]
+# `whisper-local`: local GPU inference via whisper.cpp. Any GPU feature
+# implies this; builds without it use the API-only transcription path.
+# CPU-only local inference is not supported.
+whisper-local = ["dep:whisper-rs"]
+whisper-metal = ["whisper-local", "whisper-rs/metal"]
+whisper-coreml = ["whisper-local", "whisper-rs/coreml"]
+whisper-cuda = ["whisper-local", "whisper-rs/cuda"]
+whisper-vulkan = ["whisper-local", "whisper-rs/vulkan"]
 
 [dependencies]
 agent-video-core = { path = "../core" }
@@ -27,13 +26,15 @@ toml = "1"
 dirs = "6"
 sha2 = "0.11"
 ureq = "3"
-whisper-rs = "0.16"
+whisper-rs = { version = "0.16", optional = true }
 rmcp = { version = "2", default-features = false, features = [
     "server",
     "transport-io",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 percent-encoding = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
 # Kill an expired child's whole process group, not just the direct child:

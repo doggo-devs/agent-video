@@ -39,61 +39,64 @@ fn invalid<T>(field: &str, detail: impl std::fmt::Display) -> crate::error::Resu
 /// A partial parameter set: CLI overrides (highest priority) and named
 /// profiles both resolve through this shape.
 ///
-/// Derives [`clap::Args`] directly, so the CLI flags and the override fields
-/// are the same declaration: adding an override is one field here, with no
-/// hand-copied mirror to drift in `main.rs`.
-#[derive(Debug, Clone, Default, clap::Args)]
+/// With the `clap` feature this derives `clap::Args` directly, so the CLI
+/// flags and the override fields are the same declaration: adding an
+/// override is one field here, with no hand-copied mirror to drift in
+/// `main.rs`. Without the feature it is a plain struct — the programmatic
+/// door library consumers and tests use.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct Overrides {
     /// Resolution tier: minimum readable cell edge (default: low).
-    #[arg(long, value_enum)]
+    #[cfg_attr(feature = "clap", arg(long, value_enum))]
     pub quality: Option<Quality>,
     /// Detail / sampling-density tier: sampling fps (default: standard).
-    #[arg(long, value_enum)]
+    #[cfg_attr(feature = "clap", arg(long, value_enum))]
     pub detail: Option<Detail>,
 
     /// Override base sampling fps (finer than --detail; wins over its tier).
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub base_fps: Option<f32>,
     /// Override pHash Hamming distance threshold for dedup.
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub hash_threshold: Option<u32>,
     /// Override dedup sliding window size in frames (must be >= 1).
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub dedup_window: Option<NonZeroUsize>,
     /// Override edge length of grayscale image for scoring.
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub score_edge: Option<u32>,
 
     /// Override scene-change weight in scoring.
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub w_scene: Option<f32>,
     /// Override clarity weight in scoring.
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub w_clarity: Option<f32>,
     /// Override edge-density weight in scoring.
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub w_edge: Option<f32>,
 
     /// Override chunk size in seconds.
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub chunk_seconds: Option<f32>,
     /// Override minimum temporal gap (seconds) between selected frames.
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub min_gap: Option<f32>,
 
     /// Override JPEG output quality (1-100).
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub jpeg_quality: Option<u8>,
     /// Override hero frame border thickness in pixels.
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub hero_border_px: Option<u32>,
 
     /// Override minimum raw scene difference (0-255) for a selected frame to
     /// qualify as a hero; lower catches softer cuts.
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub hero_scene_diff: Option<f32>,
     /// Override max hero frames per grid (0 disables hero emphasis).
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub max_heroes: Option<usize>,
 }
 
@@ -102,26 +105,27 @@ pub struct Overrides {
 ///
 /// The clap defaults and [`Default`] share the `DEFAULT_*` consts, so the CLI
 /// and a programmatically-built config cannot disagree.
-#[derive(Debug, Clone, Copy, clap::Args)]
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct StrategyOpts {
     /// Frame sampling strategy [default: adaptive]. When omitted, the default
     /// is applied leniently: it degrades to fixed-fps on sources with too few
     /// keyframes. An explicit value is honored strictly — too few keyframes is
     /// then an error rather than a fall back.
-    #[arg(long, value_enum)]
+    #[cfg_attr(feature = "clap", arg(long, value_enum))]
     pub strategy: Option<SampleStrategy>,
     /// Gap threshold (seconds) for adaptive sparse region fill.
-    #[arg(long, default_value_t = Self::DEFAULT_GAP_THRESHOLD)]
+    #[cfg_attr(feature = "clap", arg(long, default_value_t = Self::DEFAULT_GAP_THRESHOLD))]
     pub gap_threshold: f32,
     /// Minimum keyframes required for keyframes/adaptive strategies.
-    #[arg(long, default_value_t = Self::DEFAULT_MIN_KEYFRAMES)]
+    #[cfg_attr(feature = "clap", arg(long, default_value_t = Self::DEFAULT_MIN_KEYFRAMES))]
     pub min_keyframes: usize,
     /// Max duration (seconds) allowed for fixed-fps sampling; longer videos
     /// need --force or a keyframe strategy.
-    #[arg(long, default_value_t = Self::DEFAULT_MAX_DURATION)]
+    #[cfg_attr(feature = "clap", arg(long, default_value_t = Self::DEFAULT_MAX_DURATION))]
     pub max_duration: f32,
     /// Allow fixed-fps on videos exceeding the max-duration limit.
-    #[arg(long)]
+    #[cfg_attr(feature = "clap", arg(long))]
     pub force: bool,
 }
 

@@ -121,7 +121,7 @@ scoring weights, timing, subtitles).
 
 ## License
 
-MIT. The embedded timestamp font (Liberation Sans Bold) is licensed under the
-SIL Open Font License 1.1 — see `assets/OFL.txt`. FFmpeg libraries are linked
-(dynamically by default, statically with `--features static-ffmpeg`) and carry
-their own LGPL/GPL licensing depending on the build configuration.
+Apache-2.0. The embedded timestamp font (Liberation Sans Bold) is licensed under
+the SIL Open Font License 1.1 — see `assets/OFL.txt`. FFmpeg libraries are
+linked (dynamically by default, statically with `--features static-ffmpeg`) and
+carry their own LGPL/GPL licensing depending on the build configuration.

@@ -99,6 +99,15 @@ pub(super) fn coerce_args(
         "confirm",
         "confirm must be a string token echoed from a previous response",
     )?;
+    let transcribe = match raw.get("transcribe") {
+        None => None,
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(_) => {
+            return Err(Fault::bad_input(
+                r#"transcribe must be a boolean, e.g. {"transcribe": true}"#,
+            ));
+        }
+    };
     Ok(VideoArgs {
         source,
         from,
@@ -107,6 +116,7 @@ pub(super) fn coerce_args(
         strategy,
         raw: raw_arg,
         confirm,
+        transcribe,
     })
 }
 

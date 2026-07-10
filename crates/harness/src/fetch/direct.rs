@@ -10,12 +10,14 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::{DownloadIo, DownloadOption, ProgressFn, Recipe, SourceInfo, estimate_label};
+use super::{
+    DownloadIo, DownloadOption, Downloaded, ProgressFn, Recipe, SourceInfo, estimate_label,
+};
 use crate::config::Config;
 use crate::fault::Fault;
 use crate::netguard::{GuardedResolver, VettedUrl};
 use crate::plan::format_bytes;
-use crate::probe::probe_media_url;
+use crate::probe::{container_label, is_ext_shaped, probe_media_url};
 use crate::schema::ProbeSummary;
 use crate::tokens::{Dest, Token};
 use agent_video_core::types::format_ts;
@@ -128,44 +130,19 @@ pub fn download(
     io: DownloadIo<'_>,
     cfg: &Config,
     progress: ProgressFn<'_>,
-) -> Result<PathBuf, Fault> {
+) -> Result<Downloaded, Fault> {
     let dest = match io {
         DownloadIo::Cache { dir, key } => dir.join(format!("{key}.{}", recipe.ext)),
         DownloadIo::Keep { dir } => available_path(&dir.join(&recipe.filename))?,
     };
     download_direct(url, &dest, cfg, progress)?;
-    Ok(dest)
+    Ok(Downloaded {
+        path: dest,
+        warning: None,
+    })
 }
 
 // ── link identity ──
-
-/// Best-effort extension from a demuxer format name (comma-list).
-pub fn ext_from_container(container: Option<&str>) -> String {
-    let first = container
-        .and_then(|c| c.split(',').next())
-        .unwrap_or("")
-        .trim();
-    match first {
-        "matroska" => "mkv",
-        "webm" => "webm",
-        "mov" | "mp4" => "mp4",
-        "mpegts" => "ts",
-        "avi" => "avi",
-        "flv" => "flv",
-        "asf" => "wmv",
-        "ogg" => "ogg",
-        other if is_ext_shaped(other) => other,
-        _ => "mp4",
-    }
-    .to_string()
-}
-
-/// `[a-z0-9]{2,5}` — plausible as a file extension.
-fn is_ext_shaped(s: &str) -> bool {
-    (2..=5).contains(&s.len())
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-}
 
 /// Extension plus a keep-dir filename for a direct media link.
 pub fn direct_identity(url: &str, probe: &ProbeSummary) -> DirectRecipe {
@@ -180,7 +157,9 @@ pub fn direct_identity(url: &str, probe: &ProbeSummary) -> DirectRecipe {
     let ext = if is_ext_shaped(&url_ext) {
         url_ext.clone()
     } else {
-        ext_from_container(probe.container.as_deref())
+        // The probe canonicalizes container to an ext-shaped label already;
+        // the mapping also swallows raw demuxer names from older callers.
+        container_label(probe.container.as_deref().unwrap_or(""))
     };
     let filename = if base.is_empty() || base == format!(".{url_ext}") {
         format!("download.{ext}")
@@ -288,19 +267,25 @@ pub fn download_direct(
             .map_err(|e| Fault::environment(format!("cannot create {}: {e}", parent.display())))?;
     }
     let part = part_path(dest);
-    let result = stream_to_part(&mut res, &part, max_bytes, total, progress);
-    match result {
-        Ok(bytes) => {
-            std::fs::rename(&part, dest).map_err(|e| {
-                Fault::environment(format!("cannot finalize {}: {e}", dest.display()))
-            })?;
-            Ok(bytes)
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&part);
-            Err(e)
-        }
-    }
+    let result = stream_to_part(&mut res, &part, max_bytes, total, progress)
+        .and_then(|(file, bytes)| publish(file, &part, dest).map(|()| bytes));
+    result.inspect_err(|_| {
+        let _ = std::fs::remove_file(&part);
+    })
+}
+
+/// Publish a fully-written staging file at its final name. `sync_all` runs
+/// before the rename — the writer's own handle, no reopen — so a crash can
+/// never leave the published name pointing at bytes still in the page
+/// cache; the rename is atomic per writer. A crash between sync and rename
+/// leaves only a `.part` for the staleness sweep. The directory entry
+/// itself is not fsynced, accepted: losing the rename to a power cut is a
+/// cache miss, never a torn published file.
+fn publish(file: std::fs::File, part: &Path, dest: &Path) -> Result<(), Fault> {
+    file.sync_all()
+        .map_err(|e| Fault::environment(format!("cannot sync {}: {e}", part.display())))?;
+    std::fs::rename(part, dest)
+        .map_err(|e| Fault::environment(format!("cannot finalize {}: {e}", dest.display())))
 }
 
 /// Per-writer staging path for `dest`. The cache directory is shared across
@@ -320,13 +305,16 @@ fn part_path(dest: &Path) -> PathBuf {
     ))
 }
 
+/// Stream the body into `part`; returns the still-open write handle so the
+/// caller can decide durability before publishing — ownership of the bytes
+/// and of the fsync travel together.
 fn stream_to_part(
     res: &mut ureq::http::Response<ureq::Body>,
     part: &Path,
     max_bytes: u64,
     total: Option<u64>,
     progress: ProgressFn<'_>,
-) -> Result<u64, Fault> {
+) -> Result<(std::fs::File, u64), Fault> {
     let mut file = std::fs::File::create(part)
         .map_err(|e| Fault::environment(format!("cannot write {}: {e}", part.display())))?;
     let mut reader = res.body_mut().as_reader();
@@ -357,7 +345,7 @@ fn stream_to_part(
         }
     }
     progress(bytes, total.or(Some(bytes)));
-    Ok(bytes)
+    Ok((file, bytes))
 }
 
 #[cfg(test)]
@@ -373,15 +361,6 @@ mod tests {
             container: container.map(String::from),
             subtitles: vec![],
         }
-    }
-
-    #[test]
-    fn maps_container_names_to_extensions() {
-        assert_eq!(ext_from_container(Some("matroska,webm")), "mkv");
-        assert_eq!(ext_from_container(Some("mov,mp4,m4a,3gp,3g2,mj2")), "mp4");
-        assert_eq!(ext_from_container(Some("asf")), "wmv");
-        assert_eq!(ext_from_container(Some("weird_thing")), "mp4");
-        assert_eq!(ext_from_container(None), "mp4");
     }
 
     #[test]

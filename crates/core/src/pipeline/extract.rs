@@ -7,7 +7,6 @@
 //! within a single competition set instead of per-chunk.
 
 use std::mem;
-use std::path::Path;
 
 use anyhow::Result;
 use image::GrayImage;
@@ -23,7 +22,7 @@ use super::candidates::CandidateStream;
 use super::chunk::{build_grid_draft, extract_selected};
 use super::output::OutputSession;
 use super::state::extract_batch_frames;
-use super::{OutputMode, SubtitleSource};
+use super::{OutputSink, SubtitleSource};
 
 /// Run the `extract` pipeline: high-density sampling of `range` into a single
 /// equal-cell grid, frames in time order (no hero emphasis).
@@ -34,17 +33,16 @@ use super::{OutputMode, SubtitleSource};
 /// range extraction.
 pub fn extract_range(
     input: &Source,
-    out_dir: &Path,
+    sink: OutputSink<'_>,
     cfg: &Config,
     range: TimeRange,
-    mode: OutputMode,
     subs: SubtitleSource<'_>,
 ) -> Result<()> {
     super::validate_input(input)?;
     // Before the expensive sampling pass: subtitle errors must fail fast,
     // not after all the CPU and IO have been spent.
     let subs = Subtitles::resolve(input, subs)?;
-    let session = OutputSession::open(out_dir, mode)?;
+    let session = OutputSession::open(sink)?;
 
     let fps = cfg.extract_fps();
     // `extract` exposes no --threads flag; the decoder auto-sizes its pool.

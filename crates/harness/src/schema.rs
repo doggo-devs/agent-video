@@ -84,6 +84,9 @@ pub struct VideoArgs {
     /// Echo of a consent token issued by a previous response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm: Option<String>,
+    /// `true` = generate (or reuse) a whisper transcript for the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcribe: Option<bool>,
 }
 
 impl VideoArgs {
@@ -97,6 +100,7 @@ impl VideoArgs {
             strategy: None,
             raw: None,
             confirm: None,
+            transcribe: None,
         }
     }
 
@@ -110,7 +114,7 @@ impl VideoArgs {
 }
 
 /// Single-line tool description shown in the tool list.
-pub const VIDEO_TOOL_DESCRIPTION: &str = "Watch a video (local path or URL) as VLM-readable frame grids with timestamps and subtitles. Call with just `source` first: short videos run immediately, everything else answers with metadata and copyable next calls.";
+pub const VIDEO_TOOL_DESCRIPTION: &str = "Watch a video (local path or URL) as VLM-readable frame grids with timestamps and subtitles, or transcribe its audio with `transcribe: true`. Call with just `source` first: short videos run immediately, everything else answers with metadata and copyable next calls.";
 
 /// JSON Schema for MCP `tools/list`, kept in sync with [`VideoArgs`].
 pub fn video_input_schema() -> Value {
@@ -145,7 +149,11 @@ pub fn video_input_schema() -> Value {
             },
             "confirm": {
                 "type": "string",
-                "description": "Echo a consent token issued by a previous response to authorize the pending action. Tokens are single-use and bound to the latest plan; pass confirm alone with source."
+                "description": "Echo a consent token issued by a previous response to authorize the pending action. Tokens stay valid until a newer plan for the same source replaces them; pass confirm alone with source."
+            },
+            "transcribe": {
+                "type": "boolean",
+                "description": "Set true (alone with source) to generate a whisper transcript of the audio; it is cached and rides along with every grid afterwards. Needs local media: for a URL, download it first (bare call, then confirm), then repeat with transcribe."
             }
         },
         "required": ["source"],
@@ -159,7 +167,8 @@ pub fn video_input_schema() -> Value {
 /// wire contract (`sizeBytes` stays camelCase for TS-harness compatibility).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeSummary {
-    /// Seconds.
+    /// Seconds, centisecond precision — probes round before emitting so
+    /// f32-widening noise never reaches the model.
     pub duration: f64,
     pub width: u32,
     pub height: u32,
@@ -167,6 +176,8 @@ pub struct ProbeSummary {
     /// absent on the wire, never a fake `0`.
     #[serde(rename = "sizeBytes", default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
+    /// Short container label (`mp4`, `mkv`), never libav's demuxer alias
+    /// list; see `crate::probe::container_label`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
     /// Human-readable descriptions, e.g. `embedded #0 (eng, subrip)`.

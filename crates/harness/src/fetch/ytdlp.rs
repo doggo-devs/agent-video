@@ -16,8 +16,11 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::{DownloadIo, DownloadOption, ProgressFn, Recipe, SourceInfo, estimate_label};
+use super::{
+    DownloadIo, DownloadOption, Downloaded, ProgressFn, Recipe, SourceInfo, estimate_label,
+};
 use crate::config::Config;
+use crate::cookies::CookieHandle;
 use crate::fault::Fault;
 use crate::netguard::VettedUrl;
 use crate::plan::format_bytes;
@@ -98,7 +101,7 @@ pub struct SiteUrlInfo {
     pub subtitle_langs: Vec<String>,
     /// Distinct available heights, descending, already capped in count.
     pub keep_tiers: Vec<KeepTier>,
-    /// Estimate for the analysis rip (video-only, height-capped).
+    /// Estimate for the analysis rip (best video ≤ cap plus audio).
     pub analysis_estimated_bytes: Option<u64>,
 }
 
@@ -128,7 +131,7 @@ fn max_size<'a>(fmts: impl Iterator<Item = &'a YtdlpFormat>) -> Option<u64> {
 
 /// Reduce a `-J` document to [`SiteUrlInfo`]; pure. Size estimates mirror
 /// download selectors: keep = best video at tier + best audio, analysis =
-/// best video-only rendition at or under `analysis_max_height`.
+/// best video-only rendition at or under `analysis_max_height`, plus audio.
 pub fn site_info(doc: &YtdlpJson, analysis_max_height: u32) -> SiteUrlInfo {
     let empty = Vec::new();
     let formats = doc.formats.as_ref().unwrap_or(&empty);
@@ -173,8 +176,19 @@ pub fn site_info(doc: &YtdlpJson, analysis_max_height: u32) -> SiteUrlInfo {
         video_only
     };
     let best_height = pool.iter().map(|f| height_of(f)).max();
-    let analysis_estimated_bytes =
+    let video_estimate =
         best_height.and_then(|h| max_size(pool.iter().copied().filter(|f| height_of(f) == h)));
+    // Add audio unless the chosen rendition already carries it.
+    let chosen_muxed = best_height
+        .map(|h| pool.iter().any(|f| height_of(f) == h && f.acodec.is_some()))
+        .unwrap_or(false);
+    let analysis_estimated_bytes = video_estimate.map(|v| {
+        v + if chosen_muxed {
+            0
+        } else {
+            audio_size.unwrap_or(0)
+        }
+    });
 
     SiteUrlInfo {
         title: doc
@@ -214,13 +228,13 @@ pub fn site_source_info(info: &SiteUrlInfo, cfg: &Config) -> SourceInfo {
             None => "analysis rip".to_string(),
         },
         effect: format!(
-            "download a video-only rip (≤{h}p, {}) plus subtitles into the analysis cache \
+            "download a rip (≤{h}p video + audio, {}) plus subtitles into the analysis cache \
              (evictable)",
             estimate_label(info.analysis_estimated_bytes)
         ),
         estimated_bytes: info.analysis_estimated_bytes,
         recipe: Recipe::Ytdlp(YtdlpRecipe {
-            format: format!("bv[height<={h}]/bv*[height<={h}]/b"),
+            format: format!("bv[height<={h}]+ba/bv*[height<={h}]+ba/b[height<={h}]/b"),
             subs: true,
         }),
     }];
@@ -263,12 +277,14 @@ pub fn site_source_info(info: &SiteUrlInfo, cfg: &Config) -> SourceInfo {
 const SUBS_INFIX: &str = "_subs";
 
 /// Copy the preferred-language downloaded subtitle to `<key>.<ext>` — the
-/// rip's one sidecar, picked up by core's auto-detection.
+/// rip's one sidecar, picked up by core's auto-detection. `preferred_langs`
+/// is the election policy (`subtitles.preferred_langs` in config.toml):
+/// prefix-matched, first hit wins, no hit falls back to the first candidate.
 ///
 /// Only formats core actually reads are eligible
 /// ([`SIDECAR_SUBTITLE_EXTS`]): an unconverted leftover (`--convert-subs`
 /// can fail) must not become a sidecar core cannot parse.
-pub fn promote_subtitle(dir: &Path, key: &str) -> std::io::Result<()> {
+pub fn promote_subtitle(dir: &Path, key: &str, preferred_langs: &[String]) -> std::io::Result<()> {
     use agent_video_core::subtitle::SIDECAR_SUBTITLE_EXTS;
 
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -292,13 +308,12 @@ pub fn promote_subtitle(dir: &Path, key: &str) -> std::io::Result<()> {
             valid.then_some((n.as_str(), lang, ext))
         })
         .collect();
-    let preferred = candidates
+    let preferred = preferred_langs
         .iter()
-        .find(|(_, lang, _)| lang.starts_with("en"))
-        .or_else(|| {
+        .find_map(|want| {
             candidates
                 .iter()
-                .find(|(_, lang, _)| lang.starts_with("zh"))
+                .find(|(_, lang, _)| lang.starts_with(want.as_str()))
         })
         .or_else(|| candidates.first());
     let Some((name, _, ext)) = preferred else {
@@ -330,6 +345,63 @@ fn spawn_error(e: std::io::Error) -> Fault {
     }
 }
 
+/// Acquire the configured cookie source; a jar that cannot be staged is
+/// the user's environment, not the URL.
+fn acquire_cookies(cfg: &Config) -> Result<CookieHandle, Fault> {
+    CookieHandle::acquire(&cfg.cookies)
+        .map_err(|e| Fault::environment(format!("cannot stage the cookie jar: {e}")))
+}
+
+/// Adopt rotated cookies back into the canonical jar; best-effort — the
+/// media verdict must not depend on jar bookkeeping.
+fn commit_cookies(cookies: CookieHandle) {
+    if let Err(e) = cookies.commit() {
+        tracing::warn!("cookie write-back failed: {e}");
+    }
+}
+
+/// yt-dlp's own error lines. The auth heuristic below runs on these only:
+/// a WARNING quoting "premium" or progress noise mentioning a member
+/// stream is not a login wall. No `ERROR:` lines at all (a bare traceback,
+/// a signal kill) falls back to the full text — a mislabeled hint beats a
+/// lost one.
+fn error_lines(stderr: &str) -> String {
+    let errors: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.trim_start().starts_with("ERROR"))
+        .collect();
+    if errors.is_empty() {
+        stderr.to_string()
+    } else {
+        errors.join("\n")
+    }
+}
+
+/// yt-dlp stderr markers meaning "this source wants a login", not "retry":
+/// yt-dlp's own auth errors suggest `--cookies`, and extractors phrase
+/// gated content as sign-in / members-only / private. Judged on yt-dlp's
+/// error lines only ([`error_lines`]).
+fn is_auth_failure(stderr: &str) -> bool {
+    let lower = error_lines(stderr).to_lowercase();
+    [
+        "--cookies",
+        "sign in",
+        "log in",
+        "login required",
+        "private video",
+        "members-only",
+        "members only",
+        "premium",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
+}
+
+/// The actionable way out of an auth failure, appended to its fault.
+const AUTH_HINT: &str = "this source requires a login — export cookies from a logged-in browser \
+     session and run `agent-video cookie import <file>`, or set cookies.from_browser in \
+     config.toml";
+
 /// How long a `yt-dlp -J` probe may run before it is killed: it is pure
 /// network metadata work, so a minute of silence means a hung site, not a
 /// slow one.
@@ -337,11 +409,15 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Probe a site page: `yt-dlp -J` reduced through [`site_info`].
 pub fn probe(url: &VettedUrl, cfg: &Config) -> Result<SourceInfo, Fault> {
-    let out = crate::proc::output_with_deadline(
-        Command::new("yt-dlp").args(["-J", "--no-playlist", url.as_str()]),
-        PROBE_DEADLINE,
-    )
-    .map_err(spawn_error)?;
+    let cookies = acquire_cookies(cfg)?;
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args(["-J", "--no-playlist"])
+        .args(cookies.args())
+        .arg(url.as_str());
+    let out = crate::proc::output_with_deadline(&mut cmd, PROBE_DEADLINE).map_err(spawn_error)?;
+    // Even a probe rotates cookies on some sites; adopt them whatever the
+    // verdict (a deadline-killed child left an empty delta).
+    commit_cookies(cookies);
     let Some(status) = out.status else {
         return Err(Fault::transient(format!(
             "yt-dlp probing {url} hung for {}s and was aborted — the site may be \
@@ -350,10 +426,17 @@ pub fn probe(url: &VettedUrl, cfg: &Config) -> Result<SourceInfo, Fault> {
         )));
     };
     if !status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr.bytes);
+        if is_auth_failure(&stderr) {
+            return Err(Fault::environment(format!(
+                "yt-dlp could not read {url}: {} — {AUTH_HINT}",
+                stderr_tail(&stderr)
+            )));
+        }
         return Err(Fault::transient(format!(
             "yt-dlp could not read {url} (exit {}): {}",
             status.code().unwrap_or(1),
-            stderr_tail(&String::from_utf8_lossy(&out.stderr.bytes))
+            stderr_tail(&stderr)
         )));
     }
     if out.stdout.truncated {
@@ -379,6 +462,11 @@ const STALL_LIMIT: Duration = Duration::from_secs(300);
 
 /// How long a child may linger after closing its output before being killed.
 const REAP_GRACE: Duration = Duration::from_secs(30);
+
+/// Grace between SIGINT and SIGKILL when aborting a stalled child: enough
+/// for yt-dlp's KeyboardInterrupt path to save rotated cookies into the
+/// staged jar, far below every caller-facing wait bound.
+const INT_GRACE: Duration = Duration::from_secs(10);
 
 /// Terminal state of the yt-dlp child, decided by the watchdog thread that
 /// owns it.
@@ -407,10 +495,13 @@ fn watch_child(mut child: Child, activity: mpsc::Receiver<()>) -> ChildOutcome {
                 };
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // The whole group: a stalled yt-dlp may have live ffmpeg
-                // children holding the pipes, and the pipe readers only
-                // unblock once every write end is gone.
-                crate::proc::kill_tree(&mut child);
+                // Gently first: a SIGKILLed yt-dlp never saves rotated
+                // cookies to its jar, so a stall would burn the login
+                // session on top of the download. The whole group either
+                // way: a stalled yt-dlp may have live ffmpeg children
+                // holding the pipes, and the pipe readers only unblock
+                // once every write end is gone.
+                crate::proc::kill_tree_graceful(&mut child, INT_GRACE);
                 return ChildOutcome::Stalled;
             }
         }
@@ -439,14 +530,16 @@ pub fn parse_progress(line: &str) -> Option<(u64, Option<u64>)> {
     Some((downloaded, total.or(estimate)))
 }
 
-/// A per-process staging directory inside the shared cache: two servers
-/// confirming the same URL would otherwise hand yt-dlp the same output
-/// template — and yt-dlp's own `.part` handling interleaves their writes.
-/// Each job downloads into its own directory and adopts the results into
-/// the cache with per-file renames (same filesystem, atomic per writer;
-/// last-writer-wins is safe because equal keys mean equal recipes).
-/// Removed on drop; a crash leaves it for [`crate::cache::Cache::evict`]'s
-/// stale-staging sweep.
+/// A per-writer staging directory inside the shared cache: two jobs
+/// confirming the same URL — whether in one server or two — would
+/// otherwise hand yt-dlp the same output template, and yt-dlp's own
+/// `.part` handling interleaves their writes. Ownership is per writer,
+/// not per process: a pid alone would let two threads of one server
+/// share a directory. Each job downloads into its own directory and
+/// adopts the results into the cache with per-file renames (same
+/// filesystem, atomic per writer; last-writer-wins is safe because equal
+/// keys mean equal recipes). Removed on drop; a crash leaves it for
+/// [`crate::cache::Cache::evict`]'s stale-staging sweep.
 struct StagingDir {
     path: PathBuf,
 }
@@ -457,16 +550,31 @@ pub const STAGING_PREFIX: &str = ".staging-";
 
 impl StagingDir {
     fn create(parent: &Path, key: &str) -> std::io::Result<Self> {
-        let path = parent.join(format!("{STAGING_PREFIX}{key}-{}", std::process::id()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static WRITER_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = WRITER_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            "{STAGING_PREFIX}{key}-{}-{seq}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&path)?;
         Ok(StagingDir { path })
     }
 
     /// Move every staged file up into `dest_dir`; the media named by
     /// `filepath` (yt-dlp's report, inside staging) maps to its final path.
+    ///
+    /// Each file is fsynced before its rename — yt-dlp does not sync, so
+    /// without this a crash after adoption could publish a cache name whose
+    /// bytes are still in the page cache. Best-effort: a platform refusing
+    /// fsync on a read-only handle degrades to plain rename durability,
+    /// which is not worth failing a finished download over.
     fn adopt_into(&self, dest_dir: &Path, filepath: &Path) -> std::io::Result<PathBuf> {
         for entry in std::fs::read_dir(&self.path)? {
             let entry = entry?;
+            if let Ok(file) = std::fs::File::open(entry.path()) {
+                let _ = file.sync_all();
+            }
             std::fs::rename(entry.path(), dest_dir.join(entry.file_name()))?;
         }
         let name = filepath
@@ -482,6 +590,42 @@ impl Drop for StagingDir {
     }
 }
 
+/// Judge a finished yt-dlp run. A non-zero exit does not decide failure by
+/// itself: yt-dlp reflects any recorded error in its exit code, including
+/// best-effort side work such as subtitle fetching or conversion (e.g. a
+/// site serving login-gated subtitles). The `after_move:filepath` line
+/// prints only once the media file reached its final path, so `media_landed`
+/// is the ground truth: media on disk downgrades the exit code to a warning
+/// the caller surfaces; no media means the download really failed.
+fn settle_exit(
+    status: ExitStatus,
+    media_landed: bool,
+    stderr: &str,
+) -> Result<Option<String>, Fault> {
+    if status.success() {
+        return Ok(None);
+    }
+    if media_landed {
+        return Ok(Some(format!(
+            "yt-dlp reported errors after the media file completed (exit {}); best-effort \
+             extras such as subtitles may be missing: {}",
+            status.code().unwrap_or(1),
+            stderr_tail(stderr)
+        )));
+    }
+    if is_auth_failure(stderr) {
+        return Err(Fault::environment(format!(
+            "yt-dlp download failed: {} — {AUTH_HINT}",
+            stderr_tail(stderr)
+        )));
+    }
+    Err(Fault::transient(format!(
+        "yt-dlp download failed (exit {}): {}",
+        status.code().unwrap_or(1),
+        stderr_tail(stderr)
+    )))
+}
+
 /// Download via yt-dlp, blocking until the file is at its final path; yt-dlp
 /// owns `.part` handling and atomic renames within the staging directory.
 pub fn download(
@@ -490,7 +634,7 @@ pub fn download(
     io: DownloadIo<'_>,
     cfg: &Config,
     progress: ProgressFn<'_>,
-) -> Result<PathBuf, Fault> {
+) -> Result<Downloaded, Fault> {
     let (staging, output, subtitle_output, promote_key) = match io {
         DownloadIo::Cache { dir, key } => {
             let staging = StagingDir::create(dir, key).map_err(|e| {
@@ -536,7 +680,10 @@ pub fn download(
             [
                 "--write-subs",
                 "--sub-langs",
-                "all,-live_chat",
+                // live_chat and danmaku are sidecar formats core can never
+                // read; danmaku xml additionally makes `--convert-subs`
+                // fail hard on an ffmpeg error.
+                "all,-live_chat,-danmaku",
                 "--convert-subs",
                 "srt",
                 "-o",
@@ -545,6 +692,8 @@ pub fn download(
         );
         args.push(format!("subtitle:{}", sub.display()));
     }
+    let cookies = acquire_cookies(cfg)?;
+    args.extend(cookies.args());
     args.push(url.as_str().to_string());
 
     let mut cmd = Command::new("yt-dlp");
@@ -612,7 +761,11 @@ pub fn download(
     let stderr = stderr_thread.join().unwrap_or_default();
     let outcome = watchdog.join().expect("watchdog thread does not panic");
 
-    match outcome {
+    // Whatever the verdict: a normal exit and a graceful abort both saved
+    // the staged jar, a hard-killed child left an empty delta.
+    commit_cookies(cookies);
+
+    let warning = match outcome {
         ChildOutcome::Stalled => {
             return Err(Fault::transient(format!(
                 "the download stalled — no output from yt-dlp for {}s — and was aborted; \
@@ -625,15 +778,11 @@ pub fn download(
                 "yt-dlp did not exit after its output closed and was killed",
             ));
         }
-        ChildOutcome::Exited(status) if !status.success() => {
-            return Err(Fault::transient(format!(
-                "yt-dlp download failed (exit {}): {}",
-                status.code().unwrap_or(1),
-                stderr_tail(&stderr)
-            )));
+        ChildOutcome::Exited(status) => {
+            let media_landed = filepath.as_deref().is_some_and(|p| Path::new(p).is_file());
+            settle_exit(status, media_landed, &stderr)?
         }
-        ChildOutcome::Exited(_) => {}
-    }
+    };
     if let Some(e) = read_error {
         return Err(Fault::transient(format!(
             "reading yt-dlp output failed mid-download: {e}"
@@ -648,16 +797,20 @@ pub fn download(
     };
     let filepath = PathBuf::from(filepath);
     let Some((staging, dest_dir)) = staging else {
-        return Ok(filepath);
+        return Ok(Downloaded {
+            path: filepath,
+            warning,
+        });
     };
     // Elect the one sidecar before the results become visible to other
     // processes: adoption must publish a complete entry.
     if let Some(key) = promote_key {
-        let _ = promote_subtitle(&staging.path, &key);
+        let _ = promote_subtitle(&staging.path, &key, &cfg.subtitles.preferred_langs);
     }
-    staging
+    let path = staging
         .adopt_into(&dest_dir, &filepath)
-        .map_err(|e| Fault::environment(format!("cannot move the download into the cache: {e}")))
+        .map_err(|e| Fault::environment(format!("cannot move the download into the cache: {e}")))?;
+    Ok(Downloaded { path, warning })
 }
 
 #[cfg(test)]
@@ -717,17 +870,18 @@ mod tests {
     }
 
     #[test]
-    fn analysis_estimate_prefers_video_only_under_cap() {
+    fn analysis_estimate_prefers_video_only_under_cap_plus_audio() {
         let doc = YtdlpJson {
             formats: Some(vec![
                 fmt(480.0, "avc1", "none", Some(30.0)),
                 fmt(360.0, "avc1", "none", Some(20.0)),
                 fmt(480.0, "avc1", "mp4a", Some(60.0)),
+                fmt(0.0, "none", "opus", Some(5.0)),
             ]),
             ..Default::default()
         };
         let info = site_info(&doc, 480);
-        assert_eq!(info.analysis_estimated_bytes, Some(30));
+        assert_eq!(info.analysis_estimated_bytes, Some(35));
     }
 
     #[test]
@@ -748,6 +902,72 @@ mod tests {
         };
         assert_eq!(site_info(&doc, 480).title, "abc123");
         assert_eq!(site_info(&YtdlpJson::default(), 480).title, "untitled");
+    }
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_exit_settles_without_warning() {
+        let settled = settle_exit(exit_status(0), true, "").expect("success");
+        assert_eq!(settled, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn degrades_exit_error_to_warning_when_media_landed() {
+        // BiliBili without login: the rip completes, then subtitle
+        // conversion fails and yt-dlp exits 1. The finished media must
+        // survive as a warning, not be discarded as a failed download.
+        let warning = settle_exit(exit_status(1), true, "ERROR: Preprocessing: Invalid data")
+            .expect("media landed ⇒ success")
+            .expect("non-zero exit ⇒ warning");
+        assert!(warning.contains("subtitles may be missing"), "{warning}");
+        assert!(warning.contains("Invalid data"), "stderr rides along");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_failure_becomes_an_environment_fault_with_the_import_hint() {
+        // YouTube's login wall: the fix is user action (import cookies),
+        // not a retry — the fault class and message must say so.
+        let stderr = "ERROR: [youtube] abc: Sign in to confirm you’re not a bot. \
+                      Use --cookies-from-browser or --cookies for the authentication";
+        let fault = settle_exit(exit_status(1), false, stderr).expect_err("no media ⇒ failure");
+        assert_eq!(fault.kind, crate::fault::FaultKind::Environment);
+        assert!(
+            fault.to_string().contains("agent-video cookie import"),
+            "names the way out: {fault}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fails_exit_error_when_media_never_landed() {
+        let fault = settle_exit(exit_status(1), false, "ERROR: no formats")
+            .expect_err("no media ⇒ failure");
+        assert!(fault.to_string().contains("no formats"), "{fault}");
+    }
+
+    #[test]
+    fn auth_markers_outside_error_lines_do_not_fire() {
+        // A WARNING quoting "premium" next to a plain network error must
+        // settle as transient, not as a login wall.
+        let stderr = "WARNING: [site] skipping premium-quality subtitles\n\
+                      ERROR: unable to download video data: timed out";
+        assert!(!is_auth_failure(stderr), "warning noise must not fire");
+        assert!(
+            is_auth_failure("ERROR: [youtube] private video, sign in"),
+            "real auth errors still fire"
+        );
+        assert!(
+            is_auth_failure("Traceback: use --cookies for authentication"),
+            "no ERROR lines falls back to the full text"
+        );
     }
 
     #[test]
@@ -788,7 +1008,10 @@ mod tests {
         let Recipe::Ytdlp(r) = &si.options[0].recipe else {
             panic!("analysis recipe is ytdlp");
         };
-        assert_eq!(r.format, "bv[height<=480]/bv*[height<=480]/b");
+        assert_eq!(
+            r.format,
+            "bv[height<=480]+ba/bv*[height<=480]+ba/b[height<=480]/b"
+        );
         assert!(r.subs);
     }
 
@@ -805,20 +1028,33 @@ mod tests {
         dir
     }
 
+    fn langs(prefs: &[&str]) -> Vec<String> {
+        prefs.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn promotes_english_subtitle_first() {
+    fn promotes_the_configured_language_first() {
         let dir = temp_dir("promote");
         std::fs::write(dir.join("k_subs.zh-Hans.srt"), b"zh").expect("write");
         std::fs::write(dir.join("k_subs.en-US.srt"), b"en").expect("write");
-        promote_subtitle(&dir, "k").expect("promote");
+        promote_subtitle(&dir, "k", &langs(&["en", "zh"])).expect("promote");
         assert_eq!(std::fs::read(dir.join("k.srt")).expect("promoted"), b"en");
+    }
+
+    #[test]
+    fn promotion_preference_is_policy_not_hardcode() {
+        let dir = temp_dir("promote-zh");
+        std::fs::write(dir.join("k_subs.zh-Hans.srt"), b"zh").expect("write");
+        std::fs::write(dir.join("k_subs.en-US.srt"), b"en").expect("write");
+        promote_subtitle(&dir, "k", &langs(&["zh", "en"])).expect("promote");
+        assert_eq!(std::fs::read(dir.join("k.srt")).expect("promoted"), b"zh");
     }
 
     #[test]
     fn promote_ignores_unrelated_files() {
         let dir = temp_dir("unrelated");
         std::fs::write(dir.join("k.mp4"), b"v").expect("write");
-        promote_subtitle(&dir, "k").expect("promote");
+        promote_subtitle(&dir, "k", &langs(&["en"])).expect("promote");
         assert!(!dir.join("k.srt").exists());
     }
 
@@ -828,7 +1064,7 @@ mod tests {
         // become a sidecar core would refuse to parse.
         let dir = temp_dir("vtt");
         std::fs::write(dir.join("k_subs.en.vtt"), b"vtt").expect("write");
-        promote_subtitle(&dir, "k").expect("promote");
+        promote_subtitle(&dir, "k", &langs(&["en"])).expect("promote");
         assert!(!dir.join("k.vtt").exists());
         assert!(!dir.join("k.srt").exists());
     }
@@ -859,7 +1095,7 @@ mod tests {
         std::fs::write(dir.join("k.mp4"), b"v").expect("write");
         std::fs::write(dir.join("k_subs.en.srt"), b"en").expect("write");
         std::fs::write(dir.join("k_subs.zh.srt"), b"zh").expect("write");
-        promote_subtitle(&dir, "k").expect("promote");
+        promote_subtitle(&dir, "k", &langs(&["en", "zh"])).expect("promote");
 
         let sidecars = agent_video_core::subtitle::find_sidecars(&dir.join("k.mp4"));
         assert_eq!(sidecars, vec![dir.join("k.srt")]);
