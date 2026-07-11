@@ -18,7 +18,8 @@ use anyhow::Result;
 use image::GrayImage;
 
 use crate::config::Config;
-use crate::types::{CandidateFrame, GridMeta, LayoutKind, TimeRange, format_ts};
+use crate::event::EventSink;
+use crate::types::{CandidateFrame, GridMeta, LayoutKind, TimeRange};
 use crate::{compose, layout};
 
 use super::chunk::{GridResult, ProcessChunkEnv, process_chunk};
@@ -51,6 +52,9 @@ pub struct ProcessState<'a> {
     grid_metas: Vec<GridMeta>,
     static_seq: usize,
     static_metas: Vec<GridMeta>,
+    /// Diagnostic sink: static-stretch collapses report through it as typed
+    /// events, so this shell never writes to stderr itself.
+    events: &'a dyn EventSink,
 }
 
 impl<'a> ProcessState<'a> {
@@ -59,6 +63,7 @@ impl<'a> ProcessState<'a> {
         pool: &'a rayon::ThreadPool,
         session: &'a OutputSession<'a>,
         parallelism: NonZeroUsize,
+        events: &'a dyn EventSink,
     ) -> Self {
         Self {
             cfg,
@@ -79,6 +84,7 @@ impl<'a> ProcessState<'a> {
             grid_metas: Vec::new(),
             static_seq: 0,
             static_metas: Vec::new(),
+            events,
         }
     }
 
@@ -90,7 +96,7 @@ impl<'a> ProcessState<'a> {
     /// Timeline placement and its failure mode (broken timestamps) live in
     /// [`Chunker::push`].
     pub fn push_judged(&mut self, frame: CandidateFrame, kept: bool) -> Result<()> {
-        let events = self.chunker.push(frame, kept, self.capacity())?;
+        let events = self.chunker.push(frame, kept, self.capacity(), self.events)?;
         self.handle_events(events)
     }
 
@@ -134,11 +140,11 @@ impl<'a> ProcessState<'a> {
         let jpeg = compose::render_single(&rgb, start, self.cfg.jpeg_quality())?;
         let file = format!("static_{:03}.jpg", self.static_seq);
         let image = self.session.emit_image(&file, &jpeg)?;
-        eprintln!(
-            "  static stretch {}-{} collapsed into {file}",
-            format_ts(start),
-            format_ts(end)
-        );
+        self.events.event(crate::event::Event::StaticCollapsed {
+            start,
+            end,
+            file: &file,
+        });
         self.static_metas.push(GridMeta {
             image,
             time_range: TimeRange::new(start, end).expect("static stretch has start <= end"),
@@ -206,6 +212,7 @@ fn panic_to_anyhow(payload: Box<dyn std::any::Any + Send>) -> anyhow::Error {
 mod tests {
     use super::*;
     use crate::config::{Overrides, StrategyOpts};
+    use crate::event::Discard;
     use crate::types::{Detail, GridImage, GridMeta, Quality};
     use crate::{dedup, extract};
     use image::{Rgb, RgbImage};
@@ -290,7 +297,7 @@ mod tests {
     ) -> Vec<GridMeta> {
         let session = json_session();
         let parallelism = NonZeroUsize::new(parallelism).expect("test parallelism is nonzero");
-        let mut state = ProcessState::new(cfg, pool, &session, parallelism);
+        let mut state = ProcessState::new(cfg, pool, &session, parallelism, &Discard);
         for (frame, kept) in judge(cfg, frames) {
             state.push_judged(frame, kept).expect("push frame");
         }
@@ -383,7 +390,7 @@ mod tests {
         let pool = pool(2);
         let session = json_session();
         let one = NonZeroUsize::new(1).expect("1 is nonzero");
-        let mut state = ProcessState::new(&cfg, &pool, &session, one);
+        let mut state = ProcessState::new(&cfg, &pool, &session, one, &Discard);
         for (frame, kept) in judge(&cfg, &frames) {
             state.push_judged(frame, kept).expect("push frame");
         }

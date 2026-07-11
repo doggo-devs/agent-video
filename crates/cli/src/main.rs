@@ -16,10 +16,92 @@ use clap::{Parser, Subcommand, ValueHint};
 
 use agent_video_core::config::{Config, Overrides, StrategyOpts};
 use agent_video_core::error::Error;
+use agent_video_core::event::{Event, EventSink};
 use agent_video_core::pipeline::{self, parse_range};
 use agent_video_core::source::Source;
-use agent_video_core::types::TimeRange;
+use agent_video_core::types::{TimeRange, format_ts};
 use agent_video_harness as harness;
+
+/// The CLI's diagnostic renderer: turns the kernel's typed [`Event`]s back
+/// into the exact stderr lines the tool has always printed.
+///
+/// This is the one place that decides wording, float precision, and timestamp
+/// format; the kernel only reports data. Every arm reproduces its historical
+/// string byte-for-byte, indentation included.
+struct StderrEvents;
+
+impl EventSink for StderrEvents {
+    fn event(&self, event: Event<'_>) {
+        match event {
+            Event::SeekFallback { start, error } => eprintln!(
+                "warning: cannot seek to {start:.2}s ({error}); \
+                 reading sequentially from the start"
+            ),
+            Event::FixedFpsWindow { fps, start, end } => {
+                let end = end.map_or("end".to_string(), |e| format!("{e:.1}s"));
+                eprintln!("fixed-fps mode: sampling at {fps:.1} fps over {start:.1}s-{end}");
+            }
+            Event::FixedFps { fps } => {
+                eprintln!("fixed-fps mode: sampling at {fps:.1} fps");
+            }
+            Event::KeyframesMode {
+                count,
+                duration,
+                mean_gap,
+                max_gap,
+            } => eprintln!(
+                "keyframes mode: {count} I-frames over {duration:.1}s \
+                 (mean gap {mean_gap:.1}s, max {max_gap:.1}s)"
+            ),
+            Event::AdaptiveMode {
+                keyframes,
+                max_gap,
+                sparse_regions,
+                threshold,
+            } => eprintln!(
+                "adaptive mode: {keyframes} I-frames (max gap {max_gap:.1}s), \
+                 {sparse_regions} sparse regions (threshold {threshold:.1}s)"
+            ),
+            Event::AdaptiveFallbackFixedFps { coverage_percent } => eprintln!(
+                "adaptive mode: sparse regions cover {coverage_percent:.0}% of the video; \
+                 falling back to a single fixed-fps pass"
+            ),
+            Event::FillingSparseRegion { start, end } => {
+                eprintln!("  filling sparse region {start:.1}s-{end:.1}s");
+            }
+            Event::KeyframePoorDegrade { count, minimum } => eprintln!(
+                "warning: only {count} keyframes (<{minimum} required); \
+                 falling back to fixed-fps sampling"
+            ),
+            Event::StaticCollapsed { start, end, file } => eprintln!(
+                "  static stretch {}-{} collapsed into {file}",
+                format_ts(start),
+                format_ts(end)
+            ),
+            Event::UnplaceableTimestamp { ts, last } => eprintln!(
+                "  warning: skipping frame with unplaceable timestamp {ts} (last {last:?})"
+            ),
+            Event::GridsWritten { count, dir } => {
+                eprintln!("wrote {count} grid(s) to {}", dir.display());
+            }
+            Event::EmbeddedSubtitlesEmpty => eprintln!(
+                "warning: the embedded subtitle stream contains no text cues; \
+                 continuing without subtitles"
+            ),
+            Event::SidecarScanFailed { dir, error } => eprintln!(
+                "warning: cannot list directory {} for subtitle sidecars: {error}; \
+                 pass --subtitle to use one explicitly",
+                dir.display()
+            ),
+            Event::SidecarEntryUnreadable { error } => {
+                eprintln!("warning: skipping unreadable directory entry during sidecar scan: {error}")
+            }
+            // `Event` is non_exhaustive: a kernel that learns a new diagnostic
+            // stays silent here until this renderer teaches it a string.
+            _ => {}
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -322,10 +404,19 @@ fn run() -> anyhow::Result<()> {
             let window = pipeline::Window::from_args(*from, *until)?;
             let threads = threads.unwrap_or(0);
             let in_flight = in_flight.unwrap_or(pipeline::DEFAULT_IN_FLIGHT);
-            pipeline::process(&source, sink, &cfg, threads, in_flight, subs, window)
+            pipeline::process(
+                &source,
+                sink,
+                &cfg,
+                threads,
+                in_flight,
+                subs,
+                window,
+                &StderrEvents,
+            )
         }
         Command::Extract { range, .. } => {
-            pipeline::extract_range(&source, sink, &cfg, *range, subs)
+            pipeline::extract_range(&source, sink, &cfg, *range, subs, &StderrEvents)
         }
         Command::Mcp
         | Command::InstallWhisper { .. }

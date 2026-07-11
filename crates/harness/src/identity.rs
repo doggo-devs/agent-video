@@ -174,16 +174,7 @@ mod tests {
         assert_eq!(a.id, b.id, "sampled identity ignores middle bytes");
     }
 
-    fn tempdir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "av-identity-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir
+    fn tempdir() -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new("av-identity")
     }
 }

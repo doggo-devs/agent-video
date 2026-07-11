@@ -24,11 +24,11 @@ whisper-vulkan = ["agent-video-harness/whisper-vulkan"]
 [dependencies]
 agent-video-core = { path = "../core", features = ["clap"] }
 agent-video-harness = { path = "../harness" }
-clap = { version = "4", features = ["derive"] }
-anyhow = "1"
+clap = { workspace = true }
+anyhow = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # Restore SIGPIPE to SIG_DFL at startup: the Rust runtime installs SIG_IGN,
 # which turns a closed downstream pipe (e.g. `| head`) into an EPIPE panic
 # under `panic = "abort"` instead of a clean signal termination.
-libc = "0.2"
+libc = { workspace = true }

@@ -11,6 +11,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::error::{Error, ErrorCode, ErrorContext, Result};
+use crate::event::{Discard, Event, EventSink};
 use crate::media;
 use crate::source::Source;
 use crate::types::{GridSubtitles, TimeRange};
@@ -82,7 +83,16 @@ impl Subtitles {
     /// [`ErrorCode::InputCorrupt`] instead: every grid's `subtitles` field
     /// would be empty while the run reports success — not what the user
     /// asked for.
-    pub fn resolve(input: &Source, source: SubtitleSource<'_>) -> Result<Option<Self>> {
+    ///
+    /// `events` receives the auto path's environmental warnings (an empty
+    /// embedded track, an unlistable sidecar directory) as typed events; the
+    /// explicit-source paths emit none. Pass [`crate::event::Discard`] for
+    /// silence.
+    pub fn resolve(
+        input: &Source,
+        source: SubtitleSource<'_>,
+        events: &dyn EventSink,
+    ) -> Result<Option<Self>> {
         match source {
             SubtitleSource::File(p) => Ok(Some(Self::from_srt_text(input, extract_from_file(p)?)?)),
             SubtitleSource::Track(t) => {
@@ -96,7 +106,7 @@ impl Subtitles {
                 }
                 Ok(Some(Self::from_cues(cues)))
             }
-            SubtitleSource::Auto => match auto_detect(input)? {
+            SubtitleSource::Auto => match auto_detect(input, events)? {
                 Some(AutoSource::Sidecar(text)) => Ok(Some(Self::from_srt_text(input, text)?)),
                 Some(AutoSource::Embedded(cues)) => Ok(Some(Self::from_cues(cues))),
                 None => Ok(None),
@@ -171,9 +181,9 @@ fn extract_from_file(path: &Path) -> Result<String> {
 /// Returns `None` when no subtitles are found. Sidecar discovery is
 /// local-only: a remote source has no directory to scan, so only its embedded
 /// tracks are considered.
-fn auto_detect(input: &Source) -> Result<Option<AutoSource>> {
+fn auto_detect(input: &Source, events: &dyn EventSink) -> Result<Option<AutoSource>> {
     let sidecars = match input {
-        Source::Local(path) => find_sidecars(path),
+        Source::Local(path) => find_sidecars_inner(path, events),
         Source::Remote(_) => Vec::new(),
     };
     let embedded = media::subtitle::list_tracks(input)?;
@@ -212,10 +222,7 @@ fn auto_detect(input: &Source) -> Result<Option<AutoSource>> {
         if cues.is_empty() {
             // A present-but-empty text track is a legal container state, not
             // corruption; unrequested, the auto path degrades to no subtitles.
-            eprintln!(
-                "warning: the embedded subtitle stream contains no text cues; \
-                 continuing without subtitles"
-            );
+            events.event(Event::EmbeddedSubtitlesEmpty);
             return Ok(None);
         }
         return Ok(Some(AutoSource::Embedded(cues)));
@@ -238,9 +245,20 @@ pub const SIDECAR_SUBTITLE_EXTS: &[&str] = &["srt"];
 /// including ones that need no subtitles, so a directory that cannot be
 /// listed (permissions, sandbox) degrades to a warning and whatever the
 /// exact-name check already found — mirroring the missing-track downgrade
-/// in [`auto_detect`]. A sidecar that is *found* but unreadable still fails,
-/// in [`read_sidecar`].
+/// in `auto_detect`. A sidecar that is *found* but unreadable still fails,
+/// in `read_sidecar`.
+///
+/// Library consumers that only want the list stay silent: this discards the
+/// scan diagnostics. The pipeline's auto path uses [`find_sidecars_inner`] to
+/// route them into its event sink instead.
 pub fn find_sidecars(input: &Path) -> Vec<std::path::PathBuf> {
+    find_sidecars_inner(input, &Discard)
+}
+
+/// Sidecar discovery that reports scan diagnostics into `events`: an
+/// unlistable directory or an unreadable entry becomes a typed event rather
+/// than a hardcoded stderr line. [`find_sidecars`] is the silent wrapper.
+fn find_sidecars_inner(input: &Path, events: &dyn EventSink) -> Vec<std::path::PathBuf> {
     let Some(stem) = input.file_stem().and_then(|s| s.to_str()) else {
         return Vec::new();
     };
@@ -261,11 +279,10 @@ pub fn find_sidecars(input: &Path) -> Vec<std::path::PathBuf> {
     let entries = match fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(e) => {
-            eprintln!(
-                "warning: cannot list directory {} for subtitle sidecars: {e}; \
-                 pass --subtitle to use one explicitly",
-                parent.display()
-            );
+            events.event(Event::SidecarScanFailed {
+                dir: parent,
+                error: e.to_string(),
+            });
             return results;
         }
     };
@@ -274,7 +291,9 @@ pub fn find_sidecars(input: &Path) -> Vec<std::path::PathBuf> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                eprintln!("warning: skipping unreadable directory entry during sidecar scan: {e}");
+                events.event(Event::SidecarEntryUnreadable {
+                    error: e.to_string(),
+                });
                 continue;
             }
         };
@@ -557,8 +576,12 @@ with continuation
         let sub = dir.join("broken.srt");
         fs::write(&sub, "this is not SRT\njust prose\n").expect("write test subtitle");
 
-        let err = Subtitles::resolve(&Source::classify("video.mp4"), SubtitleSource::File(&sub))
-            .expect_err("unparseable subtitle must fail");
+        let err = Subtitles::resolve(
+            &Source::classify("video.mp4"),
+            SubtitleSource::File(&sub),
+            &Discard,
+        )
+        .expect_err("unparseable subtitle must fail");
         assert_eq!(err.code, ErrorCode::InputCorrupt);
 
         fs::remove_dir_all(&dir).expect("cleanup test dir");

@@ -5,7 +5,7 @@
 //! Rank normalization and selection are deliberately per-chunk: scores are only
 //! meaningful relative to the frames they compete with. A chunk is at least
 //! `chunk_seconds` of video, and stretches further when sparse chunks merge
-//! forward (see [`state`]) — the unit of competition is "whatever fills one
+//! forward (see `state`) — the unit of competition is "whatever fills one
 //! grid".
 
 mod candidates;
@@ -26,7 +26,8 @@ use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::error::{Error, ErrorCode, ErrorContext};
-use crate::probe::{KeyframeInfo, MonotonicTimestamps, SampleStrategy};
+use crate::event::{Event, EventSink};
+use crate::probe::{KeyframeInfo, SampleStrategy};
 use crate::source::Source;
 use crate::subtitle::Subtitles;
 use crate::types::{GridMeta, TimeRange};
@@ -61,6 +62,9 @@ struct RunCtx<'a> {
     /// the frame-derived estimate: keyframe sampling can stop well short of
     /// the tail, and its `+1/base_fps` padding only fits fixed-fps sampling.
     probed_duration: Option<f32>,
+    /// Diagnostic sink for the run: mode announcements, sparse-region fill
+    /// lines, and decode-open warnings flow here as typed events.
+    events: &'a dyn EventSink,
 }
 
 /// Where a run's artifacts land. The output directory exists only in the
@@ -75,7 +79,36 @@ pub enum OutputSink<'a> {
     JsonStdout,
 }
 
+/// Strategy resolved and validated against the probed input; keyframe
+/// data rides inside the variant that needs it, so "keyframe strategy
+/// without probe data" is unrepresentable. Every value is already valid:
+/// [`resolve_plan`] is the only constructor, and it folds probing and
+/// validation in before returning, so no downstream code has to re-check
+/// the pairing invariant.
+enum ResolvedPlan {
+    /// `probed_duration` is `None` exactly when `--force` skipped the
+    /// duration probe (see the fixed-fps arm of [`resolve_plan`]).
+    FixedFps { probed_duration: Option<f32> },
+    Keyframes(KeyframeInfo),
+    Adaptive(KeyframeInfo),
+}
+
+impl ResolvedPlan {
+    /// Container duration from the probe, when one ran. `None` only for a
+    /// forced fixed-fps run that skipped the probe.
+    fn probed_duration(&self) -> Option<f32> {
+        match self {
+            ResolvedPlan::FixedFps { probed_duration } => *probed_duration,
+            ResolvedPlan::Keyframes(info) | ResolvedPlan::Adaptive(info) => Some(info.duration),
+        }
+    }
+}
+
 /// Run the full `process` pipeline.
+///
+/// `events` receives every diagnostic the run emits (mode announcements,
+/// sparse-region fill lines, decode-open and subtitle warnings) as typed
+/// [`Event`]s; pass [`crate::event::Discard`] for silence.
 #[allow(clippy::too_many_arguments)]
 pub fn process(
     input: &Source,
@@ -85,18 +118,18 @@ pub fn process(
     max_in_flight: NonZeroUsize,
     subs: SubtitleSource<'_>,
     window: Option<Window>,
+    events: &dyn EventSink,
 ) -> Result<()> {
     validate_input(input)?;
-    // Two adjustments can move a defaulted keyframe/adaptive request onto
-    // fixed-fps: a window (pairing can't survive a seek) and a keyframe-poor
-    // source. An explicit --strategy is honored and validated instead.
-    let strategy = resolve_windowed_strategy(cfg, window)?;
-    let keyframe_info = probe_if_needed(input, strategy, cfg)?;
-    let strategy = degrade_if_keyframe_poor(cfg, strategy, keyframe_info.as_ref());
-    validate_strategy(cfg, strategy, keyframe_info.as_ref(), window)?;
+    // One door: window resolution, probe, keyframe-poor degradation, and
+    // validation fold into a single plan. Two adjustments can move a
+    // defaulted keyframe/adaptive request onto fixed-fps: a window (pairing
+    // can't survive a seek) and a keyframe-poor source. An explicit
+    // --strategy is honored and validated instead.
+    let plan = resolve_plan(input, cfg, window, events)?;
     // Before any side effect: a subtitle failure must not leave grids on
     // disk without metadata.
-    let subs = Subtitles::resolve(input, subs)?;
+    let subs = Subtitles::resolve(input, subs, events)?;
 
     let mut builder = rayon::ThreadPoolBuilder::new();
     if threads > 0 {
@@ -117,19 +150,19 @@ pub fn process(
         pool: &pool,
         ffmpeg_threads: NonZeroUsize::new(threads),
         subs,
-        probed_duration: keyframe_info.as_ref().map(|i| i.duration),
+        probed_duration: plan.probed_duration(),
+        events,
     };
     // Every strategy reduces to one decode pass; the tail is shared.
     let session = OutputSession::open(sink)?;
-    let stream = match strategy {
-        SampleStrategy::FixedFps => match window {
+    let stream = match plan {
+        ResolvedPlan::FixedFps { .. } => match window {
             Some(w) => {
-                eprintln!(
-                    "fixed-fps mode: sampling at {:.1} fps over {:.1}s-{}",
-                    cfg.base_fps(),
-                    w.start(),
-                    w.end().map_or("end".into(), |e| format!("{e:.1}s"))
-                );
+                events.event(Event::FixedFpsWindow {
+                    fps: cfg.base_fps(),
+                    start: w.start(),
+                    end: w.end(),
+                });
                 extract_frames::stream_window(
                     input,
                     cfg.base_fps(),
@@ -138,39 +171,39 @@ pub fn process(
                     w.start(),
                     w.end(),
                     ctx.ffmpeg_threads,
+                    events,
                 )?
             }
             None => {
-                eprintln!("fixed-fps mode: sampling at {:.1} fps", cfg.base_fps());
+                events.event(Event::FixedFps {
+                    fps: cfg.base_fps(),
+                });
                 extract_frames::stream_frames(
                     input,
                     cfg.base_fps(),
                     cfg.min_frame_size(),
                     cfg.score_edge(),
                     ctx.ffmpeg_threads,
+                    events,
                 )?
             }
         },
-        SampleStrategy::Keyframes => {
-            let info = keyframe_info.expect("validated");
-            eprintln!(
-                "keyframes mode: {} I-frames over {:.1}s (mean gap {:.1}s, max {:.1}s)",
-                info.count(),
-                info.duration,
-                info.mean_gap(),
-                info.max_gap()
-            );
+        ResolvedPlan::Keyframes(info) => {
+            events.event(Event::KeyframesMode {
+                count: info.count(),
+                duration: info.duration,
+                mean_gap: info.mean_gap(),
+                max_gap: info.max_gap(),
+            });
             extract_frames::stream_keyframes(
                 input,
                 cfg.min_frame_size(),
                 cfg.score_edge(),
                 ctx.ffmpeg_threads,
+                events,
             )?
         }
-        SampleStrategy::Adaptive => {
-            let info = keyframe_info.expect("validated");
-            adaptive_stream(&ctx, &info)?
-        }
+        ResolvedPlan::Adaptive(info) => adaptive_stream(&ctx, &info)?,
     };
     process_stream(&ctx, session, stream)
 }
@@ -186,38 +219,35 @@ fn adaptive_stream(ctx: &RunCtx<'_>, info: &KeyframeInfo) -> Result<extract_fram
         info.sparse_regions(cfg.gap_threshold()),
         cfg.gap_threshold(),
     );
-    eprintln!(
-        "adaptive mode: {} I-frames (max gap {:.1}s), {} sparse regions (threshold {:.1}s)",
-        info.count(),
-        info.max_gap(),
-        fill.len(),
-        cfg.gap_threshold()
-    );
+    ctx.events.event(Event::AdaptiveMode {
+        keyframes: info.count(),
+        max_gap: info.max_gap(),
+        sparse_regions: fill.len(),
+        threshold: cfg.gap_threshold(),
+    });
 
     // When sparse regions dominate, the mixed plan decodes nearly every
     // packet anyway; a plain fixed-fps pass covers the same ground.
     let covered: f32 = fill.iter().map(TimeRange::duration).sum();
     if covered > 0.5 * info.duration {
-        eprintln!(
-            "adaptive mode: sparse regions cover {:.0}% of the video; \
-             falling back to a single fixed-fps pass",
-            100.0 * covered / info.duration
-        );
+        ctx.events.event(Event::AdaptiveFallbackFixedFps {
+            coverage_percent: 100.0 * covered / info.duration,
+        });
         return Ok(extract_frames::stream_frames(
             ctx.input,
             cfg.base_fps(),
             cfg.min_frame_size(),
             cfg.score_edge(),
             ctx.ffmpeg_threads,
+            ctx.events,
         )?);
     }
 
     for region in &fill {
-        eprintln!(
-            "  filling sparse region {:.1}s-{:.1}s",
-            region.start(),
-            region.end()
-        );
+        ctx.events.event(Event::FillingSparseRegion {
+            start: region.start(),
+            end: region.end(),
+        });
     }
     Ok(extract_frames::stream_mixed(
         ctx.input,
@@ -226,6 +256,7 @@ fn adaptive_stream(ctx: &RunCtx<'_>, info: &KeyframeInfo) -> Result<extract_fram
         cfg.min_frame_size(),
         cfg.score_edge(),
         ctx.ffmpeg_threads,
+        ctx.events,
     )?)
 }
 
@@ -250,14 +281,62 @@ fn resolve_windowed_strategy(cfg: &Config, window: Option<Window>) -> Result<Sam
     Ok(SampleStrategy::FixedFps)
 }
 
+/// The single door onto a validated [`ResolvedPlan`]: resolve the strategy
+/// against the window, probe the input, degrade a keyframe-poor default to
+/// fixed-fps, and validate — folded so every returned plan is already valid
+/// and no caller has to re-establish the "keyframe strategy implies probe
+/// data" invariant. The four legacy steps survive as private helpers below,
+/// preserving their exact order and every diagnostic.
+fn resolve_plan(
+    input: &Source,
+    cfg: &Config,
+    window: Option<Window>,
+    events: &dyn EventSink,
+) -> Result<ResolvedPlan> {
+    let strategy = resolve_windowed_strategy(cfg, window)?;
+    match strategy {
+        SampleStrategy::FixedFps if cfg.force_long_video() => {
+            Ok(ResolvedPlan::FixedFps {
+                probed_duration: None,
+            })
+        }
+        // `.context` keeps the probe's own error code downcastable, so the
+        // exit code names the real cause rather than a generic wrapper.
+        SampleStrategy::FixedFps => {
+            let duration = probe::probe_duration(input)
+                .context("cannot verify duration safety for fixed-fps sampling (use --force to skip this check)")?;
+            let probed_duration = Some(duration);
+            validate_fixed_fps(cfg, probed_duration, window)?;
+            Ok(ResolvedPlan::FixedFps { probed_duration })
+        }
+        SampleStrategy::Keyframes | SampleStrategy::Adaptive => {
+            let info = probe::probe_keyframes(input)?;
+            // A defaulted keyframe/adaptive request degrades to fixed-fps for a
+            // keyframe-poor source; its probed duration still carries forward.
+            if degrade_if_keyframe_poor(cfg, strategy, &info, events) == SampleStrategy::FixedFps {
+                let probed_duration = Some(info.duration);
+                validate_fixed_fps(cfg, probed_duration, window)?;
+                return Ok(ResolvedPlan::FixedFps { probed_duration });
+            }
+            validate_keyframe_sufficiency(cfg, &info)?;
+            Ok(match strategy {
+                SampleStrategy::Keyframes => ResolvedPlan::Keyframes(info),
+                _ => ResolvedPlan::Adaptive(info),
+            })
+        }
+    }
+}
+
 /// Degrade a *defaulted* keyframe/adaptive strategy to fixed-fps when the
 /// source has fewer than `min_keyframes`, so a bare `process` always produces
 /// output regardless of keyframe density. An explicit request is left intact
-/// for [`validate_strategy`] to reject with `InsufficientKeyframes`.
+/// for [`validate_keyframe_sufficiency`] to reject with `InsufficientKeyframes`.
+/// `events` receives a [`Event::KeyframePoorDegrade`] on the degrade path.
 fn degrade_if_keyframe_poor(
     cfg: &Config,
     strategy: SampleStrategy,
-    info: Option<&KeyframeInfo>,
+    info: &KeyframeInfo,
+    events: &dyn EventSink,
 ) -> SampleStrategy {
     if cfg.strategy_explicit()
         || !matches!(
@@ -267,102 +346,81 @@ fn degrade_if_keyframe_poor(
     {
         return strategy;
     }
-    let count = info
-        .expect("keyframe probe runs for keyframe strategies")
-        .count();
+    let count = info.count();
     if count >= cfg.min_keyframes() {
         return strategy;
     }
-    eprintln!(
-        "warning: only {count} keyframes (<{} required); \
-         falling back to fixed-fps sampling",
-        cfg.min_keyframes()
-    );
+    events.event(Event::KeyframePoorDegrade {
+        count,
+        minimum: cfg.min_keyframes(),
+    });
     SampleStrategy::FixedFps
 }
 
-fn probe_if_needed(
-    input: &Source,
-    strategy: SampleStrategy,
+/// Validate a fixed-fps plan against its probed duration and any window.
+///
+/// `probed_duration` is `None` only for a forced run that skipped the probe,
+/// in which case there is nothing to check.
+fn validate_fixed_fps(
     cfg: &Config,
-) -> Result<Option<KeyframeInfo>> {
-    match strategy {
-        SampleStrategy::FixedFps if cfg.force_long_video() => Ok(None),
-        // `.context` keeps the probe's own error code downcastable, so the
-        // exit code names the real cause rather than a generic wrapper.
-        SampleStrategy::FixedFps => {
-            let duration = probe::probe_duration(input)
-                .context("cannot verify duration safety for fixed-fps sampling (use --force to skip this check)")?;
-            Ok(Some(KeyframeInfo {
-                timestamps: MonotonicTimestamps::default(),
-                duration,
-            }))
-        }
-        SampleStrategy::Keyframes | SampleStrategy::Adaptive => {
-            Ok(Some(probe::probe_keyframes(input)?))
-        }
-    }
-}
-
-fn validate_strategy(
-    cfg: &Config,
-    strategy: SampleStrategy,
-    info: Option<&KeyframeInfo>,
+    probed_duration: Option<f32>,
     window: Option<Window>,
 ) -> Result<()> {
-    match strategy {
-        SampleStrategy::FixedFps => {
-            let Some(i) = info else { return Ok(()) };
-            if let Some(w) = window
-                && w.start() >= i.duration
-            {
-                return Err(Error::new(
-                    ErrorCode::InvalidRange,
-                    format!(
-                        "--from ({:.1}s) is at or past the end of the video ({:.1}s)",
-                        w.start(),
-                        i.duration
-                    ),
-                )
-                .into());
-            }
-            // The decode-cost guard applies to what is actually decoded: the
-            // window span when clamped, the whole video otherwise.
-            let span = window.map_or(i.duration, |w| w.effective_span(i.duration));
-            if span > cfg.max_duration() && !cfg.force_long_video() {
-                let hours = span / 3600.0;
-                let what = if window.is_some() {
-                    "window covers"
-                } else {
-                    "video is"
-                };
-                return Err(Error::new(
-                    ErrorCode::InputTooLong,
-                    format!(
-                        "{what} {hours:.1}h (>{:.0}s limit for fixed-fps); \
-                         use --force, --max-duration, --strategy keyframes/adaptive, \
-                         or a narrower --from/--until",
-                        cfg.max_duration()
-                    ),
-                )
-                .into());
-            }
-        }
-        SampleStrategy::Keyframes | SampleStrategy::Adaptive => {
-            let i = info.expect("probe should succeed for keyframes/adaptive");
-            if i.count() < cfg.min_keyframes() {
-                return Err(Error::new(
-                    ErrorCode::InsufficientKeyframes,
-                    format!(
-                        "video has only {} keyframes (<{} required); \
-                         lower --min-keyframes or use --strategy fixed-fps",
-                        i.count(),
-                        cfg.min_keyframes()
-                    ),
-                )
-                .into());
-            }
-        }
+    let Some(duration) = probed_duration else {
+        return Ok(());
+    };
+    if let Some(w) = window
+        && w.start() >= duration
+    {
+        return Err(Error::new(
+            ErrorCode::InvalidRange,
+            format!(
+                "--from ({:.1}s) is at or past the end of the video ({:.1}s)",
+                w.start(),
+                duration
+            ),
+        )
+        .into());
+    }
+    // The decode-cost guard applies to what is actually decoded: the
+    // window span when clamped, the whole video otherwise.
+    let span = window.map_or(duration, |w| w.effective_span(duration));
+    if span > cfg.max_duration() && !cfg.force_long_video() {
+        let hours = span / 3600.0;
+        let what = if window.is_some() {
+            "window covers"
+        } else {
+            "video is"
+        };
+        return Err(Error::new(
+            ErrorCode::InputTooLong,
+            format!(
+                "{what} {hours:.1}h (>{:.0}s limit for fixed-fps); \
+                 use --force, --max-duration, --strategy keyframes/adaptive, \
+                 or a narrower --from/--until",
+                cfg.max_duration()
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Reject a keyframe/adaptive plan whose source has fewer than
+/// `min_keyframes`. Reached only for an explicit request; a defaulted one has
+/// already degraded to fixed-fps by this point.
+fn validate_keyframe_sufficiency(cfg: &Config, info: &KeyframeInfo) -> Result<()> {
+    if info.count() < cfg.min_keyframes() {
+        return Err(Error::new(
+            ErrorCode::InsufficientKeyframes,
+            format!(
+                "video has only {} keyframes (<{} required); \
+                 lower --min-keyframes or use --strategy fixed-fps",
+                info.count(),
+                cfg.min_keyframes()
+            ),
+        )
+        .into());
     }
     Ok(())
 }
@@ -415,7 +473,7 @@ fn process_stream(
         cfg.score_edge(),
         Some(ctx.pool),
     );
-    let mut state = ProcessState::new(cfg, ctx.pool, &session, ctx.max_in_flight);
+    let mut state = ProcessState::new(cfg, ctx.pool, &session, ctx.max_in_flight, ctx.events);
 
     while let Some(batch) = stream.next_batch()? {
         if let Some(aspect) = stream.aspect() {
@@ -436,6 +494,7 @@ fn process_stream(
         duration,
         grid_metas,
         ctx.subs.as_ref(),
+        ctx.events,
     )
 }
 
@@ -488,6 +547,8 @@ fn merge_regions(regions: Vec<TimeRange>, bridge: f32) -> Vec<TimeRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Discard;
+    use crate::probe::MonotonicTimestamps;
 
     #[test]
     fn rejects_missing_input_with_not_found_code() {
@@ -596,7 +657,7 @@ mod tests {
         // 2 < default min_keyframes (10): a bare `process` must still produce
         // output, so the plan degrades to fixed-fps.
         let resolved =
-            degrade_if_keyframe_poor(&cfg, SampleStrategy::Adaptive, Some(&keyframes(2)));
+            degrade_if_keyframe_poor(&cfg, SampleStrategy::Adaptive, &keyframes(2), &Discard);
         assert_eq!(resolved, SampleStrategy::FixedFps);
     }
 
@@ -604,7 +665,7 @@ mod tests {
     fn keeps_defaulted_adaptive_when_keyframes_sufficient() {
         let cfg = cfg_with_strategy(None);
         let resolved =
-            degrade_if_keyframe_poor(&cfg, SampleStrategy::Adaptive, Some(&keyframes(20)));
+            degrade_if_keyframe_poor(&cfg, SampleStrategy::Adaptive, &keyframes(20), &Discard);
         assert_eq!(resolved, SampleStrategy::Adaptive);
     }
 
@@ -612,7 +673,7 @@ mod tests {
     fn keeps_explicit_adaptive_when_keyframe_poor() {
         let cfg = cfg_with_strategy(Some(SampleStrategy::Adaptive));
         let resolved =
-            degrade_if_keyframe_poor(&cfg, SampleStrategy::Adaptive, Some(&keyframes(2)));
+            degrade_if_keyframe_poor(&cfg, SampleStrategy::Adaptive, &keyframes(2), &Discard);
         assert_eq!(resolved, SampleStrategy::Adaptive);
     }
 

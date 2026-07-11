@@ -4,7 +4,13 @@ dist/
 
 ## node
 node_modules/
-bun.lock
+
+## developer scratch media (real fixtures are synthesized in tests)
+/*.mp4
+/*.mkv
+/*.webm
+/*.srt
+/media/
 
 ## secrets
 secret.env
@@ -21,6 +27,3 @@ _legacy/
 ## md
 AGENTS.md
 CLAUDE.md
-
-## internal planning
-docs/

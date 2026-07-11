@@ -5,11 +5,16 @@
 //!
 //! One `video` call flows through the layers in order: [`server`] speaks
 //! rmcp and hosts the blocking [`handler`], which executes against the
-//! injected capabilities in [`deps`] and answers in the shapes of [`wire`].
+//! injected capabilities in [`deps`] and answers in the shapes of `wire`.
 
 pub mod core_run;
 pub mod deps;
+mod download;
 pub mod handler;
+mod invoke;
+mod probe_cache;
 pub mod server;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod tracker;
 mod wire;

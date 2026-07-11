@@ -6,8 +6,7 @@
 //! belongs to the MCP stdio transport, and this crate builds with
 //! `panic = "abort"`, so an in-process decode panic would take the whole
 //! server down. Self-spawn buys stdout isolation and crash containment for
-//! the cost of one fork — the same contract the TS harness had with the
-//! pinned core binary, minus the second artifact.
+//! the cost of one fork.
 
 use std::num::NonZeroI32;
 use std::process::{Command, ExitStatus};
@@ -29,7 +28,7 @@ pub enum CoreExit {
     Failure(NonZeroI32),
     /// Killed by a signal; no exit code exists.
     Signal,
-    /// Still running at [`CORE_DEADLINE`]; killed by the harness.
+    /// Still running at `CORE_DEADLINE`; killed by the harness.
     Hung,
 }
 
@@ -67,6 +66,10 @@ impl std::fmt::Display for CoreExit {
 pub struct CoreRun {
     pub exit: CoreExit,
     pub stdout: String,
+    /// True when stdout blew the capture cap: the bytes are an arbitrary
+    /// prefix and parsing must not be attempted, let alone diagnosed as
+    /// a wire-contract bug.
+    pub stdout_truncated: bool,
     pub stderr: String,
 }
 
@@ -83,13 +86,14 @@ impl CoreRunner for SelfSpawn {
         let exe = std::env::current_exe()?;
         // Deadline-bounded with capped captures (see [`crate::proc`]): a
         // wedged child cannot pin this thread, and runaway stderr cannot
-        // balloon memory. A truncated stdout surfaces as a JSON parse
-        // failure downstream, which is the right diagnosis — well-formed
-        // core output is orders of magnitude below the cap.
+        // balloon memory. Stdout truncation is carried explicitly so the
+        // handler answers it as bad input (narrow the request) rather than
+        // misdiagnosing the clipped bytes as a JSON parse bug.
         let out = crate::proc::output_with_deadline(Command::new(exe).args(args), CORE_DEADLINE)?;
         Ok(CoreRun {
             exit: out.status.map_or(CoreExit::Hung, CoreExit::from),
             stdout: String::from_utf8_lossy(&out.stdout.bytes).into_owned(),
+            stdout_truncated: out.stdout.truncated,
             stderr: String::from_utf8_lossy(&out.stderr.bytes).into_owned(),
         })
     }

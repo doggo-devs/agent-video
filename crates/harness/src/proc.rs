@@ -27,12 +27,12 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// capture stops while the pipe is still drained to EOF.
 const CAPTURE_LIMIT: u64 = 64 * 1024 * 1024;
 
-/// One captured pipe: at most [`CAPTURE_LIMIT`] bytes, with overflow
+/// One captured pipe: at most `CAPTURE_LIMIT` bytes, with overflow
 /// recorded rather than silently dropped.
 #[derive(Debug, Default)]
 pub struct Capture {
     pub bytes: Vec<u8>,
-    /// True when the pipe produced more than [`CAPTURE_LIMIT`] bytes; the
+    /// True when the pipe produced more than `CAPTURE_LIMIT` bytes; the
     /// excess was read and discarded so the child never blocked on a full
     /// pipe. Callers must treat truncated bytes as unparseable.
     pub truncated: bool,
@@ -52,9 +52,9 @@ pub struct Outcome {
 /// (yt-dlp's ffmpeg) inheriting the pipes dies with it — is killed and
 /// reaped, and `status` is `None`. Both pipes are drained concurrently, so
 /// a chatty child cannot deadlock against a full pipe buffer; each capture
-/// is capped at [`CAPTURE_LIMIT`] bytes, so a hostile source cannot balloon
+/// is capped at `CAPTURE_LIMIT` bytes, so a hostile source cannot balloon
 /// memory within the deadline window. A pipe held open past the child by a
-/// process outside the kill group is abandoned after [`DRAIN_GRACE`] (its
+/// process outside the kill group is abandoned after `DRAIN_GRACE` (its
 /// capture comes back empty), so the deadline bounds the call regardless.
 pub fn output_with_deadline(cmd: &mut Command, deadline: Duration) -> std::io::Result<Outcome> {
     let mut child = isolate_group(cmd)
@@ -240,8 +240,7 @@ mod tests {
     fn graceful_kill_lets_the_child_run_its_int_trap() {
         // Models yt-dlp's KeyboardInterrupt cleanup (cookie jar save): the
         // trap must run to completion before the process dies.
-        let dir = std::env::temp_dir().join(format!("av-proc-int-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = crate::testutil::TempDir::new("av-proc-int");
         let marker = dir.join("saved");
         let _ = std::fs::remove_file(&marker);
         let mut child = isolate_group(Command::new("sh").args([
@@ -259,7 +258,6 @@ mod tests {
         kill_tree_graceful(&mut child, Duration::from_secs(5));
 
         assert!(marker.is_file(), "the INT trap must have run");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

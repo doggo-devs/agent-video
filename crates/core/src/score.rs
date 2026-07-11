@@ -64,9 +64,7 @@ impl IndexMut<Dim> for RawScores {
 /// input scale.
 ///
 /// A zero input weight is not a value — it is absence: the dimension is
-/// simply not in the active set, so no consumer can forget to skip it (the
-/// old three-named-fields shape required every call site to re-derive
-/// "is this dimension on?" from `w > 0.0`, and one of them didn't).
+/// simply not in the active set, so no consumer can forget to skip it.
 /// Invariants — at least one active dimension, every stored weight finite
 /// and strictly positive, actives summing to 1 — live here, not in a
 /// caller-side check.

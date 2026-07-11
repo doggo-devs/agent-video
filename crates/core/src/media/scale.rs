@@ -14,10 +14,9 @@ use image::RgbImage;
 use crate::error::{Error, ErrorCode, Result};
 
 /// Cached swscale conversion to RGB24 with the shorter edge pinned to
-/// `min_edge` (aspect preserved, upscaling allowed) — the same geometry the
-/// old `scale=E:E:force_original_aspect_ratio=increase` filter produced.
-/// The context is rebuilt only when the source geometry or pixel format
-/// changes (mid-stream resolution switches are rare but legal).
+/// `min_edge` (aspect preserved, upscaling allowed). The context is rebuilt
+/// only when the source geometry or pixel format changes (mid-stream
+/// resolution switches are rare but legal).
 pub struct Rescaler {
     min_edge: u32,
     ctx: Option<scaling::Context>,

@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Embedded subtitle extraction via the in-process subtitle decoder.
 //!
-//! Replaces two subprocess round-trips (an ffprobe stream scan and an ffmpeg
-//! SRT transcode): tracks are listed from the opened container's stream
-//! table, and cues are decoded directly from the subtitle stream's packets.
-//! Text-based codecs (SubRip, ASS/SSA, mov_text, WebVTT) decode to ASS event
-//! lines, which are stripped down to plain cue text; bitmap subtitle tracks
-//! (DVD, PGS) carry no text and are rejected with an input-decade error, the
-//! same way the old `-f srt` transcode failed on them.
+//! Tracks are listed from the opened container's stream table, and cues are
+//! decoded directly from the subtitle stream's packets. Text-based codecs
+//! (SubRip, ASS/SSA, mov_text, WebVTT) decode to ASS event lines, which are
+//! stripped down to plain cue text; bitmap subtitle tracks (DVD, PGS) carry
+//! no text and are rejected with an input-decade error.
 
 use ffmpeg::codec::Context as CodecContext;
 use ffmpeg::codec::subtitle::Rect;
@@ -350,7 +348,7 @@ fn strip_ass_markup(text: &str) -> String {
 }
 
 /// Render cues back to SRT text — the `subtitles.txt` payload for embedded
-/// sources, which no longer pass through an intermediate SRT transcode.
+/// sources.
 pub fn cues_to_srt(cues: &[Cue]) -> String {
     use std::fmt::Write;
 

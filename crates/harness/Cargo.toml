@@ -19,9 +19,9 @@ whisper-vulkan = ["whisper-local", "whisper-rs/vulkan"]
 
 [dependencies]
 agent-video-core = { path = "../core" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
 toml = "1"
 dirs = "6"
 sha2 = "0.11"
@@ -39,4 +39,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(unix)'.dependencies]
 # Kill an expired child's whole process group, not just the direct child:
 # a yt-dlp-spawned ffmpeg must not survive holding the output pipes.
-libc = "0.2"
+libc = { workspace = true }

@@ -247,8 +247,7 @@ mod tests {
 
     #[test]
     fn hashes_file_contents() {
-        let dir = std::env::temp_dir().join(format!("av-install-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = crate::testutil::TempDir::new("av-install");
         let p = dir.join("x.bin");
         std::fs::write(&p, b"abc").expect("write");
         assert_eq!(
@@ -259,8 +258,7 @@ mod tests {
 
     #[test]
     fn sweeps_stale_part_files_but_keeps_finished_weights() {
-        let dir = std::env::temp_dir().join(format!("av-sweep-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = crate::testutil::TempDir::new("av-sweep");
         std::fs::write(dir.join("ggml-medium.bin.part"), b"partial").expect("write part");
         std::fs::write(dir.join("ggml-medium.bin"), b"whole").expect("write bin");
 
@@ -274,7 +272,6 @@ mod tests {
             dir.join("ggml-medium.bin").exists(),
             "a finished weight file is untouched"
         );
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]

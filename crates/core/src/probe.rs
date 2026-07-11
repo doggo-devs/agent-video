@@ -2,9 +2,7 @@
 //! Video metadata probing via the in-process demuxer.
 //!
 //! Keyframe timestamps come from a packet-level scan (`packet.is_key()`)
-//! that decodes no pixels — strictly cheaper than the old ffprobe
-//! `-skip_frame nokey` pass, which had to run the video decoder. Duration
-//! comes from the container header.
+//! that decodes no pixels. Duration comes from the container header.
 
 use crate::error::{Error, ErrorCode, ErrorContext, Result};
 use crate::media;

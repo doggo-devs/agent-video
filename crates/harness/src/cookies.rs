@@ -28,7 +28,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::CookiesCfg;
@@ -134,11 +134,12 @@ impl JarLease {
         };
         {
             let _lock = JarLock::exclusive(canonical)?;
-            fs::copy(canonical, lease.staged())?;
-            fs::copy(canonical, lease.snapshot())?;
+            // fs::copy clones the source mode; a user-supplied canonical
+            // jar may be 0644, so these credential copies are created born
+            // 0600 instead — no world-readable window.
+            copy_private(canonical, &lease.staged())?;
+            copy_private(canonical, &lease.snapshot())?;
         }
-        restrict_to_owner(&lease.staged())?;
-        restrict_to_owner(&lease.snapshot())?;
         Ok(lease)
     }
 
@@ -247,12 +248,50 @@ fn write_jar(path: &Path, entries: &Entries) -> io::Result<()> {
         text.push('\n');
     }
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&tmp, text)?;
-    restrict_to_owner(&tmp)?;
+    let mut file = create_private(&tmp)?;
+    file.write_all(text.as_bytes())?;
+    // Close before rename: Windows refuses to rename a file with an open
+    // handle, and the release matrix ships win32-x64.
+    drop(file);
     fs::rename(&tmp, path)
 }
 
-/// Owner-only permissions for credential files; no-op off Unix.
+/// Create `path` for writing with owner-only permissions from its first
+/// byte. A credential file must never exist — not even momentarily —
+/// wider than 0600: `fs::write` at the umask default lands at 0644
+/// (group/world-readable) until a later chmod, a window an attacker can
+/// read through. On Unix the mode is set atomically at `open`; a stale
+/// file from a crashed run is removed first so `create_new` cannot reuse
+/// its loose permissions. Off Unix, [`restrict_to_owner`] is a
+/// best-effort fallback.
+fn create_private(path: &Path) -> io::Result<File> {
+    let _ = fs::remove_file(path);
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path)?;
+    restrict_to_owner(path)?;
+    Ok(file)
+}
+
+/// Copy `src` to `dst` with owner-only permissions from creation.
+/// [`fs::copy`] clones the source's mode (a user-supplied jar may be
+/// 0644), so it cannot bear a credential copy without a world-readable
+/// window; this streams the bytes into a file born 0600. Returns the
+/// number of bytes copied.
+fn copy_private(src: &Path, dst: &Path) -> io::Result<u64> {
+    let mut reader = File::open(src)?;
+    let mut writer = create_private(dst)?;
+    io::copy(&mut reader, &mut writer)
+}
+
+/// Owner-only permissions for credential files. On Unix files are born
+/// 0600 via [`create_private`], so this only re-affirms the mode; off
+/// Unix it is the sole (best-effort, currently no-op) protection.
 fn restrict_to_owner(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -396,20 +435,13 @@ pub fn clear(cfg: &CookiesCfg, domain: Option<&str>) -> Result<usize, CookieErro
 mod tests {
     use super::*;
 
-    fn temp_cfg(tag: &str) -> CookiesCfg {
-        let dir = std::env::temp_dir().join(format!(
-            "av-cookies-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("mkdir");
-        CookiesCfg {
+    fn temp_cfg(tag: &str) -> (CookiesCfg, crate::testutil::TempDir) {
+        let dir = crate::testutil::TempDir::new(&format!("av-cookies-{tag}"));
+        let cfg = CookiesCfg {
             from_browser: None,
             jar: dir.join("cookies.txt"),
-        }
+        };
+        (cfg, dir)
     }
 
     fn line(domain: &str, name: &str, value: &str) -> String {
@@ -418,7 +450,7 @@ mod tests {
 
     #[test]
     fn mode_prefers_browser_over_jar() {
-        let mut cfg = temp_cfg("mode");
+        let (mut cfg, _dir) = temp_cfg("mode");
         fs::write(&cfg.jar, line(".a.com", "n", "v")).expect("write");
         assert_eq!(mode(&cfg), CookieMode::Jar(cfg.jar.clone()));
         cfg.from_browser = Some("firefox".to_string());
@@ -427,7 +459,7 @@ mod tests {
 
     #[test]
     fn mode_is_anonymous_without_jar_or_browser() {
-        let cfg = temp_cfg("anon");
+        let (cfg, _dir) = temp_cfg("anon");
         assert_eq!(mode(&cfg), CookieMode::Anonymous);
         assert!(matches!(
             CookieHandle::acquire(&cfg).expect("acquire"),
@@ -452,7 +484,7 @@ mod tests {
         // youtube cookie in the canonical jar. A's run rotates a bilibili
         // cookie in its staged copy. A's commit must adopt the bilibili
         // rotation without clobbering B's youtube rotation.
-        let cfg = temp_cfg("delta");
+        let (cfg, _dir) = temp_cfg("delta");
         let youtube = line(".youtube.com", "SID", "old");
         let bilibili = line(".bilibili.com", "SESSDATA", "old");
         fs::write(&cfg.jar, format!("{youtube}\n{bilibili}\n")).expect("write");
@@ -485,7 +517,7 @@ mod tests {
     fn commit_with_unwritten_staged_jar_is_a_noop() {
         // A SIGKILLed child never wrote the staged file: the canonical
         // jar must come through byte-identical.
-        let cfg = temp_cfg("noop");
+        let (cfg, _dir) = temp_cfg("noop");
         fs::write(&cfg.jar, format!("{}\n", line(".a.com", "n", "v"))).expect("write");
         let before = fs::read_to_string(&cfg.jar).expect("read");
 
@@ -499,7 +531,7 @@ mod tests {
     fn commit_never_propagates_deletions() {
         // A truncated staged file (killed writer) must not delete cookies
         // from the canonical jar.
-        let cfg = temp_cfg("keep");
+        let (cfg, _dir) = temp_cfg("keep");
         fs::write(
             &cfg.jar,
             format!(
@@ -520,7 +552,7 @@ mod tests {
 
     #[test]
     fn dropping_a_lease_removes_its_staging_dir() {
-        let cfg = temp_cfg("drop");
+        let (cfg, _dir) = temp_cfg("drop");
         fs::write(&cfg.jar, line(".a.com", "n", "v")).expect("write");
         let lease = JarLease::checkout(&cfg.jar).expect("checkout");
         let staging = lease.staging.clone();
@@ -531,7 +563,7 @@ mod tests {
 
     #[test]
     fn import_rejects_a_non_jar_file() {
-        let cfg = temp_cfg("badimport");
+        let (cfg, _dir) = temp_cfg("badimport");
         let bogus = cfg.jar.with_file_name("export.json");
         fs::write(&bogus, "{\"cookies\":[]}").expect("write");
         let err = import(&cfg, &bogus).expect_err("json is not a jar");
@@ -541,7 +573,7 @@ mod tests {
 
     #[test]
     fn import_merges_with_incoming_winning() {
-        let cfg = temp_cfg("import");
+        let (cfg, _dir) = temp_cfg("import");
         fs::write(
             &cfg.jar,
             format!(
@@ -570,7 +602,7 @@ mod tests {
 
     #[test]
     fn status_groups_by_domain() {
-        let cfg = temp_cfg("status");
+        let (cfg, _dir) = temp_cfg("status");
         assert_eq!(status(&cfg).expect("no jar is empty"), Vec::new());
         fs::write(
             &cfg.jar,
@@ -590,7 +622,7 @@ mod tests {
 
     #[test]
     fn clear_domain_removes_it_and_its_subdomains_only() {
-        let cfg = temp_cfg("clear");
+        let (cfg, _dir) = temp_cfg("clear");
         fs::write(
             &cfg.jar,
             format!(
@@ -612,7 +644,7 @@ mod tests {
 
     #[test]
     fn clear_all_removes_the_jar_file() {
-        let cfg = temp_cfg("clearall");
+        let (cfg, _dir) = temp_cfg("clearall");
         fs::write(&cfg.jar, line(".a.com", "n", "v")).expect("write");
         clear(&cfg, None).expect("clear");
         assert!(!cfg.jar.exists());
@@ -623,7 +655,7 @@ mod tests {
     #[test]
     fn jar_and_staged_copies_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let cfg = temp_cfg("perms");
+        let (cfg, _dir) = temp_cfg("perms");
         let incoming = cfg.jar.with_file_name("export.txt");
         fs::write(&incoming, format!("{}\n", line(".a.com", "n", "v"))).expect("write");
         import(&cfg, &incoming).expect("import");
@@ -636,5 +668,28 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(staged_mode & 0o777, 0o600, "staged copy is owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jar_copies_and_writes_are_born_owner_only() {
+        // A canonical jar left world-readable (0644, the umask default a
+        // user's `cp` produces) must never propagate that mode: every
+        // copy and rewrite lands at 0600 from creation, not after a chmod.
+        use std::os::unix::fs::PermissionsExt;
+        let (cfg, _dir) = temp_cfg("born-private");
+        fs::write(&cfg.jar, format!("{}\n", line(".a.com", "n", "v"))).expect("write");
+        fs::set_permissions(&cfg.jar, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let mode = |p: PathBuf| fs::metadata(p).expect("meta").permissions().mode() & 0o777;
+        let lease = JarLease::checkout(&cfg.jar).expect("checkout");
+        assert_eq!(mode(lease.staged()), 0o600, "staged copy is owner-only");
+        assert_eq!(mode(lease.snapshot()), 0o600, "snapshot copy is owner-only");
+
+        // The write_jar path (via import) must also be born 0600.
+        let incoming = cfg.jar.with_file_name("in.txt");
+        fs::write(&incoming, format!("{}\n", line(".b.com", "m", "w"))).expect("write");
+        import(&cfg, &incoming).expect("import");
+        assert_eq!(mode(cfg.jar.clone()), 0o600, "written jar is owner-only");
     }
 }

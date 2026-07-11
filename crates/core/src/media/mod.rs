@@ -8,9 +8,8 @@
 //!
 //! Because decoding is in-process, a frame's timestamp comes from the frame
 //! itself (`pts × time_base`), produced by the same decoder that produced the
-//! pixels. The old subprocess design had to pair an ffprobe timestamp list
-//! with an ffmpeg frame stream by index — a whole class of misattribution
-//! failures that this module makes unrepresentable.
+//! pixels, so a frame and its timestamp cannot be misattributed by index
+//! pairing.
 
 pub mod audio;
 pub mod decode;
@@ -28,8 +27,8 @@ use crate::source::Source;
 /// Initialize libav once per process and quiet its logging to errors.
 ///
 /// libav writes its log to stderr directly; at `Error` level a fatal decode
-/// complaint still reaches the user in real time (the moral successor of the
-/// captured child stderr), without per-frame warning noise.
+/// complaint still reaches the user in real time, without per-frame warning
+/// noise.
 pub fn init() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -207,8 +206,7 @@ pub fn best_video_stream(
 ///
 /// Prefers the container header (`AVFormatContext.duration`), falling back to
 /// the best video stream's own duration. A container that reports neither
-/// (fragmented MP4, raw streams) yields an input-decade error, mirroring the
-/// old ffprobe "N/A" handling.
+/// (fragmented MP4, raw streams) yields an input-decade error.
 pub fn duration_seconds(ictx: &ffmpeg::format::context::Input, source: &Source) -> Result<f32> {
     let container = ictx.duration();
     if container > 0 {

@@ -9,12 +9,14 @@
 //! is opt-in via the `clap` feature; without it core is a plain library.
 //! The public surface is what the CLI and
 //! the harness crate consume: [`pipeline`] to run, [`config`] to configure,
-//! [`media`]/[`probe`] to inspect, [`wire`] as the output contract, and
+//! [`media`]/[`probe`] to inspect, [`wire`] as the output contract,
+//! [`event`] as the observability contract, and
 //! [`source`]/[`types`]/[`error`] as shared vocabulary. Everything else is
 //! implementation detail.
 
 pub mod config;
 pub mod error;
+pub mod event;
 pub mod media;
 pub mod pipeline;
 pub mod probe;

@@ -9,6 +9,7 @@ use anyhow::Result;
 
 use crate::config::Config;
 use crate::error::{Error, ErrorCode, ErrorContext};
+use crate::event::{Event, EventSink};
 use crate::source::Source;
 use crate::subtitle::Subtitles;
 use crate::types::{GridImage, GridMeta};
@@ -115,7 +116,16 @@ impl<'a> OutputSession<'a> {
     /// Steps 2–3 are past the point of no return: staging is the only
     /// complete copy of the new run, so a failure there preserves it (the
     /// error names the location) instead of letting drop-cleanup destroy it.
-    pub fn commit(mut self, meta: &wire::Metadata, subtitles_txt: Option<&str>) -> Result<()> {
+    ///
+    /// `events` receives a [`Event::GridsWritten`] once file-mode promotion
+    /// succeeds; JSON mode emits none. Pass [`crate::event::Discard`] for
+    /// silence.
+    pub fn commit(
+        mut self,
+        meta: &wire::Metadata,
+        subtitles_txt: Option<&str>,
+        events: &dyn EventSink,
+    ) -> Result<()> {
         let json = serde_json::to_string_pretty(meta).map_err(|e| {
             Error::new(
                 ErrorCode::OutputWriteFailed,
@@ -142,7 +152,10 @@ impl<'a> OutputSession<'a> {
                 };
                 sweep_stale(dir).map_err(preserved)?;
                 promote(dir, &staging).map_err(preserved)?;
-                eprintln!("wrote {} grid(s) to {}", meta.grids.len(), dir.display());
+                events.event(Event::GridsWritten {
+                    count: meta.grids.len(),
+                    dir,
+                });
             }
             Sink::Json => println!("{json}"),
         }
@@ -237,7 +250,8 @@ fn is_own_artifact(name: &str) -> bool {
 ///
 /// `subs` is already resolved by the caller — resolution can fail (ambiguous
 /// sources, unreadable files) and must happen before any grid hits the disk,
-/// not here at the tail of the run.
+/// not here at the tail of the run. `events` receives the commit's
+/// [`Event::GridsWritten`] in file mode.
 pub fn write_outputs(
     session: OutputSession<'_>,
     input: &Source,
@@ -245,6 +259,7 @@ pub fn write_outputs(
     duration: f32,
     mut grid_metas: Vec<GridMeta>,
     subs: Option<&Subtitles>,
+    events: &dyn EventSink,
 ) -> Result<()> {
     for grid in &mut grid_metas {
         grid.subtitles = match subs {
@@ -261,7 +276,7 @@ pub fn write_outputs(
         grids: grid_metas.into_iter().map(Into::into).collect(),
     };
 
-    session.commit(&meta, subs.map(Subtitles::raw))
+    session.commit(&meta, subs.map(Subtitles::raw), events)
 }
 
 /// Write a staged file, mapping failures into the output error decade.
@@ -278,6 +293,7 @@ fn write_file(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Discard;
 
     /// A fresh temp output dir per test, cleaned up by the caller.
     fn test_dir(tag: &str) -> PathBuf {
@@ -352,7 +368,7 @@ mod tests {
         );
 
         session
-            .commit(&committed_meta(), Some("cues"))
+            .commit(&committed_meta(), Some("cues"), &Discard)
             .expect("commit");
 
         assert!(!stale.exists(), "stale grid swept at commit");
@@ -405,7 +421,7 @@ mod tests {
         // Staging keeps its own permissions, so writes into it still work;
         // only renames into the read-only parent fail.
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).expect("make dir read-only");
-        let result = session.commit(&committed_meta(), None);
+        let result = session.commit(&committed_meta(), None, &Discard);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("restore permissions");
 
         let Err(err) = result else {

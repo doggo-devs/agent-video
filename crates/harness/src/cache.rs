@@ -264,16 +264,8 @@ fn list_with_stats(dir: &Path) -> Vec<Stat> {
 mod tests {
     use super::*;
 
-    fn cache(max_bytes: u64) -> (Cache, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "av-cache-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+    fn cache(max_bytes: u64) -> (Cache, crate::testutil::TempDir) {
+        let dir = crate::testutil::TempDir::new("av-cache");
         (
             Cache::new(&dir, NonZeroU64::new(max_bytes).expect("non-zero")),
             dir,
@@ -410,9 +402,7 @@ mod tests {
         assert!(!remove_if_unbumped(&stale), "bumped mtime vetoes");
         assert!(p.exists(), "the just-used file survives");
 
-        let current = fs::metadata(&p)
-            .and_then(|m| m.modified())
-            .expect("mtime");
+        let current = fs::metadata(&p).and_then(|m| m.modified()).expect("mtime");
         assert!(
             remove_if_unbumped(&Stat {
                 path: p.clone(),

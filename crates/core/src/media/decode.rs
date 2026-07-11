@@ -2,16 +2,13 @@
 //! In-process frame decoding: a dedicated decode thread feeding a bounded
 //! channel of small RGB frames.
 //!
-//! The old design got decode/score pipelining for free from the process
-//! boundary (ffmpeg decoded while Rust scored, the pipe provided
-//! backpressure). The decode thread and `sync_channel` reproduce exactly that
-//! shape in-process: the channel is the pipe, its capacity the buffer, and a
-//! dropped receiver the closed pipe that stops the producer.
+//! The decode thread and `sync_channel` pipeline decoding against scoring:
+//! the channel's capacity bounds buffered frames and provides backpressure,
+//! and a dropped receiver stops the producer.
 //!
 //! Timestamps come from the decoded frames themselves (`best-effort pts ×
 //! time_base`, rebased to the stream start), produced by the same decoder
-//! that produced the pixels — there is no cross-process index pairing left to
-//! go wrong.
+//! that produced the pixels.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -25,6 +22,7 @@ use ffmpeg_next as ffmpeg;
 use image::RgbImage;
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::event::{Event, EventSink};
 use crate::source::Source;
 use crate::types::TimeRange;
 
@@ -101,11 +99,14 @@ impl FrameSource {
     /// `threads` caps the decoder's thread count (`None` = auto). Container,
     /// stream, decoder, and seek failures surface here, synchronously, with
     /// precise error codes; mid-stream failures surface from `next_frame`.
+    /// `events` receives a [`Event::SeekFallback`] when a seek to a window
+    /// start fails and decoding degrades to a sequential read.
     pub fn open(
         input: &Source,
         spec: SampleSpec,
         min_edge: u32,
         threads: Option<NonZeroUsize>,
+        events: &dyn EventSink,
     ) -> Result<Self> {
         // Built before the container so it can ride into libav's interrupt
         // callback, arming every blocking I/O call in this context.
@@ -122,10 +123,10 @@ impl FrameSource {
         {
             let target = video.timeline.seek_target(*start as f64).as_av_time();
             if let Err(e) = ictx.seek(target, ..target) {
-                eprintln!(
-                    "warning: cannot seek to {start:.2}s ({e}); \
-                     reading sequentially from the start"
-                );
+                events.event(Event::SeekFallback {
+                    start: *start,
+                    error: e.to_string(),
+                });
             }
         }
 
@@ -196,7 +197,10 @@ impl FrameSource {
     }
 
     /// Read the next sampled frame, or `None` after a clean end of stream.
-    pub fn next_frame(&mut self) -> anyhow::Result<Option<RgbFrame>> {
+    /// A decode-thread panic surfaces here as an [`Error`] with
+    /// [`ErrorCode::DecodeFailed`], never as a silently truncated stream.
+    /// Mid-stream decode failures carry the worker's typed code unchanged.
+    pub fn next_frame(&mut self) -> Result<Option<RgbFrame>> {
         if self.done {
             return Ok(None);
         }
@@ -209,22 +213,40 @@ impl FrameSource {
             }
             Ok(Err(e)) => {
                 self.done = true;
-                Err(e.into())
+                Err(e)
             }
-            // Channel closed: the decode thread finished cleanly.
+            // Channel closed: the worker is gone, but a panic also drops
+            // `tx` on unwind. Joining tells a clean end of stream from a
+            // crashed worker, which must not masquerade as EOF.
             Err(_) => {
                 self.done = true;
-                self.join();
-                Ok(None)
+                match self.join() {
+                    Ok(()) => Ok(None),
+                    Err(payload) => Err(Error::new(
+                        ErrorCode::DecodeFailed,
+                        format!(
+                            "decode thread panicked: {}",
+                            panic_message(payload.as_ref())
+                        ),
+                    )),
+                }
             }
         }
     }
 
-    fn join(&mut self) {
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+    fn join(&mut self) -> std::thread::Result<()> {
+        self.thread.take().map_or(Ok(()), JoinHandle::join)
     }
+}
+
+/// Best-effort text from a panic payload: `panic!` carries `&str` or
+/// `String`; anything else gets a placeholder.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 impl Drop for FrameSource {
@@ -235,7 +257,9 @@ impl Drop for FrameSource {
         // even on a source that will never deliver another byte.
         self.stop.store(true, Ordering::Relaxed);
         self.rx = None;
-        self.join();
+        // A panic here was already reported by the panic hook; propagating
+        // out of Drop would escalate it to an abort.
+        let _ = self.join();
     }
 }
 

@@ -2,7 +2,7 @@
 //! Decision engine.
 //!
 //! Pure `(args, probe, config) → action`; consent state lives in the passed
-//! [`TokenRegistry`]. Grid count picks extract vs process; the budget ladder
+//! [`Tokens`]. Grid count picks extract vs process; the budget ladder
 //! gates on stretch and consent. Never panics on model input — invalid input
 //! becomes a `Reject` with a model-presentable message.
 
@@ -11,7 +11,7 @@ use super::look::preset_for;
 use super::raw::{RawSubcommand, parse_raw};
 use super::schema::{Look, ProbeSummary, RecommendedCall, Strategy, VideoArgs};
 use super::time::{ArgError, Window, resolve_window};
-use super::tokens::{DownloadPlan, Offer, PendingAction, Token, Tokens};
+use super::tokens::{DownloadPlan, Offer, PendingAction, Redemption, Token, Tokens};
 use agent_video_core::types::format_ts;
 
 /// A fully-decided core run; the server injects source and I/O flags.
@@ -47,8 +47,14 @@ pub enum Decision {
     },
     Download {
         plan: DownloadPlan,
+        /// The redeemed token, so a completed keep download can be recorded
+        /// back into the registry ([`Tokens::fulfill`]) as a receipt.
+        token: Token,
         notices: Vec<String>,
     },
+    /// A keep token echoed after its download already completed: the file
+    /// at `path` is the answer, no work left to authorize.
+    Saved { path: std::path::PathBuf },
     Plan(PlanDecision),
     /// Consent required: the offers carry both the model-facing token list
     /// and the actions to register — the caller commits them on render.
@@ -85,7 +91,7 @@ pub fn redeem(args: &VideoArgs, store: &Tokens) -> Decision {
         };
     }
     let token = Token::new(args.confirm.as_deref().unwrap_or(""));
-    let Some(action) = store.take(&args.source, &token) else {
+    let Some(redemption) = store.take(&args.source, &token) else {
         return Decision::Reject {
             message: format!(
                 "token \"{token}\" is unknown or stale for this source. Tokens stay valid \
@@ -95,12 +101,17 @@ pub fn redeem(args: &VideoArgs, store: &Tokens) -> Decision {
         };
     };
     let notices = vec![format!("confirmed: {token}")];
-    match action {
-        PendingAction::Core(invocation) => Decision::Run {
+    match redemption {
+        Redemption::Fresh(PendingAction::Core(invocation)) => Decision::Run {
             invocation,
             notices,
         },
-        PendingAction::Download(plan) => Decision::Download { plan, notices },
+        Redemption::Fresh(PendingAction::Download(plan)) => Decision::Download {
+            plan,
+            token,
+            notices,
+        },
+        Redemption::Fulfilled(path) => Decision::Saved { path },
     }
 }
 

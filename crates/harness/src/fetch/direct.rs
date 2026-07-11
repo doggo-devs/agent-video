@@ -450,12 +450,10 @@ mod tests {
 
     #[test]
     fn available_path_appends_counter() {
-        let dir = std::env::temp_dir().join(format!("av-direct-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = crate::testutil::TempDir::new("av-direct");
         let p = dir.join("v.mp4");
         std::fs::write(&p, b"x").expect("write");
         let next = available_path(&p).expect("free name");
         assert_eq!(next, dir.join("v (1).mp4"));
-        let _ = std::fs::remove_file(&p);
     }
 }

@@ -7,7 +7,7 @@
 //! and how to fetch exactly what its recipe describes.
 //!
 //! Every entry point that touches the network takes a
-//! [`VettedUrl`](crate::netguard::VettedUrl): the egress policy has run
+//! [`VettedUrl`]: the egress policy has run
 //! before any byte leaves, by construction.
 
 pub mod direct;
@@ -102,7 +102,7 @@ pub struct Downloaded {
 /// HTML page from a flaky network) and never discarded: it rides along, and
 /// if yt-dlp fails too the caller sees both reasons — a transient network
 /// error on a real media link must not be misdiagnosed as "install yt-dlp".
-/// The combined kind is the join of both faults ([`combine_kinds`]).
+/// The combined kind is the join of both faults (`combine_kinds`).
 pub fn probe_url(url: &VettedUrl, cfg: &Config) -> Result<SourceInfo, Fault> {
     let direct_failure = match direct::probe(url, cfg) {
         Ok(info) => return Ok(info),

@@ -33,7 +33,7 @@ pub struct CandidateFrame {
 
 /// A frame after per-competition-set rank normalization.
 ///
-/// Produced by [`crate::score::score_frames`] at the single scoring boundary.
+/// Produced by `crate::score::score_frames` at the single scoring boundary.
 #[derive(Debug, Clone)]
 pub struct ScoredFrame {
     /// Presentation timestamp in seconds.
@@ -54,7 +54,7 @@ pub struct ScoredFrame {
 
 /// Rank-normalized frame score: finite and in `0..=100` by construction.
 ///
-/// Only the scoring boundary ([`crate::score`]) mints values; everything
+/// Only the scoring boundary (`crate::score`) mints values; everything
 /// downstream (selection, eviction, layout promotion) reads them via
 /// [`Score::get`], so a `-999` or `NaN` score is unrepresentable past that
 /// boundary.
@@ -223,7 +223,7 @@ pub enum Detail {
 const MAX_CANVAS_EDGE: u32 = 65_535;
 
 /// Resolved canvas geometry for layout: `1 <= min_cell_edge <= edge <=`
-/// [`MAX_CANVAS_EDGE`] by construction.
+/// `MAX_CANVAS_EDGE` by construction.
 #[derive(Debug, Clone, Copy)]
 pub struct CanvasSpec {
     /// Longer canvas edge in pixels.

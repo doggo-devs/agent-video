@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn awkward_frame_count_still_tiles() {
-        // 7 is prime: the old rectangular packer always left a black hole here.
+        // 7 is prime: cannot tile a rectangle exactly.
         for n in [3, 5, 7, 11, 13] {
             let l = compute(&flat(n), &[], 16.0 / 9.0, &spec());
             assert_tiles(&l);

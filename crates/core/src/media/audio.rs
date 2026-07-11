@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Audio decoding for transcription: any input's best audio stream to
 //! 16 kHz mono f32 PCM (what whisper.cpp consumes), in-process via
-//! libswresample — the moral successor of the old `ffmpeg -ac 1 -ar 16000`
-//! subprocess, minus the subprocess.
+//! libswresample.
 
 use ffmpeg_next as ffmpeg;
 

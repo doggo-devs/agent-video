@@ -24,6 +24,8 @@ pub mod probe;
 pub mod proc;
 pub mod raw;
 pub mod schema;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod time;
 pub mod tokens;
 pub mod transcribe;

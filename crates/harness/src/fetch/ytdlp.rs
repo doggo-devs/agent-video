@@ -282,7 +282,7 @@ const SUBS_INFIX: &str = "_subs";
 /// prefix-matched, first hit wins, no hit falls back to the first candidate.
 ///
 /// Only formats core actually reads are eligible
-/// ([`SIDECAR_SUBTITLE_EXTS`]): an unconverted leftover (`--convert-subs`
+/// ([`agent_video_core::subtitle::SIDECAR_SUBTITLE_EXTS`]): an unconverted leftover (`--convert-subs`
 /// can fail) must not become a sidecar core cannot parse.
 pub fn promote_subtitle(dir: &Path, key: &str, preferred_langs: &[String]) -> std::io::Result<()> {
     use agent_video_core::subtitle::SIDECAR_SUBTITLE_EXTS;
@@ -1015,17 +1015,8 @@ mod tests {
         assert!(r.subs);
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "av-ytdlp-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir
+    fn temp_dir(tag: &str) -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new(&format!("av-ytdlp-{tag}"))
     }
 
     fn langs(prefs: &[&str]) -> Vec<String> {

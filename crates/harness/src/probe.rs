@@ -207,15 +207,7 @@ mod tests {
 
     #[test]
     fn advertises_only_what_core_discovers() {
-        let dir = std::env::temp_dir().join(format!(
-            "av-probe-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = crate::testutil::TempDir::new("av-probe");
         let video = dir.join("talk.mp4");
         std::fs::write(&video, b"").expect("write");
         std::fs::write(dir.join("talk.srt"), b"").expect("write");

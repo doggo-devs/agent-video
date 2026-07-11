@@ -13,6 +13,7 @@ use std::sync::Arc;
 use image::{GrayImage, RgbImage};
 use rayon::prelude::*;
 
+use crate::event::EventSink;
 use crate::media::decode::{FrameSource, SampleSpec};
 use crate::source::Source;
 use crate::types::{CandidateFrame, TimeRange};
@@ -25,13 +26,15 @@ pub type FrameStream = FrameSource;
 
 /// Open a streaming extractor for the whole video at a fixed fps.
 ///
-/// `threads` caps the decoder's thread count (`None` = auto).
+/// `threads` caps the decoder's thread count (`None` = auto); `events`
+/// receives any decode-open diagnostics.
 pub fn stream_frames(
     input: &Source,
     fps: f32,
     cell_min_edge: u32,
     score_edge: u32,
     threads: Option<NonZeroUsize>,
+    events: &dyn EventSink,
 ) -> crate::error::Result<FrameStream> {
     FrameSource::open(
         input,
@@ -42,13 +45,14 @@ pub fn stream_frames(
         },
         pipe_edge(cell_min_edge, score_edge),
         threads,
+        events,
     )
 }
 
 /// Open a streaming extractor for a time range at a fixed fps.
 ///
 /// Timestamps produced by the stream are absolute (0-based at the stream
-/// start), not range-relative.
+/// start), not range-relative. `events` receives any decode-open diagnostics.
 pub fn stream_range(
     input: &Source,
     fps: f32,
@@ -56,6 +60,7 @@ pub fn stream_range(
     score_edge: u32,
     range: TimeRange,
     threads: Option<NonZeroUsize>,
+    events: &dyn EventSink,
 ) -> crate::error::Result<FrameStream> {
     FrameSource::open(
         input,
@@ -66,11 +71,14 @@ pub fn stream_range(
         },
         pipe_edge(cell_min_edge, score_edge),
         threads,
+        events,
     )
 }
 
 /// Open a streaming extractor from `start` to `end`, or to EOF when `end` is
 /// `None` — the `process --from/--until` window. Timestamps stay absolute.
+/// `events` receives any decode-open diagnostics, including a seek fallback.
+#[allow(clippy::too_many_arguments)]
 pub fn stream_window(
     input: &Source,
     fps: f32,
@@ -79,12 +87,14 @@ pub fn stream_window(
     start: f32,
     end: Option<f32>,
     threads: Option<NonZeroUsize>,
+    events: &dyn EventSink,
 ) -> crate::error::Result<FrameStream> {
     FrameSource::open(
         input,
         SampleSpec::Fps { fps, start, end },
         pipe_edge(cell_min_edge, score_edge),
         threads,
+        events,
     )
 }
 
@@ -94,7 +104,8 @@ pub fn stream_window(
 /// `fill` must be ascending and non-overlapping — the invariant
 /// [`crate::probe::KeyframeInfo::sparse_regions`] provides and region merging
 /// preserves. One decoder emits the merged stream in presentation order, so
-/// downstream monotonicity needs no interleaving choreography.
+/// downstream monotonicity needs no interleaving choreography. `events`
+/// receives any decode-open diagnostics.
 pub fn stream_mixed(
     input: &Source,
     fps: f32,
@@ -102,31 +113,35 @@ pub fn stream_mixed(
     cell_min_edge: u32,
     score_edge: u32,
     threads: Option<NonZeroUsize>,
+    events: &dyn EventSink,
 ) -> crate::error::Result<FrameStream> {
     FrameSource::open(
         input,
         SampleSpec::Mixed { fps, fill },
         pipe_edge(cell_min_edge, score_edge),
         threads,
+        events,
     )
 }
 
 /// Open a keyframe-only streaming extractor.
 ///
 /// Only key packets reach the decoder, so this decodes I-frames exclusively.
-/// Each frame carries its own pts — there is no probed timestamp list to
-/// pair against, and no pairing to break.
+/// Each frame carries its own pts. `events` receives any decode-open
+/// diagnostics.
 pub fn stream_keyframes(
     input: &Source,
     cell_min_edge: u32,
     score_edge: u32,
     threads: Option<NonZeroUsize>,
+    events: &dyn EventSink,
 ) -> crate::error::Result<FrameStream> {
     FrameSource::open(
         input,
         SampleSpec::Keyframes,
         pipe_edge(cell_min_edge, score_edge),
         threads,
+        events,
     )
 }
 

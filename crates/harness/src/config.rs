@@ -577,6 +577,26 @@ mod tests {
         test_dirs(Path::new("/home/u"))
     }
 
+    /// The last ```` ```toml ```` block in a doc, verbatim between fences.
+    /// The example is the first fence under the doc's own `## Complete
+    /// example` heading — anchored to structure, not to global block order,
+    /// so a per-key snippet added elsewhere can never silently steal the
+    /// guard from the load-bearing block.
+    fn extract_toml_block(doc: &str) -> Option<&str> {
+        let section = &doc[doc.find("## Complete example")?..];
+        let fence = section.find("```toml")?;
+        let after = &section[fence + "```toml".len()..];
+        let body = &after[after.find('\n')? + 1..];
+        Some(&body[..body.find("```")?])
+    }
+
+    #[test]
+    fn config_doc_example_parses_cleanly() {
+        let doc = include_str!("../../../docs/config.md");
+        let example = extract_toml_block(doc).expect("doc carries the example");
+        parse_config(example, &dirs()).expect("the documented config is a valid config");
+    }
+
     #[test]
     fn defaults_hang_off_base_dirs() {
         let cfg = default_config(&dirs());

@@ -13,6 +13,7 @@ use image::GrayImage;
 
 use crate::config::Config;
 use crate::error::{Error, ErrorCode, ErrorContext};
+use crate::event::EventSink;
 use crate::source::Source;
 use crate::subtitle::Subtitles;
 use crate::types::{CandidateFrame, CanvasSpec, ScoredFrame, TimeRange, format_ts};
@@ -31,17 +32,21 @@ use super::{OutputSink, SubtitleSource};
 /// the requested range travel inside the metadata's `subtitles` field; no
 /// `subtitles.txt` is written — the full-video text is not an artifact of a
 /// range extraction.
+///
+/// `events` receives every diagnostic the run emits (decode-open and subtitle
+/// warnings) as typed events; pass [`crate::event::Discard`] for silence.
 pub fn extract_range(
     input: &Source,
     sink: OutputSink<'_>,
     cfg: &Config,
     range: TimeRange,
     subs: SubtitleSource<'_>,
+    events: &dyn EventSink,
 ) -> Result<()> {
     super::validate_input(input)?;
     // Before the expensive sampling pass: subtitle errors must fail fast,
     // not after all the CPU and IO have been spent.
-    let subs = Subtitles::resolve(input, subs)?;
+    let subs = Subtitles::resolve(input, subs, events)?;
     let session = OutputSession::open(sink)?;
 
     let fps = cfg.extract_fps();
@@ -53,6 +58,7 @@ pub fn extract_range(
         cfg.score_edge(),
         range,
         None,
+        events,
     )?;
 
     let batch_size = extract_batch_frames(fps, cfg.chunk_seconds());
@@ -163,7 +169,7 @@ pub fn extract_range(
     };
 
     // No subtitles.txt: the range-sliced cues already travel in the metadata.
-    session.commit(&meta, None)?;
+    session.commit(&meta, None, events)?;
 
     Ok(())
 }

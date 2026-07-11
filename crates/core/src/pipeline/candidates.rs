@@ -30,7 +30,9 @@ pub trait RgbSource {
 
 impl RgbSource for extract::FrameStream {
     fn next_frame(&mut self) -> Result<Option<RgbFrame>> {
-        extract::FrameStream::next_frame(self)
+        // `?` lifts the typed `error::Error` into `anyhow::Error`, keeping it
+        // downcastable so the CLI can still recover the exit code.
+        Ok(extract::FrameStream::next_frame(self)?)
     }
     fn aspect(&self) -> Option<f32> {
         extract::FrameStream::aspect(self)
