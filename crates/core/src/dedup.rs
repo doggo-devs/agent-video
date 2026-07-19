@@ -29,8 +29,8 @@ pub struct Deduper {
 }
 
 impl Deduper {
-    /// `window` is the number of recently-kept hashes to compare against; the
-    /// type rules out zero, which would grow `recent` without bound.
+    /// `window` is the number of recently-kept hashes to compare against;
+    /// zero would grow `recent` without bound.
     pub fn new(hash_threshold: u32, window: NonZeroUsize) -> Self {
         Self {
             hasher: HasherConfig::new().to_hasher(),

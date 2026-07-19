@@ -94,7 +94,9 @@ impl EventSink for StderrEvents {
                 dir.display()
             ),
             Event::SidecarEntryUnreadable { error } => {
-                eprintln!("warning: skipping unreadable directory entry during sidecar scan: {error}")
+                eprintln!(
+                    "warning: skipping unreadable directory entry during sidecar scan: {error}"
+                )
             }
             // `Event` is non_exhaustive: a kernel that learns a new diagnostic
             // stays silent here until this renderer teaches it a string.
@@ -336,6 +338,47 @@ fn reset_sigpipe() {
     }
 }
 
+/// Everything a media-processing run (`process` or `extract`) derives from
+/// the shared IO/common flags: resolved config, output sink, subtitle source,
+/// and the classified input. Borrows the parsed args it was built from.
+struct MediaRun<'a> {
+    cfg: Config,
+    sink: pipeline::OutputSink<'a>,
+    subs: pipeline::SubtitleSource<'a>,
+    source: Source,
+}
+
+impl<'a> MediaRun<'a> {
+    fn new(io: &'a IoArgs, opts: &'a CommonOpts, strategy: StrategyOpts) -> anyhow::Result<Self> {
+        let cfg = Config::new(
+            opts.max_edge,
+            opts.profile.as_deref(),
+            &opts.overrides,
+            strategy,
+        )?;
+
+        // clap guarantees exactly one destination: `-o` xor `--json`.
+        let sink = match &io.output {
+            Some(dir) => pipeline::OutputSink::Files(dir),
+            None => pipeline::OutputSink::JsonStdout,
+        };
+
+        // clap's `conflicts_with` guarantees the flags are mutually exclusive.
+        let subs = match (&opts.subtitle, opts.subtitle_track) {
+            (Some(path), _) => pipeline::SubtitleSource::File(path),
+            (None, Some(track)) => pipeline::SubtitleSource::Track(track),
+            (None, None) => pipeline::SubtitleSource::Auto,
+        };
+
+        Ok(Self {
+            cfg,
+            sink,
+            subs,
+            source: Source::classify(&io.input),
+        })
+    }
+}
+
 fn run() -> anyhow::Result<()> {
     // `--mcp` compat: MCP client configs written for the TS harness passed a
     // flag, not a subcommand. Rewriting the first argument keeps them valid.
@@ -348,81 +391,56 @@ fn run() -> anyhow::Result<()> {
     });
     let cli = Cli::parse_from(args);
 
-    let (io, opts) = match &cli.command {
-        Command::Process { io, opts, .. } => (io, opts),
-        Command::Extract { io, opts, .. } => (io, opts),
-        Command::Mcp => return harness::mcp::server::serve_stdio(),
+    match cli.command {
+        Command::Process {
+            io,
+            opts,
+            strategy,
+            from,
+            until,
+            threads,
+            in_flight,
+        } => {
+            let run = MediaRun::new(&io, &opts, strategy)?;
+            let window = pipeline::Window::from_args(from, until)?;
+            pipeline::process(
+                &run.source,
+                run.sink,
+                &run.cfg,
+                pipeline::ProcessOpts {
+                    threads: threads.unwrap_or(0),
+                    max_in_flight: in_flight.unwrap_or(pipeline::DEFAULT_IN_FLIGHT),
+                    subs: run.subs,
+                    window,
+                    events: &StderrEvents,
+                },
+            )
+        }
+        Command::Extract { io, range, opts } => {
+            // `extract` has no strategy flags: it always samples its explicit
+            // range at fixed fps, so the defaults are inert here.
+            let run = MediaRun::new(&io, &opts, StrategyOpts::default())?;
+            pipeline::extract_range(
+                &run.source,
+                run.sink,
+                &run.cfg,
+                range,
+                run.subs,
+                &StderrEvents,
+            )
+        }
+        Command::Mcp => harness::mcp::server::serve_stdio(),
         Command::InstallWhisper { model } => {
             let dirs = harness::config::BaseDirs::detect();
             let cfg = harness::config::load_config(&dirs)?;
             harness::install::install_whisper(&cfg, model.as_deref())?;
-            return Ok(());
+            Ok(())
         }
-        Command::Cookie { action } => return run_cookie(action),
+        Command::Cookie { action } => run_cookie(&action),
         Command::ProbeGpu { backend } => {
             // The parent reads only the exit status; bypass the error
             // plumbing and its exit-code conventions entirely.
-            std::process::exit(harness::gpu::probe_child(backend));
-        }
-    };
-
-    let strategy_opts = match &cli.command {
-        Command::Process { strategy, .. } => *strategy,
-        _ => StrategyOpts::default(),
-    };
-
-    let cfg = Config::new(
-        opts.max_edge,
-        opts.profile.as_deref(),
-        &opts.overrides,
-        strategy_opts,
-    )?;
-
-    // clap guarantees exactly one destination: `-o` xor `--json`.
-    let sink = match &io.output {
-        Some(dir) => pipeline::OutputSink::Files(dir),
-        None => pipeline::OutputSink::JsonStdout,
-    };
-
-    // clap's `conflicts_with` guarantees the flags are mutually exclusive.
-    let subs = match (&opts.subtitle, opts.subtitle_track) {
-        (Some(path), _) => pipeline::SubtitleSource::File(path),
-        (None, Some(track)) => pipeline::SubtitleSource::Track(track),
-        (None, None) => pipeline::SubtitleSource::Auto,
-    };
-
-    let source = Source::classify(&io.input);
-
-    match &cli.command {
-        Command::Process {
-            threads,
-            in_flight,
-            from,
-            until,
-            ..
-        } => {
-            let window = pipeline::Window::from_args(*from, *until)?;
-            let threads = threads.unwrap_or(0);
-            let in_flight = in_flight.unwrap_or(pipeline::DEFAULT_IN_FLIGHT);
-            pipeline::process(
-                &source,
-                sink,
-                &cfg,
-                threads,
-                in_flight,
-                subs,
-                window,
-                &StderrEvents,
-            )
-        }
-        Command::Extract { range, .. } => {
-            pipeline::extract_range(&source, sink, &cfg, *range, subs, &StderrEvents)
-        }
-        Command::Mcp
-        | Command::InstallWhisper { .. }
-        | Command::Cookie { .. }
-        | Command::ProbeGpu { .. } => {
-            unreachable!("handled above")
+            std::process::exit(harness::gpu::probe_child(&backend));
         }
     }
 }

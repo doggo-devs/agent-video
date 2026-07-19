@@ -17,6 +17,16 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 
+# One lint policy for every member; each crate opts in via `lints.workspace`.
+# CI runs `cargo clippy -- -D warnings`, so a "warn" here is a hard gate.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+# Mechanical enforcement of the SAFETY-comment convention: every `unsafe`
+# block must be preceded by a `// SAFETY:` justification.
+undocumented_unsafe_blocks = "warn"
+
 # Profiles only apply at the workspace root; member-level profiles are ignored.
 [profile.release]
 strip = true

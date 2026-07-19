@@ -54,11 +54,13 @@ pub fn extract_range(
     let stream = extract::stream_range(
         input,
         fps,
-        cfg.min_frame_size(),
-        cfg.score_edge(),
         range,
-        None,
-        events,
+        extract::StreamParams {
+            cell_min_edge: cfg.min_frame_size(),
+            score_edge: cfg.score_edge(),
+            threads: None,
+            events,
+        },
     )?;
 
     let batch_size = extract_batch_frames(fps, cfg.chunk_seconds());

@@ -7,31 +7,27 @@
 //! `--progress-template` for progress, `--print after_move:filepath` for the
 //! final path; the human progress bar is never parsed.
 
-use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use serde::Deserialize;
-
-use super::{
-    DownloadIo, DownloadOption, Downloaded, ProgressFn, Recipe, SourceInfo, estimate_label,
-};
+use super::{DownloadIo, Downloaded, ProgressFn, SourceInfo};
 use crate::config::Config;
 use crate::cookies::CookieHandle;
 use crate::fault::Fault;
 use crate::netguard::VettedUrl;
-use crate::plan::format_bytes;
-use crate::tokens::{Dest, Token};
-use agent_video_core::types::format_ts;
+use crate::relay::PolicyRelay;
+
+mod document;
+
+pub use document::{
+    KEEP_TIER_LIMIT, KeepTier, SiteUrlInfo, YtdlpFormat, YtdlpJson, site_info, site_source_info,
+};
 
 const INSTALL_HINT: &str = "yt-dlp not found on PATH — install it (https://github.com/yt-dlp/yt-dlp) to handle \
      site URLs, or download the video manually and pass the local file path as source";
-
-/// How many keep tiers (distinct heights) to offer at most.
-pub const KEEP_TIER_LIMIT: usize = 3;
 
 /// Recipe carried by yt-dlp download plans.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,232 +38,7 @@ pub struct YtdlpRecipe {
     pub subs: bool,
 }
 
-// ── -J document ──
-
-#[derive(Debug, Default, Deserialize)]
-pub struct YtdlpFormat {
-    #[serde(default)]
-    pub height: Option<f64>,
-    /// `Some` = the format carries video. yt-dlp encodes absence as the
-    /// literal string `"none"`; that sentinel dies at this boundary.
-    #[serde(default, deserialize_with = "none_is_absent")]
-    pub vcodec: Option<String>,
-    /// `Some` = the format carries audio; same sentinel rule as `vcodec`.
-    #[serde(default, deserialize_with = "none_is_absent")]
-    pub acodec: Option<String>,
-    #[serde(default)]
-    pub filesize: Option<f64>,
-    #[serde(default)]
-    pub filesize_approx: Option<f64>,
-}
-
-/// Map yt-dlp's `"none"` codec sentinel to a plain absent value, so no
-/// in-memory consumer ever compares against the magic string.
-fn none_is_absent<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<String>::deserialize(deserializer)?;
-    Ok(value.filter(|v| v != "none"))
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct YtdlpJson {
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub duration: Option<f64>,
-    #[serde(default)]
-    pub subtitles: Option<BTreeMap<String, serde_json::Value>>,
-    #[serde(default)]
-    pub formats: Option<Vec<YtdlpFormat>>,
-}
-
-/// One keep tier derived from a site's format list.
-#[derive(Debug, Clone, PartialEq)]
-pub struct KeepTier {
-    pub height: u32,
-    pub estimated_bytes: Option<u64>,
-}
-
-/// A site page probed via `yt-dlp -J`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SiteUrlInfo {
-    pub title: String,
-    /// Seconds; live streams may not report one.
-    pub duration: Option<f64>,
-    pub subtitle_langs: Vec<String>,
-    /// Distinct available heights, descending, already capped in count.
-    pub keep_tiers: Vec<KeepTier>,
-    /// Estimate for the analysis rip (best video ≤ cap plus audio).
-    pub analysis_estimated_bytes: Option<u64>,
-}
-
-fn size_of(f: &YtdlpFormat) -> Option<u64> {
-    f.filesize
-        .or(f.filesize_approx)
-        .filter(|&n| n > 0.0)
-        .map(|n| n as u64)
-}
-
-fn height_of(f: &YtdlpFormat) -> u32 {
-    f.height.filter(|&h| h > 0.0).map(|h| h as u32).unwrap_or(0)
-}
-
-fn is_video(f: &YtdlpFormat) -> bool {
-    f.vcodec.is_some() && height_of(f) > 0
-}
-
-fn is_audio_only(f: &YtdlpFormat) -> bool {
-    f.acodec.is_some() && !is_video(f)
-}
-
-/// Largest known size among `fmts`, or `None` when none reports one.
-fn max_size<'a>(fmts: impl Iterator<Item = &'a YtdlpFormat>) -> Option<u64> {
-    fmts.filter_map(size_of).max()
-}
-
-/// Reduce a `-J` document to [`SiteUrlInfo`]; pure. Size estimates mirror
-/// download selectors: keep = best video at tier + best audio, analysis =
-/// best video-only rendition at or under `analysis_max_height`, plus audio.
-pub fn site_info(doc: &YtdlpJson, analysis_max_height: u32) -> SiteUrlInfo {
-    let empty = Vec::new();
-    let formats = doc.formats.as_ref().unwrap_or(&empty);
-    let video: Vec<&YtdlpFormat> = formats.iter().filter(|f| is_video(f)).collect();
-    let audio_size = max_size(formats.iter().filter(|f| is_audio_only(f)));
-
-    let mut heights: Vec<u32> = video.iter().map(|f| height_of(f)).collect();
-    heights.sort_unstable_by(|a, b| b.cmp(a));
-    heights.dedup();
-    heights.truncate(KEEP_TIER_LIMIT);
-
-    let keep_tiers: Vec<KeepTier> = heights
-        .into_iter()
-        .map(|height| {
-            let at_height: Vec<&YtdlpFormat> = video
-                .iter()
-                .copied()
-                .filter(|f| height_of(f) == height)
-                .collect();
-            let video_size = max_size(at_height.iter().copied());
-            let muxed = at_height.iter().any(|f| f.acodec.is_some());
-            KeepTier {
-                height,
-                estimated_bytes: video_size
-                    .map(|v| v + if muxed { 0 } else { audio_size.unwrap_or(0) }),
-            }
-        })
-        .collect();
-
-    let video_only: Vec<&YtdlpFormat> = video
-        .iter()
-        .copied()
-        .filter(|f| height_of(f) <= analysis_max_height && f.acodec.is_none())
-        .collect();
-    let pool: Vec<&YtdlpFormat> = if video_only.is_empty() {
-        video
-            .iter()
-            .copied()
-            .filter(|f| height_of(f) <= analysis_max_height)
-            .collect()
-    } else {
-        video_only
-    };
-    let best_height = pool.iter().map(|f| height_of(f)).max();
-    let video_estimate =
-        best_height.and_then(|h| max_size(pool.iter().copied().filter(|f| height_of(f) == h)));
-    // Add audio unless the chosen rendition already carries it.
-    let chosen_muxed = best_height
-        .map(|h| pool.iter().any(|f| height_of(f) == h && f.acodec.is_some()))
-        .unwrap_or(false);
-    let analysis_estimated_bytes = video_estimate.map(|v| {
-        v + if chosen_muxed {
-            0
-        } else {
-            audio_size.unwrap_or(0)
-        }
-    });
-
-    SiteUrlInfo {
-        title: doc
-            .title
-            .clone()
-            .or_else(|| doc.id.clone())
-            .unwrap_or_else(|| "untitled".to_string()),
-        duration: doc.duration.filter(|&d| d > 0.0),
-        subtitle_langs: doc
-            .subtitles
-            .as_ref()
-            .map(|s| s.keys().cloned().collect())
-            .unwrap_or_default(),
-        keep_tiers,
-        analysis_estimated_bytes,
-    }
-}
-
-/// Turn site facts into the source info: analysis rip plus keep tiers.
-pub fn site_source_info(info: &SiteUrlInfo, cfg: &Config) -> SourceInfo {
-    let h = cfg.download.analysis_max_height.get();
-    let duration = info
-        .duration
-        .map(|d| format_ts(d as f32))
-        .unwrap_or_else(|| "unknown duration".to_string());
-    let subs = if info.subtitle_langs.is_empty() {
-        "no subtitles listed".to_string()
-    } else {
-        format!("subtitles: {}", info.subtitle_langs.join(", "))
-    };
-
-    let mut options = vec![DownloadOption {
-        token: Token::new("dl-analysis"),
-        dest: Dest::Cache,
-        label: match info.analysis_estimated_bytes {
-            Some(n) => format!("analysis rip ({})", format_bytes(n)),
-            None => "analysis rip".to_string(),
-        },
-        effect: format!(
-            "download a rip (≤{h}p video + audio, {}) plus subtitles into the analysis cache \
-             (evictable)",
-            estimate_label(info.analysis_estimated_bytes)
-        ),
-        estimated_bytes: info.analysis_estimated_bytes,
-        recipe: Recipe::Ytdlp(YtdlpRecipe {
-            format: format!("bv[height<={h}]+ba/bv*[height<={h}]+ba/b[height<={h}]/b"),
-            subs: true,
-        }),
-    }];
-    for tier in &info.keep_tiers {
-        options.push(DownloadOption {
-            token: Token::new(format!("dl-keep-{}", tier.height)),
-            dest: Dest::Keep,
-            label: match tier.estimated_bytes {
-                Some(n) => format!("{}p ({})", tier.height, format_bytes(n)),
-                None => format!("{}p", tier.height),
-            },
-            effect: format!(
-                "save best audio+video at ≤{}p ({}) to {} for the user",
-                tier.height,
-                estimate_label(tier.estimated_bytes),
-                cfg.paths.keep.display()
-            ),
-            estimated_bytes: tier.estimated_bytes,
-            recipe: Recipe::Ytdlp(YtdlpRecipe {
-                format: format!("bv*[height<={h}]+ba/b[height<={h}]/b", h = tier.height),
-                subs: false,
-            }),
-        });
-    }
-
-    SourceInfo {
-        headline: format!(
-            "\"{}\" — {duration}, {subs}. Nothing is downloaded yet.",
-            info.title
-        ),
-        options,
-    }
-}
+// ── sidecar promotion ──
 
 /// Name segment separating downloaded subtitles from the media's sidecar
 /// namespace: they land as `<key>_subs.<lang>.<ext>`, which core's sidecar
@@ -327,6 +98,47 @@ pub fn promote_subtitle(dir: &Path, key: &str, preferred_langs: &[String]) -> st
 }
 
 // ── spawning ──
+
+/// Diagnostics only ever read the tail (`stderr_tail`, `is_auth_failure`),
+/// so keep at most this many bytes and let whole lines fall off the front.
+const STDERR_TAIL_LIMIT: usize = 64 * 1024;
+
+/// Line-oriented tail buffer bounded to `limit` bytes: once appending a
+/// line pushes the total over, whole lines fall off the front. The newest
+/// line always survives intact, even alone over the limit — a truncated
+/// diagnostic is worse than a briefly oversized buffer.
+struct TailBuf {
+    buf: String,
+    limit: usize,
+}
+
+impl TailBuf {
+    fn new(limit: usize) -> Self {
+        TailBuf {
+            buf: String::new(),
+            limit,
+        }
+    }
+
+    /// Append `line` (newline added here) and evict whole lines from the
+    /// front until the buffer fits `limit` or one line remains.
+    fn push_line(&mut self, line: &str) {
+        self.buf.push_str(line);
+        self.buf.push('\n');
+        while self.buf.len() > self.limit {
+            // Every line ends in '\n'; a boundary before the trailing one
+            // means more than one line is stored.
+            let Some(i) = self.buf[..self.buf.len() - 1].find('\n') else {
+                break;
+            };
+            self.buf.drain(..=i);
+        }
+    }
+
+    fn into_string(self) -> String {
+        self.buf
+    }
+}
 
 fn stderr_tail(stderr: &str) -> String {
     let tail: Vec<&str> = stderr.trim().lines().rev().take(5).collect();
@@ -407,13 +219,44 @@ const AUTH_HINT: &str = "this source requires a login — export cookies from a 
 /// slow one.
 const PROBE_DEADLINE: Duration = Duration::from_secs(60);
 
+/// Assemble the `yt-dlp -J` probe arguments, routing every connection
+/// through the relay with `--proxy`. Extracted so a test can assert the
+/// proxy is wired without spawning yt-dlp.
+fn probe_args(url: &VettedUrl, relay: &PolicyRelay, cookies: &CookieHandle) -> Vec<String> {
+    let mut args: Vec<String> = ["-J", "--no-playlist", "--proxy"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    args.push(relay.url());
+    args.extend(cookies.args());
+    args.push(url.as_str().to_string());
+    args
+}
+
+/// Set proxy environment variables so the ffmpeg yt-dlp spawns internally
+/// inherits the same egress route as yt-dlp itself — `--proxy` binds
+/// yt-dlp's own requests, the env vars bind its children's.
+///
+/// `no_proxy` is blanked, not inherited: ffmpeg's http protocol consults it
+/// at connect time even when a proxy is explicitly configured, so an
+/// inherited value would silently route matching hosts around the policy
+/// relay.
+fn set_proxy_env(cmd: &mut Command, relay: &PolicyRelay) {
+    let url = relay.url();
+    for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+        cmd.env(key, &url);
+    }
+    for key in ["no_proxy", "NO_PROXY"] {
+        cmd.env(key, "");
+    }
+}
+
 /// Probe a site page: `yt-dlp -J` reduced through [`site_info`].
-pub fn probe(url: &VettedUrl, cfg: &Config) -> Result<SourceInfo, Fault> {
+pub fn probe(url: &VettedUrl, cfg: &Config, relay: &PolicyRelay) -> Result<SourceInfo, Fault> {
     let cookies = acquire_cookies(cfg)?;
     let mut cmd = Command::new("yt-dlp");
-    cmd.args(["-J", "--no-playlist"])
-        .args(cookies.args())
-        .arg(url.as_str());
+    cmd.args(probe_args(url, relay, &cookies));
+    set_proxy_env(&mut cmd, relay);
     let out = crate::proc::output_with_deadline(&mut cmd, PROBE_DEADLINE).map_err(spawn_error)?;
     // Even a probe rotates cookies on some sites; adopt them whatever the
     // verdict (a deadline-killed child left an empty delta).
@@ -460,6 +303,54 @@ pub fn probe(url: &VettedUrl, cfg: &Config) -> Result<SourceInfo, Fault> {
 /// bytes flow, so this is generous even across silent phase transitions.
 const STALL_LIMIT: Duration = Duration::from_secs(300);
 
+/// No *byte progress* for this long means the download is wedged even if
+/// it keeps logging (a fragment-retry loop chatters forever without moving
+/// bytes). Long enough to cover the chatter-only pre-download phase
+/// (extractor negotiation) and post-download remuxing, and strictly inside
+/// the tracker's abandon limit — see the compile-time assertion in
+/// `mcp::download` — so an abandoned slot can never leave a live child
+/// behind.
+pub(crate) const NO_PROGRESS_LIMIT: Duration = Duration::from_secs(480);
+
+/// One liveness signal from the pipe readers. The two variants feed two
+/// clocks: `Chatter` proves the child is talking, `Bytes` proves it is
+/// working. Only the stdout progress parse — the same parse that feeds
+/// the tracker — may claim `Bytes`, so the watchdog and the tracker's
+/// abandon clock share one definition of progress and cannot disagree.
+#[derive(Debug, Clone, Copy)]
+enum Pulse {
+    /// A parsed progress line: bytes moved. Resets both clocks.
+    Bytes,
+    /// Any other output line. Resets only the silence clock.
+    Chatter,
+    /// The downloader is unwinding: kill the child now. Sent only by
+    /// [`WatchdogGuard`]'s `Drop`.
+    Abort,
+}
+
+/// Absolute wall-clock ceiling on a yt-dlp child's lifetime, progress or
+/// not: a server drip-feeding one progress tick every few minutes resets
+/// both stall clocks forever, so the stall machinery alone never ends it.
+/// Matches the direct path's `BODY_CEILING`.
+const LIFETIME_CEILING: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// The watchdog's deadlines, injectable so tests run in milliseconds.
+#[derive(Debug, Clone, Copy)]
+struct StallLimits {
+    /// Kill after this long with no output at all.
+    silence: Duration,
+    /// Kill after this long with no byte progress, chatter or not.
+    no_progress: Duration,
+    /// Kill after this long since spawn, whatever the progress.
+    lifetime: Duration,
+}
+
+const STALL_LIMITS: StallLimits = StallLimits {
+    silence: STALL_LIMIT,
+    no_progress: NO_PROGRESS_LIMIT,
+    lifetime: LIFETIME_CEILING,
+};
+
 /// How long a child may linger after closing its output before being killed.
 const REAP_GRACE: Duration = Duration::from_secs(30);
 
@@ -474,20 +365,50 @@ const INT_GRACE: Duration = Duration::from_secs(10);
 enum ChildOutcome {
     /// Exited on its own after closing both pipes.
     Exited(ExitStatus),
-    /// Silent past [`STALL_LIMIT`]; killed mid-download.
+    /// Silent past [`StallLimits::silence`]; killed mid-download.
     Stalled,
+    /// Kept chattering but moved no bytes for [`StallLimits::no_progress`];
+    /// killed mid-download.
+    NoProgress,
+    /// Alive past [`StallLimits::lifetime`], progress or not; killed.
+    Expired,
     /// Closed both pipes but did not exit within [`REAP_GRACE`]; killed.
     Unreaped,
+    /// Killed on [`Pulse::Abort`]: the downloader unwound mid-flight.
+    Aborted,
 }
 
-/// Own the child until it terminates. Liveness is message arrival: each
-/// ping on `activity` resets the stall clock, and all senders dropping
-/// (both pipes at EOF) means the work is done and the child only needs
-/// reaping. Sole owner of the child, so the kill paths cannot race a wait.
-fn watch_child(mut child: Child, activity: mpsc::Receiver<()>) -> ChildOutcome {
+/// Own the child until it terminates. Liveness is typed: a [`Pulse::Bytes`]
+/// resets both clocks, a [`Pulse::Chatter`] only the silence clock, so a
+/// child that logs forever without moving bytes still dies. All senders
+/// dropping (both pipes at EOF) means the work is done and the child only
+/// needs reaping. Sole owner of the child, so the kill paths cannot race a
+/// wait.
+fn watch_child(
+    mut child: Child,
+    pulses: mpsc::Receiver<Pulse>,
+    limits: StallLimits,
+) -> ChildOutcome {
+    let start = Instant::now();
+    let mut last_any = start;
+    let mut last_bytes = start;
     loop {
-        match activity.recv_timeout(STALL_LIMIT) {
-            Ok(()) => continue,
+        let deadline = (last_any + limits.silence)
+            .min(last_bytes + limits.no_progress)
+            .min(start + limits.lifetime);
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match pulses.recv_timeout(wait) {
+            Ok(Pulse::Bytes) => {
+                let now = Instant::now();
+                last_any = now;
+                last_bytes = now;
+            }
+            Ok(Pulse::Chatter) => last_any = Instant::now(),
+            Ok(Pulse::Abort) => {
+                // Gently, as on a stall: the INT path saves rotated cookies.
+                crate::proc::kill_tree_graceful(&mut child, INT_GRACE);
+                return ChildOutcome::Aborted;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return match crate::proc::wait_with_deadline(&mut child, REAP_GRACE) {
                     Some(status) => ChildOutcome::Exited(status),
@@ -502,9 +423,67 @@ fn watch_child(mut child: Child, activity: mpsc::Receiver<()>) -> ChildOutcome {
                 // holding the pipes, and the pipe readers only unblock
                 // once every write end is gone.
                 crate::proc::kill_tree_graceful(&mut child, INT_GRACE);
-                return ChildOutcome::Stalled;
+                return if start.elapsed() >= limits.lifetime {
+                    ChildOutcome::Expired
+                } else if last_any.elapsed() >= limits.silence {
+                    ChildOutcome::Stalled
+                } else {
+                    ChildOutcome::NoProgress
+                };
             }
         }
+    }
+}
+
+/// Pins the child's lifetime to the download call. The tracker
+/// (`crate::mcp::tracker`) re-admits a URL's slot the moment this thread's
+/// reporter drops, so a child that outlives its call would race the retry
+/// on the same output paths — the keep directory has no per-job staging.
+/// A normal path takes the watchdog's verdict through [`Self::join`]; an
+/// unwind (a panicking progress callback) reaches `Drop`, which orders the
+/// kill and waits for it before the unwinding continues.
+struct WatchdogGuard {
+    abort: mpsc::Sender<Pulse>,
+    handle: Option<std::thread::JoinHandle<ChildOutcome>>,
+}
+
+impl WatchdogGuard {
+    /// Spawn the watchdog thread owning `child`; `abort` must be a sender
+    /// into the same channel `pulses` reads.
+    fn spawn(
+        child: Child,
+        pulses: mpsc::Receiver<Pulse>,
+        abort: mpsc::Sender<Pulse>,
+        limits: StallLimits,
+    ) -> Self {
+        WatchdogGuard {
+            abort,
+            handle: Some(std::thread::spawn(move || {
+                watch_child(child, pulses, limits)
+            })),
+        }
+    }
+
+    /// Wait for the watchdog's verdict. The abort sender is released before
+    /// the join: the watchdog's normal exit condition is the pulse
+    /// channel's disconnect, which a sender parked here would veto.
+    fn join(mut self) -> ChildOutcome {
+        let handle = self.handle.take().expect("join consumes the only handle");
+        drop(self); // no handle left: Drop only releases the abort sender
+        handle.join().expect("watchdog thread does not panic")
+    }
+}
+
+impl Drop for WatchdogGuard {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        // Unwinding: order the kill and wait for the reap, so the child is
+        // provably dead before the tracker can hand its key to a retry. A
+        // failed send means the watchdog already returned; join either way.
+        let _ = self.abort.send(Pulse::Abort);
+        let _ = handle.join();
     }
 }
 
@@ -633,6 +612,7 @@ pub fn download(
     recipe: &YtdlpRecipe,
     io: DownloadIo<'_>,
     cfg: &Config,
+    relay: &PolicyRelay,
     progress: ProgressFn<'_>,
 ) -> Result<Downloaded, Fault> {
     let (staging, output, subtitle_output, promote_key) = match io {
@@ -674,6 +654,10 @@ pub fn download(
     .into_iter()
     .map(String::from)
     .collect();
+    // Every yt-dlp connection (and its ffmpeg children, via the env below)
+    // routes through the policy relay.
+    args.push("--proxy".to_string());
+    args.push(relay.url());
     args.push(output.to_string_lossy().into_owned());
     if let Some(sub) = &subtitle_output {
         args.extend(
@@ -697,6 +681,7 @@ pub fn download(
     args.push(url.as_str().to_string());
 
     let mut cmd = Command::new("yt-dlp");
+    set_proxy_env(&mut cmd, relay);
     let mut child = crate::proc::isolate_group(&mut cmd)
         .args(&args)
         .stdin(Stdio::null())
@@ -707,30 +692,32 @@ pub fn download(
     let stdout_pipe = child.stdout.take().expect("stdout was piped");
     let stderr_pipe = child.stderr.take().expect("stderr was piped");
 
-    // Any output on either pipe pings the watchdog, so a silent
-    // post-processing phase that still logs is not mistaken for a stall.
-    let (activity, watchdog_rx) = mpsc::channel::<()>();
+    // Pipe readers feed the watchdog typed pulses: only the stdout
+    // progress parse claims Bytes, everything else is Chatter, so a child
+    // that logs (fragment retries) without moving bytes still expires.
+    let (activity, watchdog_rx) = mpsc::channel::<Pulse>();
 
-    // stderr drains on a helper thread (yt-dlp writes progress noise there
-    // too); stdout — progress lines plus the final filepath — parses here.
+    // stderr drains on a helper thread (yt-dlp writes log noise there);
+    // stdout — progress lines plus the final filepath — parses here.
     let stderr_thread = {
         let activity = activity.clone();
         std::thread::spawn(move || {
-            let mut buf = String::new();
+            let mut tail = TailBuf::new(STDERR_TAIL_LIMIT);
             for line in BufReader::new(stderr_pipe).lines() {
                 let Ok(line) = line else { break };
-                let _ = activity.send(());
-                buf.push_str(&line);
-                buf.push('\n');
+                let _ = activity.send(Pulse::Chatter);
+                tail.push_line(&line);
             }
-            buf
+            tail.into_string()
         })
     };
 
     // Watchdog: a child that stops producing output has hung (network stall,
     // dead peer). Kill it so the job settles as a retryable failure instead
     // of pinning this thread and the URL's pending slot until server exit.
-    let watchdog = std::thread::spawn(move || watch_child(child, watchdog_rx));
+    // The guard additionally kills the child if this thread unwinds — see
+    // [`WatchdogGuard`].
+    let watchdog = WatchdogGuard::spawn(child, watchdog_rx, activity.clone(), STALL_LIMITS);
 
     let mut filepath: Option<String> = None;
     let mut read_error: Option<std::io::Error> = None;
@@ -744,11 +731,14 @@ pub fn download(
                 break;
             }
         };
-        let _ = activity.send(());
         if let Some((downloaded, total)) = parse_progress(&line) {
+            // The one site that claims byte progress — the same parse feeds
+            // the tracker, so both stall clocks agree on what "moving" means.
+            let _ = activity.send(Pulse::Bytes);
             progress(downloaded, total);
             continue;
         }
+        let _ = activity.send(Pulse::Chatter);
         let trimmed = line.trim();
         if !trimmed.is_empty() {
             filepath = Some(trimmed.to_string());
@@ -759,7 +749,7 @@ pub fn download(
     // sees the disconnect and reaps.
     drop(activity);
     let stderr = stderr_thread.join().unwrap_or_default();
-    let outcome = watchdog.join().expect("watchdog thread does not panic");
+    let outcome = watchdog.join();
 
     // Whatever the verdict: a normal exit and a graceful abort both saved
     // the staged jar, a hard-killed child left an empty delta.
@@ -773,10 +763,29 @@ pub fn download(
                 STALL_LIMIT.as_secs()
             )));
         }
+        ChildOutcome::NoProgress => {
+            return Err(Fault::transient(format!(
+                "yt-dlp kept producing output but moved no bytes for {}s — likely wedged \
+                 in a retry loop — and was aborted; confirm again to retry",
+                NO_PROGRESS_LIMIT.as_secs()
+            )));
+        }
+        ChildOutcome::Expired => {
+            return Err(Fault::transient(format!(
+                "the download exceeded the {}h lifetime ceiling and was aborted — the \
+                 source may be serving impossibly slowly; confirm again to retry",
+                LIFETIME_CEILING.as_secs() / 3600
+            )));
+        }
         ChildOutcome::Unreaped => {
             return Err(Fault::transient(
                 "yt-dlp did not exit after its output closed and was killed",
             ));
+        }
+        // Only the guard's Drop sends Abort, and that path discards the
+        // outcome while unwinding — but the type cannot promise it.
+        ChildOutcome::Aborted => {
+            return Err(Fault::transient("the download was aborted mid-flight"));
         }
         ChildOutcome::Exited(status) => {
             let media_landed = filepath.as_deref().is_some_and(|p| Path::new(p).is_file());
@@ -816,93 +825,6 @@ pub fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Mirrors the wire boundary: `"none"` arrives as absent.
-    fn fmt(height: f64, vcodec: &str, acodec: &str, size: Option<f64>) -> YtdlpFormat {
-        YtdlpFormat {
-            height: Some(height),
-            vcodec: (vcodec != "none").then(|| vcodec.to_string()),
-            acodec: (acodec != "none").then(|| acodec.to_string()),
-            filesize: size,
-            filesize_approx: None,
-        }
-    }
-
-    #[test]
-    fn codec_none_sentinel_deserializes_to_absent() {
-        let f: YtdlpFormat =
-            serde_json::from_str(r#"{"vcodec":"none","acodec":"opus"}"#).expect("valid json");
-        assert_eq!(f.vcodec, None, "sentinel dies at the wire");
-        assert_eq!(f.acodec.as_deref(), Some("opus"));
-    }
-
-    #[test]
-    fn reduces_formats_to_keep_tiers_descending() {
-        let doc = YtdlpJson {
-            title: Some("T".into()),
-            formats: Some(vec![
-                fmt(360.0, "avc1", "none", Some(10.0)),
-                fmt(720.0, "avc1", "none", Some(50.0)),
-                fmt(1080.0, "avc1", "none", Some(100.0)),
-                fmt(1440.0, "avc1", "none", Some(200.0)),
-                fmt(0.0, "none", "opus", Some(5.0)),
-            ]),
-            ..Default::default()
-        };
-        let info = site_info(&doc, 480);
-        let heights: Vec<u32> = info.keep_tiers.iter().map(|t| t.height).collect();
-        assert_eq!(heights, [1440, 1080, 720], "top 3 distinct, descending");
-        // Video-only tiers add best audio.
-        assert_eq!(info.keep_tiers[0].estimated_bytes, Some(205));
-    }
-
-    #[test]
-    fn muxed_tier_does_not_add_audio() {
-        let doc = YtdlpJson {
-            formats: Some(vec![
-                fmt(720.0, "avc1", "mp4a", Some(80.0)),
-                fmt(0.0, "none", "opus", Some(5.0)),
-            ]),
-            ..Default::default()
-        };
-        let info = site_info(&doc, 480);
-        assert_eq!(info.keep_tiers[0].estimated_bytes, Some(80));
-    }
-
-    #[test]
-    fn analysis_estimate_prefers_video_only_under_cap_plus_audio() {
-        let doc = YtdlpJson {
-            formats: Some(vec![
-                fmt(480.0, "avc1", "none", Some(30.0)),
-                fmt(360.0, "avc1", "none", Some(20.0)),
-                fmt(480.0, "avc1", "mp4a", Some(60.0)),
-                fmt(0.0, "none", "opus", Some(5.0)),
-            ]),
-            ..Default::default()
-        };
-        let info = site_info(&doc, 480);
-        assert_eq!(info.analysis_estimated_bytes, Some(35));
-    }
-
-    #[test]
-    fn falls_back_to_muxed_when_no_video_only() {
-        let doc = YtdlpJson {
-            formats: Some(vec![fmt(480.0, "avc1", "mp4a", Some(60.0))]),
-            ..Default::default()
-        };
-        let info = site_info(&doc, 480);
-        assert_eq!(info.analysis_estimated_bytes, Some(60));
-    }
-
-    #[test]
-    fn untitled_falls_back_to_id_then_placeholder() {
-        let doc = YtdlpJson {
-            id: Some("abc123".into()),
-            ..Default::default()
-        };
-        assert_eq!(site_info(&doc, 480).title, "abc123");
-        assert_eq!(site_info(&YtdlpJson::default(), 480).title, "untitled");
-    }
 
     #[cfg(unix)]
     fn exit_status(code: i32) -> ExitStatus {
@@ -971,6 +893,56 @@ mod tests {
     }
 
     #[test]
+    fn probe_args_route_through_the_relay() {
+        let relay = crate::relay::PolicyRelay::start(false).expect("relay starts");
+        let mut cfg =
+            crate::config::default_config(&crate::config::test_dirs(Path::new("/home/u")));
+        // Skip DNS in `vet` so the test never depends on how a public
+        // hostname resolves on the runner (offline CI, or a resolver that
+        // maps example.com into a non-global range); the arg wiring under
+        // test is independent of the address policy.
+        cfg.network.allow_private_hosts = true;
+        let cookies = acquire_cookies(&cfg).expect("anonymous cookies stage cleanly");
+        let url = crate::netguard::vet("https://example.com/watch", &cfg).expect("well-formed url");
+        let args = probe_args(&url, &relay, &cookies);
+        let proxy_at = args
+            .iter()
+            .position(|a| a == "--proxy")
+            .expect("probe passes --proxy");
+        assert_eq!(
+            args[proxy_at + 1],
+            relay.url(),
+            "--proxy points at the policy relay"
+        );
+        assert_eq!(args.last().expect("url is last"), url.as_str());
+    }
+
+    #[test]
+    fn proxy_env_blanks_no_proxy_for_children() {
+        let relay = crate::relay::PolicyRelay::start(false).expect("relay starts");
+        let mut cmd = Command::new("yt-dlp");
+        set_proxy_env(&mut cmd, &relay);
+        let envs: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&Some(relay.url().into())),
+                "{key} points at the relay"
+            );
+        }
+        for key in ["no_proxy", "NO_PROXY"] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&Some(std::ffi::OsString::new())),
+                "{key} is blanked so no inherited value bypasses the relay"
+            );
+        }
+    }
+
+    #[test]
     fn parses_progress_template_lines() {
         assert_eq!(
             parse_progress("AVDL 1024 2048 NA"),
@@ -984,35 +956,6 @@ mod tests {
         assert_eq!(parse_progress("AVDL 1536.0 NA NA"), Some((1536, None)));
         assert_eq!(parse_progress("/some/file/path.mp4"), None);
         assert_eq!(parse_progress("AVDL NA NA NA"), None);
-    }
-
-    #[test]
-    fn source_info_offers_analysis_plus_tiers() {
-        let cfg = crate::config::default_config(&crate::config::test_dirs(Path::new("/home/u")));
-        let info = SiteUrlInfo {
-            title: "Talk".into(),
-            duration: Some(90.0),
-            subtitle_langs: vec!["en".into()],
-            keep_tiers: vec![KeepTier {
-                height: 1080,
-                estimated_bytes: Some(1024 * 1024),
-            }],
-            analysis_estimated_bytes: Some(512 * 1024),
-        };
-        let si = site_source_info(&info, &cfg);
-        assert_eq!(si.options.len(), 2);
-        assert_eq!(si.options[0].token, Token::new("dl-analysis"));
-        assert_eq!(si.options[1].token, Token::new("dl-keep-1080"));
-        assert!(si.headline.contains("\"Talk\""));
-        assert!(si.headline.contains("subtitles: en"));
-        let Recipe::Ytdlp(r) = &si.options[0].recipe else {
-            panic!("analysis recipe is ytdlp");
-        };
-        assert_eq!(
-            r.format,
-            "bv[height<=480]+ba/bv*[height<=480]+ba/b[height<=480]/b"
-        );
-        assert!(r.subs);
     }
 
     fn temp_dir(tag: &str) -> crate::testutil::TempDir {
@@ -1090,5 +1033,156 @@ mod tests {
 
         let sidecars = agent_video_core::subtitle::find_sidecars(&dir.join("k.mp4"));
         assert_eq!(sidecars, vec![dir.join("k.srt")]);
+    }
+
+    /// A long-sleeping child in its own process group, as production spawns
+    /// them, so the watchdog's group kill cannot reach the test process.
+    #[cfg(unix)]
+    fn sleeping_child() -> Child {
+        crate::proc::isolate_group(&mut Command::new("sleep"))
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    #[cfg(unix)]
+    const TEST_LIMITS: StallLimits = StallLimits {
+        silence: Duration::from_millis(100),
+        no_progress: Duration::from_millis(250),
+        lifetime: Duration::from_secs(60),
+    };
+
+    #[cfg(unix)]
+    #[test]
+    fn guard_drop_kills_the_child_before_unwinding_continues() {
+        // The Fold::Dead race: a panicking download thread drops its
+        // reporter, the tracker re-admits the URL at once, and a surviving
+        // yt-dlp would share the keep path with the retry. The guard's
+        // Drop must therefore not return until the child is dead.
+        let child = sleeping_child();
+        let pid = child.id() as i32;
+        let (tx, rx) = mpsc::channel::<Pulse>();
+        let guard = WatchdogGuard::spawn(child, rx, tx, TEST_LIMITS);
+        drop(guard);
+        // SAFETY: signal 0 probes existence only; the pid was just reaped
+        // by the guard's kill path, so ESRCH is the expected verdict.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the child must be dead when Drop returns");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn silent_child_is_killed_as_stalled() {
+        let child = sleeping_child();
+        let (_tx, rx) = mpsc::channel::<Pulse>();
+        let outcome = watch_child(child, rx, TEST_LIMITS);
+        assert!(matches!(outcome, ChildOutcome::Stalled), "{outcome:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chatter_without_bytes_is_killed_as_no_progress() {
+        // Chatter faster than the silence limit, never a byte: the old
+        // single-clock watchdog lived forever here while the tracker
+        // abandoned the slot — the orphan-process bug.
+        let child = sleeping_child();
+        let (tx, rx) = mpsc::channel::<Pulse>();
+        let chatterer = std::thread::spawn(move || {
+            // Outlives no_progress (250ms) with gaps well under silence (100ms).
+            for _ in 0..40 {
+                if tx.send(Pulse::Chatter).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let outcome = watch_child(child, rx, TEST_LIMITS);
+        chatterer.join().expect("chatterer");
+        assert!(matches!(outcome, ChildOutcome::NoProgress), "{outcome:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn byte_pulses_reset_both_clocks() {
+        // Bytes arriving slower than the silence limit but faster than the
+        // no-progress limit must keep the child alive: a slow but moving
+        // download is progress, not a stall.
+        let child = crate::proc::isolate_group(&mut Command::new("true"))
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        let limits = StallLimits {
+            silence: Duration::from_millis(150),
+            no_progress: Duration::from_millis(300),
+            lifetime: Duration::from_secs(60),
+        };
+        let (tx, rx) = mpsc::channel::<Pulse>();
+        let pulser = std::thread::spawn(move || {
+            // 8 × 50ms = 400ms of liveness, past both raw limits.
+            for _ in 0..8 {
+                if tx.send(Pulse::Bytes).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // Sender drops: EOF, the exited child is reaped as Exited.
+        });
+        let outcome = watch_child(child, rx, limits);
+        pulser.join().expect("pulser");
+        assert!(matches!(outcome, ChildOutcome::Exited(_)), "{outcome:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aborts_a_child_past_the_lifetime_ceiling() {
+        // Byte pulses faster than both stall clocks — a drip-feeding
+        // server resets them forever; only the lifetime ceiling may end
+        // the child.
+        let child = sleeping_child();
+        let limits = StallLimits {
+            silence: Duration::from_millis(200),
+            no_progress: Duration::from_millis(400),
+            lifetime: Duration::from_millis(300),
+        };
+        let (tx, rx) = mpsc::channel::<Pulse>();
+        let pulser = std::thread::spawn(move || {
+            for _ in 0..20 {
+                if tx.send(Pulse::Bytes).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let outcome = watch_child(child, rx, limits);
+        pulser.join().expect("pulser");
+        assert!(matches!(outcome, ChildOutcome::Expired), "{outcome:?}");
+    }
+
+    #[test]
+    fn caps_stderr_to_a_bounded_tail() {
+        let mut tail = TailBuf::new(64);
+        for i in 0..100 {
+            tail.push_line(&format!("line-{i:03}"));
+        }
+        let s = tail.into_string();
+        assert!(s.len() <= 64, "stays within the byte limit: {}", s.len());
+        assert!(!s.contains("line-000"), "oldest lines fall off the front");
+        assert!(s.ends_with("line-099\n"), "newest line survives intact");
+        assert!(
+            s.lines().all(|l| l.len() == "line-000".len()),
+            "eviction drops whole lines, never splits one: {s:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_a_single_line_over_the_limit_intact() {
+        // One oversized line must not be evicted down to nothing: a whole
+        // diagnostic beats an empty buffer.
+        let mut tail = TailBuf::new(8);
+        tail.push_line("a line far past eight bytes");
+        assert_eq!(tail.into_string(), "a line far past eight bytes\n");
     }
 }

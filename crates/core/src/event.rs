@@ -53,11 +53,7 @@ pub enum Event<'a> {
     /// `count` keyframes, below the `minimum` required.
     KeyframePoorDegrade { count: usize, minimum: usize },
     /// A static stretch `[start, end]` seconds was collapsed into `file`.
-    StaticCollapsed {
-        start: f32,
-        end: f32,
-        file: &'a str,
-    },
+    StaticCollapsed { start: f32, end: f32, file: &'a str },
     /// A frame carried an unplaceable timestamp (non-finite or backwards) and
     /// was skipped; `last` is the last placed timestamp.
     UnplaceableTimestamp { ts: f32, last: Option<f32> },

@@ -84,12 +84,22 @@ pub struct Window {
 }
 
 /// Resolve `[from ?? 0, until ?? duration]` against the video duration.
-/// Out-of-bounds `until` is clamped with a notice; out-of-bounds `from` errors.
+/// Out-of-bounds `until` is clamped with a notice; out-of-bounds `from`
+/// errors. A zero (or negative) `duration` is the probe reporting a
+/// zero-length video — rejected naming the file, not the arguments, as
+/// the problem.
 pub fn resolve_window(
     from: Option<&TimeValue>,
     until: Option<&TimeValue>,
     duration: f64,
 ) -> Result<Window, ArgError> {
+    if duration <= 0.0 {
+        return Err(ArgError(
+            "the probe reports a zero-length video — the file has no playable duration, \
+             so no window can be resolved (the file, not from/until, is the problem)"
+                .to_string(),
+        ));
+    }
     let mut notices = Vec::new();
     let start = match from {
         None => 0.0,
@@ -196,6 +206,17 @@ mod tests {
     fn rejects_from_past_video_end() {
         let err = resolve_window(Some(&text("3:00")), None, 120.0).expect_err("past end");
         assert!(err.0.contains("past the end"), "{}", err.0);
+    }
+
+    #[test]
+    fn names_zero_duration_as_the_culprit() {
+        let err = resolve_window(None, None, 0.0).expect_err("zero-length video");
+        assert!(err.0.contains("zero-length"), "names the file: {}", err.0);
+        assert!(
+            !err.0.contains("past the end"),
+            "must not blame the arguments: {}",
+            err.0
+        );
     }
 
     #[test]

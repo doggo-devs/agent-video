@@ -21,6 +21,7 @@ use crate::fault::Fault;
 use crate::fetch::{
     DownloadIo, DownloadOption, Downloaded, ProgressFn, Recipe, SourceInfo, direct::DirectRecipe,
 };
+use crate::relay::PolicyRelay;
 use crate::schema::ProbeSummary;
 use crate::tokens::{Dest, DownloadPlan, Token, Tokens};
 
@@ -62,8 +63,8 @@ impl<T: CoreRunner> CoreRunner for Arc<T> {
 }
 
 impl<T: UrlFetcher> UrlFetcher for Arc<T> {
-    fn probe_url(&self, url: &str, cfg: &Config) -> Result<SourceInfo, Fault> {
-        (**self).probe_url(url, cfg)
+    fn probe_url(&self, url: &str, cfg: &Config, relay: &PolicyRelay) -> Result<SourceInfo, Fault> {
+        (**self).probe_url(url, cfg, relay)
     }
 
     fn download(
@@ -71,9 +72,10 @@ impl<T: UrlFetcher> UrlFetcher for Arc<T> {
         plan: &DownloadPlan,
         io: DownloadIo<'_>,
         cfg: &Config,
+        relay: &PolicyRelay,
         progress: ProgressFn<'_>,
     ) -> Result<Downloaded, Fault> {
-        (**self).download(plan, io, cfg, progress)
+        (**self).download(plan, io, cfg, relay, progress)
     }
 }
 
@@ -133,7 +135,12 @@ pub(crate) struct FakeFetcher {
 }
 
 impl UrlFetcher for FakeFetcher {
-    fn probe_url(&self, _url: &str, _cfg: &Config) -> Result<SourceInfo, Fault> {
+    fn probe_url(
+        &self,
+        _url: &str,
+        _cfg: &Config,
+        _relay: &PolicyRelay,
+    ) -> Result<SourceInfo, Fault> {
         Ok(self.info.clone())
     }
 
@@ -142,6 +149,7 @@ impl UrlFetcher for FakeFetcher {
         _plan: &DownloadPlan,
         io: DownloadIo<'_>,
         _cfg: &Config,
+        _relay: &PolicyRelay,
         progress: ProgressFn<'_>,
     ) -> Result<Downloaded, Fault> {
         *self.downloads.lock().expect("downloads") += 1;
@@ -266,6 +274,7 @@ pub(crate) fn env_with_fetcher(
         fetcher: Box::new(Arc::clone(&fetcher)),
         whisper: Box::new(Arc::clone(&whisper)),
         core: Box::new(Arc::clone(&core)),
+        relay: std::sync::OnceLock::new(),
         config,
     });
     TestEnv {
@@ -291,6 +300,20 @@ pub(crate) fn analysis_option() -> DownloadOption {
     }
 }
 
+pub(crate) fn keep_option() -> DownloadOption {
+    DownloadOption {
+        token: Token::new("dl-keep"),
+        dest: Dest::Keep,
+        label: "1080p".to_string(),
+        effect: "save the full-quality file to the keep dir".to_string(),
+        estimated_bytes: Some(4096),
+        recipe: Recipe::Direct(DirectRecipe {
+            ext: "mp4".to_string(),
+            filename: "v.mp4".to_string(),
+        }),
+    }
+}
+
 pub(crate) fn media_file(env: &TestEnv, name: &str) -> PathBuf {
     let p = env.dir.join(name);
     std::fs::write(&p, b"pretend this is a video").expect("write media");
@@ -298,10 +321,20 @@ pub(crate) fn media_file(env: &TestEnv, name: &str) -> PathBuf {
 }
 
 pub(crate) fn call(env: &TestEnv, args: serde_json::Value) -> CallToolResult {
+    call_with_notify(env, args, &null_notifier())
+}
+
+/// Drive one call with a caller-owned notifier, for tests pinning who may
+/// send progress notifications (and when).
+pub(crate) fn call_with_notify(
+    env: &TestEnv,
+    args: serde_json::Value,
+    notify: &super::deps::Notifier,
+) -> CallToolResult {
     let serde_json::Value::Object(map) = args else {
         panic!("args must be an object");
     };
-    handle_video_call(&map, &env.deps, &null_notifier())
+    handle_video_call(&map, &env.deps, notify)
 }
 
 pub(crate) fn text_of(result: &CallToolResult) -> String {

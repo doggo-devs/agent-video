@@ -56,11 +56,13 @@ fn run_process(
         &source_of(media),
         OutputSink::Files(&dir),
         &cfg,
-        0,
-        pipeline::DEFAULT_IN_FLIGHT,
-        subs,
-        window,
-        &Discard,
+        pipeline::ProcessOpts {
+            threads: 0,
+            max_in_flight: pipeline::DEFAULT_IN_FLIGHT,
+            subs,
+            window,
+            events: &Discard,
+        },
     )
     .expect("process succeeds on the synthesized fixture");
     support::read_metadata(&dir)
@@ -85,11 +87,13 @@ fn covers_full_duration_without_overlap() {
         &source_of(&fx.media),
         OutputSink::Files(&dir),
         &cfg,
-        0,
-        pipeline::DEFAULT_IN_FLIGHT,
-        SubtitleSource::Auto,
-        None,
-        &Discard,
+        pipeline::ProcessOpts {
+            threads: 0,
+            max_in_flight: pipeline::DEFAULT_IN_FLIGHT,
+            subs: SubtitleSource::Auto,
+            window: None,
+            events: &Discard,
+        },
     )
     .expect("process succeeds on the synthesized fixture");
     let meta = support::read_metadata(&dir);
@@ -307,6 +311,17 @@ fn survives_mid_stream_audio_param_change_in_process() {
 }
 
 #[test]
+fn reports_a_missing_audio_track_as_absence_not_failure() {
+    // keyframe_poor synthesizes video only — no audio input at all. A
+    // legitimate silent video (surveillance, screen capture) must decode
+    // to "no audio here", never to a corrupt-input error.
+    let fx = require_fixture!(support::fixtures::keyframe_poor(2.0));
+    let decoded = decode_audio_16k_mono(&source_of(&fx.media))
+        .expect("a video without an audio track is not a decode failure");
+    assert!(decoded.is_none(), "absence is Ok(None), not an error");
+}
+
+#[test]
 fn follows_mid_stream_sample_rate_change_in_audio_decode() {
     let fx = require_fixture!(support::fixtures::audio_param_change(6.0));
     // The 7f7191f regression path: a fixed swresample context answered the
@@ -314,7 +329,8 @@ fn follows_mid_stream_sample_rate_change_in_audio_decode() {
     // discarded everything already decoded. Following the change means the
     // decode succeeds AND its output spans both segments, not just the first.
     let samples = decode_audio_16k_mono(&source_of(&fx.media))
-        .expect("audio decode follows the mid-stream sample-rate change");
+        .expect("audio decode follows the mid-stream sample-rate change")
+        .expect("the fixture has an audio track");
     let expected = fx.duration * WHISPER_SAMPLE_RATE as f32;
     assert!(
         samples.len() as f32 >= 0.9 * expected,

@@ -7,19 +7,29 @@
 //! to loopback, private (RFC 1918), link-local (cloud metadata), or any
 //! other non-global address, unless `network.allow_private_hosts` is set.
 //!
-//! Enforcement happens at two moments:
-//! - [`vet`] resolves the host once, up front, so a refusal reaches the
-//!   model with a clear reason before any packet leaves.
-//! - [`GuardedResolver`] re-screens every address the direct-http client is
-//!   about to connect to — redirect targets and DNS answers that changed
-//!   since [`vet`] included — closing the check-then-use window there.
+//! The policy is one function — `screen` resolves a host and rejects the
+//! whole set if any address is non-global — enforced up front and again per
+//! connection everywhere a connection is made:
+//! - [`vet`] runs `screen` once, up front, so a refusal reaches the model
+//!   with a clear reason before any packet leaves.
+//! - [`GuardedResolver`] re-runs the same classification on every address
+//!   the direct-http client is about to connect to — redirect targets and
+//!   DNS answers that changed since [`vet`] included — closing the
+//!   check-then-use window on that path.
+//! - [`crate::relay::PolicyRelay`] runs `screen` on every connection the
+//!   yt-dlp subprocess and the libav demuxer make, then connects to the
+//!   already-screened address. Those two paths resolve hostnames
+//!   themselves and never re-check after [`vet`], so their traffic is
+//!   routed through the relay (`--proxy` for yt-dlp, the `http_proxy`
+//!   demuxer option for libav) to bring them under the same per-connection
+//!   check. An attacker who rebinds a passing name to an internal address
+//!   between [`vet`] and the connection is refused at the relay, not
+//!   trusted from the earlier resolution.
 //!
-//! Residual risk, accepted: the libav probe and the yt-dlp subprocess
-//! resolve hostnames themselves, so an attacker who controls a domain's
-//! DNS records can pass [`vet`] and rebind to an internal address on those
-//! two paths. Closing that would mean proxying both; the payloads that
-//! matter in practice — literal internal IPs, metadata endpoints, private
-//! hostnames — are stopped at [`vet`].
+//! `no_proxy` would punch a hole in the relay routing — libav consults the
+//! env var at connect time even when a proxy is explicitly configured — so
+//! the MCP server scrubs it from its own environment at boot and blanks it
+//! in every yt-dlp child's environment.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
@@ -91,9 +101,56 @@ impl fmt::Display for UrlRejection {
 
 impl std::error::Error for UrlRejection {}
 
-/// Parse, resolve, classify. One forbidden address fails the whole URL —
-/// a host resolving to both public and private addresses is exactly the
-/// rebinding shape, not something to connect to on its good side.
+/// Why [`screen`] refused a host: a resolvable name whose addresses fail
+/// the policy, or a name that would not resolve. [`vet`] and the relay map
+/// this to their own model-facing errors.
+#[derive(Debug)]
+pub(crate) enum ScreenRefusal {
+    /// An address in the set is non-global; `range` names the banning range.
+    Forbidden { ip: IpAddr, range: &'static str },
+    /// The host did not resolve to any address.
+    Dns { detail: String },
+}
+
+/// Resolve `host:port` and apply the egress policy to every answer,
+/// returning the screened addresses on success.
+///
+/// One forbidden address fails the whole set — a host resolving to both
+/// public and private addresses is exactly the rebinding shape, not
+/// something to connect to on its good side. Callers connect to one of the
+/// returned addresses directly rather than re-resolving, so the address
+/// that passed the check is the address that gets used — no check-then-use
+/// window. `host` may carry IPv6 brackets; they are stripped for the
+/// resolver form.
+pub(crate) fn screen(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, ScreenRefusal> {
+    // `Uri::host` keeps IPv6 brackets; the (host, port) resolver form wants
+    // the bare address.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let addrs: Vec<std::net::SocketAddr> = (bare, port)
+        .to_socket_addrs()
+        .map_err(|e| ScreenRefusal::Dns {
+            detail: e.to_string(),
+        })?
+        .collect();
+    if addrs.is_empty() {
+        return Err(ScreenRefusal::Dns {
+            detail: "resolved to no addresses".to_string(),
+        });
+    }
+    for addr in &addrs {
+        if let Some(range) = forbidden(addr.ip()) {
+            return Err(ScreenRefusal::Forbidden {
+                ip: addr.ip(),
+                range,
+            });
+        }
+    }
+    Ok(addrs)
+}
+
+/// Parse, resolve, classify. Shares `screen`'s "one forbidden address
+/// fails the whole URL" policy with the per-connection relay, so a model
+/// sees the same verdict up front that the relay would enforce later.
 ///
 /// With `network.allow_private_hosts` set, only URL well-formedness is
 /// checked; no resolution happens here (the probe resolves anyway).
@@ -120,33 +177,13 @@ pub fn vet(source: &str, cfg: &Config) -> Result<VettedUrl, UrlRejection> {
     }
 
     let port = uri.port_u16().unwrap_or(default_port);
-    // `Uri::host` keeps IPv6 brackets; the (host, port) resolver form
-    // wants the bare address.
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    let addrs = (bare, port)
-        .to_socket_addrs()
-        .map_err(|e| UrlRejection::DnsFailure {
-            host: host.clone(),
-            detail: e.to_string(),
-        })?;
-    let mut resolved_any = false;
-    for addr in addrs {
-        resolved_any = true;
-        if let Some(range) = forbidden(addr.ip()) {
-            return Err(UrlRejection::ForbiddenAddress {
-                host,
-                ip: addr.ip(),
-                range,
-            });
+    match screen(&host, port) {
+        Ok(_) => Ok(VettedUrl(source.to_string())),
+        Err(ScreenRefusal::Forbidden { ip, range }) => {
+            Err(UrlRejection::ForbiddenAddress { host, ip, range })
         }
+        Err(ScreenRefusal::Dns { detail }) => Err(UrlRejection::DnsFailure { host, detail }),
     }
-    if !resolved_any {
-        return Err(UrlRejection::DnsFailure {
-            host,
-            detail: "resolved to no addresses".to_string(),
-        });
-    }
-    Ok(VettedUrl(source.to_string()))
 }
 
 // ── address classification ──
@@ -195,6 +232,16 @@ fn forbidden_v4(ip: Ipv4Addr) -> Option<&'static str> {
     None
 }
 
+/// The IPv4 address packed into two adjacent IPv6 segments.
+fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
+    Ipv4Addr::new(
+        (hi >> 8) as u8,
+        (hi & 0xff) as u8,
+        (lo >> 8) as u8,
+        (lo & 0xff) as u8,
+    )
+}
+
 fn forbidden_v6(ip: Ipv6Addr) -> Option<&'static str> {
     // Honest reasons for the two addresses `to_ipv4` would misfile
     // (`::` → 0.0.0.0, `::1` → 0.0.0.1).
@@ -212,13 +259,19 @@ fn forbidden_v6(ip: Ipv6Addr) -> Option<&'static str> {
     let s = ip.segments();
     if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
         // NAT64 (64:ff9b::/96): judge the embedded IPv4.
-        let v4 = Ipv4Addr::new(
-            (s[6] >> 8) as u8,
-            (s[6] & 0xff) as u8,
-            (s[7] >> 8) as u8,
-            (s[7] & 0xff) as u8,
-        );
-        return forbidden_v4(v4);
+        return forbidden_v4(embedded_v4(s[6], s[7]));
+    }
+    if s[0] == 0x2002 {
+        // 6to4 (2002::/16): bits 16..48 embed the IPv4 the packet is
+        // routed to; judge it, as NAT64.
+        return forbidden_v4(embedded_v4(s[1], s[2]));
+    }
+    if s[0] == 0x2001 && s[1] == 0 {
+        // Teredo (2001:0::/32): the server IPv4 sits plain in bits 32..64,
+        // the client IPv4 bit-inverted in the last 32; either being
+        // forbidden bans the address.
+        return forbidden_v4(embedded_v4(s[2], s[3]))
+            .or_else(|| forbidden_v4(embedded_v4(!s[6], !s[7])));
     }
     if (s[0] & 0xfe00) == 0xfc00 {
         return Some("the unique-local range");
@@ -397,6 +450,42 @@ mod tests {
             let ip: Ipv4Addr = ip.parse().expect("literal");
             assert!(forbidden_v4(ip).is_none(), "{ip} must be permitted");
         }
+    }
+
+    #[test]
+    fn rejects_6to4_embedded_private_v4() {
+        // 2002:c0a8:0105:: embeds 192.168.1.5.
+        let ip: Ipv6Addr = "2002:c0a8:105::1".parse().expect("literal");
+        assert_eq!(forbidden_v6(ip), Some("a private (RFC 1918) range"));
+    }
+
+    #[test]
+    fn permits_6to4_of_public_v4() {
+        // 2002:0808:0808:: embeds 8.8.8.8 — same policy as NAT64.
+        let ip: Ipv6Addr = "2002:808:808::1".parse().expect("literal");
+        assert_eq!(forbidden_v6(ip), None);
+    }
+
+    #[test]
+    fn rejects_teredo_embedding_private_client_v4() {
+        // Client 192.168.1.5 = c0a8:0105, bit-inverted → 3f57:fefa;
+        // server is public 8.8.8.8.
+        let ip: Ipv6Addr = "2001:0:808:808::3f57:fefa".parse().expect("literal");
+        assert_eq!(forbidden_v6(ip), Some("a private (RFC 1918) range"));
+    }
+
+    #[test]
+    fn rejects_teredo_embedding_private_server_v4() {
+        // Server 10.0.0.1 = 0a00:0001; inverted client is public 8.8.4.4.
+        let ip: Ipv6Addr = "2001:0:a00:1::f7f7:fbfb".parse().expect("literal");
+        assert_eq!(forbidden_v6(ip), Some("a private (RFC 1918) range"));
+    }
+
+    #[test]
+    fn permits_teredo_of_public_endpoints() {
+        // Server 1.1.1.1, client 8.8.4.4 (inverted f7f7:fbfb).
+        let ip: Ipv6Addr = "2001:0:101:101::f7f7:fbfb".parse().expect("literal");
+        assert_eq!(forbidden_v6(ip), None);
     }
 
     #[test]

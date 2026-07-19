@@ -13,17 +13,19 @@ use std::sync::Arc;
 use rmcp::model::CallToolResult;
 
 use super::deps::{Notifier, ServerDeps};
-use super::download::{DOWNLOAD_ABANDON_LIMIT, execute_download, keep_response};
+use super::download::{
+    DOWNLOAD_ABANDON_LIMIT, execute_download, keep_response, progress_message, slot_key,
+};
 use super::invoke::{run_invocation, transcribe_flow};
 use super::probe_cache::cached_probe;
 use super::tracker::Poll;
 use super::wire::{coerce_args, failed, is_url, json_result, pending_result};
-use crate::cache::url_key;
 use crate::fault::Fault;
 use crate::fetch::rip_key;
 use crate::plan::{Decision, PlanDecision, decide, redeem};
 use crate::schema::OfferedToken;
 use crate::schema::{RecommendedCall, VideoArgs, VideoBody};
+use crate::tokens::Dest;
 use crate::url_policy::decide_url;
 
 // ── tool handler ──
@@ -40,26 +42,11 @@ pub fn handle_video_call(
         Err(e) => return failed(&e),
     };
 
-    // Background downloads first: one poll resolves the slot's whole state
-    // machine, so a URL can never sit on Pending for the whole session.
-    if is_url(&args.source) {
-        match deps
-            .downloads
-            .poll(&url_key(&args.source), DOWNLOAD_ABANDON_LIMIT)
-        {
-            Poll::Vacant => {}
-            Poll::Settled(result) => return result,
-            Poll::Running { downloaded, total } => return pending_result(downloaded, total),
-            Poll::Abandoned => {
-                return failed(&Fault::transient(
-                    "the background download stopped reporting progress and was abandoned — \
-                     call again with the URL to start over",
-                ));
-            }
-        }
-    }
-
-    // Consent next: a URL source may not exist locally until its download runs.
+    // Consent first: a confirm names its own plan, and the slot poll below
+    // must not swallow it — a keep confirm during a running analysis
+    // download starts the keep job, it does not observe the analysis one.
+    // A confirm for a plan whose own download already runs converges inside
+    // `execute_download` (same slot, one writer).
     if args.confirm.is_some() {
         let decision = redeem(&args, &deps.tokens);
         return render_decision(&args, decision, None, Vec::new(), deps, notify);
@@ -71,7 +58,33 @@ pub fn handle_video_call(
         return transcribe_flow(&args, deps, notify);
     }
 
+    // Background downloads: one poll per destination resolves each slot's
+    // whole state machine, so a URL can never sit on Pending for the whole
+    // session. Progress samples ride the *polling* request's own token.
     if is_url(&args.source) {
+        for dest in [Dest::Cache, Dest::Keep] {
+            match deps
+                .downloads
+                .poll(&slot_key(&args.source, dest), DOWNLOAD_ABANDON_LIMIT)
+            {
+                Poll::Vacant => {}
+                Poll::Settled(result) => return result,
+                Poll::Running { downloaded, total } => {
+                    notify(
+                        downloaded as f64,
+                        total.map(|t| t as f64),
+                        progress_message(downloaded, total),
+                    );
+                    return pending_result(downloaded, total);
+                }
+                Poll::Abandoned => {
+                    return failed(&Fault::transient(
+                        "the background download stopped reporting progress and was abandoned — \
+                         call again with the URL to start over",
+                    ));
+                }
+            }
+        }
         return match deps
             .cache
             .find_download(&rip_key(&args.source, &deps.config))
@@ -146,7 +159,11 @@ fn url_first_contact(
     deps: &Arc<ServerDeps>,
     notify: &Notifier,
 ) -> CallToolResult {
-    let info = match deps.fetcher.probe_url(&args.source, &deps.config) {
+    let relay = match deps.relay() {
+        Ok(r) => r,
+        Err(e) => return failed(&e),
+    };
+    let info = match deps.fetcher.probe_url(&args.source, &deps.config, relay) {
         Ok(i) => i,
         Err(e) => return failed(&e),
     };
@@ -653,7 +670,7 @@ mod tests {
         // Rewind the job's progress clock past the abandonment limit — the
         // downloader-side watchdogs have failed and the thread is wedged.
         env.deps.downloads.age(
-            &url_key(url),
+            &slot_key(url, Dest::Cache),
             DOWNLOAD_ABANDON_LIMIT + Duration::from_secs(60),
         );
 
@@ -672,5 +689,148 @@ mod tests {
         let file = media_file(&env, "v.mp4");
         let r = call(&env, serde_json::json!({"source": file, "confirm": "nope"}));
         assert!(text_of(&r).contains("stale"), "{}", text_of(&r));
+    }
+
+    /// A counting notifier plus its call count, for pinning who may send
+    /// progress notifications.
+    fn counting_notifier() -> (Notifier, Arc<std::sync::atomic::AtomicU32>) {
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen = Arc::clone(&count);
+        let notifier: Notifier = Arc::new(move |_, _, _| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        (notifier, count)
+    }
+
+    fn gated_env(options: Vec<crate::fetch::DownloadOption>) -> (TestEnv, Sender<()>) {
+        let (release, gate): (Sender<()>, Receiver<()>) = std::sync::mpsc::channel();
+        let mut env = env_with_fetcher(
+            probe(90.0, vec![]),
+            false,
+            FakeFetcher {
+                info: SourceInfo {
+                    headline: "A video.".to_string(),
+                    options,
+                },
+                gate: Some(Mutex::new(gate)),
+                warning: None,
+                downloads: Mutex::new(0),
+            },
+        );
+        Arc::get_mut(&mut env.deps)
+            .expect("sole owner before threads spawn")
+            .config
+            .download
+            .sync_wait_seconds = std::num::NonZeroU32::new(1).expect("non-zero");
+        (env, release)
+    }
+
+    #[test]
+    fn keep_confirm_during_a_running_analysis_download_is_not_swallowed() {
+        let (env, release) = gated_env(vec![analysis_option(), keep_option()]);
+        let url = "https://example.com/v.mp4";
+
+        let offer = body_of(&call(&env, serde_json::json!({"source": url})));
+        assert_eq!(offer["status"], "confirm_required", "{offer}");
+
+        let analysis = body_of(&call(
+            &env,
+            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+        ));
+        assert_eq!(analysis["status"], "pending", "{analysis}");
+
+        // The keep confirm must start its own job — not observe the running
+        // analysis download and hand its caller someone else's response.
+        let keep = body_of(&call(
+            &env,
+            serde_json::json!({"source": url, "confirm": "dl-keep"}),
+        ));
+        assert_eq!(keep["status"], "pending", "{keep}");
+        assert_eq!(
+            *env.fetcher.downloads.lock().expect("downloads"),
+            2,
+            "both jobs must be running"
+        );
+
+        release.send(()).expect("release analysis");
+        release.send(()).expect("release keep");
+        // Both outcomes surface across successive polls, each exactly once.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut saw_analysis, mut saw_keep) = (false, false);
+        while !(saw_analysis && saw_keep) {
+            let text = text_of(&call(&env, serde_json::json!({"source": url})));
+            saw_analysis |= text.contains("Analysis rip downloaded");
+            saw_keep |= text.contains("Saved to");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "downloads never settled (analysis: {saw_analysis}, keep: {saw_keep})"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn detached_download_sends_no_notifications_after_pending() {
+        let (env, release) = gated_env(vec![analysis_option()]);
+        let url = "https://example.com/v.mp4";
+        let (notifier, count) = counting_notifier();
+
+        let offer = body_of(&call(&env, serde_json::json!({"source": url})));
+        assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let pending = body_of(&call_with_notify(
+            &env,
+            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+            &notifier,
+        ));
+        assert_eq!(pending["status"], "pending", "{pending}");
+        let at_pending = count.load(std::sync::atomic::Ordering::SeqCst);
+
+        release.send(()).expect("release download");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // Null-notifier polls: any notification from here on would have
+            // to come from the detached thread — whose request is over.
+            let body = body_of(&call(&env, serde_json::json!({"source": url})));
+            if body["status"] == "plan" {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "never settled");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            at_pending,
+            "a completed request's progress token must never be used again"
+        );
+    }
+
+    #[test]
+    fn polling_call_reports_progress_through_its_own_notifier() {
+        let (env, release) = gated_env(vec![analysis_option()]);
+        let url = "https://example.com/v.mp4";
+
+        let offer = body_of(&call(&env, serde_json::json!({"source": url})));
+        assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let pending = body_of(&call(
+            &env,
+            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+        ));
+        assert_eq!(pending["status"], "pending", "{pending}");
+
+        // The fake reported 1024/4096 before blocking on the gate; the
+        // polling call renders that sample under its own token.
+        let (notifier, count) = counting_notifier();
+        let poll = body_of(&call_with_notify(
+            &env,
+            serde_json::json!({"source": url}),
+            &notifier,
+        ));
+        assert_eq!(poll["status"], "pending", "{poll}");
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one running snapshot, one notification"
+        );
+        drop(release);
     }
 }

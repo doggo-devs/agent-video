@@ -18,6 +18,7 @@ use crate::fault::Fault;
 use crate::netguard::{GuardedResolver, VettedUrl};
 use crate::plan::format_bytes;
 use crate::probe::{container_label, is_ext_shaped, probe_media_url};
+use crate::relay::PolicyRelay;
 use crate::schema::ProbeSummary;
 use crate::tokens::{Dest, Token};
 use agent_video_core::types::format_ts;
@@ -70,8 +71,8 @@ pub struct DirectRecipe {
 /// from "network trouble", so this source never claims that distinction.
 /// The chain in [`super::probe_url`] falls through to yt-dlp either way and
 /// only surfaces this error when yt-dlp fails too.
-pub fn probe(url: &VettedUrl, cfg: &Config) -> Result<SourceInfo, Fault> {
-    let mut probe = probe_media_url(url.as_str())?;
+pub fn probe(url: &VettedUrl, cfg: &Config, relay: &PolicyRelay) -> Result<SourceInfo, Fault> {
+    let mut probe = probe_media_url(url.as_str(), relay)?;
     if probe.size_bytes.is_none() {
         probe.size_bytes = head_content_length(url, cfg);
     }
@@ -131,11 +132,18 @@ pub fn download(
     cfg: &Config,
     progress: ProgressFn<'_>,
 ) -> Result<Downloaded, Fault> {
-    let dest = match io {
-        DownloadIo::Cache { dir, key } => dir.join(format!("{key}.{}", recipe.ext)),
-        DownloadIo::Keep { dir } => available_path(&dir.join(&recipe.filename))?,
+    let (dest, reserved) = match io {
+        DownloadIo::Cache { dir, key } => (dir.join(format!("{key}.{}", recipe.ext)), false),
+        DownloadIo::Keep { dir } => (reserve_available_path(&dir.join(&recipe.filename))?, true),
     };
-    download_direct(url, &dest, cfg, progress)?;
+    if let Err(e) = download_direct(url, &dest, cfg, progress) {
+        // Release the name: a failed keep download must not leave an empty
+        // placeholder squatting on the user's filename.
+        if reserved {
+            let _ = std::fs::remove_file(&dest);
+        }
+        return Err(e);
+    }
     Ok(Downloaded {
         path: dest,
         warning: None,
@@ -196,9 +204,18 @@ fn sanitize_filename(name: &str) -> String {
         .to_string()
 }
 
-/// First non-colliding variant of `p`: `name.ext`, `name (1).ext`, …
-pub fn available_path(p: &Path) -> Result<PathBuf, Fault> {
+/// First non-colliding variant of `p` (`name.ext`, `name (1).ext`, …),
+/// *reserved* at return: the winning name is claimed with `create_new`
+/// (O_EXCL), so the probe and the claim are one atomic step and two
+/// concurrent downloads of the same filename can never both adopt it — a
+/// bare `exists()` probe would let the loser silently overwrite the
+/// winner at publish time. The zero-byte placeholder is replaced by the
+/// final rename on success and removed by the caller on failure; a crash
+/// leaves an empty file behind, harmless — the next reservation skips it.
+pub fn reserve_available_path(p: &Path) -> Result<PathBuf, Fault> {
     let dir = p.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)
+        .map_err(|e| Fault::environment(format!("cannot create {}: {e}", dir.display())))?;
     let ext = p.extension().and_then(|e| e.to_str());
     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("download");
     for n in 0..100 {
@@ -210,8 +227,19 @@ pub fn available_path(p: &Path) -> Result<PathBuf, Fault> {
                 None => dir.join(format!("{stem} ({n})")),
             }
         };
-        if !candidate.exists() {
-            return Ok(candidate);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(Fault::environment(format!(
+                    "cannot reserve {}: {e}",
+                    candidate.display()
+                )));
+            }
         }
     }
     Err(Fault::environment(format!(
@@ -445,15 +473,30 @@ mod tests {
             .get("http://127.0.0.1:9/x")
             .call()
             .expect_err("loopback must be refused");
+
         assert!(err.to_string().contains("loopback"), "{err}");
     }
 
     #[test]
-    fn available_path_appends_counter() {
+    fn reservation_skips_taken_names() {
         let dir = crate::testutil::TempDir::new("av-direct");
         let p = dir.join("v.mp4");
         std::fs::write(&p, b"x").expect("write");
-        let next = available_path(&p).expect("free name");
+        let next = reserve_available_path(&p).expect("free name");
         assert_eq!(next, dir.join("v (1).mp4"));
+    }
+
+    #[test]
+    fn reservation_claims_the_name_it_returns() {
+        // The atomicity contract, observed: once a caller holds a reserved
+        // path, a second probe of the same name cannot win it — the old
+        // exists()-based probe handed both callers "v.mp4".
+        let dir = crate::testutil::TempDir::new("av-direct-claim");
+        let p = dir.join("v.mp4");
+        let first = reserve_available_path(&p).expect("free name");
+        assert_eq!(first, p);
+        assert!(first.exists(), "the returned name is claimed on disk");
+        let second = reserve_available_path(&p).expect("free name");
+        assert_eq!(second, dir.join("v (1).mp4"));
     }
 }

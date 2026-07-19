@@ -100,9 +100,7 @@ impl<'a> OutputSession<'a> {
         }
     }
 
-    /// Commit the run. Consuming `self` makes the commit point a type-level
-    /// fact — one commit per session, nothing written after it. JSON mode
-    /// prints the metadata to stdout instead.
+    /// Commit the run. JSON mode prints the metadata to stdout instead.
     ///
     /// File mode orders the steps so every abort window is safe:
     /// 1. `subtitles.txt` (when given) and `metadata.json` land in staging —

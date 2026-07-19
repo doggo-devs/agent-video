@@ -17,6 +17,7 @@ const { version } = require('../packages/harness/package.json') as { version: st
 
 interface SchemaProp {
 	description: string
+	type?: string
 	enum?: readonly string[]
 	anyOf?: readonly unknown[]
 }
@@ -144,6 +145,7 @@ function typeboxOf(p: SchemaProp): string {
 	if (p.enum) return `StringEnum(${JSON.stringify(p.enum)} as const, ${opts})`
 	// the only anyOf in the schema is the seconds-or-timestamp union
 	if (p.anyOf) return `Type.Union([Type.String(), Type.Number()], ${opts})`
+	if (p.type === 'boolean') return `Type.Boolean(${opts})`
 	return `Type.String(${opts})`
 }
 

@@ -111,7 +111,7 @@ impl FrameSource {
         // Built before the container so it can ride into libav's interrupt
         // callback, arming every blocking I/O call in this context.
         let stop = Arc::new(AtomicBool::new(false));
-        let mut ictx = open_input_interruptible(input, Arc::clone(&stop))?;
+        let mut ictx = open_input_interruptible(input, Arc::clone(&stop), &[])?;
         let video = best_video_stream(&ictx, input)?;
 
         // Seek before building the decoder so no flush is needed. The seek

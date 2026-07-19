@@ -3,7 +3,7 @@
 //!
 //! The handler itself is synchronous; rmcp's tokio runtime hosts it via
 //! `spawn_blocking`, so tokio stays local to this module as the migration
-//! plan requires. Progress notifications are bridged over an unbounded
+//! plan requires. Progress notifications are bridged over a bounded, lossy
 //! channel — best-effort, a dead transport never kills a call.
 
 use std::sync::Arc;
@@ -75,10 +75,13 @@ impl ServerHandler for VideoServer {
         let args = request.arguments.unwrap_or_default();
 
         // Progress is best-effort; a dead transport must not kill the call.
+        // The channel is bounded and lossy on purpose: progress is a
+        // sampling, not a log. `try_send` drops the newest update when the
+        // peer drains slowly — the backlog it does drain is already stale
+        // either way, and bounding beats buffering without limit.
         let notify: Notifier = match context.meta.get_progress_token() {
             Some(token) => {
-                let (tx, mut rx) =
-                    tokio::sync::mpsc::unbounded_channel::<(f64, Option<f64>, String)>();
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<(f64, Option<f64>, String)>(64);
                 let peer = context.peer.clone();
                 tokio::spawn(async move {
                     while let Some((progress, total, message)) = rx.recv().await {
@@ -89,7 +92,7 @@ impl ServerHandler for VideoServer {
                     }
                 });
                 Arc::new(move |p, t, m| {
-                    let _ = tx.send((p, t, m));
+                    let _ = tx.try_send((p, t, m));
                 })
             }
             None => null_notifier(),
@@ -105,6 +108,20 @@ impl ServerHandler for VideoServer {
 /// Boot the stdio MCP server with production deps; blocks until the client
 /// disconnects. Owns the process's only tokio runtime.
 pub fn serve_stdio() -> anyhow::Result<()> {
+    // The in-process libav demuxer consults `no_proxy` at connect time even
+    // when the `http_proxy` option routes it through the policy relay
+    // (ffmpeg's http protocol checks the env var first), so an inherited
+    // value would silently bypass the per-connection egress screen. Scrub
+    // it for the whole server process. Direct CLI runs (`process`,
+    // `extract`) are untouched: there the user's proxy environment is
+    // their own business.
+    // SAFETY: runs at server boot before the tokio runtime or any other
+    // thread exists, so no concurrent getenv can race the mutation.
+    unsafe {
+        std::env::remove_var("no_proxy");
+        std::env::remove_var("NO_PROXY");
+    }
+
     // stderr is safe: MCP transport is on stdin/stdout.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

@@ -341,12 +341,16 @@ mod tests {
     fn skips_backwards_timestamp_frames() {
         let mut chunker = Chunker::new(60.0, 1.0);
 
-        chunker.push(frame(10.0), true, 4, &Discard).expect("place 10.0");
+        chunker
+            .push(frame(10.0), true, 4, &Discard)
+            .expect("place 10.0");
         let events = chunker
             .push(frame(5.0), true, 4, &Discard)
             .expect("bounded bad timestamps must not fail the run");
         assert!(events.is_empty(), "the backwards frame emits nothing");
-        chunker.push(frame(11.0), true, 4, &Discard).expect("place 11.0");
+        chunker
+            .push(frame(11.0), true, 4, &Discard)
+            .expect("place 11.0");
 
         let events = chunker.finish(4);
         assert_eq!(
@@ -360,11 +364,15 @@ mod tests {
     fn skips_non_finite_timestamp_frames() {
         let mut chunker = Chunker::new(60.0, 1.0);
 
-        chunker.push(frame(0.0), true, 4, &Discard).expect("place 0.0");
+        chunker
+            .push(frame(0.0), true, 4, &Discard)
+            .expect("place 0.0");
         chunker
             .push(frame(f32::NAN), true, 4, &Discard)
             .expect("a NaN timestamp is skipped, not fatal");
-        chunker.push(frame(1.0), true, 4, &Discard).expect("place 1.0");
+        chunker
+            .push(frame(1.0), true, 4, &Discard)
+            .expect("place 1.0");
 
         let events = chunker.finish(4);
         assert_eq!(chunk_ts(&events), vec![vec![0.0, 1.0]]);
@@ -374,7 +382,9 @@ mod tests {
     fn fails_after_unbounded_backwards_timestamps() {
         let mut chunker = Chunker::new(60.0, 1.0);
 
-        chunker.push(frame(1000.0), true, 4, &Discard).expect("place anchor");
+        chunker
+            .push(frame(1000.0), true, 4, &Discard)
+            .expect("place anchor");
         for i in 0..MAX_TS_REGRESSIONS {
             chunker
                 .push(frame(i as f32), true, 4, &Discard)
@@ -401,7 +411,11 @@ mod tests {
         let mut events = Vec::new();
         events.extend(chunker.push(frame(0.0), true, 8, &Discard).expect("push"));
         for ts in 1..=70 {
-            events.extend(chunker.push(frame(ts as f32), false, 8, &Discard).expect("push"));
+            events.extend(
+                chunker
+                    .push(frame(ts as f32), false, 8, &Discard)
+                    .expect("push"),
+            );
         }
         events.extend(chunker.push(frame(75.0), true, 8, &Discard).expect("push"));
 

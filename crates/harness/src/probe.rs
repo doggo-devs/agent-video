@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use super::schema::ProbeSummary;
 use crate::fault::Fault;
+use crate::relay::PolicyRelay;
 use agent_video_core::media;
 use agent_video_core::source::Source;
 use agent_video_core::subtitle::find_sidecars;
@@ -78,10 +79,12 @@ impl Deadline {
     }
 }
 
-/// Human-readable subtitle descriptions: embedded tracks then sidecars,
-/// mirroring the TS wire text (`embedded #0 (eng, subrip)`, `sidecar x.srt`).
-fn describe_subtitles(summary: &media::MediaSummary, sidecars: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = summary
+/// Human-readable embedded-track descriptions, mirroring the TS wire text
+/// (`embedded #0 (eng, subrip)`). Sidecar lines (`sidecar x.srt`) are a
+/// property of the file's directory, not its content, and are appended
+/// live by callers via [`scan_sidecars`].
+fn describe_subtitles(summary: &media::MediaSummary) -> Vec<String> {
+    summary
         .subtitle_tracks
         .iter()
         .enumerate()
@@ -89,9 +92,7 @@ fn describe_subtitles(summary: &media::MediaSummary, sidecars: &[String]) -> Vec
             Some(lang) => format!("embedded #{i} ({lang}, {})", t.codec),
             None => format!("embedded #{i} ({})", t.codec),
         })
-        .collect();
-    out.extend(sidecars.iter().map(|name| format!("sidecar {name}")));
-    out
+        .collect()
 }
 
 /// Basenames of the sidecar subtitle files core's auto-detection would
@@ -105,22 +106,23 @@ pub fn scan_sidecars(video: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Probe a local video file; sidecar subtitles are discovered exactly as a
-/// core run would discover them.
+/// Probe a local video file. The summary is a deterministic function of
+/// the file's *content* only — no sidecar lines — so it may be cached by
+/// content fingerprint. Callers who want the sidecar advertisement append
+/// it live via [`scan_sidecars`].
 pub fn probe_local_file(file: &Path) -> Result<ProbeSummary, Fault> {
     let source = Source::classify(&file.to_string_lossy());
     // A failed stat is an unknown size, not a zero-byte claim.
     let size = std::fs::metadata(file).ok().map(|m| m.len());
     let ictx = media::open_input(&source)?;
     let summary = media::summarize_input(&ictx, &source)?;
-    let sidecars = scan_sidecars(file);
     Ok(ProbeSummary {
         duration: round_centis(summary.duration),
         width: summary.width,
         height: summary.height,
         size_bytes: size,
         container: Some(container_label(&summary.container)),
-        subtitles: describe_subtitles(&summary, &sidecars),
+        subtitles: describe_subtitles(&summary),
     })
 }
 
@@ -156,14 +158,20 @@ pub fn coverage_shortfall(file: &Path) -> Option<String> {
 /// unknown (the caller may fill it via HEAD). Fails when the URL is not
 /// direct media (HTML pages land here) or the probe exceeds
 /// [`URL_PROBE_TIMEOUT`].
-pub fn probe_media_url(url: &str) -> Result<ProbeSummary, Fault> {
+///
+/// `relay` routes libav's connection through the policy relay via the
+/// `http_proxy` demuxer option, so the demuxer's own hostname resolution
+/// and redirect-following are re-screened per connection rather than
+/// trusted from the up-front [`crate::netguard::vet`].
+pub fn probe_media_url(url: &str, relay: &PolicyRelay) -> Result<ProbeSummary, Fault> {
     let source = Source::classify(url);
     // Deadline: arms libav's interrupt callback, turning a stalled
     // open/read into AVERROR_EXIT. The atomic is the FFI boundary — the C
     // callback polls it.
     let stop = Arc::new(AtomicBool::new(false));
     let _deadline = Deadline::arm(Arc::clone(&stop), URL_PROBE_TIMEOUT);
-    let ictx = media::open_input_interruptible(&source, stop)?;
+    let proxy = relay.url();
+    let ictx = media::open_input_interruptible(&source, stop, &[("http_proxy", &proxy)])?;
     let summary = media::summarize_input(&ictx, &source)?;
     Ok(ProbeSummary {
         duration: round_centis(summary.duration),
@@ -171,7 +179,7 @@ pub fn probe_media_url(url: &str) -> Result<ProbeSummary, Fault> {
         height: summary.height,
         size_bytes: None,
         container: Some(container_label(&summary.container)),
-        subtitles: describe_subtitles(&summary, &[]),
+        subtitles: describe_subtitles(&summary),
     })
 }
 
@@ -242,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn describes_embedded_then_sidecar() {
+    fn describes_embedded_tracks_only() {
         let summary = media::MediaSummary {
             duration: 10.0,
             width: 100,
@@ -260,12 +268,8 @@ mod tests {
             ],
         };
         assert_eq!(
-            describe_subtitles(&summary, &["talk.srt".to_string()]),
-            [
-                "embedded #0 (eng, subrip)",
-                "embedded #1 (ass)",
-                "sidecar talk.srt"
-            ]
+            describe_subtitles(&summary),
+            ["embedded #0 (eng, subrip)", "embedded #1 (ass)"]
         );
     }
 }

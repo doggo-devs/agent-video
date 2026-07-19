@@ -28,9 +28,7 @@ pub struct Stretch {
 }
 
 /// The run of frames dropped as duplicates since the last kept frame: how
-/// many, and when the last one was seen. Present only after at least one
-/// drop, so "no drops yet" and "a drop at 0.0s" are distinct states by type
-/// rather than by a sentinel value.
+/// many, and when the last one was seen.
 struct DropRun {
     count: usize,
     last_ts: f32,
@@ -52,7 +50,6 @@ pub struct StretchDetector {
     /// representative should a static gap follow it. The `Arc` makes retaining
     /// it a pointer clone rather than a deep copy of the ~1.4 MB image.
     last_kept: Option<(f32, Arc<RgbImage>)>,
-    /// Duplicates dropped since the last kept frame, if any.
     drops: Option<DropRun>,
 }
 
@@ -65,7 +62,6 @@ impl StretchDetector {
         }
     }
 
-    /// Number of duplicates dropped since the last kept frame.
     fn drop_count(&self) -> usize {
         self.drops.as_ref().map_or(0, |d| d.count)
     }

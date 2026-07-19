@@ -22,6 +22,7 @@ use super::config::Config;
 use super::fault::{Fault, FaultKind};
 use super::netguard::VettedUrl;
 use super::plan::format_bytes;
+use super::relay::PolicyRelay;
 use super::tokens::{Dest, DownloadPlan, Token};
 
 /// Version of the download recipe logic. Bump when the bytes a download
@@ -103,12 +104,12 @@ pub struct Downloaded {
 /// if yt-dlp fails too the caller sees both reasons — a transient network
 /// error on a real media link must not be misdiagnosed as "install yt-dlp".
 /// The combined kind is the join of both faults (`combine_kinds`).
-pub fn probe_url(url: &VettedUrl, cfg: &Config) -> Result<SourceInfo, Fault> {
-    let direct_failure = match direct::probe(url, cfg) {
+pub fn probe_url(url: &VettedUrl, cfg: &Config, relay: &PolicyRelay) -> Result<SourceInfo, Fault> {
+    let direct_failure = match direct::probe(url, cfg, relay) {
         Ok(info) => return Ok(info),
         Err(e) => e,
     };
-    ytdlp::probe(url, cfg).map_err(|yt| {
+    ytdlp::probe(url, cfg, relay).map_err(|yt| {
         Fault::new(
             combine_kinds(yt.kind, direct_failure.kind),
             format!("{yt}\nProbing it as a direct media link also failed: {direct_failure}"),
@@ -150,11 +151,15 @@ pub fn download(
     plan: &DownloadPlan,
     io: DownloadIo<'_>,
     cfg: &Config,
+    relay: &PolicyRelay,
     progress: ProgressFn<'_>,
 ) -> Result<Downloaded, Fault> {
     match &plan.recipe {
+        // The direct client owns its own per-connection screen via
+        // `GuardedResolver`, so it needs no relay; only the subprocess path
+        // does.
         Recipe::Direct(recipe) => direct::download(url, recipe, io, cfg, progress),
-        Recipe::Ytdlp(recipe) => ytdlp::download(url, recipe, io, cfg, progress),
+        Recipe::Ytdlp(recipe) => ytdlp::download(url, recipe, io, cfg, relay, progress),
     }
 }
 

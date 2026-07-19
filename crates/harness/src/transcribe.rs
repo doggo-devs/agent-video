@@ -218,19 +218,32 @@ pub fn transcribe(
     on_step("extracting audio");
     let source = Source::classify(&file.to_string_lossy());
     let t = Instant::now();
-    let samples = decode_audio_16k_mono(&source)?;
+    let decoded = decode_audio_16k_mono(&source)?;
+    let sample_count = decoded.as_deref().map_or(0, <[f32]>::len);
     tracing::info!(
         elapsed_ms = t.elapsed().as_millis() as u64,
-        samples = samples.len(),
-        duration_s = samples.len() as f64 / WHISPER_SAMPLE_RATE as f64,
+        samples = sample_count,
+        duration_s = sample_count as f64 / WHISPER_SAMPLE_RATE as f64,
         "audio decode complete",
     );
-    if samples.is_empty() {
-        return Err(Fault::bad_input(format!(
-            "{} decoded to zero audio samples — nothing to transcribe",
-            file.display()
-        )));
-    }
+    // Both flavors of silence are the input's shape, not a decode failure:
+    // a container with no audio track (screen capture, surveillance) and a
+    // track that decoded to zero samples each get named for what they are.
+    let samples = match decoded {
+        Some(samples) if !samples.is_empty() => samples,
+        Some(_) => {
+            return Err(Fault::bad_input(format!(
+                "{} decoded to zero audio samples — nothing to transcribe",
+                file.display()
+            )));
+        }
+        None => {
+            return Err(Fault::bad_input(format!(
+                "{} has no audio track — nothing to transcribe",
+                file.display()
+            )));
+        }
+    };
 
     let audio_seconds = samples.len() as f64 / f64::from(WHISPER_SAMPLE_RATE);
     let cues = match route {
@@ -648,20 +661,42 @@ fn srt_timestamp(cs: i64) -> String {
 /// Write the SRT atomically: parent dirs, per-writer `.part`, rename. The
 /// transcript cache is shared across server processes and the destination
 /// name is deterministic (fingerprint × route identity), so the staging
-/// name carries the pid — two processes transcribing the same content must
-/// not interleave into one file.
+/// name must be per-writer, not per-process ([`part_path`]) — two writers,
+/// even two threads in one process, must not interleave into one file. A
+/// failed write removes its `.part` rather than leaving it for the
+/// staleness sweep.
 fn write_srt(out_srt: &Path, cues: &[Cue]) -> Result<(), Fault> {
     if let Some(parent) = out_srt.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Fault::environment(format!("cannot create {}: {e}", parent.display())))?;
     }
-    let part = PathBuf::from(format!("{}.{}.part", out_srt.display(), std::process::id()));
+    let part = part_path(out_srt);
     std::fs::write(&part, format_srt(cues))
-        .map_err(|e| Fault::environment(format!("cannot write {}: {e}", part.display())))?;
-    std::fs::rename(&part, out_srt).map_err(|e| {
-        let _ = std::fs::remove_file(&part);
-        Fault::environment(format!("cannot finalize {}: {e}", out_srt.display()))
-    })
+        .map_err(|e| Fault::environment(format!("cannot write {}: {e}", part.display())))
+        .and_then(|()| {
+            std::fs::rename(&part, out_srt).map_err(|e| {
+                Fault::environment(format!("cannot finalize {}: {e}", out_srt.display()))
+            })
+        })
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&part);
+        })
+}
+
+/// Per-writer staging path for `dest` (docs/shared-cache.md Pattern 2,
+/// mirroring `fetch::direct`): pid plus a process-wide sequence, so
+/// concurrent writers never share a staging file; the final rename is
+/// atomic per writer and last-writer-wins is safe because equal keys mean
+/// equal recipes.
+fn part_path(dest: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PART_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
+    PathBuf::from(format!(
+        "{}.{}-{seq}.part",
+        dest.display(),
+        std::process::id()
+    ))
 }
 
 #[cfg(test)]
@@ -774,6 +809,21 @@ mod tests {
     fn auto_detection_picks_the_first_usable_compiled_backend() {
         let backend = local_backend(&cfg(), |_| true).expect("auto never errors");
         assert_eq!(backend, Backend::compiled().first().copied());
+    }
+
+    #[test]
+    fn stages_srt_under_a_per_writer_name() {
+        let dest = Path::new("/cache/transcripts/k.srt");
+        let a = part_path(dest);
+        assert!(a.to_string_lossy().ends_with(".part"));
+        assert!(
+            a.to_string_lossy().starts_with("/cache/transcripts/k.srt."),
+            "stays next to its destination: {a:?}"
+        );
+        // Two writers (even two threads in one process) must not share a
+        // staging file.
+        let b = part_path(dest);
+        assert_ne!(a, b);
     }
 
     #[test]

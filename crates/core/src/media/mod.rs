@@ -52,22 +52,96 @@ pub fn open_input(source: &Source) -> Result<ffmpeg::format::context::Input> {
     ffmpeg::format::input(source.as_path()).map_err(|e| open_error(source, e))
 }
 
-/// Like [`open_input`], but wires `stop` into libav's interrupt callback:
-/// raising the flag makes any blocking I/O inside the returned context —
-/// the open itself, seeks, and every subsequent packet read — return
+/// Like [`open_input`], but wires `stop` into libav's interrupt callback and
+/// forwards `options` as protocol/demuxer knobs to the open.
+///
+/// Raising `stop` makes any blocking I/O inside the returned context — the
+/// open itself, seeks, and every subsequent packet read — return
 /// `AVERROR_EXIT` instead of blocking until the operation completes. This is
 /// what bounds a consumer's shutdown on a stalled source (dead network peer,
 /// hung pipe), where a plain read would never return and a joining thread
 /// would hang with it.
+///
+/// `options` become an `AVDictionary` handed to `avformat_open_input`, so
+/// each pair is a libav protocol/demuxer option — e.g.
+/// `("http_proxy", "http://127.0.0.1:port")` to route every connection the
+/// demuxer makes through a forward proxy. This module forwards them
+/// verbatim and never interprets their meaning; pass `&[]` for a plain open.
 pub fn open_input_interruptible(
     source: &Source,
     stop: Arc<AtomicBool>,
+    options: &[(&str, &str)],
 ) -> Result<ffmpeg::format::context::Input> {
     init();
-    // ffmpeg-next boxes the closure and never reclaims it (no teardown hook):
-    // a few leaked bytes per open, bounded by the handful a run performs.
-    ffmpeg::format::input_with_interrupt(source.as_path(), move || stop.load(Ordering::Relaxed))
-        .map_err(|e| open_error(source, e))
+    open_with_interrupt_and_options(source, stop, options).map_err(|e| open_error(source, e))
+}
+
+/// Open an input with both an interrupt callback and an options dictionary.
+///
+/// `ffmpeg-next` exposes `input_with_interrupt` and `input_with_dictionary`
+/// but not their union, so this drops to FFI to set the interrupt callback
+/// and pass the options dictionary on one `AVFormatContext`. Returning
+/// libav's raw error keeps the coded mapping in one place ([`open_error`]).
+fn open_with_interrupt_and_options(
+    source: &Source,
+    stop: Arc<AtomicBool>,
+    options: &[(&str, &str)],
+) -> std::result::Result<ffmpeg::format::context::Input, ffmpeg::Error> {
+    use ffmpeg::format::context::Input;
+    use std::ffi::CString;
+
+    let path = CString::new(
+        source
+            .as_path()
+            .as_os_str()
+            .to_str()
+            .expect("source path is valid UTF-8"),
+    )
+    .expect("source path has no interior NUL");
+    let mut dict = ffmpeg::Dictionary::new();
+    for (key, value) in options {
+        dict.set(key, value);
+    }
+
+    // SAFETY: `ps` is allocated by libav and handed straight to
+    // `avformat_open_input`, which on success adopts it (freed later by the
+    // wrapping `Input`'s Drop) and on error frees it via
+    // `avformat_close_input`. The interrupt closure is boxed and
+    // deliberately leaked, exactly as `ffmpeg::format::input_with_interrupt`
+    // does: the context has no teardown hook to reclaim it, so a few bytes
+    // leak per open, bounded by the handful a run performs. `opts` is
+    // disowned into the call and re-owned after so the reclaimed dictionary
+    // frees any options libav did not consume.
+    unsafe {
+        let mut ps = ffmpeg::ffi::avformat_alloc_context();
+        if ps.is_null() {
+            // Allocation failed (OOM); return before any deref. `dict` is
+            // never disowned on this path, so it drops and frees normally.
+            return Err(ffmpeg::Error::Other {
+                errno: ffmpeg::error::ENOMEM,
+            });
+        }
+        (*ps).interrupt_callback =
+            ffmpeg::util::interrupt::new(Box::new(move || stop.load(Ordering::Relaxed))).interrupt;
+        let mut opts = dict.disown();
+        let res = ffmpeg::ffi::avformat_open_input(
+            &mut ps,
+            path.as_ptr(),
+            std::ptr::null_mut(),
+            &mut opts,
+        );
+        ffmpeg::Dictionary::own(opts);
+        if res < 0 {
+            return Err(ffmpeg::Error::from(res));
+        }
+        match ffmpeg::ffi::avformat_find_stream_info(ps, std::ptr::null_mut()) {
+            r if r >= 0 => Ok(Input::wrap(ps)),
+            e => {
+                ffmpeg::ffi::avformat_close_input(&mut ps);
+                Err(ffmpeg::Error::from(e))
+            }
+        }
+    }
 }
 
 /// Map a container-open failure into the pipeline's coded error space.
@@ -157,6 +231,10 @@ impl Timeline {
     /// Reverse projection: logical 0-based seconds back to the container's
     /// absolute clock, as a demuxer seek position.
     pub fn seek_target(&self, logical_secs: f64) -> SeekTarget {
+        // The `as i64` cannot lose a valid seek: callers pass a validated
+        // window position (≤ the probed duration), and i64::MAX at
+        // AV_TIME_BASE (1 µs) ticks is ~292k years; float→int `as` also
+        // saturates rather than wrapping.
         SeekTarget(((logical_secs + self.origin) * ffmpeg::ffi::AV_TIME_BASE as f64) as i64)
     }
 }

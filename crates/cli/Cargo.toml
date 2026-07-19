@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 readme = "../README.md"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "agent-video"
 path = "src/main.rs"

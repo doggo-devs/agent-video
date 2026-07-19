@@ -18,7 +18,7 @@ export const PARAMETERS = Type.Object(
 		raw: Type.Optional(Type.String({ description: "Expert escape hatch: verbatim agent-video core CLI arguments starting with the subcommand, e.g. \"process --strategy keyframes --base-fps 0.2\". Mutually exclusive with from/until/look/strategy. Input/output plumbing is injected by the server." })),
 		source: Type.String({ description: "Local video file path or URL. Call with only `source` first; the response tells you what to do next." }),
 		strategy: Type.Optional(StringEnum(["adaptive","keyframes","uniform"] as const, { description: "Which moments become frames: adaptive (default: keyframes plus fill in sparse stretches, right for most footage), keyframes (cheapest scan, frames land on cuts — triage for edited footage, blind to changes inside static shots), uniform (evenly spaced in time — use when keyframes mislead: screen recordings, slides, long static takes). Orthogonal to look, which sets frame size/density." })),
-		transcribe: Type.Optional(Type.String({ description: "Set true (alone with source) to generate a whisper transcript of the audio; it is cached and rides along with every grid afterwards. Needs local media: for a URL, download it first (bare call, then confirm), then repeat with transcribe." })),
+		transcribe: Type.Optional(Type.Boolean({ description: "Set true (alone with source) to generate a whisper transcript of the audio; it is cached and rides along with every grid afterwards. Needs local media: for a URL, download it first (bare call, then confirm), then repeat with transcribe." })),
 		until: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Window end, same formats. Omit to go to the end of the video." })),
 	},
 	{ additionalProperties: false }

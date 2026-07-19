@@ -67,6 +67,19 @@ struct RunCtx<'a> {
     events: &'a dyn EventSink,
 }
 
+impl<'a> RunCtx<'a> {
+    /// The extractor knobs every sampling shape shares, derived once from
+    /// the run's config and thread cap.
+    fn stream_params(&self) -> extract_frames::StreamParams<'a> {
+        extract_frames::StreamParams {
+            cell_min_edge: self.cfg.min_frame_size(),
+            score_edge: self.cfg.score_edge(),
+            threads: self.ffmpeg_threads,
+            events: self.events,
+        }
+    }
+}
+
 /// Where a run's artifacts land. The output directory exists only in the
 /// files variant, so "JSON mode plus a dummy directory" is unrepresentable
 /// — no caller ever has to invent a path it promises not to use.
@@ -88,7 +101,9 @@ pub enum OutputSink<'a> {
 enum ResolvedPlan {
     /// `probed_duration` is `None` exactly when `--force` skipped the
     /// duration probe (see the fixed-fps arm of [`resolve_plan`]).
-    FixedFps { probed_duration: Option<f32> },
+    FixedFps {
+        probed_duration: Option<f32>,
+    },
     Keyframes(KeyframeInfo),
     Adaptive(KeyframeInfo),
 }
@@ -104,22 +119,39 @@ impl ResolvedPlan {
     }
 }
 
+/// Run knobs for [`process`] beyond the input, the output sink, and the
+/// frame config: parallelism, subtitles, the attention window, and the
+/// diagnostic sink. The subset of the run's internal context a caller
+/// decides.
+pub struct ProcessOpts<'a> {
+    /// Rayon pool size and decoder thread cap; `0` = auto-detect.
+    pub threads: usize,
+    /// Max in-flight chunks (running + queued results awaiting emit).
+    pub max_in_flight: NonZeroUsize,
+    /// Subtitle selection.
+    pub subs: SubtitleSource<'a>,
+    /// Attention window (`--from`/`--until`); `None` covers the whole video.
+    pub window: Option<Window>,
+    /// Receives every diagnostic the run emits (mode announcements,
+    /// sparse-region fill lines, decode-open and subtitle warnings) as
+    /// typed [`Event`]s; pass [`crate::event::Discard`] for silence.
+    pub events: &'a dyn EventSink,
+}
+
 /// Run the full `process` pipeline.
-///
-/// `events` receives every diagnostic the run emits (mode announcements,
-/// sparse-region fill lines, decode-open and subtitle warnings) as typed
-/// [`Event`]s; pass [`crate::event::Discard`] for silence.
-#[allow(clippy::too_many_arguments)]
 pub fn process(
     input: &Source,
     sink: OutputSink<'_>,
     cfg: &Config,
-    threads: usize,
-    max_in_flight: NonZeroUsize,
-    subs: SubtitleSource<'_>,
-    window: Option<Window>,
-    events: &dyn EventSink,
+    opts: ProcessOpts<'_>,
 ) -> Result<()> {
+    let ProcessOpts {
+        threads,
+        max_in_flight,
+        subs,
+        window,
+        events,
+    } = opts;
     validate_input(input)?;
     // One door: window resolution, probe, keyframe-poor degradation, and
     // validation fold into a single plan. Two adjustments can move a
@@ -166,26 +198,16 @@ pub fn process(
                 extract_frames::stream_window(
                     input,
                     cfg.base_fps(),
-                    cfg.min_frame_size(),
-                    cfg.score_edge(),
                     w.start(),
                     w.end(),
-                    ctx.ffmpeg_threads,
-                    events,
+                    ctx.stream_params(),
                 )?
             }
             None => {
                 events.event(Event::FixedFps {
                     fps: cfg.base_fps(),
                 });
-                extract_frames::stream_frames(
-                    input,
-                    cfg.base_fps(),
-                    cfg.min_frame_size(),
-                    cfg.score_edge(),
-                    ctx.ffmpeg_threads,
-                    events,
-                )?
+                extract_frames::stream_frames(input, cfg.base_fps(), ctx.stream_params())?
             }
         },
         ResolvedPlan::Keyframes(info) => {
@@ -195,13 +217,7 @@ pub fn process(
                 mean_gap: info.mean_gap(),
                 max_gap: info.max_gap(),
             });
-            extract_frames::stream_keyframes(
-                input,
-                cfg.min_frame_size(),
-                cfg.score_edge(),
-                ctx.ffmpeg_threads,
-                events,
-            )?
+            extract_frames::stream_keyframes(input, ctx.stream_params())?
         }
         ResolvedPlan::Adaptive(info) => adaptive_stream(&ctx, &info)?,
     };
@@ -236,10 +252,7 @@ fn adaptive_stream(ctx: &RunCtx<'_>, info: &KeyframeInfo) -> Result<extract_fram
         return Ok(extract_frames::stream_frames(
             ctx.input,
             cfg.base_fps(),
-            cfg.min_frame_size(),
-            cfg.score_edge(),
-            ctx.ffmpeg_threads,
-            ctx.events,
+            ctx.stream_params(),
         )?);
     }
 
@@ -253,10 +266,7 @@ fn adaptive_stream(ctx: &RunCtx<'_>, info: &KeyframeInfo) -> Result<extract_fram
         ctx.input,
         cfg.base_fps(),
         fill,
-        cfg.min_frame_size(),
-        cfg.score_edge(),
-        ctx.ffmpeg_threads,
-        ctx.events,
+        ctx.stream_params(),
     )?)
 }
 
@@ -295,11 +305,9 @@ fn resolve_plan(
 ) -> Result<ResolvedPlan> {
     let strategy = resolve_windowed_strategy(cfg, window)?;
     match strategy {
-        SampleStrategy::FixedFps if cfg.force_long_video() => {
-            Ok(ResolvedPlan::FixedFps {
-                probed_duration: None,
-            })
-        }
+        SampleStrategy::FixedFps if cfg.force_long_video() => Ok(ResolvedPlan::FixedFps {
+            probed_duration: None,
+        }),
         // `.context` keeps the probe's own error code downcastable, so the
         // exit code names the real cause rather than a generic wrapper.
         SampleStrategy::FixedFps => {

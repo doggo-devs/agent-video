@@ -8,46 +8,70 @@
 use std::fmt;
 use std::path::PathBuf;
 
-/// Exit code categories, designed for harness-layer decision making.
-///
-/// A Unix exit status carries only 8 bits, so every code must fit in a `u8`
-/// (the `repr` enforces this at compile time). The decades below also avoid
-/// the conventional codes: 1 (uncoded errors: bugs, panics), 2 (CLI usage
-/// errors from clap), and 126+ (shell/signal range).
-///
-/// Ranges:
-/// - 10-19: media-stack issues (a decoder this build lacks, decode failures)
-/// - 20-29: input issues (file not found, corrupt, constraints violated)
-/// - 30-39: configuration issues (invalid profile, ambiguous options)
-/// - 40-49: output issues (cannot write, permission denied)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ErrorCode {
+/// Declares [`ErrorCode`] from a single variant list: each variant carries
+/// its exit code and log identifier exactly once. [`ErrorCode::ALL`] and
+/// [`ErrorCode::as_str`] expand from the same list, so a new variant cannot
+/// be added without also joining the round-trip test's domain.
+macro_rules! error_codes {
+    ($( $(#[$meta:meta])* $variant:ident = $code:literal => $name:literal, )+) => {
+        /// Exit code categories, designed for harness-layer decision making.
+        ///
+        /// A Unix exit status carries only 8 bits, so every code must fit in a `u8`
+        /// (the `repr` enforces this at compile time). The decades below also avoid
+        /// the conventional codes: 1 (uncoded errors: bugs, panics), 2 (CLI usage
+        /// errors from clap), and 126+ (shell/signal range).
+        ///
+        /// Ranges:
+        /// - 10-19: media-stack issues (a decoder this build lacks, decode failures)
+        /// - 20-29: input issues (file not found, corrupt, constraints violated)
+        /// - 30-39: configuration issues (invalid profile, ambiguous options)
+        /// - 40-49: output issues (cannot write, permission denied)
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(u8)]
+        pub enum ErrorCode {
+            $( $(#[$meta])* $variant = $code, )+
+        }
+
+        impl ErrorCode {
+            /// Every variant, in declaration order.
+            pub const ALL: &'static [ErrorCode] = &[ $(ErrorCode::$variant,)+ ];
+
+            /// Short identifier for logs.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $( ErrorCode::$variant => $name, )+
+                }
+            }
+        }
+    };
+}
+
+error_codes! {
     // Media stack (in-process FFmpeg libraries)
     /// The linked libavcodec has no decoder for the stream's codec.
-    DecoderMissing = 10,
+    DecoderMissing = 10 => "DECODER_MISSING",
     /// Demuxing or decoding failed mid-stream.
-    DecodeFailed = 12,
+    DecodeFailed = 12 => "DECODE_FAILED",
 
     // Input problems
-    InputNotFound = 20,
-    InputUnreadable = 21,
-    InputCorrupt = 22,
-    InputTooLong = 23,
-    InsufficientKeyframes = 24,
-    NoFramesExtracted = 25,
+    InputNotFound = 20 => "INPUT_NOT_FOUND",
+    InputUnreadable = 21 => "INPUT_UNREADABLE",
+    InputCorrupt = 22 => "INPUT_CORRUPT",
+    InputTooLong = 23 => "INPUT_TOO_LONG",
+    InsufficientKeyframes = 24 => "INSUFFICIENT_KEYFRAMES",
+    NoFramesExtracted = 25 => "NO_FRAMES_EXTRACTED",
     /// The input URL's protocol is not compiled into the linked FFmpeg.
-    ProtocolUnsupported = 26,
+    ProtocolUnsupported = 26 => "PROTOCOL_UNSUPPORTED",
 
     // Configuration problems
-    InvalidProfile = 30,
-    InvalidRange = 31,
-    AmbiguousSubtitle = 32,
-    InvalidConfig = 33,
+    InvalidProfile = 30 => "INVALID_PROFILE",
+    InvalidRange = 31 => "INVALID_RANGE",
+    AmbiguousSubtitle = 32 => "AMBIGUOUS_SUBTITLE",
+    InvalidConfig = 33 => "INVALID_CONFIG",
 
     // Output problems
-    OutputDirCreate = 40,
-    OutputWriteFailed = 41,
+    OutputDirCreate = 40 => "OUTPUT_DIR_CREATE",
+    OutputWriteFailed = 41 => "OUTPUT_WRITE_FAILED",
 }
 
 impl ErrorCode {
@@ -60,45 +84,7 @@ impl ErrorCode {
     /// [`exit_code`](Self::exit_code). `None` for uncoded exits (1: bugs and
     /// panics, 2: CLI usage) and anything outside the assigned decades.
     pub fn from_exit_code(code: u8) -> Option<Self> {
-        let known = [
-            ErrorCode::DecoderMissing,
-            ErrorCode::DecodeFailed,
-            ErrorCode::InputNotFound,
-            ErrorCode::InputUnreadable,
-            ErrorCode::InputCorrupt,
-            ErrorCode::InputTooLong,
-            ErrorCode::InsufficientKeyframes,
-            ErrorCode::NoFramesExtracted,
-            ErrorCode::ProtocolUnsupported,
-            ErrorCode::InvalidProfile,
-            ErrorCode::InvalidRange,
-            ErrorCode::AmbiguousSubtitle,
-            ErrorCode::InvalidConfig,
-            ErrorCode::OutputDirCreate,
-            ErrorCode::OutputWriteFailed,
-        ];
-        known.into_iter().find(|c| c.exit_code() == code)
-    }
-
-    /// Short identifier for logs.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ErrorCode::DecoderMissing => "DECODER_MISSING",
-            ErrorCode::DecodeFailed => "DECODE_FAILED",
-            ErrorCode::InputNotFound => "INPUT_NOT_FOUND",
-            ErrorCode::InputUnreadable => "INPUT_UNREADABLE",
-            ErrorCode::InputCorrupt => "INPUT_CORRUPT",
-            ErrorCode::InputTooLong => "INPUT_TOO_LONG",
-            ErrorCode::InsufficientKeyframes => "INSUFFICIENT_KEYFRAMES",
-            ErrorCode::NoFramesExtracted => "NO_FRAMES_EXTRACTED",
-            ErrorCode::ProtocolUnsupported => "PROTOCOL_UNSUPPORTED",
-            ErrorCode::InvalidProfile => "INVALID_PROFILE",
-            ErrorCode::InvalidRange => "INVALID_RANGE",
-            ErrorCode::AmbiguousSubtitle => "AMBIGUOUS_SUBTITLE",
-            ErrorCode::InvalidConfig => "INVALID_CONFIG",
-            ErrorCode::OutputDirCreate => "OUTPUT_DIR_CREATE",
-            ErrorCode::OutputWriteFailed => "OUTPUT_WRITE_FAILED",
-        }
+        Self::ALL.iter().copied().find(|c| c.exit_code() == code)
     }
 }
 
@@ -198,27 +184,23 @@ mod tests {
 
     #[test]
     fn exit_codes_round_trip_through_from_exit_code() {
-        for code in [
-            ErrorCode::DecoderMissing,
-            ErrorCode::DecodeFailed,
-            ErrorCode::InputNotFound,
-            ErrorCode::InputUnreadable,
-            ErrorCode::InputCorrupt,
-            ErrorCode::InputTooLong,
-            ErrorCode::InsufficientKeyframes,
-            ErrorCode::NoFramesExtracted,
-            ErrorCode::ProtocolUnsupported,
-            ErrorCode::InvalidProfile,
-            ErrorCode::InvalidRange,
-            ErrorCode::AmbiguousSubtitle,
-            ErrorCode::InvalidConfig,
-            ErrorCode::OutputDirCreate,
-            ErrorCode::OutputWriteFailed,
-        ] {
+        for &code in ErrorCode::ALL {
             assert_eq!(ErrorCode::from_exit_code(code.exit_code()), Some(code));
         }
         assert_eq!(ErrorCode::from_exit_code(1), None, "uncoded exit");
         assert_eq!(ErrorCode::from_exit_code(2), None, "CLI usage exit");
+    }
+
+    #[test]
+    fn all_exit_codes_stay_in_assigned_decades() {
+        for &code in ErrorCode::ALL {
+            let n = code.exit_code();
+            assert!(
+                (10..=49).contains(&n),
+                "{} = {n} escapes the assigned decades",
+                code.as_str()
+            );
+        }
     }
 
     #[test]

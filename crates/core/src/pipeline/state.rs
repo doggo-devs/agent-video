@@ -96,7 +96,9 @@ impl<'a> ProcessState<'a> {
     /// Timeline placement and its failure mode (broken timestamps) live in
     /// [`Chunker::push`].
     pub fn push_judged(&mut self, frame: CandidateFrame, kept: bool) -> Result<()> {
-        let events = self.chunker.push(frame, kept, self.capacity(), self.events)?;
+        let events = self
+            .chunker
+            .push(frame, kept, self.capacity(), self.events)?;
         self.handle_events(events)
     }
 

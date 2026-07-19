@@ -58,7 +58,9 @@ pub(super) fn coerce_args(
         match raw.get(key) {
             None => Ok(None),
             Some(serde_json::Value::String(s)) => Ok(Some(TimeValue::Text(s.clone()))),
-            Some(v) if v.is_number() => Ok(Some(TimeValue::Number(v.as_f64().unwrap_or_default()))),
+            Some(v) if v.is_number() => Ok(Some(TimeValue::Number(
+                v.as_f64().expect("serde_json numbers are f64-representable"),
+            ))),
             Some(_) => Err(Fault::bad_input(format!(
                 "{key} must be seconds or a timestamp string, e.g. {example}"
             ))),

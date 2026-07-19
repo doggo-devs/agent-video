@@ -23,6 +23,12 @@
 //! and this makes a killed child — whose staged file may be missing or
 //! truncated — an empty or additive delta instead of a destructive one.
 //!
+//! Absent is never conflated with unreadable: a canonical jar that does
+//! not exist is genuinely empty, but one that exists and fails to read
+//! (EIO, permissions) aborts the operation before any rewrite — treating
+//! it as empty would replace every other site's cookies with this run's
+//! delta.
+//!
 //! Only the yt-dlp source consumes cookies; direct media links
 //! ([`crate::fetch::direct`]) authenticate via signed URLs, not cookies.
 
@@ -170,7 +176,7 @@ impl JarLease {
             return Ok(());
         }
         let _lock = JarLock::exclusive(&self.canonical)?;
-        let mut canonical = parse_lenient(&fs::read_to_string(&self.canonical).unwrap_or_default());
+        let mut canonical = read_jar_if_present(&self.canonical)?;
         canonical.extend(delta);
         write_jar(&self.canonical, &canonical)
     }
@@ -208,6 +214,18 @@ fn parse_line(line: &str) -> Option<EntryKey> {
         return None;
     };
     Some((domain.to_string(), path.to_string(), name.to_string()))
+}
+
+/// Read and leniently parse a jar that may not exist yet. NotFound is an
+/// empty jar; any other error propagates — every caller follows a read
+/// with a rewrite, and mistaking an unreadable jar for an empty one would
+/// destroy every cookie the read missed.
+fn read_jar_if_present(path: &Path) -> io::Result<Entries> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(parse_lenient(&text)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Entries::new()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Parse a jar, skipping anything unrecognizable: inputs here are
@@ -374,7 +392,7 @@ pub fn import(cfg: &CookiesCfg, file: &Path) -> Result<ImportReport, CookieError
         fs::create_dir_all(parent)?;
     }
     let _lock = JarLock::exclusive(&cfg.jar)?;
-    let mut entries = parse_lenient(&fs::read_to_string(&cfg.jar).unwrap_or_default());
+    let mut entries = read_jar_if_present(&cfg.jar)?;
     let imported = incoming.len();
     entries.extend(incoming);
     write_jar(&cfg.jar, &entries)?;
@@ -387,13 +405,8 @@ pub fn import(cfg: &CookiesCfg, file: &Path) -> Result<ImportReport, CookieError
 /// The jar's contents grouped for display: `(domain, cookie count)`,
 /// domain-sorted, with leading dots stripped.
 pub fn status(cfg: &CookiesCfg) -> Result<Vec<(String, usize)>, CookieError> {
-    let text = match fs::read_to_string(&cfg.jar) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
     let mut by_domain: BTreeMap<String, usize> = BTreeMap::new();
-    for (domain, _, _) in parse_lenient(&text).into_keys() {
+    for (domain, _, _) in read_jar_if_present(&cfg.jar)?.into_keys() {
         let display = domain.trim_start_matches('.').to_string();
         *by_domain.entry(display).or_insert(0) += 1;
     }
@@ -409,12 +422,7 @@ pub fn clear(cfg: &CookiesCfg, domain: Option<&str>) -> Result<usize, CookieErro
         return Ok(0);
     }
     let _lock = JarLock::exclusive(&cfg.jar)?;
-    let text = match fs::read_to_string(&cfg.jar) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e.into()),
-    };
-    let mut entries = parse_lenient(&text);
+    let mut entries = read_jar_if_present(&cfg.jar)?;
     let Some(domain) = domain else {
         fs::remove_file(&cfg.jar)?;
         return Ok(entries.len());
@@ -550,6 +558,59 @@ mod tests {
         assert!(final_jar.contains(".b.com"), "absent ≠ deleted");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn commit_rejects_unreadable_canonical_jar() {
+        // A transient read failure (EIO, permission flip) on the canonical
+        // jar must abort the commit, not masquerade as an empty jar that
+        // the delta then wholesale replaces.
+        use std::os::unix::fs::PermissionsExt;
+        let (cfg, _dir) = temp_cfg("eio-commit");
+        let before = format!(
+            "{}\n{}\n",
+            line(".a.com", "n", "v"),
+            line(".b.com", "m", "w")
+        );
+        fs::write(&cfg.jar, &before).expect("write");
+
+        let lease = JarLease::checkout(&cfg.jar).expect("checkout");
+        fs::write(lease.staged(), format!("{}\n", line(".c.com", "k", "x")))
+            .expect("write staged");
+        fs::set_permissions(&cfg.jar, fs::Permissions::from_mode(0o000)).expect("chmod");
+        if fs::read_to_string(&cfg.jar).is_ok() {
+            return; // privileged (e.g. root): unreadable cannot be simulated
+        }
+
+        lease
+            .commit()
+            .expect_err("unreadable canonical jar must abort the commit");
+
+        fs::set_permissions(&cfg.jar, fs::Permissions::from_mode(0o600)).expect("chmod back");
+        assert_eq!(
+            fs::read_to_string(&cfg.jar).expect("read"),
+            before,
+            "a failed commit leaves the canonical jar untouched"
+        );
+    }
+
+    #[test]
+    fn commit_treats_missing_canonical_jar_as_empty() {
+        // A concurrent `clear` may remove the jar mid-lease: NotFound is
+        // genuinely empty, so the commit recreates the jar with the delta.
+        let (cfg, _dir) = temp_cfg("gone");
+        fs::write(&cfg.jar, format!("{}\n", line(".a.com", "n", "v"))).expect("write");
+
+        let lease = JarLease::checkout(&cfg.jar).expect("checkout");
+        fs::write(lease.staged(), format!("{}\n", line(".a.com", "n", "new")))
+            .expect("write staged");
+        fs::remove_file(&cfg.jar).expect("remove");
+
+        lease.commit().expect("commit");
+
+        let jar = fs::read_to_string(&cfg.jar).expect("read");
+        assert!(jar.contains("new"), "delta lands in the recreated jar");
+    }
+
     #[test]
     fn dropping_a_lease_removes_its_staging_dir() {
         let (cfg, _dir) = temp_cfg("drop");
@@ -569,6 +630,51 @@ mod tests {
         let err = import(&cfg, &bogus).expect_err("json is not a jar");
         assert!(err.0.contains("Netscape"), "explains the format: {err}");
         assert!(!cfg.jar.exists(), "a failed import must not create a jar");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_rejects_unreadable_existing_jar() {
+        // An existing-but-unreadable jar is not a first-time empty jar;
+        // importing over it would replace every other site's cookies.
+        use std::os::unix::fs::PermissionsExt;
+        let (cfg, _dir) = temp_cfg("eio-import");
+        let before = format!("{}\n", line(".a.com", "n", "v"));
+        fs::write(&cfg.jar, &before).expect("write");
+        let incoming = cfg.jar.with_file_name("export.txt");
+        fs::write(&incoming, format!("{}\n", line(".b.com", "m", "w"))).expect("write");
+        fs::set_permissions(&cfg.jar, fs::Permissions::from_mode(0o000)).expect("chmod");
+        if fs::read_to_string(&cfg.jar).is_ok() {
+            return; // privileged (e.g. root): unreadable cannot be simulated
+        }
+
+        import(&cfg, &incoming).expect_err("unreadable existing jar must abort the import");
+
+        fs::set_permissions(&cfg.jar, fs::Permissions::from_mode(0o600)).expect("chmod back");
+        assert_eq!(
+            fs::read_to_string(&cfg.jar).expect("read"),
+            before,
+            "a failed import leaves the jar untouched"
+        );
+    }
+
+    #[test]
+    fn import_creates_jar_when_absent() {
+        // NotFound is a genuinely empty jar: first import creates it.
+        let (cfg, _dir) = temp_cfg("first");
+        let incoming = cfg.jar.with_file_name("export.txt");
+        fs::write(&incoming, format!("{}\n", line(".a.com", "n", "v"))).expect("write");
+
+        let report = import(&cfg, &incoming).expect("first import");
+
+        assert_eq!(
+            report,
+            ImportReport {
+                imported: 1,
+                total: 1
+            }
+        );
+        assert!(cfg.jar.is_file());
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! in fakes without touching the call flow.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::cache::Cache;
 use crate::config::Config;
@@ -15,6 +15,7 @@ use crate::fetch::{self, DownloadIo, Downloaded, ProgressFn, SourceInfo};
 use crate::mcp::core_run::{CoreRunner, SelfSpawn};
 use crate::mcp::tracker::Tracker;
 use crate::probe::probe_local_file;
+use crate::relay::PolicyRelay;
 use crate::schema::ProbeSummary;
 use crate::tokens::{DownloadPlan, Tokens};
 use crate::transcribe;
@@ -30,12 +31,13 @@ pub trait FileProber: Send + Sync {
 /// policy — the production impl vets every URL through [`crate::netguard`]
 /// before any request and again before executing a download.
 pub trait UrlFetcher: Send + Sync {
-    fn probe_url(&self, url: &str, cfg: &Config) -> Result<SourceInfo, Fault>;
+    fn probe_url(&self, url: &str, cfg: &Config, relay: &PolicyRelay) -> Result<SourceInfo, Fault>;
     fn download(
         &self,
         plan: &DownloadPlan,
         io: DownloadIo<'_>,
         cfg: &Config,
+        relay: &PolicyRelay,
         progress: ProgressFn<'_>,
     ) -> Result<Downloaded, Fault>;
 }
@@ -63,10 +65,10 @@ impl FileProber for RealProber {
 struct RealFetcher;
 
 impl UrlFetcher for RealFetcher {
-    fn probe_url(&self, url: &str, cfg: &Config) -> Result<SourceInfo, Fault> {
+    fn probe_url(&self, url: &str, cfg: &Config, relay: &PolicyRelay) -> Result<SourceInfo, Fault> {
         // A netguard rejection is a verdict on the URL, not on the network.
         let vetted = crate::netguard::vet(url, cfg).map_err(|e| Fault::bad_input(e.to_string()))?;
-        fetch::probe_url(&vetted, cfg)
+        fetch::probe_url(&vetted, cfg, relay)
     }
 
     fn download(
@@ -74,13 +76,14 @@ impl UrlFetcher for RealFetcher {
         plan: &DownloadPlan,
         io: DownloadIo<'_>,
         cfg: &Config,
+        relay: &PolicyRelay,
         progress: ProgressFn<'_>,
     ) -> Result<Downloaded, Fault> {
         // Re-vet at execution time: consent may be redeemed long after the
         // probe, and DNS may have moved underneath the plan.
         let vetted =
             crate::netguard::vet(&plan.url, cfg).map_err(|e| Fault::bad_input(e.to_string()))?;
-        fetch::download(&vetted, plan, io, cfg, progress)
+        fetch::download(&vetted, plan, io, cfg, relay, progress)
     }
 }
 
@@ -113,6 +116,9 @@ pub struct ServerDeps {
     pub fetcher: Box<dyn UrlFetcher>,
     pub whisper: Box<dyn Whisper>,
     pub core: Box<dyn CoreRunner>,
+    /// The egress policy relay, bound lazily on first URL use so a
+    /// local-file-only session never opens a listener. See [`ServerDeps::relay`].
+    pub(crate) relay: OnceLock<std::io::Result<PolicyRelay>>,
 }
 
 impl ServerDeps {
@@ -128,8 +134,20 @@ impl ServerDeps {
             fetcher: Box::new(RealFetcher),
             whisper: Box::new(RealWhisper),
             core: Box::new(SelfSpawn),
+            relay: OnceLock::new(),
             config,
         }
+    }
+
+    /// The policy relay, started on first call and shared thereafter. Every
+    /// URL probe and download routes its subprocess/demuxer traffic through
+    /// it; local-file sessions never call this, so they never bind a
+    /// listener. A bind failure is the server's environment, not the URL's.
+    pub fn relay(&self) -> Result<&PolicyRelay, Fault> {
+        self.relay
+            .get_or_init(|| PolicyRelay::start(self.config.network.allow_private_hosts))
+            .as_ref()
+            .map_err(|e| Fault::environment(format!("cannot start the egress policy relay: {e}")))
     }
 }
 

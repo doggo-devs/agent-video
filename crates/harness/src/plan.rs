@@ -54,7 +54,9 @@ pub enum Decision {
     },
     /// A keep token echoed after its download already completed: the file
     /// at `path` is the answer, no work left to authorize.
-    Saved { path: std::path::PathBuf },
+    Saved {
+        path: std::path::PathBuf,
+    },
     Plan(PlanDecision),
     /// Consent required: the offers carry both the model-facing token list
     /// and the actions to register — the caller commits them on render.
@@ -210,7 +212,14 @@ fn decide_inner(
             (stretched / 60.0).round()
         ),
         offers: vec![Offer {
-            token: Token::new(format!("force-stretch-{max}-grids")),
+            // The window rides in the token text so plans for different
+            // windows of the same source can never alias: a superseded
+            // token stays unknown instead of silently authorizing the
+            // newer plan.
+            token: Token::new(format!(
+                "force-stretch-{max}-grids-{}-{}",
+                window.start as u64, window.end as u64
+            )),
             effect: format!("run anyway: {max} grids, ~{stretched}s of video per grid"),
             action: PendingAction::Core(invocation),
         }],
@@ -253,11 +262,26 @@ fn decide_raw(args: &VideoArgs, probe: &ProbeSummary, cfg: &Config) -> Result<De
             format_ts(probe.duration as f32)
         ),
         offers: vec![Offer {
-            token: Token::new(format!("raw-full-{predicted}-grids")),
+            // Fingerprint the raw flags into the token so two raw plans
+            // that happen to predict the same grid count cannot alias.
+            token: Token::new(format!(
+                "raw-full-{predicted}-grids-{:04x}",
+                flags_fingerprint(&invocation.flags)
+            )),
             effect: format!("run anyway, emitting ~{predicted} grids"),
             action: PendingAction::Core(invocation),
         }],
     })
+}
+
+/// Session-local 16-bit fingerprint of a flag vector, for token texts that
+/// must differ when the plan differs. Tokens are opaque to everything but
+/// the registry, so collisions merely re-alias what was aliased before.
+fn flags_fingerprint(flags: &[String]) -> u16 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    flags.hash(&mut h);
+    (h.finish() & 0xffff) as u16
 }
 
 fn process_invocation(flags: Vec<String>, window: &Window, predicted_grids: u32) -> CoreInvocation {
@@ -456,6 +480,28 @@ mod tests {
     }
 
     #[test]
+    fn distinguishes_stretch_tokens_by_window() {
+        // Two over-budget plans for the same source but different windows
+        // must mint different tokens: replacing one plan with the other
+        // invalidates the first token instead of silently rebinding it.
+        let full = VideoArgs {
+            look: Some(Look::Overview),
+            ..VideoArgs::bare("/v.mp4")
+        };
+        let half = VideoArgs {
+            until: Some(TimeValue::Number(24000.0)),
+            ..full.clone()
+        };
+        let probe = probe(48000.0);
+        let (Decision::Confirm { offers: a, .. }, Decision::Confirm { offers: b, .. }) =
+            (decide(&full, &probe, &cfg()), decide(&half, &probe, &cfg()))
+        else {
+            panic!("both windows must require consent");
+        };
+        assert_ne!(a[0].token.as_str(), b[0].token.as_str());
+    }
+
+    #[test]
     fn absurd_stretch_requires_consent() {
         // 6000s per grid > 600s floor.
         let args = VideoArgs {
@@ -466,7 +512,7 @@ mod tests {
         let Decision::Confirm { offers, .. } = d else {
             panic!("expected Confirm, got {d:?}");
         };
-        assert_eq!(offers[0].token.as_str(), "force-stretch-8-grids");
+        assert_eq!(offers[0].token.as_str(), "force-stretch-8-grids-0-48000");
 
         // The echoed token authorizes exactly the committed invocation.
         let store = Tokens::default();
@@ -501,7 +547,32 @@ mod tests {
         let Decision::Confirm { offers, .. } = d else {
             panic!("expected Confirm, got {d:?}");
         };
-        assert_eq!(offers[0].token.as_str(), "raw-full-60-grids");
+        // The fingerprint suffix is not a contract (std's hasher may change
+        // between toolchains); the readable stem plus its presence is.
+        assert!(
+            offers[0].token.as_str().starts_with("raw-full-60-grids-"),
+            "{}",
+            offers[0].token.as_str()
+        );
+    }
+
+    #[test]
+    fn distinguishes_raw_tokens_by_flags() {
+        let confirm_token = |raw: &str| {
+            let args = VideoArgs {
+                raw: Some(raw.into()),
+                ..VideoArgs::bare("/v.mp4")
+            };
+            match decide_bare(3600.0, args) {
+                Decision::Confirm { offers, .. } => offers[0].token.as_str().to_string(),
+                d => panic!("expected Confirm, got {d:?}"),
+            }
+        };
+        assert_ne!(
+            confirm_token("process"),
+            confirm_token("process --quality high"),
+            "different raw plans must not alias into one token"
+        );
     }
 
     #[test]

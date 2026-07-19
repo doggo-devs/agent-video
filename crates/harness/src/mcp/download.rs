@@ -2,11 +2,13 @@
 //! Download execution: start the fetch on its own thread, wait out a sync
 //! grace window (fast downloads answer inline, slow ones detach into the
 //! tracker), verify coverage before caching, sweep, and shape the analysis
-//! or keep response.
+//! or keep response. The tracker is the one channel between the download
+//! thread and the protocol: progress and the final result both land there,
+//! and the inline waiter is just the slot's first poller.
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use rmcp::model::CallToolResult;
 
@@ -27,6 +29,35 @@ use crate::tokens::{Dest, DownloadPlan, Token};
 /// watchdog, ureq's phase timeouts), so it only fires when those failed to.
 pub(super) const DOWNLOAD_ABANDON_LIMIT: Duration = Duration::from_secs(10 * 60);
 
+/// Sampling tick of the sync grace window's poll loop.
+const SYNC_POLL_TICK: Duration = Duration::from_millis(200);
+
+// The watchdog's no-progress bound must sit inside the tracker's abandon
+// limit: the child dies before its slot is given up, so an abandoned
+// download can never leave a live yt-dlp (and its staging dir) behind.
+const _: () =
+    assert!(crate::fetch::ytdlp::NO_PROGRESS_LIMIT.as_secs() <= DOWNLOAD_ABANDON_LIMIT.as_secs());
+
+/// Tracker slot key for one download job. An analysis rip and a keep
+/// download of the same URL are different jobs — different destinations,
+/// different consent tokens — so they must not share a state machine: a
+/// keep confirm during a running analysis download starts (or observes)
+/// the keep job, never the analysis one.
+pub(super) fn slot_key(source: &str, dest: Dest) -> String {
+    match dest {
+        Dest::Cache => format!("cache.{}", url_key(source)),
+        Dest::Keep => format!("keep.{}", url_key(source)),
+    }
+}
+
+/// Progress line for MCP notifications and pending bodies.
+pub(super) fn progress_message(downloaded: u64, total: Option<u64>) -> String {
+    let total_text = total
+        .map(|t| format!(" / {}", format_bytes(t)))
+        .unwrap_or_default();
+    format!("downloading: {}{total_text}", format_bytes(downloaded))
+}
+
 /// Start the download on its own thread, then wait out a sync grace window:
 /// fast downloads answer inline, slow ones detach into the tracker and are
 /// polled by later calls.
@@ -44,7 +75,7 @@ pub(super) fn execute_download(
     {
         return analysis_response(source, &cached, None, deps);
     }
-    let key = url_key(source);
+    let key = slot_key(source, plan.dest);
     // Claim the slot atomically: a concurrent confirm for the same URL
     // must observe this job instead of spawning a second downloader into
     // the same cache entry.
@@ -53,44 +84,59 @@ pub(super) fn execute_download(
         Admission::Running { downloaded, total } => return pending_result(downloaded, total),
         Admission::Settled(result) => return result,
     };
-    let (tx, rx) = std::sync::mpsc::channel::<CallToolResult>();
     {
         let deps = Arc::clone(deps);
         let source = source.to_string();
-        let notify = Arc::clone(notify);
+        // The reporter is the thread's only voice. MCP progress
+        // notifications are rendered by whoever holds a live request —
+        // never by this thread, whose spawning request (and its progress
+        // token) may complete long before the download does.
         std::thread::spawn(move || {
-            let mut progress = |bytes: u64, total: Option<u64>| {
-                reporter.progress(bytes, total);
-                let total_text = total
-                    .map(|t| format!(" / {}", format_bytes(t)))
-                    .unwrap_or_default();
-                notify(
-                    bytes as f64,
-                    total.map(|t| t as f64),
-                    format!("downloading: {}{total_text}", format_bytes(bytes)),
-                );
-            };
+            let mut progress = |bytes: u64, total: Option<u64>| reporter.progress(bytes, total);
             let result = perform_download(&source, &plan, &token, &deps, &mut progress);
-            reporter.settle(result.clone());
-            // Receiver gone after the grace window: the settled job waits in
-            // the tracker for the next poll.
-            let _ = tx.send(result);
+            reporter.settle(result);
         });
     }
     let window = Duration::from_secs(u64::from(deps.config.download.sync_wait_seconds.get()));
-    match rx.recv_timeout(window) {
-        Ok(result) => {
-            deps.downloads.clear(&key);
-            result
+    let deadline = Instant::now() + window;
+    let mut last_sent: u64 = 0;
+    loop {
+        match deps.downloads.poll(&key, DOWNLOAD_ABANDON_LIMIT) {
+            Poll::Settled(result) => return result,
+            Poll::Running { downloaded, total } => {
+                // MCP progress must not go backwards; a coverage retry
+                // rewinds the byte count, so only growth is reported.
+                if downloaded > last_sent {
+                    last_sent = downloaded;
+                    notify(
+                        downloaded as f64,
+                        total.map(|t| t as f64),
+                        progress_message(downloaded, total),
+                    );
+                }
+                if Instant::now() >= deadline {
+                    return pending_result(downloaded, total);
+                }
+            }
+            // Our own thread died without settling: reported once, the slot
+            // is free for a retry.
+            Poll::Abandoned => {
+                return failed(&Fault::transient(
+                    "the download thread died before reporting a result — call again to retry",
+                ));
+            }
+            // The slot vanished mid-wait: a concurrent call for the same
+            // source consumed the outcome. The executed actions are
+            // idempotent — a retry serves the landed rip or replays the
+            // keep receipt — so redirecting the caller is safe.
+            Poll::Vacant => {
+                return failed(&Fault::transient(
+                    "this download was resolved by a concurrent call for the same source — \
+                     call again",
+                ));
+            }
         }
-        // Timed out (slow detach) or the thread died; one poll resolves either.
-        Err(_) => match deps.downloads.poll(&key, DOWNLOAD_ABANDON_LIMIT) {
-            Poll::Settled(result) => result,
-            Poll::Running { downloaded, total } => pending_result(downloaded, total),
-            Poll::Vacant | Poll::Abandoned => failed(&Fault::transient(
-                "the download thread died before reporting a result — call again to retry",
-            )),
-        },
+        std::thread::sleep(SYNC_POLL_TICK);
     }
 }
 
@@ -103,6 +149,10 @@ fn perform_download(
     deps: &Arc<ServerDeps>,
     progress: ProgressFn<'_>,
 ) -> CallToolResult {
+    let relay = match deps.relay() {
+        Ok(r) => r,
+        Err(e) => return failed(&e),
+    };
     let fetch = |progress: ProgressFn<'_>| -> Result<Downloaded, Fault> {
         match plan.dest {
             Dest::Cache => deps
@@ -117,6 +167,7 @@ fn perform_download(
                         plan,
                         DownloadIo::Cache { dir, key: &key },
                         &deps.config,
+                        relay,
                         progress,
                     )
                 }),
@@ -134,6 +185,7 @@ fn perform_download(
                             dir: &deps.config.paths.keep,
                         },
                         &deps.config,
+                        relay,
                         progress,
                     )
                 }),
@@ -253,7 +305,11 @@ fn analysis_response(
 
 /// Full-quality download landed in the keep dir; the file belongs to the
 /// user. Also the replay body when a fulfilled keep token is echoed again.
-pub(super) fn keep_response(filepath: &Path, warning: Option<&str>, deps: &Arc<ServerDeps>) -> CallToolResult {
+pub(super) fn keep_response(
+    filepath: &Path,
+    warning: Option<&str>,
+    deps: &Arc<ServerDeps>,
+) -> CallToolResult {
     let (probe, _) = match cached_probe(filepath, deps) {
         Ok(v) => v,
         Err(e) => return failed(&e),

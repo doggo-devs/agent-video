@@ -31,8 +31,7 @@ impl JobReporter {
         let _ = self.0.send(JobEvent::Progress { downloaded, total });
     }
 
-    /// Deliver the final response. Consumes the reporter: a job settles at
-    /// most once, by construction.
+    /// Deliver the final response. A job settles at most once.
     pub fn settle(self, result: CallToolResult) {
         let _ = self.0.send(JobEvent::Settled(result));
     }
@@ -43,6 +42,11 @@ struct JobSlot {
     events: mpsc::Receiver<JobEvent>,
     downloaded: u64,
     total: Option<u64>,
+    /// The final response, stashed by [`JobSlot::fold`] and taken exactly
+    /// once by `poll`/`admit`. Stashing (rather than returning out of the
+    /// fold) keeps "the result exists" a slot fact, so it always beats the
+    /// disconnect that follows a settle.
+    done: Option<CallToolResult>,
     /// Stamped by the reader on every folded progress event (job start until
     /// the first report). The poll path abandons jobs whose thread stopped
     /// reporting — the guarantee that a wedged download can never pin its
@@ -50,10 +54,8 @@ struct JobSlot {
     last_progress: Instant,
 }
 
-/// What folding a slot's pending events resolved to.
+/// Whether a slot's reporter is still connected after a fold.
 enum Fold {
-    /// The final response arrived; it beats every other observation.
-    Settled(CallToolResult),
     /// The reporter is gone without settling: the thread died.
     Dead,
     /// Still connected; the snapshot is current.
@@ -66,12 +68,13 @@ impl JobSlot {
             events,
             downloaded: 0,
             total: None,
+            done: None,
             last_progress: Instant::now(),
         }
     }
 
-    /// Drain pending events into the snapshot; a settled result
-    /// short-circuits.
+    /// Drain pending events into the snapshot; a settled result is stashed
+    /// in `done` (checked before liveness by every caller).
     fn fold(&mut self) -> Fold {
         loop {
             match self.events.try_recv() {
@@ -82,7 +85,7 @@ impl JobSlot {
                     }
                     self.last_progress = Instant::now();
                 }
-                Ok(JobEvent::Settled(result)) => return Fold::Settled(result),
+                Ok(JobEvent::Settled(result)) => self.done = Some(result),
                 Err(mpsc::TryRecvError::Empty) => return Fold::Live,
                 Err(mpsc::TryRecvError::Disconnected) => return Fold::Dead,
             }
@@ -142,11 +145,12 @@ impl Tracker {
     pub fn admit(&self, key: &str, stall_limit: Duration) -> Admission {
         let mut jobs = self.lock();
         if let Some(slot) = jobs.get_mut(key) {
-            match slot.fold() {
-                Fold::Settled(result) => {
-                    jobs.remove(key);
-                    return Admission::Settled(result);
-                }
+            let liveness = slot.fold();
+            if slot.done.is_some() {
+                let slot = jobs.remove(key).expect("slot was just folded");
+                return Admission::Settled(slot.done.expect("checked above"));
+            }
+            match liveness {
                 // Dead or wedged: nothing to hand out; claim the slot anew.
                 Fold::Dead => {}
                 Fold::Live if slot.last_progress.elapsed() > stall_limit => {}
@@ -170,11 +174,12 @@ impl Tracker {
         let Some(slot) = jobs.get_mut(key) else {
             return Poll::Vacant;
         };
-        match slot.fold() {
-            Fold::Settled(result) => {
-                jobs.remove(key);
-                Poll::Settled(result)
-            }
+        let liveness = slot.fold();
+        if slot.done.is_some() {
+            let slot = jobs.remove(key).expect("slot was just folded");
+            return Poll::Settled(slot.done.expect("checked above"));
+        }
+        match liveness {
             Fold::Dead => {
                 jobs.remove(key);
                 Poll::Abandoned
@@ -188,11 +193,6 @@ impl Tracker {
                 total: slot.total,
             },
         }
-    }
-
-    /// Drop a job without reading it (sync-window completions).
-    pub fn clear(&self, key: &str) {
-        self.lock().remove(key);
     }
 
     /// Rewind a job's progress clock by `by`, as if it had been silent that
@@ -319,15 +319,6 @@ mod tests {
         let reporter = start(&tracker, "k");
         reporter.settle(settled_result());
         assert!(matches!(tracker.poll("k", LIMIT), Poll::Settled(_)));
-    }
-
-    #[test]
-    fn clear_drops_job_unread() {
-        let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
-        reporter.settle(settled_result());
-        tracker.clear("k");
-        assert!(matches!(tracker.poll("k", LIMIT), Poll::Vacant));
     }
 
     #[test]

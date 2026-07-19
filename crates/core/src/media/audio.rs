@@ -11,7 +11,7 @@ use ffmpeg::util::format::sample::{Sample, Type};
 use ffmpeg::util::frame;
 
 use super::{ErrorBudget, open_input};
-use crate::error::{Error, ErrorCode, ErrorContext, Result};
+use crate::error::Result;
 use crate::source::Source;
 
 /// The sample rate whisper.cpp expects.
@@ -19,22 +19,16 @@ pub const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
 /// Decode `source`'s best audio stream to 16 kHz mono f32 samples.
 ///
-/// Fails with an input-decade error when the container has no audio stream
-/// (the caller turns that into "nothing to transcribe") or when decoding
-/// breaks mid-stream.
-pub fn decode_audio_16k_mono(source: &Source) -> Result<Vec<f32>> {
+/// `Ok(None)` when the container carries no audio stream at all: absence
+/// is a fact about the input, not a decode failure, and the caller decides
+/// what "nothing to transcribe" means. Errors are reserved for a container
+/// that cannot be opened or a decode that breaks mid-stream.
+pub fn decode_audio_16k_mono(source: &Source) -> Result<Option<Vec<f32>>> {
     let mut ictx = open_input(source)?;
 
-    let stream = ictx
-        .streams()
-        .best(ffmpeg::media::Type::Audio)
-        .ok_or_else(|| {
-            Error::new(
-                ErrorCode::InputCorrupt,
-                format!("{source} contains no audio stream"),
-            )
-            .with_context(ErrorContext::default().with_input(source.as_path()))
-        })?;
+    let Some(stream) = ictx.streams().best(ffmpeg::media::Type::Audio) else {
+        return Ok(None);
+    };
     let stream_index = stream.index();
 
     let ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
@@ -83,7 +77,7 @@ pub fn decode_audio_16k_mono(source: &Source) -> Result<Vec<f32>> {
     sink.drain(&mut samples)
         .map_err(|e| super::decode_error("flushing audio resampler", e))?;
 
-    Ok(samples)
+    Ok(Some(samples))
 }
 
 /// Streaming converter to 16 kHz mono f32 that follows mid-stream input

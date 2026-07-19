@@ -9,8 +9,28 @@ use std::path::PathBuf;
 use super::time::ArgError;
 use agent_video_core::config::{DEFAULT_CHUNK_SECONDS, default_chunk_seconds};
 
-/// Server-owned flags; rejected if they appear in raw.
-const FORBIDDEN: [&str; 3] = ["-o", "--output", "--json"];
+/// Server-owned long flags; rejected exact or in clap's `--flag=value`
+/// form. The short `-o` is handled separately ([`forbidden_flag`]) because
+/// clap also accepts its attached forms (`-oVALUE`, `-o=VALUE`).
+const FORBIDDEN_LONG: [&str; 2] = ["--output", "--json"];
+
+/// The server-owned flag `token` spells, or `None`.
+///
+/// The rule is precise: exact match (`-o`, `--output`, `--json`),
+/// `flag=`-prefix for the long flags (`--output=/x`), and `-o` attachment
+/// (`-o/x`, `-o=/x` — clap short-flag attachment). A flag that merely
+/// shares a prefix (a hypothetical `--jsonx`) is not matched.
+fn forbidden_flag(token: &str) -> Option<&'static str> {
+    if token.starts_with("-o") && !token.starts_with("--") {
+        return Some("-o");
+    }
+    FORBIDDEN_LONG.into_iter().find(|flag| {
+        token == *flag
+            || token
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
+}
 
 /// The core subcommand a raw string may start with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,10 +105,10 @@ pub fn parse_raw(raw: &str) -> Result<RawInvocation, ArgError> {
     let mut flags: Vec<String> = tokens[1..].to_vec();
 
     for t in &flags {
-        if FORBIDDEN.contains(&t.as_str()) {
+        if let Some(flag) = forbidden_flag(t) {
             return Err(ArgError(format!(
-                "raw must not contain {t}: input/output plumbing is injected by the server. \
-                 Pass only strategy flags."
+                "raw must not contain {t} ({flag} is server-owned): input/output plumbing \
+                 is injected by the server. Pass only strategy flags."
             )));
         }
     }
@@ -163,6 +183,30 @@ mod tests {
             let err = parse_raw(raw).expect_err("plumbing is server-owned");
             assert!(err.0.contains("plumbing"), "{}", err.0);
         }
+    }
+
+    #[test]
+    fn rejects_attached_output_flag() {
+        for raw in ["process -o/tmp/x", "process -o=/tmp/x", "extract -ox.json"] {
+            let err = parse_raw(raw).expect_err("clap accepts -o attachment");
+            assert!(err.0.contains("plumbing"), "{raw}: {}", err.0);
+        }
+    }
+
+    #[test]
+    fn rejects_equals_form_of_forbidden_flags() {
+        for raw in ["process --output=/tmp/x", "process --json=frames"] {
+            let err = parse_raw(raw).expect_err("clap accepts --flag=value");
+            assert!(err.0.contains("plumbing"), "{raw}: {}", err.0);
+        }
+    }
+
+    #[test]
+    fn permits_flags_that_merely_share_a_prefix() {
+        // `--jsonx` is not `--json`: the ban is exact-or-`=`-attached, not
+        // a prefix match.
+        let inv = parse_raw("process --jsonx foo").expect("prefix-sharing flag passes");
+        assert_eq!(inv.flags, ["--jsonx", "foo"]);
     }
 
     #[test]

@@ -249,7 +249,7 @@ pub const SIDECAR_SUBTITLE_EXTS: &[&str] = &["srt"];
 /// in `read_sidecar`.
 ///
 /// Library consumers that only want the list stay silent: this discards the
-/// scan diagnostics. The pipeline's auto path uses [`find_sidecars_inner`] to
+/// scan diagnostics. The pipeline's auto path uses `find_sidecars_inner` to
 /// route them into its event sink instead.
 pub fn find_sidecars(input: &Path) -> Vec<std::path::PathBuf> {
     find_sidecars_inner(input, &Discard)

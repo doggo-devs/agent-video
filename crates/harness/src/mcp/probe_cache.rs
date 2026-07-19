@@ -2,7 +2,8 @@
 //! Probe-with-cache: a version-tagged on-disk envelope so a summary written
 //! under an older schema — or older field semantics — misses instead of
 //! being read as current, plus the content-fingerprint cache lookup that
-//! decorates hits with any cached whisper transcript.
+//! decorates every summary with live-rescanned sidecar files and any
+//! cached whisper transcript.
 
 use std::path::Path;
 
@@ -22,7 +23,11 @@ struct ProbeDoc {
     probe: ProbeSummary,
 }
 
-const PROBE_DOC_VERSION: u32 = 1;
+// Bumped to 2: v1 documents baked path-dependent sidecar lines into the
+// content-keyed summary, so a moved file could advertise a stale sidecar
+// for the cache lifetime. v2 documents carry embedded tracks only;
+// sidecars are rescanned live on every lookup.
+const PROBE_DOC_VERSION: u32 = 2;
 
 fn parse_probe_doc(text: &str) -> Option<ProbeSummary> {
     serde_json::from_str::<ProbeDoc>(text)
@@ -40,8 +45,10 @@ fn render_probe_doc(probe: &ProbeSummary) -> Option<String> {
 }
 
 /// Probe via content-fingerprint cache; unstable files are probed fresh,
-/// never cached. A cached whisper transcript decorates the summary (never
-/// the cache entry).
+/// never cached. The cached document is a function of content only:
+/// sidecar subtitle files — a property of the file's directory — are
+/// rescanned live and appended after the cache read, and a cached whisper
+/// transcript decorates the summary last (never the cache entry).
 pub(super) fn cached_probe(
     file: &Path,
     deps: &ServerDeps,
@@ -69,6 +76,13 @@ pub(super) fn cached_probe(
             p
         }
     };
+    // Sidecars live next to the file, not inside it: rescan on every call
+    // so the content-keyed doc stays deterministic and moves are honest.
+    probe.subtitles.extend(
+        crate::probe::scan_sidecars(file)
+            .into_iter()
+            .map(|name| format!("sidecar {name}")),
+    );
     if deps
         .cache
         .find_transcript(&fp.id, &transcribe::transcript_id(&deps.config))
@@ -82,15 +96,15 @@ pub(super) fn cached_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::testutil::probe;
+    use crate::mcp::testutil::{env, media_file, probe};
 
     #[test]
     fn probe_doc_round_trips_current_version() {
-        let summary = probe(90.0, vec!["sidecar talk.srt".to_string()]);
+        let summary = probe(90.0, vec!["embedded #0 (eng, subrip)".to_string()]);
         let doc = render_probe_doc(&summary).expect("renders");
         let back = parse_probe_doc(&doc).expect("current version parses");
         assert_eq!(back.duration, 90.0);
-        assert_eq!(back.subtitles, ["sidecar talk.srt"]);
+        assert_eq!(back.subtitles, ["embedded #0 (eng, subrip)"]);
     }
 
     #[test]
@@ -108,5 +122,53 @@ mod tests {
         );
         assert_ne!(doc, future, "version tag must be present to rewrite");
         assert!(parse_probe_doc(&future).is_none(), "future version misses");
+    }
+
+    #[test]
+    fn sidecars_never_enter_the_cached_doc() {
+        let env = env(probe(90.0, vec!["embedded #0 (eng, subrip)".to_string()]), false);
+        let file = media_file(&env, "talk.mp4");
+        std::fs::write(env.dir.join("talk.srt"), b"").expect("write sidecar");
+
+        let (summary, id) = cached_probe(&file, &env.deps).expect("probe");
+
+        assert_eq!(
+            summary.subtitles,
+            ["embedded #0 (eng, subrip)", "sidecar talk.srt"],
+            "the live summary advertises the sidecar"
+        );
+        let doc = env
+            .deps
+            .cache
+            .get_probe(&id)
+            .expect("cache read")
+            .expect("stable file stores a doc");
+        let stored = parse_probe_doc(&doc).expect("current version parses");
+        assert_eq!(stored.subtitles, ["embedded #0 (eng, subrip)"]);
+    }
+
+    #[test]
+    fn cached_probe_rescans_sidecars_on_hit() {
+        let env = env(probe(90.0, vec![]), false);
+        let dir_b = env.dir.join("b");
+        std::fs::create_dir_all(&dir_b).expect("create dir b");
+        let file_a = media_file(&env, "talk.mp4");
+        let file_b = dir_b.join("talk.mp4");
+        std::fs::copy(&file_a, &file_b).expect("same content, new directory");
+        std::fs::write(dir_b.join("talk.srt"), b"").expect("write sidecar in b");
+        let (_, id) = cached_probe(&file_a, &env.deps).expect("first probe stores the doc");
+        // A marker only the cache can produce: seeing it back proves the
+        // second call was a hit, not a fresh probe.
+        let marker = render_probe_doc(&probe(90.0, vec!["embedded #0 (marker)".to_string()]))
+            .expect("renders");
+        env.deps.cache.put_probe(&id, &marker).expect("seed marker doc");
+
+        let (hit, _) = cached_probe(&file_b, &env.deps).expect("second probe");
+
+        assert_eq!(
+            hit.subtitles,
+            ["embedded #0 (marker)", "sidecar talk.srt"],
+            "a cache hit reflects the new directory's sidecars"
+        );
     }
 }

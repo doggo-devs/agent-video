@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 readme = "../README.md"
 
+[lints]
+workspace = true
+
 [features]
 # CLI argument surface: derives `clap::Args`/`ValueEnum` on the config
 # override structs so the CLI flags and the override fields stay one

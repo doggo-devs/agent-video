@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 readme = "../README.md"
 
+[lints]
+workspace = true
+
 [features]
 # `whisper-local`: local GPU inference via whisper.cpp. Any GPU feature
 # implies this; builds without it use the API-only transcription path.

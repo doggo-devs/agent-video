@@ -25,10 +25,14 @@ regenerates. The write need not be atomic; correctness does not depend on it.
 
 **Members:**
 
-- **Probe documents** — `crate::mcp::handler::cached_probe` +
+- **Probe documents** — `crate::mcp::probe_cache::cached_probe` +
   `crate::cache::Cache::put_probe`. Keyed by content fingerprint; only stable
   files are cached. The document is a deterministic function of the file's
-  content, so the same fingerprint always renders the same JSON.
+  content, so the same fingerprint always renders the same JSON. Path-dependent
+  facts stay out of the document: sidecar subtitle files (a property of the
+  video's directory, not its bytes) are rescanned live on every lookup and
+  appended to the summary after the cache read, alongside the
+  whisper-transcript decoration — they never enter the cached document.
 - **Whisper transcripts** — keyed by content fingerprint × model identity
   (`crate::config::WhisperModel::cache_id`). A transcript from one model must
   never answer for another, so the model is part of the key; the same

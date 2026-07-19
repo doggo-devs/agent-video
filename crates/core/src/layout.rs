@@ -151,7 +151,10 @@ fn compute_wide(scores: &[f32], heroes: &[usize], a: f32, spec: &CanvasSpec) -> 
         }
     }
 
-    // Pixel sizing: row height = width / (cells × a), longer edge capped at spec.edge.
+    // Pixel sizing: row height = width / (cells × a), longer edge capped at
+    // spec.edge. Every `as u32` below rounds a non-negative f32 bounded by
+    // `spec.edge()` (a validated u32), so the casts cannot truncate a valid
+    // coordinate; float→int `as` saturates rather than wrapping regardless.
     let height_ratio: f32 = rows.iter().map(|row| 1.0 / (row.len() as f32 * a)).sum();
     let width = spec.edge() as f32 / height_ratio.max(1.0);
 

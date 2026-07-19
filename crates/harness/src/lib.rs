@@ -23,6 +23,7 @@ pub mod plan;
 pub mod probe;
 pub mod proc;
 pub mod raw;
+pub mod relay;
 pub mod schema;
 #[cfg(test)]
 pub(crate) mod testutil;

@@ -10,6 +10,13 @@
 //! pixels through an [`Arc`], so retaining a representative is a pointer clone,
 //! not a deep copy. This keeps peak memory in the hundreds-of-MB range instead
 //! of GBs for long videos.
+//!
+//! Timestamps travel as `f32` seconds. The ulp is under 1 ms out to ~4.5
+//! hours and under 8 ms out to 24 hours — far finer than grid timestamps
+//! (whole seconds on the wire) ever need. The harness computes windows in
+//! `f64`, but the hand-off is CLI text re-parsed here, so no silent
+//! in-process narrowing exists. Revisit `f64` before supporting multi-day
+//! streams, where dense sampling could collide within one ulp.
 
 use std::sync::Arc;
 
