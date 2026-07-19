@@ -233,6 +233,9 @@ pub fn direct_info(url: &str, probe: &ProbeSummary, cfg: &Config) -> SourceInfo 
             probe.height,
             format_ts(probe.duration as f32)
         ),
+        // A direct link has no title — only a filename, which is noise,
+        // not vocabulary; transcription derives no prompt from it.
+        title: None,
         options: vec![
             DownloadOption {
                 token: Token::new("dl-analysis"),

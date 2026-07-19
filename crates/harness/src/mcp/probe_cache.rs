@@ -13,6 +13,24 @@ use crate::identity::{ContentId, fingerprint_file};
 use crate::schema::ProbeSummary;
 use crate::transcribe;
 
+/// The effective whisper conditioning text for this content: the
+/// operator's `whisper.prompt`, else a continuation shaped from the
+/// first-sighted title recorded at download time
+/// ([`crate::cache::Cache::put_title`], write-once — stable per content,
+/// not a pure function of the bytes), else empty. Content-keyed, so
+/// every caller — transcribe, ride-along lookup, probe decoration —
+/// derives the same text and therefore the same transcript identity.
+pub(super) fn effective_prompt_for(fingerprint: &ContentId, deps: &ServerDeps) -> String {
+    let title = deps.cache.get_title(fingerprint);
+    transcribe::effective_prompt(&deps.config, title.as_deref())
+}
+
+/// The transcript cache identity this content would get today: whisper
+/// route × language × effective prompt ([`transcribe::transcript_id`]).
+pub(super) fn transcript_id_for(fingerprint: &ContentId, deps: &ServerDeps) -> String {
+    transcribe::transcript_id(&deps.config, &effective_prompt_for(fingerprint, deps))
+}
+
 /// On-disk probe document: a version-tagged envelope, so a summary written
 /// under an older schema — or older field semantics — misses instead of
 /// being read as current. Bump the version when [`ProbeSummary`] changes
@@ -93,7 +111,7 @@ pub(super) fn cached_probe(
     );
     if deps
         .cache
-        .find_transcript(&fp.id, &transcribe::transcript_id(&deps.config))
+        .find_transcript(&fp.id, &transcript_id_for(&fp.id, deps))
         .is_some()
     {
         probe.subtitles.push("transcript (whisper)".to_string());
@@ -130,6 +148,63 @@ mod tests {
         );
         assert_ne!(doc, future, "version tag must be present to rewrite");
         assert!(parse_probe_doc(&future).is_none(), "future version misses");
+    }
+
+    #[test]
+    fn expired_title_yields_a_clean_miss_not_a_stale_hit() {
+        let env = env(probe(90.0, vec![]), false);
+        let fp = ContentId::new("fp");
+        env.deps
+            .cache
+            .put_title(&fp, "Rust Ownership Explained")
+            .expect("record title");
+        let conditioned_id = transcript_id_for(&fp, &env.deps);
+        let srt = env.deps.cache.transcript_path(&fp, &conditioned_id);
+        std::fs::create_dir_all(srt.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&srt, b"conditioned cues").expect("write transcript");
+
+        // The sidecar ages out (simulated by removal) while the
+        // conditioned transcript is still on disk — the state the
+        // hit-side sidecar bump makes unreachable in normal operation.
+        let title_path = env
+            .deps
+            .config
+            .paths
+            .cache
+            .join("probe")
+            .join(format!("{fp}.title"));
+        std::fs::remove_file(&title_path).expect("expire the sidecar");
+
+        let bare_id = transcript_id_for(&fp, &env.deps);
+        assert_ne!(bare_id, conditioned_id, "the derived identity changed");
+        assert!(
+            env.deps.cache.find_transcript(&fp, &bare_id).is_none(),
+            "the lookup misses cleanly (re-transcribe) — the conditioned \
+             transcript must never answer under the bare id"
+        );
+    }
+
+    #[test]
+    fn a_later_title_cannot_change_the_derived_prompt() {
+        let env = env(probe(90.0, vec![]), false);
+        let fp = ContentId::new("fp");
+        env.deps
+            .cache
+            .put_title(&fp, "First Sighted Title")
+            .expect("record title");
+        let frozen = effective_prompt_for(&fp, &env.deps);
+        assert_eq!(frozen, "First Sighted Title.");
+
+        env.deps
+            .cache
+            .put_title(&fp, "Retitled Upload")
+            .expect("a repeated put is a successful no-op");
+
+        assert_eq!(
+            effective_prompt_for(&fp, &env.deps),
+            frozen,
+            "the conditioning prompt — and with it the transcript id — is frozen at first sighting"
+        );
     }
 
     #[test]

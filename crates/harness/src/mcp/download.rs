@@ -259,6 +259,20 @@ fn perform_download(
     // Sweep before building the response, which describes files on disk. The
     // rip that just landed survives via the eviction grace window.
     let _ = deps.cache.evict(SystemTime::now());
+    // Record the probe's title against the landed bytes: transcription
+    // derives its whisper prompt (and thus the transcript's cache key)
+    // from content identity alone, so the title must be recoverable from
+    // the file with no URL in hand — a kept file re-analyzed by path
+    // included. First writer wins (`put_title` is write-once): a
+    // re-download under a retitled upload must not shift the derived
+    // prompt. Best-effort: a rip without a recorded title only loses
+    // the derived prompt, never the download.
+    if let Some(title) = &plan.title
+        && let Ok(fp) = crate::identity::fingerprint_file(&path)
+        && fp.stable
+    {
+        let _ = deps.cache.put_title(&fp.id, title);
+    }
     match plan.dest {
         Dest::Cache => analysis_response(source, &path, warning.as_deref(), deps).into(),
         Dest::Keep => {

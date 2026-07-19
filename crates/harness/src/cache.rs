@@ -12,7 +12,7 @@ pub mod naming;
 
 use std::fs;
 use std::fs::File;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -86,24 +86,71 @@ impl Cache {
         self.probe_dir.join(format!("{fingerprint}.json"))
     }
 
+    // ── media titles ──
+
+    /// Record the media title learned from the source's probe document at
+    /// download time, keyed by content: any later caller holding the same
+    /// bytes recovers the *first-sighted* title — a stable-per-content
+    /// value, not a pure function of the bytes — for whisper prompt
+    /// derivation ([`crate::transcribe::effective_prompt`]) with no URL
+    /// in hand. Write-once, first writer wins: the title exists only to
+    /// derive a stable conditioning prompt, and the first sighted title
+    /// serves that end as well as any later one; freezing it removes the
+    /// re-download-under-a-new-title → new transcript id →
+    /// re-transcription fragmentation window. A repeated put is a
+    /// successful no-op. Lives beside the probe documents and ages out
+    /// with them.
+    pub fn put_title(&self, fingerprint: &ContentId, title: &str) -> std::io::Result<()> {
+        fs::create_dir_all(&self.probe_dir)?;
+        match File::create_new(self.title_path(fingerprint)) {
+            Ok(mut f) => f.write_all(title.as_bytes()),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The recorded title for this content, refreshing its age clock;
+    /// `None` when nothing was recorded (local files, pre-title rips).
+    pub fn get_title(&self, fingerprint: &ContentId) -> Option<String> {
+        let p = self.title_path(fingerprint);
+        let title = fs::read_to_string(&p).ok()?;
+        touch(&p);
+        Some(title)
+    }
+
+    fn title_path(&self, fingerprint: &ContentId) -> PathBuf {
+        self.probe_dir.join(format!("{fingerprint}.title"))
+    }
+
     // ── transcripts ──
 
     /// Target path for a whisper transcript, keyed by content fingerprint
-    /// × model identity ([`crate::config::WhisperModel::cache_id`]): a
-    /// transcript produced by one model must never answer for another, or a
-    /// model upgrade keeps serving the old model's output indefinitely —
+    /// × transcript identity ([`crate::transcribe::transcript_id`]: engine
+    /// × model × conditioning): cues produced under one recipe must never
+    /// answer for another's, or a model upgrade — or a prompt/language
+    /// change — keeps serving the old recipe's output indefinitely —
     /// every hit refreshes the age clock.
-    pub fn transcript_path(&self, fingerprint: &ContentId, model_id: &str) -> PathBuf {
+    pub fn transcript_path(&self, fingerprint: &ContentId, transcript_id: &str) -> PathBuf {
         self.transcripts_dir
-            .join(format!("{fingerprint}.{model_id}.srt"))
+            .join(format!("{fingerprint}.{transcript_id}.srt"))
     }
 
-    /// Locate a finished transcript for this content × model; hits refresh
-    /// the age clock.
-    pub fn find_transcript(&self, fingerprint: &ContentId, model_id: &str) -> Option<PathBuf> {
-        let p = self.transcript_path(fingerprint, model_id);
+    /// Locate a finished transcript for this content × recipe; hits refresh
+    /// the age clock — the transcript's and its title sidecar's.
+    ///
+    /// Invariant: a living transcript never outlives the sidecar that
+    /// derives its id. Both age independently under [`PROBE_MAX_AGE`], so
+    /// a hit must keep its key's premise alive: bumping the sidecar here
+    /// means the pair expires in the same sweep (clean slate) or not at
+    /// all — never sidecar-gone-transcript-alive, where the next lookup
+    /// re-derives the bare prompt, misses, and re-transcribes while the
+    /// conditioned transcript rots unreachable. [`touch`] is a no-op when
+    /// no sidecar exists (unconditioned ids).
+    pub fn find_transcript(&self, fingerprint: &ContentId, transcript_id: &str) -> Option<PathBuf> {
+        let p = self.transcript_path(fingerprint, transcript_id);
         if p.is_file() {
             touch(&p);
+            touch(&self.title_path(fingerprint));
             Some(p)
         } else {
             None
@@ -497,6 +544,72 @@ mod tests {
         let removed = cache.evict(later);
         assert!(removed.is_empty());
         assert!(media.exists() && srt.exists());
+    }
+
+    #[test]
+    fn title_roundtrips_by_content() {
+        let (cache, _dir) = cache(1024);
+        assert_eq!(cache.get_title(&ContentId::new("fp")), None);
+        cache
+            .put_title(&ContentId::new("fp"), "Rust Ownership Explained")
+            .expect("put");
+        assert_eq!(
+            cache.get_title(&ContentId::new("fp")).as_deref(),
+            Some("Rust Ownership Explained")
+        );
+        assert_eq!(
+            cache.get_title(&ContentId::new("other")),
+            None,
+            "titles answer only for their own content"
+        );
+    }
+
+    #[test]
+    fn later_titles_cannot_repoint_recorded_content() {
+        let (cache, _dir) = cache(1024);
+        cache
+            .put_title(&ContentId::new("fp"), "First Sighted Title")
+            .expect("first put");
+        cache
+            .put_title(&ContentId::new("fp"), "Retitled Upload")
+            .expect("a repeated put is a successful no-op");
+        assert_eq!(
+            cache.get_title(&ContentId::new("fp")).as_deref(),
+            Some("First Sighted Title"),
+            "first writer wins: the recorded title is frozen"
+        );
+    }
+
+    #[test]
+    fn transcript_hit_keeps_its_title_sidecar_alive() {
+        let (cache, _dir) = cache(1024);
+        let fp = ContentId::new("fp");
+        cache
+            .put_title(&fp, "Rust Ownership Explained")
+            .expect("put");
+        let srt = cache.transcript_path(&fp, "m-auto-abcd1234");
+        std::fs::create_dir_all(srt.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&srt, b"cues").expect("write");
+        // Age the sidecar past expiry while the transcript stays in use:
+        // without the hit-side bump the next sweep would leave the
+        // transcript alive but keyless.
+        let title = cache.probe_dir.join(format!("{fp}.title"));
+        File::options()
+            .append(true)
+            .open(&title)
+            .and_then(|f| {
+                f.set_modified(SystemTime::now() - PROBE_MAX_AGE - Duration::from_secs(60))
+            })
+            .expect("age the sidecar");
+
+        cache.find_transcript(&fp, "m-auto-abcd1234").expect("hit");
+        cache.evict(SystemTime::now());
+
+        assert_eq!(
+            cache.get_title(&fp).as_deref(),
+            Some("Rust Ownership Explained"),
+            "a living transcript's key premise survives the sweep"
+        );
     }
 
     #[test]

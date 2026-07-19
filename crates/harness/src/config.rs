@@ -90,6 +90,17 @@ pub struct WhisperCfg {
     pub api_key: Option<String>,
     /// API endpoint URL. Defaults to Groq.
     pub api_url: String,
+    /// Operator conditioning text for whisper. An initial prompt is a
+    /// continuation bias, not an instruction channel: text that reads
+    /// like preceding transcript steers vocabulary, proper nouns, and
+    /// script (简体 vs 繁体). When unset, transcription derives one from
+    /// the media title recorded at download time. Part of the transcript
+    /// cache key ([`crate::transcribe::transcript_id`]).
+    pub prompt: Option<String>,
+    /// ISO 639-1 language hint (`"zh"`, `"en"`); `None` auto-detects.
+    /// Sent to the API verbatim and pinned in local inference; part of
+    /// the transcript cache key.
+    pub language: Option<String>,
 }
 
 impl WhisperCfg {
@@ -154,6 +165,21 @@ fn parse_from_browser(value: &str) -> Result<String, ConfigError> {
     Ok(value.to_string())
 }
 
+/// Validate a `whisper.language` value: exactly two lowercase ASCII
+/// letters, the ISO 639-1 shape both engines accept. Notably this rejects
+/// `"auto"` — auto-detection is the *absence* of the key, and the OpenAI
+/// contract has no `auto` value.
+fn parse_language(value: &str) -> Result<String, ConfigError> {
+    let iso639_1 = value.len() == 2 && value.bytes().all(|b| b.is_ascii_lowercase());
+    if !iso639_1 {
+        return Err(ConfigError(format!(
+            "whisper.language must be a two-letter lowercase ISO 639-1 code (e.g. 'zh') — \
+             got '{value}'; unset it for auto-detection"
+        )));
+    }
+    Ok(value.to_string())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BudgetCfg {
     /// Predicted grid count at or below which a call runs immediately.
@@ -163,7 +189,9 @@ pub struct BudgetCfg {
 }
 
 /// Whisper model selection: a pinned name provisioned by `install-whisper`,
-/// or a self-supplied ggml file (the escape hatch).
+/// or a self-supplied ggml file (the escape hatch — spelled as a path:
+/// `"./models/ggml-tiny.bin"`, `"~/models/ggml-tiny.bin"`, or any value
+/// containing a path separator).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhisperModel {
     Medium,
@@ -173,12 +201,26 @@ pub enum WhisperModel {
 }
 
 impl WhisperModel {
-    fn parse(s: &str) -> Self {
+    /// Parse a `whisper.model` value. Known names parse to their variant;
+    /// a path-shaped value (contains a separator, or starts with `~` or
+    /// `.`) is the self-supplied-file escape hatch. Anything else — a typo
+    /// like `"large-v3-trubo"` — fails the load naming the valid options,
+    /// instead of masquerading as a model file that will never exist.
+    fn parse(s: &str) -> Result<Self, ConfigError> {
         match s {
-            "medium" => WhisperModel::Medium,
-            "large-v3" => WhisperModel::LargeV3,
-            "large-v3-turbo" => WhisperModel::LargeV3Turbo,
-            other => WhisperModel::File(PathBuf::from(other)),
+            "medium" => Ok(WhisperModel::Medium),
+            "large-v3" => Ok(WhisperModel::LargeV3),
+            "large-v3-turbo" => Ok(WhisperModel::LargeV3Turbo),
+            path if path.contains(['/', std::path::MAIN_SEPARATOR])
+                || path.starts_with('~')
+                || path.starts_with('.') =>
+            {
+                Ok(WhisperModel::File(PathBuf::from(path)))
+            }
+            other => Err(ConfigError(format!(
+                "whisper.model must be one of medium, large-v3, large-v3-turbo, or a path \
+                 to a self-supplied ggml file — got '{other}'"
+            ))),
         }
     }
 
@@ -321,6 +363,8 @@ struct FileWhisper {
     backend: Option<String>,
     api_key: Option<String>,
     api_url: Option<String>,
+    prompt: Option<String>,
+    language: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -409,6 +453,8 @@ pub fn default_config(dirs: &BaseDirs) -> Config {
             backend: None,
             api_key: None,
             api_url: WhisperCfg::DEFAULT_API_URL.to_string(),
+            prompt: None,
+            language: None,
         },
         download: DownloadCfg {
             max_bytes: nz64(2 * GIB),
@@ -527,7 +573,7 @@ pub fn parse_config(text: &str, dirs: &BaseDirs) -> Result<Config, ConfigError> 
         if m.is_empty() {
             return Err(ConfigError("whisper.model must be non-empty".into()));
         }
-        cfg.whisper.model = match WhisperModel::parse(&m) {
+        cfg.whisper.model = match WhisperModel::parse(&m)? {
             WhisperModel::File(p) => WhisperModel::File(expand_tilde(
                 p.to_str().expect("came from a &str"),
                 &dirs.home,
@@ -543,6 +589,17 @@ pub fn parse_config(text: &str, dirs: &BaseDirs) -> Result<Config, ConfigError> 
     }
     if let Some(u) = file.whisper.api_url {
         cfg.whisper.api_url = u;
+    }
+    if let Some(p) = file.whisper.prompt {
+        if p.is_empty() {
+            return Err(ConfigError(
+                "whisper.prompt must be non-empty — unset it for the derived default".into(),
+            ));
+        }
+        cfg.whisper.prompt = Some(p);
+    }
+    if let Some(l) = file.whisper.language {
+        cfg.whisper.language = Some(parse_language(&l)?);
     }
 
     Ok(cfg)
@@ -691,6 +748,14 @@ mod tests {
     }
 
     #[test]
+    fn rejects_typoed_model_name_at_load() {
+        let err = parse_config("[whisper]\nmodel = \"large-v3-trubo\"\n", &dirs())
+            .expect_err("a typo must not become a self-supplied model file");
+        assert!(err.0.contains("large-v3-trubo"), "names the value: {err}");
+        assert!(err.0.contains("large-v3-turbo"), "lists the options: {err}");
+    }
+
+    #[test]
     fn model_cache_ids_are_distinct_and_filename_safe() {
         let ids = [
             WhisperModel::Medium.cache_id(),
@@ -752,6 +817,28 @@ mod tests {
         let err = parse_config("[cookies]\nfrom_browser = \"netscape\"\n", &dirs())
             .expect_err("unknown browser");
         assert!(err.0.contains("netscape"), "names the value: {err}");
+    }
+
+    #[test]
+    fn accepts_iso639_language_hint() {
+        let cfg = parse_config("[whisper]\nlanguage = \"zh\"\n", &dirs()).expect("valid");
+        assert_eq!(cfg.whisper.language.as_deref(), Some("zh"));
+    }
+
+    #[test]
+    fn rejects_malformed_language() {
+        for junk in ["", "ZH", "auto", "zh-CN", "中文"] {
+            let err = parse_config(&format!("[whisper]\nlanguage = {junk:?}\n"), &dirs())
+                .expect_err("junk language must fail the load");
+            assert!(err.0.contains("whisper.language"), "names the key: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_prompt() {
+        let err = parse_config("[whisper]\nprompt = \"\"\n", &dirs())
+            .expect_err("empty prompt is invalid");
+        assert!(err.0.contains("whisper.prompt"), "names the key: {err}");
     }
 
     #[test]

@@ -48,10 +48,12 @@ platform-derived.
 
 | Key | Type | Default | Validation | Controls |
 |-----|------|---------|-----------|----------|
-| `model` | string | `large-v3-turbo` | non-empty | Model identity for transcription and for keying transcripts in the cache. One of the pinned names `medium`, `large-v3`, `large-v3-turbo` (provisioned by `install-whisper`), or any other value taken as a path to a self-supplied ggml file (tilde-expanded). A transcript is keyed by content × model, so changing this never serves another model's output. |
+| `model` | string | `large-v3-turbo` | known name or path-shaped | Model identity for transcription and for keying transcripts in the cache. One of the pinned names `medium`, `large-v3`, `large-v3-turbo` (provisioned by `install-whisper`), or a path to a self-supplied ggml file (tilde-expanded) — recognized by its shape: it contains a path separator or starts with `~` or `.`. Any other value (a typo like `large-v3-trubo`) fails the load. A transcript is keyed by content × model, so changing this never serves another model's output. |
 | `backend` | string | unset (auto-detect) | one of `metal`, `coreml`, `cuda`, `vulkan`, and must be compiled into this build | Pins the GPU inference backend. Unset auto-detects from compiled features. Pinning commits to local inference: a missing weight then errors instead of silently falling back to the API. CPU-only inference is not supported; a build with no `whisper-*` feature offers no local transcription at all. |
 | `api_key` | string | unset | — | API key for remote transcription (Groq / OpenAI-compatible endpoint). The `WHISPER_API_KEY` environment variable overrides this at load time; past load, nothing reads the environment again. |
 | `api_url` | string | `https://api.groq.com/openai/v1/audio/transcriptions` | — | Remote transcription endpoint. |
+| `prompt` | string | unset (derived) | non-empty | Conditioning text for whisper (its *initial prompt*). A continuation bias, not an instruction channel: write text that reads like preceding transcript — domain vocabulary, proper nouns, the desired script (简体 vs 繁体) — never directives, which the model does not obey. Budget is ~224 tokens; the harness truncates at 800 bytes. When unset, URL downloads derive a prompt from the media title reported by the site; local files get none. Part of the transcript cache key (hashed), so changing it produces a fresh transcript rather than serving a differently-conditioned one. |
+| `language` | string | unset (auto-detect) | two lowercase ASCII letters (ISO 639-1), e.g. `zh`; `auto` is invalid — auto-detection is the key's absence | Language hint for transcription. Sent to the API as the `language` field and pinned in local inference. Part of the transcript cache key. |
 
 ### `[download]`
 
@@ -119,6 +121,11 @@ model = "large-v3-turbo"
 # api_key unset by default; WHISPER_API_KEY overrides it at load time.
 # api_key = "gsk_..."
 api_url = "https://api.groq.com/openai/v1/audio/transcriptions"
+# prompt unset by default: URL downloads derive one from the media title.
+# Continuation-style vocabulary bias, not instructions.
+# prompt = "本期课程讲解 Rust 的所有权、借用检查器与生命周期。"
+# language unset by default: whisper auto-detects.
+# language = "zh"
 
 [download]
 max_bytes = 2147483648  # 2 GiB

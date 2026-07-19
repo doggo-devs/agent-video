@@ -66,6 +66,10 @@ pub struct DownloadPlan {
     pub recipe: Recipe,
     /// Best-effort size estimate; `None` = unknown before download.
     pub estimated_bytes: Option<u64>,
+    /// The media title from the probe that issued this plan, when the
+    /// source reports one; recorded by content once the file lands so
+    /// transcription can derive its whisper prompt from it.
+    pub title: Option<String>,
 }
 
 /// The action authorized once a token is redeemed.

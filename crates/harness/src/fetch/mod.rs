@@ -78,6 +78,11 @@ pub struct DownloadOption {
 #[derive(Debug, Clone)]
 pub struct SourceInfo {
     pub headline: String,
+    /// The media title as the site reports it (yt-dlp sources); `None`
+    /// for direct links, whose only "title" would be a filename — noise,
+    /// not vocabulary. Rides into every [`DownloadPlan`] so the download
+    /// can record it by content ([`crate::cache::Cache::put_title`]).
+    pub title: Option<String>,
     pub options: Vec<DownloadOption>,
 }
 

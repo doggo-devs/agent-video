@@ -12,7 +12,9 @@
 //! VAD pre-filtering; the endpoint owns hallucination suppression. Chunks
 //! split at hard byte boundaries (~13 min each), so a cue spanning a cut
 //! may lose or repeat a word: accepted for the simplicity of stateless
-//! uploads.
+//! uploads. Each chunk after the first is conditioned on the tail of the
+//! previous chunk's transcript ([`continuation_prompt`]), so vocabulary,
+//! casing, and script choice carry across the cut instead of lurching.
 //!
 //! Either way the transcript lands as an SRT whose cue times feed the grid
 //! subtitle ride-along.
@@ -175,13 +177,72 @@ pub fn available(cfg: &Config) -> bool {
     Route::resolve(cfg).is_ok()
 }
 
-/// Cache identity of the transcript the active route would produce. Falls
-/// back to the local model identity when no route resolves, so a transcript
-/// generated before a key was removed still rides along.
-pub fn transcript_id(cfg: &Config) -> String {
-    Route::resolve(cfg)
+// ── conditioning ──
+
+/// Hard byte cap on the conditioning text handed to whisper. The model
+/// conditions on at most ~224 tokens of prompt; 800 bytes of UTF-8 is
+/// roughly 200 BPE tokens for ASCII text and ~260 codepoints for CJK —
+/// under the budget either way. Anything longer would be silently cut by
+/// the tokenizer while still bloating the upload and the cache key.
+pub const PROMPT_MAX_BYTES: usize = 800;
+
+/// The effective conditioning text both engines receive: the operator's
+/// `whisper.prompt` wins; otherwise a known media `title` is shaped into
+/// continuation-style text (a fragment the transcript could plausibly
+/// follow — never an instruction, which whisper does not obey); otherwise
+/// empty. NUL bytes are stripped (the local path crosses a `CString`
+/// boundary) and the result is truncated to [`PROMPT_MAX_BYTES`] on a
+/// char boundary — what returns from here is exactly what ships, so its
+/// hash is the prompt's cache identity ([`transcript_id`]).
+pub fn effective_prompt(cfg: &Config, title: Option<&str>) -> String {
+    let text = match (&cfg.whisper.prompt, title) {
+        (Some(prompt), _) => prompt.clone(),
+        (None, Some(title)) => title_as_continuation(title),
+        (None, None) => String::new(),
+    };
+    let mut text: String = text.chars().filter(|&c| c != '\0').collect();
+    while text.len() > PROMPT_MAX_BYTES {
+        text.pop();
+    }
+    text
+}
+
+/// Shape a title as text that reads like preceding transcript: a finished
+/// sentence of its own, so the decoder treats it as context, not as the
+/// opening words of the audio.
+fn title_as_continuation(title: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        return String::new();
+    }
+    if title.ends_with(['.', '!', '?', '。', '！', '？']) {
+        title.to_string()
+    } else {
+        format!("{title}.")
+    }
+}
+
+/// Cache identity of the transcript the active route would produce for
+/// this conditioning. Everything that shapes the cues is in the key:
+/// engine × model ([`Route::cache_id`]), the language hint, and a short
+/// hash of the effective `prompt`. Unconditioned runs keep the bare model
+/// identity, so transcripts from before these knobs existed stay hits.
+/// Falls back to the local model identity when no route resolves, so a
+/// transcript generated before a key was removed still rides along.
+pub fn transcript_id(cfg: &Config, prompt: &str) -> String {
+    let base = Route::resolve(cfg)
         .map(|r| r.cache_id())
-        .unwrap_or_else(|_| cfg.whisper.model.cache_id())
+        .unwrap_or_else(|_| cfg.whisper.model.cache_id());
+    if cfg.whisper.language.is_none() && prompt.is_empty() {
+        return base;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(prompt.as_bytes());
+    format!(
+        "{base}-{}-{}",
+        cfg.whisper.language.as_deref().unwrap_or("auto"),
+        crate::identity::hex(&digest[..4])
+    )
 }
 
 // ── cue type ──
@@ -205,12 +266,15 @@ pub struct Transcribed {
 }
 
 /// Transcribe `file` into an SRT at `out_srt` (written atomically via
-/// `.part`-then-rename). `on_step` receives coarse phase messages suitable
-/// for MCP progress notifications.
+/// `.part`-then-rename). `prompt` is the effective conditioning text
+/// ([`effective_prompt`]); the caller must key `out_srt` by
+/// [`transcript_id`] over the same text. `on_step` receives coarse phase
+/// messages suitable for MCP progress notifications.
 pub fn transcribe(
     cfg: &Config,
     file: &Path,
     out_srt: &Path,
+    prompt: &str,
     on_step: &mut dyn FnMut(&str),
 ) -> Result<Transcribed, Fault> {
     let route = Route::resolve(cfg)?;
@@ -252,9 +316,16 @@ pub fn transcribe(
     let cues = match route {
         #[cfg(feature = "whisper-local")]
         Route::Local { backend, model, .. } => {
-            recognize_local(cfg, backend, &model, &samples, on_step)?
+            recognize_local(cfg, backend, &model, &samples, prompt, on_step)?
         }
-        Route::Api { key, url } => recognize_api(&key, &url, &samples, on_step)?,
+        Route::Api { key, url } => recognize_api(
+            &key,
+            &url,
+            cfg.whisper.language.as_deref(),
+            prompt,
+            &samples,
+            on_step,
+        )?,
     };
     write_srt(out_srt, &cues)?;
     Ok(Transcribed { audio_seconds })
@@ -308,6 +379,8 @@ fn api_agent(connect_timeout: Duration, call_ceiling: Duration) -> ureq::Agent {
 fn recognize_api(
     api_key: &str,
     api_url: &str,
+    language: Option<&str>,
+    prompt: &str,
     samples: &[f32],
     on_step: &mut dyn FnMut(&str),
 ) -> Result<Vec<Cue>, Fault> {
@@ -315,24 +388,90 @@ fn recognize_api(
     tracing::info!(total_chunks = chunks.len(), "uploading to API");
 
     let agent = api_agent(API_CONNECT_TIMEOUT, API_CALL_CEILING);
-    let mut all_cues = Vec::new();
-    for (i, (wav, offset_samples)) in chunks.iter().enumerate() {
+    recognize_chunked(chunks.len(), prompt, |i, chunk_prompt| {
+        let (wav, offset_samples) = &chunks[i];
         on_step(&format!(
             "transcribing via API (chunk {}/{})",
             i + 1,
             chunks.len()
         ));
         let t = Instant::now();
-        let cues = upload_and_parse(&agent, api_key, api_url, wav, *offset_samples)?;
+        let cues = upload_and_parse(
+            &agent,
+            api_key,
+            api_url,
+            language,
+            chunk_prompt,
+            wav,
+            *offset_samples,
+        )?;
         tracing::info!(
             chunk = i + 1,
             elapsed_ms = t.elapsed().as_millis() as u64,
             cues = cues.len(),
             "chunk transcribed",
         );
+        Ok(cues)
+    })
+}
+
+/// Drive a multi-chunk recognition with continuation prompting.
+/// `recognize` maps `(chunk_index, prompt)` to that chunk's cues; the
+/// prompt is [`continuation_prompt`] over the transcript tail of the last
+/// chunk that produced any cues. A silent chunk keeps the previous tail
+/// alive — one stretch of silence must not wipe the chain and reset the
+/// next chunk to the bare initial prompt.
+///
+/// Cache note: the tail derives from the previous chunk's *output*,
+/// which an endpoint need not reproduce bit-for-bit — and that is fine
+/// for the key. [`transcript_id`] over the initial prompt names the
+/// recipe, not one run of it: the whole SRT is produced under that one
+/// initial conditioning and published atomically, so whichever run lands
+/// is a valid value for its key. No cache-key change is needed here.
+fn recognize_chunked(
+    chunk_count: usize,
+    initial_prompt: &str,
+    mut recognize: impl FnMut(usize, &str) -> Result<Vec<Cue>, Fault>,
+) -> Result<Vec<Cue>, Fault> {
+    let mut all_cues = Vec::new();
+    let mut tail = String::new();
+    for i in 0..chunk_count {
+        let prompt = continuation_prompt(initial_prompt, &tail);
+        let cues = recognize(i, &prompt)?;
+        if !cues.is_empty() {
+            tail = cues
+                .iter()
+                .map(|cue| cue.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
         all_cues.extend(cues);
     }
     Ok(all_cues)
+}
+
+/// Conditioning text for one chunk: the initial prompt first (domain
+/// vocabulary), the previous chunk's transcript tail last — nearest the
+/// audio, where the decoder reads it as the immediately preceding text.
+/// The pair is truncated from the *front* to [`PROMPT_MAX_BYTES`] on a
+/// char boundary, keeping the most recent text: when the tail alone fills
+/// the budget the initial prompt gives way, because for a mid-stream
+/// chunk local continuity (casing, script choice, in-flight vocabulary)
+/// beats global vocabulary — which the tail already carries implicitly,
+/// being output that was itself conditioned on the initial prompt.
+/// With an empty tail (first chunk, or every chunk of single-chunk audio)
+/// this is the initial prompt verbatim.
+fn continuation_prompt(initial: &str, tail: &str) -> String {
+    let combined = match (initial.is_empty(), tail.is_empty()) {
+        (_, true) => return initial.to_string(),
+        (true, false) => tail.to_string(),
+        (false, false) => format!("{initial} {tail}"),
+    };
+    let mut start = combined.len().saturating_sub(PROMPT_MAX_BYTES);
+    while !combined.is_char_boundary(start) {
+        start += 1;
+    }
+    combined[start..].to_string()
 }
 
 /// Split samples into WAV byte buffers, each under `max_bytes`.
@@ -386,20 +525,14 @@ fn encode_wav(samples: &[f32]) -> Vec<u8> {
     buf
 }
 
-/// POST a WAV chunk to the API, parse the verbose-JSON response into cues.
-/// The agent's deadlines ([`api_agent`]) bound the whole exchange —
-/// including the [`read_to_string`](ureq::Body::read_to_string) below —
-/// so a hung endpoint errors out instead of pinning the thread.
-fn upload_and_parse(
-    agent: &ureq::Agent,
-    api_key: &str,
-    api_url: &str,
-    wav: &[u8],
-    offset_samples: usize,
-) -> Result<Vec<Cue>, Fault> {
-    // Build the multipart body manually — ureq 3.x has no built-in
-    // multipart. A boundary derived from the payload's own hash cannot
-    // occur inside it short of a SHA-256 preimage, so no RNG is needed.
+/// The multipart request body for one WAV chunk, plus its boundary.
+/// Built manually — ureq 3.x has no built-in multipart. A boundary derived
+/// from the payload's own hash cannot occur inside it short of a SHA-256
+/// preimage, so no RNG is needed. `language` and `prompt` ride only when
+/// configured: the OpenAI contract auto-detects when `language` is absent
+/// ("auto" is not a valid ISO-639-1 value), and an empty prompt is no
+/// prompt, not a field.
+fn multipart_body(wav: &[u8], language: Option<&str>, prompt: &str) -> (Vec<u8>, String) {
     let boundary = {
         use sha2::{Digest, Sha256};
         let digest = Sha256::digest(wav);
@@ -416,10 +549,30 @@ fn upload_and_parse(
     );
     write_multipart_text(&mut body, &boundary, "model", API_MODEL);
     write_multipart_text(&mut body, &boundary, "response_format", "verbose_json");
-    // No `language` field: the OpenAI contract auto-detects when it is
-    // absent ("auto" is not a valid ISO-639-1 value).
+    if let Some(language) = language {
+        write_multipart_text(&mut body, &boundary, "language", language);
+    }
+    if !prompt.is_empty() {
+        write_multipart_text(&mut body, &boundary, "prompt", prompt);
+    }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (body, boundary)
+}
 
+/// POST a WAV chunk to the API, parse the verbose-JSON response into cues.
+/// The agent's deadlines ([`api_agent`]) bound the whole exchange —
+/// including the [`read_to_string`](ureq::Body::read_to_string) below —
+/// so a hung endpoint errors out instead of pinning the thread.
+fn upload_and_parse(
+    agent: &ureq::Agent,
+    api_key: &str,
+    api_url: &str,
+    language: Option<&str>,
+    prompt: &str,
+    wav: &[u8],
+    offset_samples: usize,
+) -> Result<Vec<Cue>, Fault> {
+    let (body, boundary) = multipart_body(wav, language, prompt);
     let content_type = format!("multipart/form-data; boundary={boundary}");
 
     let response = agent
@@ -524,6 +677,7 @@ fn recognize_local(
     backend: Backend,
     model: &Path,
     samples: &[f32],
+    prompt: &str,
     on_step: &mut dyn FnMut(&str),
 ) -> Result<Vec<Cue>, Fault> {
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
@@ -579,10 +733,16 @@ fn recognize_local(
         );
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_language(Some("auto"));
+        params.set_language(Some(cfg.whisper.language.as_deref().unwrap_or("auto")));
         // Spans are independent; conditioning on prior text re-invites the
-        // repeat loops VAD exists to prevent.
+        // repeat loops VAD exists to prevent. The initial prompt is not
+        // that: `full` re-injects it at the start of every call, so each
+        // span opens with the same vocabulary bias and inherits no
+        // neighbor's decoded text.
         params.set_no_context(true);
+        if !prompt.is_empty() {
+            params.set_initial_prompt(prompt);
+        }
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
@@ -760,7 +920,7 @@ mod tests {
     fn api_transcripts_key_by_endpoint_model() {
         let mut cfg = cfg();
         cfg.whisper.api_key = Some("sk-test".to_string());
-        let id = transcript_id(&cfg);
+        let id = transcript_id(&cfg, "");
         assert_eq!(id, format!("api-{API_MODEL}"));
         assert_ne!(
             id,
@@ -773,7 +933,188 @@ mod tests {
     fn transcript_lookup_falls_back_to_local_model_id() {
         // No route resolves, but a transcript generated before a key was
         // removed should still be findable under the local identity.
-        assert_eq!(transcript_id(&cfg()), cfg().whisper.model.cache_id());
+        assert_eq!(transcript_id(&cfg(), ""), cfg().whisper.model.cache_id());
+    }
+
+    #[test]
+    fn transcript_id_is_stable_for_the_same_conditioning() {
+        let mut cfg = cfg();
+        cfg.whisper.api_key = Some("sk-test".to_string());
+        cfg.whisper.language = Some("zh".to_string());
+        assert_eq!(
+            transcript_id(&cfg, "Rust Ownership."),
+            transcript_id(&cfg, "Rust Ownership."),
+            "same model × language × prompt must be the same cache entry"
+        );
+    }
+
+    #[test]
+    fn transcript_id_changes_with_the_language_hint() {
+        let mut cfg = cfg();
+        cfg.whisper.api_key = Some("sk-test".to_string());
+        let auto = transcript_id(&cfg, "");
+        cfg.whisper.language = Some("zh".to_string());
+        assert_ne!(
+            auto,
+            transcript_id(&cfg, ""),
+            "a language-pinned transcript must not answer for an auto-detected one"
+        );
+    }
+
+    #[test]
+    fn transcript_id_changes_with_the_prompt() {
+        let mut cfg = cfg();
+        cfg.whisper.api_key = Some("sk-test".to_string());
+        let bare = transcript_id(&cfg, "");
+        let a = transcript_id(&cfg, "Rust Ownership.");
+        let b = transcript_id(&cfg, "Kubernetes, etcd.");
+        assert_ne!(bare, a, "conditioned output is a different cache entry");
+        assert_ne!(a, b, "different prompts, different entries");
+        for id in [&a, &b] {
+            assert!(
+                id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "transcript id {id:?} must stay filename-safe"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_prompt_overrides_the_derived_title() {
+        let mut cfg = cfg();
+        cfg.whisper.prompt = Some("Kubernetes, etcd, kubelet.".to_string());
+        assert_eq!(
+            effective_prompt(&cfg, Some("Unrelated Title")),
+            "Kubernetes, etcd, kubelet.",
+            "the operator's knob wins over the derived default"
+        );
+    }
+
+    #[test]
+    fn derives_a_continuation_prompt_from_the_title() {
+        assert_eq!(
+            effective_prompt(&cfg(), Some("  Rust Ownership Explained ")),
+            "Rust Ownership Explained.",
+            "the title becomes a finished sentence, not an instruction"
+        );
+        assert_eq!(
+            effective_prompt(&cfg(), Some("什么是所有权？")),
+            "什么是所有权？",
+            "a title that already ends a sentence stays untouched"
+        );
+    }
+
+    #[test]
+    fn no_prompt_and_no_title_yields_empty_conditioning() {
+        assert_eq!(effective_prompt(&cfg(), None), "");
+        assert_eq!(effective_prompt(&cfg(), Some("   ")), "");
+    }
+
+    #[test]
+    fn truncates_the_prompt_on_a_char_boundary() {
+        let mut cfg = cfg();
+        cfg.whisper.prompt = Some("语".repeat(PROMPT_MAX_BYTES)); // 3 bytes per char
+        let prompt = effective_prompt(&cfg, None);
+        assert!(prompt.len() <= PROMPT_MAX_BYTES, "{}", prompt.len());
+        assert!(!prompt.is_empty());
+        assert!(prompt.chars().all(|c| c == '语'), "prefix survives intact");
+    }
+
+    #[test]
+    fn strips_nul_bytes_before_the_cstring_boundary() {
+        let mut cfg = cfg();
+        cfg.whisper.prompt = Some("a\0b".to_string());
+        assert_eq!(effective_prompt(&cfg, None), "ab");
+    }
+
+    #[test]
+    fn multipart_body_carries_language_and_prompt_when_set() {
+        let (body, _) = multipart_body(b"RIFF", Some("zh"), "Rust Ownership.");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("name=\"language\""), "{text}");
+        assert!(text.contains("zh"), "{text}");
+        assert!(text.contains("name=\"prompt\""), "{text}");
+        assert!(text.contains("Rust Ownership."), "{text}");
+    }
+
+    #[test]
+    fn multipart_body_omits_unset_conditioning() {
+        let (body, _) = multipart_body(b"RIFF", None, "");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("name=\"language\""),
+            "absent language means auto-detect, never a fake value: {text}"
+        );
+        assert!(!text.contains("name=\"prompt\""), "{text}");
+        assert!(text.contains("name=\"model\""), "{text}");
+    }
+
+    #[test]
+    fn hostile_title_cannot_break_multipart_framing() {
+        // A title (and thus a derived prompt) is attacker-influenced text.
+        // The worst case ships CRLF framing, a boundary lookalike, and a
+        // forged field header — all of which must land inert inside the
+        // prompt field's value. This pins the by-construction safety (the
+        // boundary is the WAV payload's SHA-256, unguessable from the
+        // prompt) against a refactor to predictable boundaries.
+        let wav = b"RIFFfake wav payload";
+        let hostile = "benign words\r\n--boundary\r\n\
+                       Content-Disposition: form-data; name=\"model\"\r\n\r\n\
+                       injected-model\r\n";
+        let (body, boundary) = multipart_body(wav, None, hostile);
+        assert!(
+            !hostile.contains(&boundary),
+            "the crafted text cannot contain the payload-hash boundary"
+        );
+
+        // Parse the body the way a server does: split on the real
+        // delimiter, then split each part into header block and value.
+        let text = String::from_utf8_lossy(&body).into_owned();
+        let delim = format!("--{boundary}");
+        let parts: Vec<&str> = text.split(delim.as_str()).collect();
+        assert_eq!(
+            parts.first(),
+            Some(&""),
+            "no preamble before the first boundary"
+        );
+        assert_eq!(parts.last(), Some(&"--\r\n"), "closing delimiter intact");
+        let fields: Vec<(&str, &str)> = parts[1..parts.len() - 1]
+            .iter()
+            .map(|part| {
+                let part = part.strip_prefix("\r\n").expect("CRLF after delimiter");
+                let (headers, value) = part.split_once("\r\n\r\n").expect("header/value split");
+                let name = headers
+                    .split("name=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .expect("a field name in the part header");
+                (
+                    name,
+                    value
+                        .strip_suffix("\r\n")
+                        .expect("CRLF before next delimiter"),
+                )
+            })
+            .collect();
+
+        let names: Vec<&str> = fields.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            ["file", "model", "response_format", "prompt"],
+            "exactly the expected fields, none forged into existence"
+        );
+        let model = fields
+            .iter()
+            .find(|(n, _)| *n == "model")
+            .expect("model field");
+        assert_eq!(model.1, API_MODEL, "the forged model line did not take");
+        let prompt = fields
+            .iter()
+            .find(|(n, _)| *n == "prompt")
+            .expect("prompt field");
+        assert_eq!(
+            prompt.1, hostile,
+            "the hostile text lands whole inside the prompt value"
+        );
     }
 
     #[test]
@@ -782,6 +1123,7 @@ mod tests {
             &cfg(),
             Path::new("/nonexistent.mp4"),
             Path::new("/tmp/out.srt"),
+            "",
             &mut |_| {},
         )
         .expect_err("no route is provisioned");
@@ -896,6 +1238,7 @@ mod tests {
             &cfg,
             Path::new("clip:1.mp4"),
             Path::new("/tmp/out.srt"),
+            "",
             &mut |_| {},
         )
         .expect_err("the file does not exist");
@@ -933,6 +1276,109 @@ mod tests {
     }
 
     #[test]
+    fn second_chunk_carries_the_first_chunks_tail() {
+        let mut prompts = Vec::new();
+        let cues = recognize_chunked(2, "Rust Ownership.", |i, prompt| {
+            prompts.push(prompt.to_string());
+            Ok(vec![
+                Cue {
+                    start_cs: 0,
+                    end_cs: 100,
+                    text: format!("chunk {i} opens"),
+                },
+                Cue {
+                    start_cs: 100,
+                    end_cs: 200,
+                    text: format!("chunk {i} closes"),
+                },
+            ])
+        })
+        .expect("both chunks succeed");
+        assert_eq!(prompts[0], "Rust Ownership.", "first chunk: initial only");
+        assert_eq!(
+            prompts[1], "Rust Ownership. chunk 0 opens chunk 0 closes",
+            "initial first, previous transcript last (nearest the audio)"
+        );
+        assert_eq!(cues.len(), 4, "all cues survive in order");
+    }
+
+    #[test]
+    fn silent_chunk_does_not_erase_the_prompt_chain() {
+        let mut prompts = Vec::new();
+        recognize_chunked(3, "", |i, prompt| {
+            prompts.push(prompt.to_string());
+            Ok(if i == 1 {
+                Vec::new() // silence: the endpoint found nothing to say
+            } else {
+                vec![Cue {
+                    start_cs: 0,
+                    end_cs: 100,
+                    text: format!("speech {i}"),
+                }]
+            })
+        })
+        .expect("all chunks succeed");
+        assert_eq!(prompts[1], "speech 0");
+        assert_eq!(
+            prompts[2], "speech 0",
+            "a silent chunk keeps the last non-empty tail alive"
+        );
+    }
+
+    #[test]
+    fn single_chunk_gets_the_initial_prompt_verbatim() {
+        let mut prompts = Vec::new();
+        recognize_chunked(1, "Rust Ownership.", |_, prompt| {
+            prompts.push(prompt.to_string());
+            Ok(Vec::new())
+        })
+        .expect("the chunk succeeds");
+        assert_eq!(
+            prompts,
+            ["Rust Ownership."],
+            "no tail machinery is visible on single-chunk audio"
+        );
+    }
+
+    #[test]
+    fn truncates_the_tail_from_the_front_on_char_boundaries() {
+        // 3 bytes per char: the byte cut cannot land mid-codepoint.
+        let old = "旧".repeat(400);
+        let recent = "新".repeat(100);
+        let prompt = continuation_prompt("", &format!("{old} {recent}"));
+        assert!(prompt.len() <= PROMPT_MAX_BYTES, "{}", prompt.len());
+        assert!(
+            prompt.ends_with(&recent),
+            "the most recent text survives; the oldest falls off the front"
+        );
+        assert!(
+            prompt.starts_with('旧'),
+            "the cut lands on a char boundary: {:?}",
+            &prompt[..4]
+        );
+    }
+
+    #[test]
+    fn overflowing_tail_evicts_the_initial_prompt() {
+        let tail = "语".repeat(PROMPT_MAX_BYTES); // 3× the budget in bytes
+        let prompt = continuation_prompt("Rust Ownership.", &tail);
+        assert!(prompt.len() <= PROMPT_MAX_BYTES, "{}", prompt.len());
+        assert!(
+            !prompt.contains("Rust"),
+            "mid-stream, local continuity outranks global vocabulary"
+        );
+        assert!(prompt.chars().all(|c| c == '语'));
+    }
+
+    #[test]
+    fn combined_prompt_respects_the_byte_cap() {
+        let initial = "a".repeat(PROMPT_MAX_BYTES); // already at the cap
+        let prompt = continuation_prompt(&initial, "tail text");
+        assert!(prompt.len() <= PROMPT_MAX_BYTES, "{}", prompt.len());
+        assert!(prompt.ends_with("tail text"), "the tail stays whole");
+    }
+
+    #[test]
     fn hung_api_endpoint_errors_within_the_call_ceiling() {
         // A server that accepts, swallows the request, and never answers —
         // the wedged endpoint that used to pin the spawn_blocking thread
@@ -953,8 +1399,16 @@ mod tests {
         );
         let started = Instant::now();
 
-        let err = upload_and_parse(&agent, "sk-test", &format!("http://{addr}/v1"), b"RIFF", 0)
-            .expect_err("a silent endpoint must not pin the call");
+        let err = upload_and_parse(
+            &agent,
+            "sk-test",
+            &format!("http://{addr}/v1"),
+            None,
+            "",
+            b"RIFF",
+            0,
+        )
+        .expect_err("a silent endpoint must not pin the call");
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),

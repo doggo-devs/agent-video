@@ -12,7 +12,7 @@ use rmcp::model::CallToolResult;
 
 use super::deps::{Notifier, ServerDeps};
 use super::handler::resolve_media;
-use super::probe_cache::cached_probe;
+use super::probe_cache::{cached_probe, effective_prompt_for, transcript_id_for};
 use super::wire::{CoreMetadata, failed, json_result, ready_result};
 use crate::fault::{Fault, FaultKind};
 use crate::identity::fingerprint_file;
@@ -47,7 +47,7 @@ pub(super) fn run_invocation(
     let subtitle = invocation.subtitle.clone().or_else(|| {
         let fp = fingerprint_file(media_path).ok()?;
         deps.cache
-            .find_transcript(&fp.id, &transcribe::transcript_id(&deps.config))
+            .find_transcript(&fp.id, &transcript_id_for(&fp.id, deps))
     });
     if let Some(subtitle) = subtitle {
         args.extend([
@@ -144,7 +144,12 @@ pub(super) fn transcribe_flow(
             )));
         }
     };
-    let transcript_id = transcribe::transcript_id(&deps.config);
+    // The conditioning is content-determined (operator knobs × recorded
+    // title), so the transcript identity — and with it the single-flight
+    // key and the cache path — is the same for every caller of this
+    // content.
+    let prompt = effective_prompt_for(&fingerprint, deps);
+    let transcript_id = transcribe::transcript_id(&deps.config, &prompt);
     let mut decoded_seconds: Option<f64> = None;
     {
         // Single-flight per transcript (content × recipe): the cache check
@@ -165,12 +170,12 @@ pub(super) fn transcribe_flow(
             let out = deps.cache.transcript_path(&fingerprint, &transcript_id);
             let mut step = 0.0f64;
             let notify = Arc::clone(notify);
-            let result = deps
-                .whisper
-                .transcribe(&deps.config, &media, &out, &mut |message| {
-                    step += 1.0;
-                    notify(step, None, message.to_string());
-                });
+            let result =
+                deps.whisper
+                    .transcribe(&deps.config, &media, &out, &prompt, &mut |message| {
+                        step += 1.0;
+                        notify(step, None, message.to_string());
+                    });
             match result {
                 Ok(outcome) => decoded_seconds = Some(outcome.audio_seconds),
                 Err(e) => return failed(&e),
@@ -208,6 +213,87 @@ pub(super) fn transcribe_flow(
 #[cfg(test)]
 mod tests {
     use crate::mcp::testutil::{body_of, call, env, media_file, probe};
+
+    /// Run the URL flow up to a cached analysis rip, then transcribe it.
+    fn download_then_transcribe(env: &crate::mcp::testutil::TestEnv, url: &str) {
+        let offer = body_of(&call(env, serde_json::json!({"source": url})));
+        assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let done = body_of(&call(
+            env,
+            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+        ));
+        assert_eq!(done["status"], "plan", "{done}");
+        let after = body_of(&call(
+            env,
+            serde_json::json!({"source": url, "transcribe": true}),
+        ));
+        assert_eq!(after["status"], "plan", "{after}");
+    }
+
+    fn titled_env() -> crate::mcp::testutil::TestEnv {
+        use crate::fetch::SourceInfo;
+        use crate::mcp::testutil::{FakeFetcher, analysis_option, env_with_fetcher};
+        use std::sync::Mutex;
+        env_with_fetcher(
+            probe(3600.0, vec![]),
+            true,
+            FakeFetcher {
+                info: SourceInfo {
+                    headline: "\"Rust Ownership Explained\" — a video.".to_string(),
+                    title: Some("Rust Ownership Explained".to_string()),
+                    options: vec![analysis_option()],
+                },
+                gate: None,
+                warning: None,
+                downloads: Mutex::new(0),
+                finished: Mutex::new(0),
+                last_cancel: Mutex::new(None),
+            },
+        )
+    }
+
+    #[test]
+    fn derived_title_prompt_conditions_url_transcription() {
+        let env = titled_env();
+        download_then_transcribe(&env, "https://example.com/v.mp4");
+        assert_eq!(
+            *env.whisper.prompts.lock().expect("prompts"),
+            ["Rust Ownership Explained."],
+            "the recorded title, shaped as continuation text, primes whisper"
+        );
+    }
+
+    #[test]
+    fn operator_prompt_wins_over_the_derived_title() {
+        let mut env = titled_env();
+        std::sync::Arc::get_mut(&mut env.deps)
+            .expect("sole owner before threads spawn")
+            .config
+            .whisper
+            .prompt = Some("Kubernetes, etcd, kubelet.".to_string());
+        download_then_transcribe(&env, "https://example.com/v.mp4");
+        assert_eq!(
+            *env.whisper.prompts.lock().expect("prompts"),
+            ["Kubernetes, etcd, kubelet."],
+            "whisper.prompt overrides the derived default"
+        );
+    }
+
+    #[test]
+    fn local_media_transcribes_without_a_derived_prompt() {
+        let env = env(probe(3600.0, vec![]), true);
+        let file = media_file(&env, "talk.mp4");
+        let after = body_of(&call(
+            &env,
+            serde_json::json!({"source": file.to_string_lossy(), "transcribe": true}),
+        ));
+        assert_eq!(after["status"], "plan", "{after}");
+        assert_eq!(
+            *env.whisper.prompts.lock().expect("prompts"),
+            [""],
+            "a filename is noise, not vocabulary — no conditioning for local files"
+        );
+    }
 
     #[test]
     fn concurrent_transcribes_run_whisper_once() {

@@ -101,6 +101,24 @@ impl fmt::Display for UrlRejection {
 
 impl std::error::Error for UrlRejection {}
 
+/// The one mapping from egress verdicts into harness fault classes: a
+/// malformed or forbidden URL is the caller's ([`Fault::bad_input`] —
+/// retrying the identical call cannot succeed), but a name that failed to
+/// resolve may be a resolver outage or a network blip, so it is
+/// [`Fault::transient`]. The typed rejection survives in the source chain.
+impl From<UrlRejection> for crate::fault::Fault {
+    fn from(rejection: UrlRejection) -> Self {
+        use crate::fault::Fault;
+        let fault = match &rejection {
+            UrlRejection::NotFetchable { .. } | UrlRejection::ForbiddenAddress { .. } => {
+                Fault::bad_input(rejection.to_string())
+            }
+            UrlRejection::DnsFailure { .. } => Fault::transient(rejection.to_string()),
+        };
+        fault.with_source(rejection)
+    }
+}
+
 /// Why [`screen`] refused a host: a resolvable name whose addresses fail
 /// the policy, or a name that would not resolve. [`vet`] and the relay map
 /// this to their own model-facing errors.
@@ -351,6 +369,34 @@ mod tests {
 
     fn rejection(url: &str) -> UrlRejection {
         vet(url, &cfg()).expect_err("must be refused")
+    }
+
+    #[test]
+    fn classifies_dns_failure_as_transient() {
+        let fault = crate::fault::Fault::from(UrlRejection::DnsFailure {
+            host: "cdn.example.com".to_string(),
+            detail: "resolver timed out".to_string(),
+        });
+        assert_eq!(fault.kind, crate::fault::FaultKind::Transient);
+        assert!(fault.message.contains("cdn.example.com"), "{fault}");
+    }
+
+    #[test]
+    fn classifies_forbidden_address_as_bad_input() {
+        let fault = crate::fault::Fault::from(UrlRejection::ForbiddenAddress {
+            host: "internal".to_string(),
+            ip: "10.0.0.1".parse().expect("literal"),
+            range: "a private (RFC 1918) range",
+        });
+        assert_eq!(fault.kind, crate::fault::FaultKind::BadInput);
+    }
+
+    #[test]
+    fn classifies_unfetchable_url_as_bad_input() {
+        let fault = crate::fault::Fault::from(UrlRejection::NotFetchable {
+            detail: "no host".to_string(),
+        });
+        assert_eq!(fault.kind, crate::fault::FaultKind::BadInput);
     }
 
     #[test]

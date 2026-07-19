@@ -119,6 +119,33 @@ scoring weights, timing, subtitles).
 3. **Lay out & compose** — frames are packed into a grid within the pixel budget,
    with key frames given larger cells, then rendered to JPEG.
 
+## Benchmarking transcription
+
+A manual benchmark (never run in CI) measures whether whisper conditioning —
+the `--prompt` continuation text and the `--language` hint — improves
+transcription quality on real media. It transcribes the same file under a
+2×2 conditioning matrix and reports CER (character error rate, Levenshtein
+over cue text with whitespace/punctuation stripped) against a human
+reference SRT:
+
+```bash
+cargo run -p agent-video-harness --example bench_transcribe \
+    --features whisper-vulkan --release -- \
+    <media> <reference.srt> [--prompt "..."] [--language zh]
+```
+
+With no arguments it uses `test2.mp4` / `test2.zh.srt` at the repo root
+(Chinese speech, hence the `zh` default). It needs a provisioned route:
+a local model (`agent-video install-whisper` + a GPU feature) or
+`WHISPER_API_KEY`. Each row writes to a throwaway temp directory — the
+real transcript cache is never touched.
+
+**Leakage caveat:** never feed text from the reference SRT into `--prompt`.
+The prompt must be knowledge an operator has *without* the ground truth —
+a video title, domain vocabulary — or the numbers flatter conditioning it
+cannot earn on unseen media. When `--prompt` is absent the prompt rows are
+skipped rather than derived from the reference, for exactly this reason.
+
 ## License
 
 Apache-2.0. The embedded timestamp font (Liberation Sans Bold) is licensed under

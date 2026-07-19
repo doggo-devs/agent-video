@@ -91,15 +91,19 @@ impl<T: Whisper> Whisper for Arc<T> {
         cfg: &Config,
         file: &Path,
         out_srt: &Path,
+        prompt: &str,
         on_step: &mut dyn FnMut(&str),
     ) -> Result<crate::transcribe::Transcribed, Fault> {
-        (**self).transcribe(cfg, file, out_srt, on_step)
+        (**self).transcribe(cfg, file, out_srt, prompt, on_step)
     }
 }
 
 pub(crate) struct FakeWhisper {
     available: bool,
     pub(crate) calls: Mutex<u32>,
+    /// The effective conditioning text of every `transcribe` call, in
+    /// order, so tests can pin what whisper was primed with.
+    pub(crate) prompts: Mutex<Vec<String>>,
     /// Decoded-audio seconds the fake reports; `INFINITY` = "covers
     /// everything", so only truncation tests set a finite value.
     pub(crate) audio_seconds: Mutex<f64>,
@@ -119,9 +123,14 @@ impl Whisper for FakeWhisper {
         _cfg: &Config,
         _file: &Path,
         out_srt: &Path,
+        prompt: &str,
         on_step: &mut dyn FnMut(&str),
     ) -> Result<crate::transcribe::Transcribed, Fault> {
         *self.calls.lock().expect("calls") += 1;
+        self.prompts
+            .lock()
+            .expect("prompts")
+            .push(prompt.to_string());
         if let Some((entered, release)) = &*self.gate.lock().expect("whisper gate") {
             let _ = entered.send(());
             let _ = release.recv();
@@ -255,6 +264,7 @@ pub(crate) fn env(probe_summary: ProbeSummary, whisper_available: bool) -> TestE
         FakeFetcher {
             info: SourceInfo {
                 headline: "A video.".to_string(),
+                title: None,
                 options: vec![analysis_option()],
             },
             gate: None,
@@ -285,6 +295,7 @@ pub(crate) fn env_with_fetcher(
     let whisper = Arc::new(FakeWhisper {
         available: whisper_available,
         calls: Mutex::new(0),
+        prompts: Mutex::new(Vec::new()),
         audio_seconds: Mutex::new(f64::INFINITY),
         gate: Mutex::new(None),
     });

@@ -553,6 +553,7 @@ mod tests {
             FakeFetcher {
                 info: SourceInfo {
                     headline: "A video.".to_string(),
+                    title: None,
                     options: vec![analysis_option()],
                 },
                 gate: None,
@@ -623,6 +624,7 @@ mod tests {
             FakeFetcher {
                 info: SourceInfo {
                     headline: "A video.".to_string(),
+                    title: None,
                     options: vec![analysis_option()],
                 },
                 gate: Some(Mutex::new(gate)),
@@ -681,6 +683,7 @@ mod tests {
             FakeFetcher {
                 info: SourceInfo {
                     headline: "A video.".to_string(),
+                    title: None,
                     options: vec![analysis_option()],
                 },
                 gate: Some(Mutex::new(gate)),
@@ -839,6 +842,7 @@ mod tests {
             FakeFetcher {
                 info: SourceInfo {
                     headline: "A video.".to_string(),
+                    title: None,
                     options,
                 },
                 gate: Some(Mutex::new(gate)),

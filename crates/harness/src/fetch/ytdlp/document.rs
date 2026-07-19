@@ -272,6 +272,7 @@ pub fn site_source_info(info: &SiteUrlInfo, cfg: &Config) -> SourceInfo {
             "\"{}\" — {duration}, {subs}. Nothing is downloaded yet.",
             info.title
         ),
+        title: Some(info.title.clone()),
         options,
     }
 }

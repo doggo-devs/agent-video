@@ -47,11 +47,15 @@ pub trait UrlFetcher: Send + Sync {
 /// Transcription capability; absence degrades to an install hint.
 pub trait Whisper: Send + Sync {
     fn available(&self, cfg: &Config) -> bool;
+    /// `prompt` is the effective conditioning text
+    /// ([`transcribe::effective_prompt`]); the caller keys `out_srt` by
+    /// [`transcribe::transcript_id`] over the same text.
     fn transcribe(
         &self,
         cfg: &Config,
         file: &Path,
         out_srt: &Path,
+        prompt: &str,
         on_step: &mut dyn FnMut(&str),
     ) -> Result<transcribe::Transcribed, Fault>;
 }
@@ -68,8 +72,9 @@ struct RealFetcher;
 
 impl UrlFetcher for RealFetcher {
     fn probe_url(&self, url: &str, cfg: &Config, relay: &PolicyRelay) -> Result<SourceInfo, Fault> {
-        // A netguard rejection is a verdict on the URL, not on the network.
-        let vetted = crate::netguard::vet(url, cfg).map_err(|e| Fault::bad_input(e.to_string()))?;
+        // The rejection carries its own fault class: a bad or forbidden URL
+        // is the caller's, a resolution failure may be the network's.
+        let vetted = crate::netguard::vet(url, cfg)?;
         fetch::probe_url(&vetted, cfg, relay)
     }
 
@@ -84,8 +89,7 @@ impl UrlFetcher for RealFetcher {
     ) -> Result<Downloaded, Fault> {
         // Re-vet at execution time: consent may be redeemed long after the
         // probe, and DNS may have moved underneath the plan.
-        let vetted =
-            crate::netguard::vet(&plan.url, cfg).map_err(|e| Fault::bad_input(e.to_string()))?;
+        let vetted = crate::netguard::vet(&plan.url, cfg)?;
         fetch::download(&vetted, plan, io, cfg, relay, cancel, progress)
     }
 }
@@ -102,9 +106,10 @@ impl Whisper for RealWhisper {
         cfg: &Config,
         file: &Path,
         out_srt: &Path,
+        prompt: &str,
         on_step: &mut dyn FnMut(&str),
     ) -> Result<transcribe::Transcribed, Fault> {
-        transcribe::transcribe(cfg, file, out_srt, on_step)
+        transcribe::transcribe(cfg, file, out_srt, prompt, on_step)
     }
 }
 

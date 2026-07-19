@@ -49,6 +49,7 @@ pub fn decide_url(args: &VideoArgs, info: &SourceInfo, cfg: &Config) -> Decision
                 dest: opt.dest,
                 recipe: opt.recipe.clone(),
                 estimated_bytes: opt.estimated_bytes,
+                title: info.title.clone(),
             }),
         });
     }
@@ -125,6 +126,7 @@ mod tests {
     fn info(options: Vec<DownloadOption>) -> SourceInfo {
         SourceInfo {
             headline: "A video.".to_string(),
+            title: None,
             options,
         }
     }
