@@ -35,12 +35,12 @@ pub(super) fn run_invocation(
         invocation.subcommand.as_str().to_string(),
         media_path.to_string_lossy().into_owned(),
     ];
-    if let Some((start, end)) = invocation.window {
+    if let Some(window) = invocation.window {
         args.extend([
             "--from".to_string(),
-            start.to_string(),
+            window.start().to_string(),
             "--until".to_string(),
-            end.to_string(),
+            window.end().to_string(),
         ]);
     }
     // Explicit pick, else a cached whisper transcript.
@@ -158,10 +158,21 @@ pub(super) fn transcribe_flow(
         // takes the cache hit instead of running the model — and paying
         // the GPU load or the API bill — a second time. Blocking is this
         // flow's own shape: the winner's caller waits out the whole
-        // inference anyway.
-        let _admitted = deps
-            .transcriptions
-            .admit(&format!("{fingerprint}.{transcript_id}"));
+        // inference anyway. The wait is per-waiter bounded, though: the
+        // winner's legitimate wall clock compounds per chunk (hours for a
+        // long track), and every waiter pins a `spawn_blocking` thread, so
+        // a rival that outwaits its own bound answers "in flight" instead
+        // of inheriting the winner's whole account.
+        let Some(_admitted) = deps.transcriptions.admit_within(
+            &format!("{fingerprint}.{transcript_id}"),
+            deps.transcribe_wait,
+        ) else {
+            return failed(&Fault::transient(
+                "a transcription of this content is already in flight; it lands in the shared \
+                 cache when it finishes — call again with transcribe to adopt it (or to wait \
+                 again)",
+            ));
+        };
         if deps
             .cache
             .find_transcript(&fingerprint, &transcript_id)
@@ -212,15 +223,16 @@ pub(super) fn transcribe_flow(
 
 #[cfg(test)]
 mod tests {
-    use crate::mcp::testutil::{body_of, call, env, media_file, probe};
+    use crate::mcp::testutil::{body_of, call, env, media_file, offered_tokens, probe};
 
     /// Run the URL flow up to a cached analysis rip, then transcribe it.
     fn download_then_transcribe(env: &crate::mcp::testutil::TestEnv, url: &str) {
         let offer = body_of(&call(env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let token = offered_tokens(&offer).remove(0);
         let done = body_of(&call(
             env,
-            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+            serde_json::json!({"source": url, "confirm": token}),
         ));
         assert_eq!(done["status"], "plan", "{done}");
         let after = body_of(&call(
@@ -341,6 +353,50 @@ mod tests {
                 "{name}: {body}"
             );
         }
+    }
+
+    #[test]
+    fn rival_outwaiting_the_bound_reports_in_flight() {
+        use std::sync::mpsc;
+        let mut env = env(probe(3600.0, vec![]), true);
+        std::sync::Arc::get_mut(&mut env.deps)
+            .expect("sole owner before threads spawn")
+            .transcribe_wait = std::time::Duration::from_millis(50);
+        let file = media_file(&env, "talk.mp4");
+        let request = serde_json::json!({
+            "source": file.to_string_lossy(),
+            "transcribe": true,
+        });
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *env.whisper.gate.lock().expect("whisper gate") = Some((entered_tx, release_rx));
+
+        std::thread::scope(|s| {
+            let winner = s.spawn(|| call(&env, request.clone()));
+            entered_rx
+                .recv()
+                .expect("the first request reached whisper");
+            // The winner is wedged inside whisper; the rival must give up
+            // at its own bound instead of riding out the winner's wall
+            // clock on a pinned thread.
+            let rival = body_of(&call(&env, request.clone()));
+            assert_eq!(rival["kind"], "transient", "{rival}");
+            assert!(
+                rival["error"]
+                    .as_str()
+                    .expect("error text")
+                    .contains("in flight"),
+                "{rival}"
+            );
+            release_tx.send(()).expect("release the winner");
+            let winner = body_of(&winner.join().expect("winner completes"));
+            assert_eq!(winner["status"], "plan", "the winner is unaffected");
+        });
+        assert_eq!(
+            *env.whisper.calls.lock().expect("calls"),
+            1,
+            "the refused rival never started a second whisper run"
+        );
     }
 
     #[test]

@@ -18,14 +18,76 @@ use crate::types::{CanvasSpec, Detail, Quality};
 /// Default dedup sliding window, in kept frames.
 const DEFAULT_DEDUP_WINDOW: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
+/// Default pHash Hamming distance threshold for dedup: distances at or below
+/// it mean "same shot". 8 of 64 bits catches compression jitter and slow
+/// drift without merging genuinely distinct frames.
+const DEFAULT_HASH_THRESHOLD: u32 = 8;
+
+/// Default quality tier when neither `--quality` nor a profile sets one.
+const DEFAULT_QUALITY: Quality = Quality::Low;
+
+/// Default detail tier when neither `--detail` nor a profile sets one.
+const DEFAULT_DETAIL: Detail = Detail::Standard;
+
 /// Default chunk length in seconds when neither `--chunk-seconds` nor a
 /// profile provides one.
 pub const DEFAULT_CHUNK_SECONDS: f32 = 60.0;
+
+/// Default minimum temporal gap (seconds) between selected frames — the
+/// floor under the span-derived gap `process_chunk` computes per chunk.
+const DEFAULT_MIN_GAP: f32 = 0.5;
+
+/// Default shorter edge (px) of the grayscale image scoring convolutions
+/// run on: small enough to keep the hottest CPU stage cheap, large enough
+/// that Laplacian/Sobel statistics stay stable.
+const DEFAULT_SCORE_EDGE: u32 = 256;
+
+/// Default scoring weights (scene, clarity, edge). Clarity defaults to 0: it
+/// double-counts the texture Sobel edge energy already measures. Available
+/// as an override knob.
+const DEFAULT_W_SCENE: f32 = 0.60;
+const DEFAULT_W_CLARITY: f32 = 0.0;
+const DEFAULT_W_EDGE: f32 = 0.40;
+
+/// Default JPEG output quality: high enough that grid text stays legible
+/// after the cells' downscale, without the size cliff past ~95.
+const DEFAULT_JPEG_QUALITY: u8 = 92;
+
+/// Default hero frame border thickness in pixels.
+const DEFAULT_HERO_BORDER_PX: u32 = 4;
 
 /// Default cap on hero frames per grid. A hero occupies ~4 cells, so three
 /// heroes already claim most of a typical grid's emphasis budget; the
 /// effective cap is further bounded by `capacity / 4` at the call site.
 const DEFAULT_MAX_HEROES: usize = 3;
+
+/// `extract` samples at this multiple of the detail tier's fps: the
+/// subcommand exists for high-density passes over short ranges. An explicit
+/// `--base-fps` bypasses the factor so the flag means the same density in
+/// both subcommands.
+const EXTRACT_FPS_FACTOR: f32 = 3.0;
+
+/// Minimum readable cell edge (px) per quality tier. Quality trades per-cell
+/// size for grid capacity at a fixed canvas edge, not output size; extraction
+/// pre-scales frames to this floor, so cells render 1:1.
+const fn quality_cell_edge(quality: Quality) -> u32 {
+    match quality {
+        Quality::Low => 256,
+        Quality::Medium => 384,
+        Quality::High => 512,
+    }
+}
+
+/// Sampling fps per detail tier. Detail drives sampling density only; dedup
+/// stays detail-independent so fine mode doesn't merge the subtle diffs it
+/// exists to catch.
+const fn detail_fps(detail: Detail) -> f32 {
+    match detail {
+        Detail::Coarse => 0.5,
+        Detail::Standard => 1.0,
+        Detail::Fine => 3.0,
+    }
+}
 
 /// Reject a resolved value that would corrupt scoring or sampling arithmetic,
 /// naming the offending field and value.
@@ -157,10 +219,10 @@ impl Default for StrategyOpts {
 #[derive(Debug, Clone, Copy)]
 struct Sampling {
     base_fps: f32,
-    /// Sampling fps for the `extract` subcommand. Defaults to three times the
-    /// detail tier's fps (extract exists for high-density passes over short
-    /// ranges), but an explicit `--base-fps` or profile value wins as-is, so
-    /// the flag means the same density in both subcommands.
+    /// Sampling fps for the `extract` subcommand. Defaults to the detail
+    /// tier's fps × [`EXTRACT_FPS_FACTOR`], but an explicit `--base-fps` or
+    /// profile value wins as-is, so the flag means the same density in both
+    /// subcommands.
     extract_fps: f32,
     chunk_seconds: f32,
     min_gap: f32,
@@ -358,20 +420,81 @@ pub struct Config {
     detail: Detail,
 }
 
+/// A named tuning profile: a partial parameter set one priority level
+/// below CLI overrides. The enum is the profile's identity everywhere —
+/// CLI flag values, chunk-length prediction, override resolution — so an
+/// unknown name can only exist as a parse error, never as a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    Balanced,
+    Fast,
+    Quality,
+    Action,
+}
+
+impl Profile {
+    /// Variant count, witnessed by an exhaustive match: adding a profile
+    /// fails to compile here until it is counted, and [`Profile::ALL`]'s
+    /// array type then refuses to build until the new variant joins it.
+    const COUNT: usize = match Profile::Balanced {
+        Profile::Balanced | Profile::Fast | Profile::Quality | Profile::Action => 4,
+    };
+
+    /// Every profile, in the order help text and error messages list them.
+    pub const ALL: [Profile; Self::COUNT] = [
+        Profile::Balanced,
+        Profile::Fast,
+        Profile::Quality,
+        Profile::Action,
+    ];
+
+    /// The one CLI spelling of this profile (`--profile <name>`).
+    pub const fn cli_name(self) -> &'static str {
+        match self {
+            Profile::Balanced => "balanced",
+            Profile::Fast => "fast",
+            Profile::Quality => "quality",
+            Profile::Action => "action",
+        }
+    }
+}
+
+/// Parse a CLI spelling; an unknown name is an [`ErrorCode::InvalidProfile`]
+/// error listing the valid options (derived from [`Profile::ALL`]).
+impl std::str::FromStr for Profile {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Profile::ALL
+            .into_iter()
+            .find(|p| p.cli_name() == s)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::InvalidProfile,
+                    format!(
+                        "unknown profile '{s}'; available: {}",
+                        Profile::ALL.map(Profile::cli_name).join(", ")
+                    ),
+                )
+            })
+    }
+}
+
 /// Named profiles are partial parameter sets — the same shape as CLI
-/// overrides, one priority level below them.
-fn builtin_profile(name: &str) -> Option<Overrides> {
-    Some(match name {
-        "balanced" => Overrides::default(),
+/// overrides, one priority level below them. Total: every [`Profile`] has
+/// a parameter set, so "unknown profile" cannot reach this table.
+fn builtin_profile(profile: Profile) -> Overrides {
+    match profile {
+        Profile::Balanced => Overrides::default(),
         // Coarse tier (not raw base_fps) so extract keeps its 3x-densify semantics.
-        "fast" => Overrides {
+        Profile::Fast => Overrides {
             detail: Some(Detail::Coarse),
             chunk_seconds: Some(90.0),
             min_gap: Some(1.0),
             jpeg_quality: Some(85),
             ..Default::default()
         },
-        "quality" => Overrides {
+        Profile::Quality => Overrides {
             quality: Some(Quality::High),
             chunk_seconds: Some(45.0),
             min_gap: Some(0.3),
@@ -380,7 +503,7 @@ fn builtin_profile(name: &str) -> Option<Overrides> {
         },
         // Fine tier to catch fast cuts; hero threshold at the bottom of the
         // calibrated cut/motion overlap (~67..=70) to flag softer cuts.
-        "action" => Overrides {
+        Profile::Action => Overrides {
             detail: Some(Detail::Fine),
             w_scene: Some(0.75),
             w_edge: Some(0.25),
@@ -388,8 +511,7 @@ fn builtin_profile(name: &str) -> Option<Overrides> {
             hero_scene_diff: Some(65.0),
             ..Default::default()
         },
-        _ => return None,
-    })
+    }
 }
 
 /// The chunk length (seconds) a run with `--profile <name>` resolves to,
@@ -398,11 +520,10 @@ fn builtin_profile(name: &str) -> Option<Overrides> {
 /// Routed through the same profile table [`Config::new`] resolves against,
 /// so consumers predicting grid counts (the harness budget gate divides the
 /// covered span by this value) cannot drift from what a run will actually
-/// do. An unknown name resolves to the default — `Config::new` is where it
-/// becomes an error.
-pub fn default_chunk_seconds(profile: Option<&str>) -> f32 {
+/// do.
+pub fn default_chunk_seconds(profile: Option<Profile>) -> f32 {
     profile
-        .and_then(builtin_profile)
+        .map(builtin_profile)
         .and_then(|p| p.chunk_seconds)
         .unwrap_or(DEFAULT_CHUNK_SECONDS)
 }
@@ -415,24 +536,11 @@ impl Config {
     /// floor) then serve as defaults for the finer per-field knobs.
     pub fn new(
         max_edge: u32,
-        profile: Option<&str>,
+        profile: Option<Profile>,
         cli: &Overrides,
         strategy_opts: StrategyOpts,
     ) -> crate::error::Result<Self> {
-        let prof = match profile {
-            Some(name) => match builtin_profile(name) {
-                Some(p) => Some(p),
-                None => {
-                    return Err(Error::new(
-                        ErrorCode::InvalidProfile,
-                        format!(
-                            "unknown profile '{name}'; available: balanced, fast, quality, action"
-                        ),
-                    ));
-                }
-            },
-            None => None,
-        };
+        let prof = profile.map(builtin_profile);
 
         macro_rules! resolve {
             ($field:ident, $default:expr) => {
@@ -442,46 +550,32 @@ impl Config {
             };
         }
 
-        let quality = resolve!(quality, Quality::Low);
-        let detail = resolve!(detail, Detail::Standard);
-
-        // Quality trades per-cell size for grid capacity at a fixed canvas edge,
-        // not output size; extraction pre-scales to this floor (cells render 1:1).
-        let min_frame_size = match quality {
-            Quality::Low => 256,
-            Quality::Medium => 384,
-            Quality::High => 512,
-        };
-
-        // Detail drives sampling density only; dedup stays detail-independent so
-        // fine mode doesn't merge the subtle diffs it exists to catch.
-        let detail_fps = match detail {
-            Detail::Coarse => 0.5,
-            Detail::Standard => 1.0,
-            Detail::Fine => 3.0,
-        };
+        let quality = resolve!(quality, DEFAULT_QUALITY);
+        let detail = resolve!(detail, DEFAULT_DETAIL);
+        let tier_fps = detail_fps(detail);
 
         Ok(Self {
-            canvas: CanvasSpec::new(max_edge, min_frame_size)?,
+            canvas: CanvasSpec::new(max_edge, quality_cell_edge(quality))?,
             sampling: Sampling::new(
-                resolve!(base_fps, detail_fps),
-                resolve!(base_fps, detail_fps * 3.0),
+                resolve!(base_fps, tier_fps),
+                resolve!(base_fps, tier_fps * EXTRACT_FPS_FACTOR),
                 resolve!(chunk_seconds, DEFAULT_CHUNK_SECONDS),
-                resolve!(min_gap, 0.5),
-                resolve!(score_edge, 256),
+                resolve!(min_gap, DEFAULT_MIN_GAP),
+                resolve!(score_edge, DEFAULT_SCORE_EDGE),
             )?,
             dedup: DedupCfg::new(
-                resolve!(hash_threshold, 8),
+                resolve!(hash_threshold, DEFAULT_HASH_THRESHOLD),
                 resolve!(dedup_window, DEFAULT_DEDUP_WINDOW),
             )?,
-            // Clarity defaults to 0: it double-counts the texture Sobel edge
-            // energy already measures. Available as an override knob.
             weights: Weights::new(
-                resolve!(w_scene, 0.60),
-                resolve!(w_clarity, 0.0),
-                resolve!(w_edge, 0.40),
+                resolve!(w_scene, DEFAULT_W_SCENE),
+                resolve!(w_clarity, DEFAULT_W_CLARITY),
+                resolve!(w_edge, DEFAULT_W_EDGE),
             )?,
-            render: RenderCfg::new(resolve!(jpeg_quality, 92), resolve!(hero_border_px, 4))?,
+            render: RenderCfg::new(
+                resolve!(jpeg_quality, DEFAULT_JPEG_QUALITY),
+                resolve!(hero_border_px, DEFAULT_HERO_BORDER_PX),
+            )?,
             hero: HeroCfg::new(
                 resolve!(hero_scene_diff, crate::score::DEFAULT_HERO_SCENE_DIFF),
                 resolve!(max_heroes, DEFAULT_MAX_HEROES),
@@ -735,8 +829,8 @@ mod tests {
             hero_scene_diff: Some(80.0),
             ..Default::default()
         };
-        let cfg =
-            Config::new(2000, Some("action"), &ov, StrategyOpts::default()).expect("config builds");
+        let cfg = Config::new(2000, Some(Profile::Action), &ov, StrategyOpts::default())
+            .expect("config builds");
         assert_eq!(cfg.hero_scene_diff(), 80.0, "CLI outranks the profile");
         assert_eq!(
             cfg.base_fps(),
@@ -749,7 +843,7 @@ mod tests {
     fn profile_sets_tiers() {
         let cfg = Config::new(
             2000,
-            Some("quality"),
+            Some(Profile::Quality),
             &Overrides::default(),
             StrategyOpts::default(),
         )
@@ -758,7 +852,7 @@ mod tests {
 
         let cfg = Config::new(
             2000,
-            Some("fast"),
+            Some(Profile::Fast),
             &Overrides::default(),
             StrategyOpts::default(),
         )
@@ -777,7 +871,7 @@ mod tests {
             quality: Some(Quality::Low),
             ..Default::default()
         };
-        let cfg = Config::new(2000, Some("quality"), &ov, StrategyOpts::default())
+        let cfg = Config::new(2000, Some(Profile::Quality), &ov, StrategyOpts::default())
             .expect("config builds");
         assert_eq!(cfg.min_frame_size(), 256, "explicit --quality low wins");
         assert_eq!(cfg.jpeg_quality(), 95, "other profile fields still apply");
@@ -785,13 +879,7 @@ mod tests {
 
     #[test]
     fn default_chunk_seconds_matches_every_profile_resolution() {
-        for profile in [
-            None,
-            Some("balanced"),
-            Some("fast"),
-            Some("quality"),
-            Some("action"),
-        ] {
+        for profile in std::iter::once(None).chain(Profile::ALL.into_iter().map(Some)) {
             let cfg = Config::new(
                 2000,
                 profile,
@@ -805,6 +893,26 @@ mod tests {
                 "profile {profile:?} prediction drifted from resolution"
             );
         }
+    }
+
+    #[test]
+    fn parses_every_cli_name_back_to_its_profile() {
+        for profile in Profile::ALL {
+            assert_eq!(
+                profile.cli_name().parse::<Profile>().expect("round-trips"),
+                profile
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_profile_name_listing_the_options() {
+        let err = "cinematic"
+            .parse::<Profile>()
+            .expect_err("unknown profile rejected");
+        assert_eq!(err.code, ErrorCode::InvalidProfile);
+        let listed = Profile::ALL.map(Profile::cli_name).join(", ");
+        assert!(err.to_string().contains(&listed), "{err}");
     }
 
     #[test]

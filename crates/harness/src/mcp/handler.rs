@@ -26,7 +26,7 @@ use crate::plan::{Decision, PlanDecision, decide, redeem};
 use crate::schema::OfferedToken;
 use crate::schema::{Intent, RecommendedCall, VideoArgs, VideoBody};
 use crate::time::ArgError;
-use crate::tokens::Dest;
+use crate::tokens::{Dest, OfferDraft};
 use crate::url_policy::decide_url;
 
 // ── tool handler ──
@@ -65,7 +65,7 @@ pub fn handle_video_call(
         // runs converges inside `execute_download` (same slot, one writer).
         Ok(Intent::Confirm(_)) => {
             let decision = redeem(&args, &deps.tokens);
-            return render_decision(&args, decision, None, Vec::new(), deps, notify);
+            return execute_decision(&args, decision, None, Vec::new(), deps, notify);
         }
         // Transcription is an explicit request, not a consent dance: the
         // argument itself is the intent.
@@ -134,7 +134,7 @@ fn local_flow(
     if let Decision::Plan(plan) = &mut decision {
         offer_transcription(&args.source, plan, deps);
     }
-    render_decision(
+    execute_decision(
         args,
         decision,
         Some(media_path.to_path_buf()),
@@ -183,11 +183,15 @@ fn url_first_contact(
         Err(e) => return failed(&e),
     };
     let decision = decide_url(args, &info, &deps.config);
-    render_decision(args, decision, None, Vec::new(), deps, notify)
+    execute_decision(args, decision, None, Vec::new(), deps, notify)
 }
 
-/// Turn a policy decision into the wire result, executing side effects.
-fn render_decision(
+/// Carry out a policy decision. Pure decisions (plan, reject) render
+/// directly; effectful ones execute through their named executors —
+/// committing consent offers, starting downloads, running core — and
+/// render the outcome. One dispatch, so a new [`Decision`] variant does
+/// not compile until it names where its execution lives.
+fn execute_decision(
     args: &VideoArgs,
     decision: Decision,
     media_path: Option<PathBuf>,
@@ -207,53 +211,77 @@ fn render_decision(
         Decision::Confirm {
             consequence,
             offers,
-        } => {
-            // Commit here so "the model saw it" and "it is redeemable" are
-            // the same event, from the same offers.
-            let tokens: Vec<OfferedToken> = offers
-                .iter()
-                .map(|o| OfferedToken {
-                    token: o.token.as_str().to_string(),
-                    effect: o.effect.clone(),
-                })
-                .collect();
-            deps.tokens.commit(&args.source, offers);
-            json_result(&VideoBody::ConfirmRequired {
-                consequence,
-                tokens,
-            })
-        }
+        } => commit_offers(&args.source, consequence, offers, deps),
         Decision::Run {
             invocation,
             notices,
         } => {
-            let resolved = media_path.or_else(|| resolve_media(&args.source, deps));
-            let Some(resolved) = resolved else {
-                return failed(&Fault::transient(
-                    "the cached rip for this URL is gone (evicted). Call again with just the \
-                     URL to re-download.",
-                ));
-            };
             let mut all = extra_notices;
             all.extend(notices);
-            run_invocation(&resolved, &invocation, &all, deps)
+            run_core(&args.source, &invocation, all, media_path, deps)
         }
         Decision::Download { plan, token, .. } => {
             execute_download(&args.source, plan, token, deps, notify)
         }
-        // A keep token echoed after its download completed: replay the
-        // receipt instead of ripping a duplicate into the keep dir.
-        Decision::Saved { path } => {
-            if path.exists() {
-                keep_response(&path, None, deps)
-            } else {
-                failed(&Fault::bad_input(format!(
-                    "this download already completed and was saved to {}, but the file has \
-                     since been moved or removed. Call again without confirm for a fresh plan.",
-                    path.display()
-                )))
-            }
-        }
+        Decision::Saved { path } => replay_saved(&path, deps),
+    }
+}
+
+/// Commit a decision's consent offers and render the confirm body.
+/// Committing here makes "the model saw it" and "it is redeemable" the
+/// same event: the registry mints the tokens, and the wire body renders
+/// exactly the offers it returned.
+fn commit_offers(
+    source: &str,
+    consequence: String,
+    offers: Vec<OfferDraft>,
+    deps: &ServerDeps,
+) -> CallToolResult {
+    let tokens: Vec<OfferedToken> = deps
+        .tokens
+        .commit(source, offers)
+        .into_iter()
+        .map(|o| OfferedToken {
+            token: o.token.as_str().to_string(),
+            effect: o.effect,
+        })
+        .collect();
+    json_result(&VideoBody::ConfirmRequired {
+        consequence,
+        tokens,
+    })
+}
+
+/// Run a decided core invocation against the media the source resolves to
+/// (the caller's probed path when it has one, else the URL's cached rip).
+fn run_core(
+    source: &str,
+    invocation: &crate::plan::CoreInvocation,
+    notices: Vec<String>,
+    media_path: Option<PathBuf>,
+    deps: &Arc<ServerDeps>,
+) -> CallToolResult {
+    let Some(resolved) = media_path.or_else(|| resolve_media(source, deps)) else {
+        return failed(&Fault::transient(
+            "the cached rip for this URL is gone (evicted). Call again with just the \
+             URL to re-download.",
+        ));
+    };
+    run_invocation(&resolved, invocation, &notices, deps)
+}
+
+/// Replay a completed keep download's receipt: a keep token echoed after
+/// its download finished answers with the saved file instead of ripping a
+/// duplicate into the keep dir.
+fn replay_saved(path: &Path, deps: &Arc<ServerDeps>) -> CallToolResult {
+    if path.exists() {
+        keep_response(path, None, deps)
+    } else {
+        failed(&Fault::bad_input(format!(
+            "this download already completed and was saved to {}, but the file has \
+             since been moved or removed. Call again without confirm for a fresh plan.",
+            path.display()
+        )))
     }
 }
 
@@ -524,16 +552,17 @@ mod tests {
 
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let token = offered_tokens(&offer).remove(0);
         let done = body_of(&call(
             &env,
-            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+            serde_json::json!({"source": url, "confirm": token}),
         ));
         assert_eq!(done["status"], "plan", "{done}");
 
         // The token survives redemption; echoing it again must not refetch.
         let again = body_of(&call(
             &env,
-            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+            serde_json::json!({"source": url, "confirm": token}),
         ));
         assert_eq!(again["status"], "plan", "{again}");
         assert_eq!(
@@ -568,9 +597,10 @@ mod tests {
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
 
+        let token = offered_tokens(&offer).remove(0);
         let done = body_of(&call(
             &env,
-            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+            serde_json::json!({"source": url, "confirm": token}),
         ));
         assert_eq!(done["status"], "plan", "{done}");
         let guidance = done["guidance"].as_str().expect("guidance");
@@ -591,11 +621,18 @@ mod tests {
 
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
-        assert_eq!(offer["tokens"][0]["token"], "dl-analysis");
+        let token = offered_tokens(&offer).remove(0);
+        assert!(
+            offer["tokens"][0]["effect"]
+                .as_str()
+                .expect("effect")
+                .contains("analysis"),
+            "the effect line names the tier: {offer}"
+        );
 
         let done = body_of(&call(
             &env,
-            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+            serde_json::json!({"source": url, "confirm": token}),
         ));
         assert_eq!(done["status"], "plan", "{done}");
         assert!(
@@ -645,9 +682,10 @@ mod tests {
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
 
+        let token = offered_tokens(&offer).remove(0);
         let pending = body_of(&call(
             &env,
-            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+            serde_json::json!({"source": url, "confirm": token}),
         ));
         assert_eq!(pending["status"], "pending", "{pending}");
 
@@ -702,9 +740,10 @@ mod tests {
 
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let token = offered_tokens(&offer).remove(0);
         let pending = body_of(&call(
             &env,
-            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+            serde_json::json!({"source": url, "confirm": token}),
         ));
         assert_eq!(pending["status"], "pending", "{pending}");
 
@@ -731,9 +770,10 @@ mod tests {
 
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let token = offered_tokens(&offer).remove(0);
         let pending = body_of(&call(
             &env,
-            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+            serde_json::json!({"source": url, "confirm": token}),
         ));
         assert_eq!(pending["status"], "pending", "{pending}");
         let cancel = env
@@ -767,9 +807,10 @@ mod tests {
 
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let keep_token = offered_tokens(&offer).remove(0);
         let pending = body_of(&call(
             &env,
-            serde_json::json!({"source": url, "confirm": "dl-keep"}),
+            serde_json::json!({"source": url, "confirm": keep_token}),
         ));
         assert_eq!(pending["status"], "pending", "{pending}");
 
@@ -807,12 +848,60 @@ mod tests {
 
         assert!(
             matches!(
-                env.deps.tokens.take(url, &Token::new("dl-keep")),
+                env.deps.tokens.take(url, &Token::new(keep_token)),
                 Some(Redemption::Fresh(_))
             ),
             "a job that lost its slot must not record a receipt — the token \
              stays fresh for a retry"
         );
+    }
+
+    #[test]
+    fn dropping_the_deps_graph_disowns_a_queued_keep_settlement() {
+        let (env, release) = gated_env(vec![keep_option()]);
+        let url = "https://example.com/v.mp4";
+
+        let offer = body_of(&call(&env, serde_json::json!({"source": url})));
+        assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let keep_token = offered_tokens(&offer).remove(0);
+        let pending = body_of(&call(
+            &env,
+            serde_json::json!({"source": url, "confirm": keep_token}),
+        ));
+        assert_eq!(pending["status"], "pending", "{pending}");
+
+        // Let the download finish and settle into a channel nobody polls:
+        // the keep receipt (owned effect) and its compensation now sit
+        // queued inside the tracker's slot.
+        release.send(()).expect("release download");
+        let keep_file = env.deps.config.paths.keep.join("v.mp4");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while *env.fetcher.finished.lock().expect("finished") == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the download never finished"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(keep_file.exists(), "the keep file landed");
+
+        // Drop every external handle. The queued receipt captures a Tokens
+        // handle — not Arc<ServerDeps> — so the deps graph is actually
+        // freeable: the tracker tears down, the settlement drops unadopted,
+        // and its compensation removes the file no receipt points to. (A
+        // deps-capturing receipt would cycle deps → tracker → settlement →
+        // deps and leak the graph with the drop bomb defused forever.)
+        let TestEnv {
+            deps, dir: _dir, ..
+        } = env;
+        drop(deps);
+        while keep_file.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dropping the deps graph must fire the queued settlement's compensation"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -867,10 +956,12 @@ mod tests {
 
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let tokens = offered_tokens(&offer);
+        let (analysis_token, keep_token) = (&tokens[0], &tokens[1]);
 
         let analysis = body_of(&call(
             &env,
-            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+            serde_json::json!({"source": url, "confirm": analysis_token}),
         ));
         assert_eq!(analysis["status"], "pending", "{analysis}");
 
@@ -878,7 +969,7 @@ mod tests {
         // analysis download and hand its caller someone else's response.
         let keep = body_of(&call(
             &env,
-            serde_json::json!({"source": url, "confirm": "dl-keep"}),
+            serde_json::json!({"source": url, "confirm": keep_token}),
         ));
         assert_eq!(keep["status"], "pending", "{keep}");
         assert_eq!(
@@ -912,9 +1003,10 @@ mod tests {
 
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let token = offered_tokens(&offer).remove(0);
         let pending = body_of(&call_with_notify(
             &env,
-            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+            serde_json::json!({"source": url, "confirm": token}),
             &notifier,
         ));
         assert_eq!(pending["status"], "pending", "{pending}");
@@ -946,9 +1038,10 @@ mod tests {
 
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let token = offered_tokens(&offer).remove(0);
         let pending = body_of(&call(
             &env,
-            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+            serde_json::json!({"source": url, "confirm": token}),
         ));
         assert_eq!(pending["status"], "pending", "{pending}");
 

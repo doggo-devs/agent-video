@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use super::time::ArgError;
-use agent_video_core::config::{DEFAULT_CHUNK_SECONDS, default_chunk_seconds};
+use agent_video_core::config::{DEFAULT_CHUNK_SECONDS, Profile, default_chunk_seconds};
 
 /// Server-owned long flags; rejected exact or in clap's `--flag=value`
 /// form. The short `-o` is handled separately ([`forbidden_flag`]) because
@@ -182,10 +182,13 @@ pub fn parse_raw(raw: &str) -> Result<RawInvocation, ArgError> {
     }
 
     // Profile resolution goes through core's own table, so the predicted
-    // grid-count denominator cannot drift from what the run will do.
+    // grid-count denominator cannot drift from what the run will do. An
+    // unknown name dies here, with core's own message, instead of running
+    // core just to watch it reject the flag.
     let mut chunk_seconds = f64::from(DEFAULT_CHUNK_SECONDS);
-    if let Some(profile) = find_flag(&flags, "--profile").and_then(|o| o.value) {
-        chunk_seconds = f64::from(default_chunk_seconds(Some(&profile)));
+    if let Some(name) = find_flag(&flags, "--profile").and_then(|o| o.value) {
+        let profile = name.parse::<Profile>().map_err(|e| ArgError(e.reason))?;
+        chunk_seconds = f64::from(default_chunk_seconds(Some(profile)));
     }
     if let Some(v) = find_flag(&flags, "--chunk-seconds")
         .and_then(|o| o.value)
@@ -266,15 +269,22 @@ mod tests {
     fn derives_chunk_seconds_from_profile() {
         // Expectations route through core's table too: this locks the
         // parsing (which token names the profile), not the profile values.
-        for profile in ["fast", "quality", "action"] {
+        for profile in [Profile::Fast, Profile::Quality, Profile::Action] {
             assert_eq!(
-                parse_raw(&format!("process --profile {profile}"))
+                parse_raw(&format!("process --profile {}", profile.cli_name()))
                     .expect("valid")
                     .chunk_seconds,
                 f64::from(default_chunk_seconds(Some(profile))),
-                "profile {profile}"
+                "profile {profile:?}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_unknown_profile_naming_the_options() {
+        let err = parse_raw("process --profile cinematic").expect_err("unknown profile");
+        assert!(err.0.contains("cinematic"), "names the value: {}", err.0);
+        assert!(err.0.contains("balanced"), "lists the options: {}", err.0);
     }
 
     #[test]
@@ -320,7 +330,7 @@ mod tests {
             parse_raw("process --profile=fast")
                 .expect("valid")
                 .chunk_seconds,
-            f64::from(default_chunk_seconds(Some("fast")))
+            f64::from(default_chunk_seconds(Some(Profile::Fast)))
         );
     }
 

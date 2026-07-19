@@ -36,7 +36,7 @@ use crate::plan::format_bytes;
 use crate::probe::{container_label, is_ext_shaped, probe_media_url};
 use crate::relay::PolicyRelay;
 use crate::schema::ProbeSummary;
-use crate::tokens::{Dest, Token};
+use crate::tokens::Dest;
 use agent_video_core::types::format_ts;
 
 /// Minimum interval between progress callbacks.
@@ -238,7 +238,6 @@ pub fn direct_info(url: &str, probe: &ProbeSummary, cfg: &Config) -> SourceInfo 
         title: None,
         options: vec![
             DownloadOption {
-                token: Token::new("dl-analysis"),
                 dest: Dest::Cache,
                 label: label.clone(),
                 effect: format!(
@@ -250,7 +249,6 @@ pub fn direct_info(url: &str, probe: &ProbeSummary, cfg: &Config) -> SourceInfo 
                 recipe: Recipe::Direct(recipe.clone()),
             },
             DownloadOption {
-                token: Token::new(format!("dl-keep-{}", probe.height)),
                 dest: Dest::Keep,
                 label,
                 effect: format!(
@@ -620,10 +618,18 @@ mod tests {
             &cfg,
         );
         assert_eq!(info.options.len(), 2);
-        assert_eq!(info.options[0].token, Token::new("dl-analysis"));
         assert_eq!(info.options[0].dest, Dest::Cache);
-        assert_eq!(info.options[1].token, Token::new("dl-keep-720"));
+        assert!(
+            info.options[0].effect.contains("analysis cache"),
+            "{}",
+            info.options[0].effect
+        );
         assert_eq!(info.options[1].dest, Dest::Keep);
+        assert!(
+            info.options[1].effect.contains("for the user"),
+            "{}",
+            info.options[1].effect
+        );
         assert!(info.headline.contains("1280x720"), "{}", info.headline);
     }
 

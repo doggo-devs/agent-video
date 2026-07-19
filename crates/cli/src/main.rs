@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueHint};
 
-use agent_video_core::config::{Config, Overrides, StrategyOpts};
+use agent_video_core::config::{Config, Overrides, Profile, StrategyOpts};
 use agent_video_core::error::Error;
 use agent_video_core::event::{Event, EventSink};
 use agent_video_core::pipeline::{self, parse_range};
@@ -267,8 +267,9 @@ struct CommonOpts {
     /// Canvas edge length in pixels.
     #[arg(long, default_value_t = 2048)]
     max_edge: u32,
-    /// Named profile (balanced, fast, quality, action); presets tiers and
-    /// tuning knobs, explicit flags still win.
+    /// Named profile; presets tiers and tuning knobs, explicit flags still
+    /// win. Parsed to [`Profile`] at startup — an unknown name fails with
+    /// the valid options.
     #[arg(long)]
     profile: Option<String>,
 
@@ -350,12 +351,12 @@ struct MediaRun<'a> {
 
 impl<'a> MediaRun<'a> {
     fn new(io: &'a IoArgs, opts: &'a CommonOpts, strategy: StrategyOpts) -> anyhow::Result<Self> {
-        let cfg = Config::new(
-            opts.max_edge,
-            opts.profile.as_deref(),
-            &opts.overrides,
-            strategy,
-        )?;
+        let profile = opts
+            .profile
+            .as_deref()
+            .map(str::parse::<Profile>)
+            .transpose()?;
+        let cfg = Config::new(opts.max_edge, profile, &opts.overrides, strategy)?;
 
         // clap guarantees exactly one destination: `-o` xor `--json`.
         let sink = match &io.output {

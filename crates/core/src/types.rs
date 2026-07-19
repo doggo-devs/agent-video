@@ -11,7 +11,8 @@
 //! not a deep copy. This keeps peak memory in the hundreds-of-MB range instead
 //! of GBs for long videos.
 //!
-//! Timestamps travel as `f32` seconds. The ulp is under 1 ms out to ~4.5
+//! Timestamps travel as [`Ts`] — `f32` seconds, finite by construction,
+//! minted once at the decode boundary. The ulp is under 1 ms out to ~4.5
 //! hours and under 8 ms out to 24 hours — far finer than grid timestamps
 //! (whole seconds on the wire) ever need. The harness computes windows in
 //! `f64`, but the hand-off is CLI text re-parsed here, so no silent
@@ -23,6 +24,53 @@ use std::sync::Arc;
 use image::{GrayImage, RgbImage};
 use serde::{Deserialize, Serialize};
 
+/// Presentation timestamp in seconds, 0-based at the stream start: finite by
+/// construction.
+///
+/// Minted once where timestamps are born — the decode boundary, from the
+/// frame's own pts — so a non-finite pts conversion can never enter the
+/// pipeline as a frame timestamp, and everything downstream orders and
+/// buckets timestamps without runtime finiteness checks. Negative values are
+/// valid: edit lists and decoder pre-roll place frames before the stream
+/// start. Non-decreasing order is a stream property, not a value property,
+/// and stays the chunker's to enforce.
+#[derive(Debug, Clone, Copy)]
+pub struct Ts(f32);
+
+impl Ts {
+    /// Wrap a timestamp, or `None` unless it is finite.
+    pub fn new(v: f32) -> Option<Self> {
+        v.is_finite().then_some(Self(v))
+    }
+
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+// Equality and ordering delegate to `total_cmp`, which agrees with the IEEE
+// comparison on the values `Ts` admits (finite, `-0.0` vs `0.0` excepted),
+// so the manual `Eq`/`Ord` are mutually consistent by construction.
+impl PartialEq for Ts {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0).is_eq()
+    }
+}
+
+impl Eq for Ts {}
+
+impl PartialOrd for Ts {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ts {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 /// A sampled frame before scoring: what extract, dedup, and chunking carry.
 ///
 /// Holds only downscaled derivatives, never the source-resolution buffer. The
@@ -30,8 +78,8 @@ use serde::{Deserialize, Serialize};
 /// pointer clone rather than a ~1.4 MB deep copy.
 #[derive(Debug, Clone)]
 pub struct CandidateFrame {
-    /// Presentation timestamp in seconds.
-    pub ts: f32,
+    /// Presentation timestamp.
+    pub ts: Ts,
     /// Small grayscale image used for scoring convolutions.
     pub gray: GrayImage,
     /// Small RGB image pasted onto the grid during composition.
@@ -43,8 +91,8 @@ pub struct CandidateFrame {
 /// Produced by `crate::score::score_frames` at the single scoring boundary.
 #[derive(Debug, Clone)]
 pub struct ScoredFrame {
-    /// Presentation timestamp in seconds.
-    pub ts: f32,
+    /// Presentation timestamp.
+    pub ts: Ts,
     /// Small grayscale image, retained because `extract` re-scores globally.
     pub gray: GrayImage,
     /// Small RGB image pasted onto the grid during composition.
@@ -444,6 +492,22 @@ mod tests {
         assert_eq!(format_ts(5025.0), "1:23:45");
         assert_eq!(format_ts(3599.6), "1:00:00", "rounds up into the hour");
         assert_eq!(format_ts(3599.4), "59:59", "stays MM:SS below the hour");
+    }
+
+    #[test]
+    fn rejects_non_finite_timestamps() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(Ts::new(bad).is_none(), "ts {bad} must be rejected");
+        }
+        assert!(Ts::new(-0.5).is_some(), "pre-roll timestamps are valid");
+    }
+
+    #[test]
+    fn orders_timestamps_ascending() {
+        let ts = |v| Ts::new(v).expect("finite test ts");
+        let mut v = [ts(9.0), ts(-0.5), ts(3.0)];
+        v.sort();
+        assert_eq!(v, [ts(-0.5), ts(3.0), ts(9.0)]);
     }
 
     #[test]

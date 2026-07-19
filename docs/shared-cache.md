@@ -116,7 +116,7 @@ pattern.
 | Whisper transcripts (`cache.rs` keying) | 1 | keyed by fingerprint × `model_id`; written via `write_srt` (pattern 2) | Yes — the key guarantees equal bytes; the write itself is even stronger than pattern 1 requires (staged rename). |
 | Direct downloads (`fetch/direct.rs`) | 2 | writer-unique `.part` (via `cache::naming`), `sync_all`, atomic `rename` | Yes. |
 | yt-dlp downloads (`fetch/ytdlp.rs`) | 2 | per-writer `.staging-…` dir (via `cache::naming`), fsync + per-file `rename` in `adopt_into` | Yes. |
-| Whisper SRT (`transcribe.rs::write_srt`) | 2 | writer-unique `.part` (via `cache::naming`), `rename` | Yes — verified per prior review, no change needed. |
+| Whisper SRT (`transcribe::write_srt`) | 2 | writer-unique `.part` (via `cache::naming`), `rename` | Yes — verified per prior review, no change needed. |
 | Cookie jar (`cookies.rs`) | 3 | exclusive `.lock`, checkout/commit delta merge, temp + rename publish | Yes. |
 
 No genuinely non-atomic write of a shared artifact outside its declared pattern

@@ -128,7 +128,7 @@ pub fn extract_selected(
     for i in indices {
         picked.push(frames.swap_remove(i));
     }
-    picked.sort_by(|a, b| a.ts.total_cmp(&b.ts));
+    picked.sort_by_key(|f| f.ts);
     picked
 }
 
@@ -138,13 +138,13 @@ pub fn build_grid_draft(
     template: LayoutKind,
 ) -> GridDraft {
     let (first, last) = (
-        picked.first().map(|f| f.ts).unwrap_or(0.0),
-        picked.last().map(|f| f.ts).unwrap_or(0.0),
+        picked.first().map(|f| f.ts.get()).unwrap_or(0.0),
+        picked.last().map(|f| f.ts.get()).unwrap_or(0.0),
     );
     let key_frames = heroes
         .iter()
         .map(|&i| KeyFrameMeta {
-            timestamp: crate::types::format_ts(picked[i].ts),
+            timestamp: crate::types::format_ts(picked[i].ts.get()),
             score: picked[i].score.get().round() as u32,
             grid_position: GridPosition::Hero,
         })
@@ -159,7 +159,7 @@ pub fn build_grid_draft(
 
 fn chunk_span(chunk: &[ScoredFrame]) -> f32 {
     match (chunk.first(), chunk.last()) {
-        (Some(a), Some(b)) => (b.ts - a.ts).max(0.0),
+        (Some(a), Some(b)) => (b.ts.get() - a.ts.get()).max(0.0),
         _ => 0.0,
     }
 }
@@ -171,9 +171,9 @@ mod tests {
     use std::sync::Arc;
 
     fn frame(ts: f32) -> ScoredFrame {
-        use crate::types::{SceneDiff, Score};
+        use crate::types::{SceneDiff, Score, Ts};
         ScoredFrame {
-            ts,
+            ts: Ts::new(ts).expect("finite test ts"),
             gray: GrayImage::new(1, 1),
             rgb: Arc::new(RgbImage::new(1, 1)),
             score: Score::new(0.0).expect("zero score is valid"),
@@ -187,9 +187,9 @@ mod tests {
 
         let picked = extract_selected(&mut frames, vec![0, 2]);
 
-        let picked_ts: Vec<f32> = picked.iter().map(|f| f.ts).collect();
+        let picked_ts: Vec<f32> = picked.iter().map(|f| f.ts.get()).collect();
         assert_eq!(picked_ts, vec![5.0, 9.0], "chosen frames sorted by ts");
-        let remaining_ts: Vec<f32> = frames.iter().map(|f| f.ts).collect();
+        let remaining_ts: Vec<f32> = frames.iter().map(|f| f.ts.get()).collect();
         assert_eq!(
             remaining_ts,
             vec![1.0],
@@ -221,7 +221,7 @@ mod tests {
         );
         let hero = heroes[0];
         assert!(hero < picked.len(), "hero index stays aligned");
-        assert_eq!(picked[hero].ts, 15.0, "hero frame survived eviction");
+        assert_eq!(picked[hero].ts.get(), 15.0, "hero frame survived eviction");
         let min_kept = picked
             .iter()
             .map(|f| f.score.get())

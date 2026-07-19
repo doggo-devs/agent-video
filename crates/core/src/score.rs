@@ -467,12 +467,12 @@ pub fn select_top_k(frames: &[ScoredFrame], k: usize, min_gap: f32) -> Vec<usize
         }
         let too_close = chosen
             .iter()
-            .any(|&c| (frames[c].ts - frames[i].ts).abs() < min_gap);
+            .any(|&c| (frames[c].ts.get() - frames[i].ts.get()).abs() < min_gap);
         if !too_close {
             chosen.push(i);
         }
     }
-    chosen.sort_by(|&a, &b| frames[a].ts.total_cmp(&frames[b].ts));
+    chosen.sort_by(|&a, &b| frames[a].ts.cmp(&frames[b].ts));
     chosen
 }
 
@@ -546,7 +546,7 @@ mod tests {
     /// A scored frame carrying only the fields selection reads.
     fn scored(ts: f32, score: f32) -> ScoredFrame {
         ScoredFrame {
-            ts,
+            ts: crate::types::Ts::new(ts).expect("finite test ts"),
             gray: GrayImage::new(1, 1),
             rgb: Arc::new(RgbImage::new(1, 1)),
             score: Score::new(score).expect("test score in 0..=100"),
@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn diffs_first_frame_against_boundary_context() {
         let candidate = |gray: GrayImage| CandidateFrame {
-            ts: 0.0,
+            ts: crate::types::Ts::new(0.0).expect("finite test ts"),
             gray,
             rgb: Arc::new(RgbImage::new(1, 1)),
         };
@@ -738,7 +738,7 @@ mod tests {
             .iter()
             .max_by(|a, b| a.score.get().total_cmp(&b.score.get()))
             .expect("non-empty set");
-        assert_eq!(best.ts, 60.0, "carried scene_diff decides the winner");
+        assert_eq!(best.ts.get(), 60.0, "carried scene_diff decides the winner");
         assert_eq!(
             best.scene_diff.get(),
             90.0,

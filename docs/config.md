@@ -36,7 +36,7 @@ platform-derived.
 |-----|------|---------|----------|
 | `cache` | path | `<cache_dir>/agent-video` | Evictable analysis artifacts: download rips (`downloads/`), probe documents (`probe/`), whisper transcripts (`transcripts/`). Subject to the `[cache]` LRU budget and age sweeps. |
 | `models` | path | `<data_dir>/agent-video/models` | Whisper weights (model + Silero VAD) provisioned by `install-whisper`. Persistent and LRU-exempt — never evicted. |
-| `keep` | path | `<download_dir>` | Landing directory for `dl-keep-*` downloads. Files here belong to the user; the harness never evicts or rewrites them. |
+| `keep` | path | `<download_dir>` | Landing directory for keep downloads. Files here belong to the user; the harness never evicts or rewrites them. |
 
 ### `[cache]`
 
@@ -71,6 +71,7 @@ The grid-count ladder that gates the decision engine (`crate::plan`).
 |-----|------|---------|-----------|----------|
 | `auto_run` | integer | `2` | must be > 0 | Predicted grid count at or below which a bare call runs immediately instead of answering with a plan. |
 | `max` | integer | `8` | must be > 0 | Predicted grid count above which the plan degrades (chunks stretched to fit) or, if even the stretch is too thin, requires explicit consent. |
+| `max_stretch_seconds` | integer | `600` | must be > 0 | Degradation floor: the most seconds one stretched grid may cover. Past it the plan is likely too thin to be useful, so running it requires explicit consent. |
 
 ### `[network]`
 
@@ -86,7 +87,7 @@ never an implicit browser read during a tool call.
 
 | Key | Type | Default | Validation | Controls |
 |-----|------|---------|-----------|----------|
-| `from_browser` | string | unset | base name (before any `:profile` / `+keyring` suffix) must be one of `brave`, `chrome`, `chromium`, `edge`, `firefox`, `opera`, `safari`, `vivaldi`, `whale` | yt-dlp's `--cookies-from-browser` value (e.g. `"firefox"`, `"chrome:Profile 1"`): read cookies live from the browser store at every spawn. When set, it wins over the jar. |
+| `from_browser` | string | unset | base name (before any `:profile` / `+keyring` suffix) must be a lowercase alphanumeric word; the browser set itself is yt-dlp's, checked at spawn time | yt-dlp's `--cookies-from-browser` value (e.g. `"firefox"`, `"chrome:Profile 1"`): read cookies live from the browser store at every spawn. When set, it wins over the jar. |
 
 The canonical Netscape jar lives at `<config_dir>/agent-video/cookies.txt` and
 is **not** file-configurable — it is managed by `agent-video cookie import`
@@ -135,6 +136,7 @@ sync_wait_seconds = 90
 [budget]
 auto_run = 2
 max = 8
+max_stretch_seconds = 600
 
 [network]
 allow_private_hosts = false

@@ -6,7 +6,9 @@
 //! frees the slot, so a panic can never leak admission.
 //! [`KeyedGate`] admits one holder per key: the "does the result already
 //! exist" check and the run that produces it become a single critical
-//! section, which is the whole single-flight guarantee. [`Semaphore`]
+//! section, which is the whole single-flight guarantee. Waiters sign their
+//! own wall-clock ceiling ([`KeyedGate::admit_within`]) because the
+//! holder's work has no bound of its own. [`Semaphore`]
 //! admits at most N holders total, capping jobs that each scale to the
 //! whole machine. Excess callers block ([`Semaphore::acquire`]) by
 //! default — for an agent, one blocked call is cheaper than a chain of
@@ -16,6 +18,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// One admitted holder per key; waiters for a held key block until it
 /// frees. Distinct keys never contend.
@@ -26,19 +29,30 @@ pub struct KeyedGate {
 }
 
 impl KeyedGate {
-    /// Block until `key` is free, then hold it exclusively. The returned
-    /// guard frees the key on drop — including an unwind, so a panicking
-    /// holder wakes its waiters instead of wedging the key forever.
-    pub fn admit(&self, key: &str) -> KeyHold<'_> {
+    /// Hold `key` exclusively, waiting at most `bound` while it is held by
+    /// someone else: `None` acquired nothing. The bound is the waiter's
+    /// signature on its own account — a holder's legitimate work has no
+    /// wall-clock ceiling (it may be transcribing hours of audio), so a
+    /// bounded waiter must not inherit the holder's total; it waits its
+    /// own bound and reports instead. The returned guard frees the key on
+    /// drop — including an unwind, so a panicking holder wakes its waiters
+    /// instead of wedging the key forever.
+    pub fn admit_within(&self, key: &str, bound: Duration) -> Option<KeyHold<'_>> {
+        let deadline = Instant::now() + bound;
         let mut held = self.held.lock().expect("keyed gate poisoned");
         while held.contains(key) {
-            held = self.freed.wait(held).expect("keyed gate poisoned");
+            let left = deadline.checked_duration_since(Instant::now())?;
+            held = self
+                .freed
+                .wait_timeout(held, left)
+                .expect("keyed gate poisoned")
+                .0;
         }
         held.insert(key.to_string());
-        KeyHold {
+        Some(KeyHold {
             gate: self,
             key: key.to_string(),
-        }
+        })
     }
 }
 
@@ -55,6 +69,11 @@ impl Drop for KeyHold<'_> {
             .lock()
             .expect("keyed gate poisoned")
             .remove(&self.key);
+        // One condvar for all keys, so a release wakes every waiter and
+        // the wrong-key ones re-sleep. Per-key parking would need a
+        // per-key waiter registry with its own lifecycle; at this gate's
+        // load (transcription single-flight, single-digit waiters) that
+        // is machinery for a stampede that cannot form.
         self.gate.freed.notify_all();
     }
 }
@@ -137,11 +156,11 @@ mod tests {
     #[test]
     fn keyed_gate_blocks_a_second_holder_of_the_same_key() {
         let gate = KeyedGate::default();
-        let hold = gate.admit("k");
+        let hold = gate.admit_within("k", Duration::ZERO).expect("key is free");
         let (tx, rx) = mpsc::channel();
         std::thread::scope(|s| {
             s.spawn(|| {
-                let _second = gate.admit("k");
+                let _second = gate.admit_within("k", FREED).expect("freed within bound");
                 tx.send(()).expect("test channel");
             });
             assert!(
@@ -157,8 +176,47 @@ mod tests {
     #[test]
     fn keyed_gate_admits_distinct_keys_concurrently() {
         let gate = KeyedGate::default();
-        let _a = gate.admit("a");
-        let _b = gate.admit("b"); // returns: no contention across keys
+        let _a = gate.admit_within("a", Duration::ZERO).expect("key is free");
+        // No contention across keys: acquired without waiting at all.
+        let _b = gate.admit_within("b", Duration::ZERO).expect("key is free");
+    }
+
+    #[test]
+    fn admit_within_acquires_a_free_key_immediately() {
+        let gate = KeyedGate::default();
+        let hold = gate.admit_within("k", Duration::ZERO);
+        assert!(hold.is_some(), "a free key needs no waiting at all");
+    }
+
+    #[test]
+    fn admit_within_gives_up_at_its_bound_while_the_key_is_held() {
+        let gate = KeyedGate::default();
+        let _hold = gate.admit_within("k", Duration::ZERO).expect("key is free");
+        let started = std::time::Instant::now();
+        assert!(
+            gate.admit_within("k", BLOCKED).is_none(),
+            "the waiter signs its own ceiling; it must not inherit the holder's"
+        );
+        assert!(
+            started.elapsed() < FREED,
+            "the refusal lands at the bound, not eventually: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn admit_within_acquires_when_freed_inside_the_bound() {
+        let gate = KeyedGate::default();
+        let hold = gate.admit_within("k", Duration::ZERO).expect("key is free");
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| gate.admit_within("k", FREED).is_some());
+            std::thread::sleep(BLOCKED / 2);
+            drop(hold);
+            assert!(
+                waiter.join().expect("waiter completes"),
+                "a key freed inside the bound is acquired, not refused"
+            );
+        });
     }
 
     #[test]
@@ -166,12 +224,13 @@ mod tests {
         let gate = KeyedGate::default();
         std::thread::scope(|s| {
             let holder = s.spawn(|| {
-                let _hold = gate.admit("k");
+                let _hold = gate.admit_within("k", Duration::ZERO).expect("key is free");
                 panic!("holder dies mid-flight");
             });
             assert!(holder.join().is_err(), "the holder must have panicked");
         });
-        let _reacquired = gate.admit("k"); // returns: the unwind freed it
+        let reacquired = gate.admit_within("k", Duration::ZERO);
+        assert!(reacquired.is_some(), "the unwind freed the key");
     }
 
     #[test]

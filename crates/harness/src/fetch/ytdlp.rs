@@ -114,13 +114,22 @@ pub fn promote_subtitle(dir: &Path, key: &str, preferred_langs: &[String]) -> st
 /// is intact, only the subtitle sidecar is affected.
 fn promotion_warning(result: std::io::Result<()>, warning: Option<String>) -> Option<String> {
     let Err(e) = result else { return warning };
-    let msg = format!(
-        "the downloaded subtitles could not be promoted to a sidecar ({e}); subtitles may be missing"
-    );
-    Some(match warning {
-        Some(prior) => format!("{prior}\n{msg}"),
-        None => msg,
-    })
+    stack_warnings(
+        warning,
+        Some(format!(
+            "the downloaded subtitles could not be promoted to a sidecar ({e}); subtitles may be missing"
+        )),
+    )
+}
+
+/// Stack a later degradation note under an earlier one; either may be
+/// absent. The warning channel is append-only: no note ever replaces
+/// another.
+fn stack_warnings(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+        (a, b) => a.or(b),
+    }
 }
 
 // ── spawning ──
@@ -190,12 +199,21 @@ fn acquire_cookies(cfg: &Config) -> Result<CookieHandle, Fault> {
         .map_err(|e| Fault::environment(format!("cannot stage the cookie jar: {e}")))
 }
 
-/// Adopt rotated cookies back into the canonical jar; best-effort — the
-/// media verdict must not depend on jar bookkeeping.
-fn commit_cookies(cookies: CookieHandle) {
-    if let Err(e) = cookies.commit() {
-        tracing::warn!("cookie write-back failed: {e}");
-    }
+/// Adopt rotated cookies back into the canonical jar. A failed write-back
+/// is a half-committed persistent effect — the site may already have
+/// rotated the session (invalidating the old credentials) while the
+/// canonical jar still holds the old page — so it comes back as a
+/// caller-facing warning instead of vanishing into a log line. The media
+/// verdict itself must not depend on jar bookkeeping; the warning channel
+/// is exactly that shape.
+#[must_use]
+fn commit_cookies(cookies: CookieHandle) -> Option<String> {
+    let e = cookies.commit().err()?;
+    Some(format!(
+        "rotated cookies could not be written back to the jar ({e}); the stored login \
+         session may now be stale — if the next download fails asking for a login, \
+         re-import cookies with `agent-video cookie import`"
+    ))
 }
 
 /// yt-dlp's own error lines. The auth heuristic below runs on these only:
@@ -285,8 +303,12 @@ pub fn probe(url: &VettedUrl, cfg: &Config, relay: &PolicyRelay) -> Result<Sourc
     set_proxy_env(&mut cmd, relay);
     let out = crate::proc::output_with_deadline(&mut cmd, PROBE_DEADLINE).map_err(spawn_error)?;
     // Even a probe rotates cookies on some sites; adopt them whatever the
-    // verdict (a deadline-killed child left an empty delta).
-    commit_cookies(cookies);
+    // verdict (a deadline-killed child left an empty delta). A probe's
+    // SourceInfo has no degradation channel, so a failed write-back is
+    // logged here; the download path surfaces the same warning on-wire.
+    if let Some(warning) = commit_cookies(cookies) {
+        tracing::warn!("{warning}");
+    }
     let Some(status) = out.status else {
         return Err(Fault::transient(format!(
             "yt-dlp probing {url} hung for {}s and was aborted — the site may be \
@@ -637,6 +659,10 @@ fn settle_exit(
 
 /// Download via yt-dlp, blocking until the file is at its final path; yt-dlp
 /// owns `.part` handling and atomic renames within the staging directory.
+///
+/// One straight pipeline, destination-blind between its ends: prepare the
+/// [`Landing`], assemble [`download_args`], pump the child ([`run_child`]),
+/// judge its verdict ([`settle_outcome`]), publish ([`Landing::publish`]).
 pub fn download(
     url: &VettedUrl,
     recipe: &YtdlpRecipe,
@@ -645,24 +671,150 @@ pub fn download(
     relay: &PolicyRelay,
     progress: ProgressFn<'_>,
 ) -> Result<Downloaded, Fault> {
-    let (staging, output, subtitle_output, promote_key) = match io {
-        DownloadIo::Cache { dir, key } => {
-            let staging = StagingDir::create(dir, key).map_err(|e| {
-                Fault::environment(format!("cannot create a staging directory in cache: {e}"))
-            })?;
-            let output = staging.path.join(format!("{key}.%(ext)s"));
-            // Outside the media's sidecar namespace; see [`SUBS_INFIX`].
-            let subs = recipe.subs.then(|| {
+    let landing = Landing::prepare(io, recipe.subs)?;
+    let cookies = acquire_cookies(cfg)?;
+    let args = download_args(url, recipe, &landing, cfg, relay, &cookies);
+    let run = run_child(&args, relay, progress)?;
+    // Whatever the verdict: a normal exit and a graceful abort both saved
+    // the staged jar, a hard-killed child left an empty delta. A failed
+    // write-back rides the warning channel — the remote session may have
+    // rotated past the jar, and the model must hear it from this call, not
+    // from the next download's auth failure.
+    let jar_warning = commit_cookies(cookies);
+    let warning = stack_warnings(settle_outcome(&run)?, jar_warning);
+    if let Some(e) = run.read_error {
+        return Err(Fault::transient(format!(
+            "reading yt-dlp output failed mid-download: {e}"
+        )));
+    }
+    let Some(filepath) = run.filepath else {
+        return Err(Fault::bad_input(format!(
+            "yt-dlp finished without producing a file — the size cap (download.max_bytes) \
+             may have aborted it: {}",
+            stderr_tail(&run.stderr)
+        )));
+    };
+    landing.publish(filepath, warning, cfg)
+}
+
+/// Where a yt-dlp run's files land and how they are published once the
+/// child settles. Constructed before the spawn and consumed by
+/// [`Landing::publish`], so the whole Cache/Keep divergence — staging vs
+/// direct write, subtitle side work, sidecar promotion, adoption — lives
+/// at this type's two ends; the pipeline between (argument assembly,
+/// spawn, watchdog, verdict) is destination-blind.
+enum Landing {
+    /// Per-writer staging inside the shared cache, adopted into `dest_dir`
+    /// once complete, with the preferred subtitle promoted to the rip's
+    /// one sidecar. `subs` mirrors the recipe: it turns on both the
+    /// subtitle templates and the promotion step.
+    Cache {
+        staging: StagingDir,
+        dest_dir: PathBuf,
+        key: String,
+        subs: bool,
+    },
+    /// Straight into the keep directory; yt-dlp names the file and no side
+    /// work follows — the file belongs to the user.
+    Keep { dir: PathBuf },
+}
+
+impl Landing {
+    fn prepare(io: DownloadIo<'_>, subs: bool) -> Result<Self, Fault> {
+        match io {
+            DownloadIo::Cache { dir, key } => {
+                let staging = StagingDir::create(dir, key).map_err(|e| {
+                    Fault::environment(format!("cannot create a staging directory in cache: {e}"))
+                })?;
+                Ok(Landing::Cache {
+                    staging,
+                    dest_dir: dir.to_path_buf(),
+                    key: key.to_string(),
+                    subs,
+                })
+            }
+            DownloadIo::Keep { dir } => Ok(Landing::Keep {
+                dir: dir.to_path_buf(),
+            }),
+        }
+    }
+
+    /// yt-dlp `-o` output template for the media file.
+    fn media_template(&self) -> PathBuf {
+        match self {
+            Landing::Cache { staging, key, .. } => staging.path.join(format!("{key}.%(ext)s")),
+            Landing::Keep { dir } => dir.join("%(title)s [%(id)s].%(ext)s"),
+        }
+    }
+
+    /// Subtitle output template, outside the media's sidecar namespace
+    /// (see [`SUBS_INFIX`]); cache rips only, and only when asked.
+    fn subtitle_template(&self) -> Option<PathBuf> {
+        match self {
+            Landing::Cache {
+                staging,
+                key,
+                subs: true,
+                ..
+            } => Some(
                 staging
                     .path
-                    .join(format!("{key}{SUBS_INFIX}.%(lang)s.%(ext)s"))
-            });
-            let promote = recipe.subs.then(|| key.to_string());
-            (Some((staging, dir.to_path_buf())), output, subs, promote)
+                    .join(format!("{key}{SUBS_INFIX}.%(lang)s.%(ext)s")),
+            ),
+            _ => None,
         }
-        DownloadIo::Keep { dir } => (None, dir.join("%(title)s [%(id)s].%(ext)s"), None, None),
-    };
+    }
 
+    /// Publish a finished download. Keep files are already final; cache
+    /// rips elect their one sidecar first — adoption must publish a
+    /// complete entry, and a failed election degrades to a warning since
+    /// the media is already on disk — then adopt out of staging.
+    fn publish(
+        self,
+        filepath: PathBuf,
+        warning: Option<String>,
+        cfg: &Config,
+    ) -> Result<Downloaded, Fault> {
+        match self {
+            Landing::Keep { .. } => Ok(Downloaded {
+                path: filepath,
+                warning,
+            }),
+            Landing::Cache {
+                staging,
+                dest_dir,
+                key,
+                subs,
+            } => {
+                let warning = if subs {
+                    promotion_warning(
+                        promote_subtitle(&staging.path, &key, &cfg.subtitles.preferred_langs),
+                        warning,
+                    )
+                } else {
+                    warning
+                };
+                let path = staging.adopt_into(&dest_dir, &filepath).map_err(|e| {
+                    Fault::environment(format!("cannot move the download into the cache: {e}"))
+                })?;
+                Ok(Downloaded { path, warning })
+            }
+        }
+    }
+}
+
+/// Assemble the yt-dlp download arguments: machine progress on stdout, the
+/// final path via `--print after_move:filepath`, every connection through
+/// the policy relay. Extracted so tests can pin the wiring — in particular
+/// that `-o` is followed by its template — without spawning yt-dlp.
+fn download_args(
+    url: &VettedUrl,
+    recipe: &YtdlpRecipe,
+    landing: &Landing,
+    cfg: &Config,
+    relay: &PolicyRelay,
+    cookies: &CookieHandle,
+) -> Vec<String> {
     let mut args: Vec<String> = [
         "--no-playlist",
         "--no-simulate",
@@ -679,17 +831,17 @@ pub fn download(
         &recipe.format,
         "--max-filesize",
         &cfg.download.max_bytes.get().to_string(),
-        "-o",
+        // Every yt-dlp connection (and its ffmpeg children, via the env
+        // set at spawn) routes through the policy relay.
+        "--proxy",
+        &relay.url(),
     ]
     .into_iter()
     .map(String::from)
     .collect();
-    // Every yt-dlp connection (and its ffmpeg children, via the env below)
-    // routes through the policy relay.
-    args.push("--proxy".to_string());
-    args.push(relay.url());
-    args.push(output.to_string_lossy().into_owned());
-    if let Some(sub) = &subtitle_output {
+    args.push("-o".to_string());
+    args.push(landing.media_template().to_string_lossy().into_owned());
+    if let Some(sub) = landing.subtitle_template() {
         args.extend(
             [
                 "--write-subs",
@@ -706,14 +858,40 @@ pub fn download(
         );
         args.push(format!("subtitle:{}", sub.display()));
     }
-    let cookies = acquire_cookies(cfg)?;
     args.extend(cookies.args());
     args.push(url.as_str().to_string());
+    args
+}
 
+/// What a yt-dlp child left behind once the watchdog settled it.
+struct ChildRun {
+    /// The watchdog's terminal verdict.
+    outcome: ChildOutcome,
+    /// Bounded stderr tail for diagnostics.
+    stderr: String,
+    /// yt-dlp's `after_move:filepath` line: the media's final path, ground
+    /// truth that the file landed.
+    filepath: Option<PathBuf>,
+    /// A failed stdout read — not EOF: a lost filepath line must not be
+    /// misdiagnosed as "no file produced".
+    read_error: Option<std::io::Error>,
+}
+
+/// Spawn yt-dlp and pump it until it terminates. stdout progress lines
+/// feed `progress` and the watchdog's byte clock — one parse, one
+/// definition of "moving" — everything else is chatter; stderr drains into
+/// a bounded tail on a helper thread. The watchdog owns the child and
+/// kills it on stall, no-progress, lifetime, or an unwind of this thread
+/// ([`WatchdogGuard`]).
+fn run_child(
+    args: &[String],
+    relay: &PolicyRelay,
+    progress: ProgressFn<'_>,
+) -> Result<ChildRun, Fault> {
     let mut cmd = Command::new("yt-dlp");
     set_proxy_env(&mut cmd, relay);
     let mut child = crate::proc::isolate_group(&mut cmd)
-        .args(&args)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -742,20 +920,13 @@ pub fn download(
         })
     };
 
-    // Watchdog: a child that stops producing output has hung (network stall,
-    // dead peer). Kill it so the job settles as a retryable failure instead
-    // of pinning this thread and the URL's pending slot until server exit.
-    // The guard additionally kills the child if this thread unwinds — see
-    // [`WatchdogGuard`].
     let watchdog = WatchdogGuard::spawn(child, watchdog_rx, activity.clone(), STALL_LIMITS);
 
-    let mut filepath: Option<String> = None;
+    let mut filepath: Option<PathBuf> = None;
     let mut read_error: Option<std::io::Error> = None;
     for line in BufReader::new(stdout_pipe).lines() {
         let line = match line {
             Ok(line) => line,
-            // A failed pipe read is not EOF: record it, or a lost filepath
-            // line gets misdiagnosed as "no file produced".
             Err(e) => {
                 read_error = Some(e);
                 break;
@@ -771,7 +942,7 @@ pub fn download(
         let _ = activity.send(Pulse::Chatter);
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            filepath = Some(trimmed.to_string());
+            filepath = Some(PathBuf::from(trimmed));
         }
     }
 
@@ -780,81 +951,45 @@ pub fn download(
     drop(activity);
     let stderr = stderr_thread.join().unwrap_or_default();
     let outcome = watchdog.join();
+    Ok(ChildRun {
+        outcome,
+        stderr,
+        filepath,
+        read_error,
+    })
+}
 
-    // Whatever the verdict: a normal exit and a graceful abort both saved
-    // the staged jar, a hard-killed child left an empty delta.
-    commit_cookies(cookies);
-
-    let warning = match outcome {
-        ChildOutcome::Stalled => {
-            return Err(Fault::transient(format!(
-                "the download stalled — no output from yt-dlp for {}s — and was aborted; \
-                 confirm again to retry",
-                STALL_LIMIT.as_secs()
-            )));
-        }
-        ChildOutcome::NoProgress => {
-            return Err(Fault::transient(format!(
-                "yt-dlp kept producing output but moved no bytes for {}s — likely wedged \
-                 in a retry loop — and was aborted; confirm again to retry",
-                NO_PROGRESS_LIMIT.as_secs()
-            )));
-        }
-        ChildOutcome::Expired => {
-            return Err(Fault::transient(format!(
-                "the download exceeded the {}h lifetime ceiling and was aborted — the \
-                 source may be serving impossibly slowly; confirm again to retry",
-                LIFETIME_CEILING.as_secs() / 3600
-            )));
-        }
-        ChildOutcome::Unreaped => {
-            return Err(Fault::transient(
-                "yt-dlp did not exit after its output closed and was killed",
-            ));
-        }
+/// Map the watchdog's verdict to the caller-facing result: every kill
+/// verdict is a transient fault naming what tripped; a normal exit is
+/// judged by [`settle_exit`] against whether the media actually landed.
+fn settle_outcome(run: &ChildRun) -> Result<Option<String>, Fault> {
+    match &run.outcome {
+        ChildOutcome::Stalled => Err(Fault::transient(format!(
+            "the download stalled — no output from yt-dlp for {}s — and was aborted; \
+             confirm again to retry",
+            STALL_LIMIT.as_secs()
+        ))),
+        ChildOutcome::NoProgress => Err(Fault::transient(format!(
+            "yt-dlp kept producing output but moved no bytes for {}s — likely wedged \
+             in a retry loop — and was aborted; confirm again to retry",
+            NO_PROGRESS_LIMIT.as_secs()
+        ))),
+        ChildOutcome::Expired => Err(Fault::transient(format!(
+            "the download exceeded the {}h lifetime ceiling and was aborted — the \
+             source may be serving impossibly slowly; confirm again to retry",
+            LIFETIME_CEILING.as_secs() / 3600
+        ))),
+        ChildOutcome::Unreaped => Err(Fault::transient(
+            "yt-dlp did not exit after its output closed and was killed",
+        )),
         // Only the guard's Drop sends Abort, and that path discards the
         // outcome while unwinding — but the type cannot promise it.
-        ChildOutcome::Aborted => {
-            return Err(Fault::transient("the download was aborted mid-flight"));
-        }
+        ChildOutcome::Aborted => Err(Fault::transient("the download was aborted mid-flight")),
         ChildOutcome::Exited(status) => {
-            let media_landed = filepath.as_deref().is_some_and(|p| Path::new(p).is_file());
-            settle_exit(status, media_landed, &stderr)?
+            let media_landed = run.filepath.as_deref().is_some_and(Path::is_file);
+            settle_exit(*status, media_landed, &run.stderr)
         }
-    };
-    if let Some(e) = read_error {
-        return Err(Fault::transient(format!(
-            "reading yt-dlp output failed mid-download: {e}"
-        )));
     }
-    let Some(filepath) = filepath else {
-        return Err(Fault::bad_input(format!(
-            "yt-dlp finished without producing a file — the size cap (download.max_bytes) \
-             may have aborted it: {}",
-            stderr_tail(&stderr)
-        )));
-    };
-    let filepath = PathBuf::from(filepath);
-    let Some((staging, dest_dir)) = staging else {
-        return Ok(Downloaded {
-            path: filepath,
-            warning,
-        });
-    };
-    // Elect the one sidecar before the results become visible to other
-    // processes: adoption must publish a complete entry. A failed election
-    // degrades to a warning; the media is already on disk.
-    let warning = match promote_key {
-        Some(key) => promotion_warning(
-            promote_subtitle(&staging.path, &key, &cfg.subtitles.preferred_langs),
-            warning,
-        ),
-        None => warning,
-    };
-    let path = staging
-        .adopt_into(&dest_dir, &filepath)
-        .map_err(|e| Fault::environment(format!("cannot move the download into the cache: {e}")))?;
-    Ok(Downloaded { path, warning })
 }
 
 #[cfg(test)]
@@ -1084,6 +1219,178 @@ mod tests {
             source.downcast_ref::<serde_json::Error>().is_some(),
             "source is the typed serde error"
         );
+    }
+
+    #[test]
+    fn clean_cookie_commit_yields_no_warning() {
+        assert_eq!(commit_cookies(CookieHandle::Anonymous), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_cookie_commit_surfaces_a_warning() {
+        // The child rotated a cookie into the staged jar, but the write
+        // back to the canonical jar fails: the remote session may already
+        // have moved on, so the half-committed state must reach the
+        // caller's warning channel, not just a log line.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("jar");
+        let cookie_cfg = crate::config::CookiesCfg {
+            from_browser: None,
+            jar: dir.join("cookies.txt"),
+        };
+        let jar_line = |value: &str| format!(".a.com\tTRUE\t/\tFALSE\t0\tn\t{value}\n");
+        std::fs::write(&cookie_cfg.jar, jar_line("old")).expect("write jar");
+        let handle = CookieHandle::acquire(&cookie_cfg).expect("stage jar");
+        let CookieHandle::Jar(lease) = &handle else {
+            panic!("a present jar acquires in jar mode");
+        };
+        std::fs::write(lease.staged(), jar_line("rotated")).expect("rotate staged");
+        std::fs::set_permissions(&cookie_cfg.jar, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+        if std::fs::read_to_string(&cookie_cfg.jar).is_ok() {
+            return; // privileged (e.g. root): unreadable cannot be simulated
+        }
+
+        let warning = commit_cookies(handle).expect("a failed write-back must surface");
+
+        assert!(
+            warning.contains("could not be written back"),
+            "names the failure: {warning}"
+        );
+        assert!(
+            warning.contains("cookie import"),
+            "names the way out: {warning}"
+        );
+    }
+
+    #[test]
+    fn download_args_bind_the_output_template_to_dash_o() {
+        // Regression: the --proxy pair was once inserted between `-o` and
+        // its value, so yt-dlp's parser took "--proxy" as the output
+        // template and the relay URL became a positional download target.
+        let relay = crate::relay::PolicyRelay::start(false).expect("relay starts");
+        let mut cfg =
+            crate::config::default_config(&crate::config::test_dirs(Path::new("/home/u")));
+        cfg.network.allow_private_hosts = true; // skip DNS in `vet`; see probe_args test
+        let cookies = acquire_cookies(&cfg).expect("anonymous cookies stage cleanly");
+        let url = crate::netguard::vet("https://example.com/watch", &cfg).expect("well-formed");
+        let dir = temp_dir("args");
+        let landing = Landing::prepare(
+            DownloadIo::Cache {
+                dir: &dir,
+                key: "k",
+            },
+            true,
+        )
+        .expect("staging dir");
+        let recipe = YtdlpRecipe {
+            format: "best".to_string(),
+            subs: true,
+        };
+
+        let args = download_args(&url, &recipe, &landing, &cfg, &relay, &cookies);
+
+        let o = args.iter().position(|a| a == "-o").expect("-o present");
+        assert_eq!(
+            args[o + 1],
+            landing.media_template().to_string_lossy(),
+            "-o must be immediately followed by the media template"
+        );
+        let proxy = args.iter().position(|a| a == "--proxy").expect("--proxy");
+        assert_eq!(args[proxy + 1], relay.url(), "--proxy names the relay");
+        let sub_o = args.iter().rposition(|a| a == "-o").expect("subtitle -o");
+        assert_ne!(sub_o, o, "subtitle output gets its own -o");
+        assert!(
+            args[sub_o + 1].starts_with("subtitle:"),
+            "{}",
+            args[sub_o + 1]
+        );
+        assert_eq!(args.last().expect("url is last"), url.as_str());
+    }
+
+    #[test]
+    fn keep_download_args_skip_subtitle_work() {
+        let relay = crate::relay::PolicyRelay::start(false).expect("relay starts");
+        let mut cfg =
+            crate::config::default_config(&crate::config::test_dirs(Path::new("/home/u")));
+        cfg.network.allow_private_hosts = true;
+        let cookies = acquire_cookies(&cfg).expect("anonymous cookies stage cleanly");
+        let url = crate::netguard::vet("https://example.com/watch", &cfg).expect("well-formed");
+        let landing = Landing::prepare(
+            DownloadIo::Keep {
+                dir: Path::new("/keep"),
+            },
+            // The recipe never asks for subs on keep downloads; even if it
+            // did, the keep landing has no subtitle template.
+            true,
+        )
+        .expect("keep landing");
+        let recipe = YtdlpRecipe {
+            format: "best".to_string(),
+            subs: true,
+        };
+
+        let args = download_args(&url, &recipe, &landing, &cfg, &relay, &cookies);
+
+        assert!(!args.iter().any(|a| a == "--write-subs"), "{args:?}");
+        let o = args.iter().position(|a| a == "-o").expect("-o present");
+        assert_eq!(
+            args[o + 1],
+            landing.media_template().to_string_lossy(),
+            "keep template rides -o"
+        );
+    }
+
+    #[test]
+    fn cache_landing_publishes_media_with_promoted_sidecar() {
+        let cfg = crate::config::default_config(&crate::config::test_dirs(Path::new("/home/u")));
+        let dir = temp_dir("landing");
+        let landing = Landing::prepare(
+            DownloadIo::Cache {
+                dir: &dir,
+                key: "k",
+            },
+            true,
+        )
+        .expect("staging dir");
+        let staging_path = match &landing {
+            Landing::Cache { staging, .. } => staging.path.clone(),
+            Landing::Keep { .. } => unreachable!("cache io prepares a cache landing"),
+        };
+        std::fs::write(staging_path.join("k.mp4"), b"v").expect("write media");
+        std::fs::write(staging_path.join("k_subs.en.srt"), b"en").expect("write subs");
+
+        let downloaded = landing
+            .publish(staging_path.join("k.mp4"), None, &cfg)
+            .expect("publish");
+
+        assert_eq!(downloaded.path, dir.join("k.mp4"));
+        assert!(dir.join("k.srt").exists(), "sidecar elected and adopted");
+        assert!(!staging_path.exists(), "staging cleaned up");
+    }
+
+    #[test]
+    fn keep_landing_publishes_the_reported_path_verbatim() {
+        let cfg = crate::config::default_config(&crate::config::test_dirs(Path::new("/home/u")));
+        let landing = Landing::prepare(
+            DownloadIo::Keep {
+                dir: Path::new("/keep"),
+            },
+            false,
+        )
+        .expect("keep landing");
+
+        let downloaded = landing
+            .publish(
+                PathBuf::from("/keep/My Video [id].mp4"),
+                Some("degraded".to_string()),
+                &cfg,
+            )
+            .expect("publish");
+
+        assert_eq!(downloaded.path, Path::new("/keep/My Video [id].mp4"));
+        assert_eq!(downloaded.warning.as_deref(), Some("degraded"));
     }
 
     #[test]

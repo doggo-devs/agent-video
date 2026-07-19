@@ -79,7 +79,21 @@ pub(super) fn cached_probe(
     })?;
     let cached: Option<ProbeSummary> = fp
         .stable
-        .then(|| deps.cache.get_probe(&fp.id).ok().flatten())
+        .then(|| match deps.cache.get_probe(&fp.id) {
+            Ok(doc) => doc,
+            Err(e) => {
+                // Same degradation — and the same alarm — as the write
+                // side below: a fresh probe still answers the call, but a
+                // broken cache dir must not silently turn every call into
+                // a full re-probe.
+                tracing::warn!(
+                    file = %file.display(),
+                    error = %e,
+                    "probe cache read failed; probing fresh until it heals"
+                );
+                None
+            }
+        })
         .flatten()
         .and_then(|doc| parse_probe_doc(&doc));
     let mut probe = match cached {
@@ -205,6 +219,28 @@ mod tests {
             frozen,
             "the conditioning prompt — and with it the transcript id — is frozen at first sighting"
         );
+    }
+
+    #[test]
+    fn a_broken_cache_read_degrades_to_a_fresh_probe_not_a_fault() {
+        let env = env(probe(90.0, vec![]), false);
+        let file = media_file(&env, "talk.mp4");
+        let (_, id) = cached_probe(&file, &env.deps).expect("first probe stores the doc");
+        // Corrupt the cache slot into something read_to_string cannot
+        // consume: a directory where the document should be.
+        let doc_path = env
+            .deps
+            .config
+            .paths
+            .cache
+            .join("probe")
+            .join(format!("{id}.json"));
+        std::fs::remove_file(&doc_path).expect("clear the slot");
+        std::fs::create_dir(&doc_path).expect("plant an unreadable entry");
+
+        let (summary, _) =
+            cached_probe(&file, &env.deps).expect("a broken read is a miss, never a fault");
+        assert_eq!(summary.duration, 90.0, "the fresh probe answered");
     }
 
     #[test]

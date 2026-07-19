@@ -65,7 +65,7 @@ pub struct Paths {
     pub cache: PathBuf,
     /// Whisper weights: persistent, LRU-exempt.
     pub models: PathBuf,
-    /// `dl-keep-*` landing directory; files there belong to the user.
+    /// Keep-download landing directory; files there belong to the user.
     pub keep: PathBuf,
 }
 
@@ -145,21 +145,26 @@ pub struct CookiesCfg {
     pub jar: PathBuf,
 }
 
-/// Browsers yt-dlp can extract cookies from; the config value's base name
-/// (before any `:profile` / `+keyring` suffix) must be one of these.
-const KNOWN_BROWSERS: &[&str] = &[
-    "brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale",
-];
-
+/// Validate a `cookies.from_browser` value by shape, not by list: the set
+/// of browsers yt-dlp can extract cookies from is yt-dlp's to own and
+/// grows upstream, so a frozen snapshot here would reject tomorrow's
+/// valid config at load time. Only the base name (before any `:profile` /
+/// `+keyring` suffix) is checked — a lowercase alphanumeric word, the
+/// shape every yt-dlp browser name has. A typo'd browser fails at spawn
+/// time with yt-dlp's own error naming the currently supported set.
 fn parse_from_browser(value: &str) -> Result<String, ConfigError> {
     let base = value
         .split([':', '+'])
         .next()
         .expect("split yields at least one item");
-    if !KNOWN_BROWSERS.contains(&base) {
+    let word = !base.is_empty()
+        && base
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    if !word {
         return Err(ConfigError(format!(
-            "cookies.from_browser must start with one of {} — got '{value}'",
-            KNOWN_BROWSERS.join(", ")
+            "cookies.from_browser must start with a browser name yt-dlp knows, like \
+             'firefox' or 'chrome:Profile 1' — got '{value}'"
         )));
     }
     Ok(value.to_string())
@@ -186,6 +191,10 @@ pub struct BudgetCfg {
     pub auto_run: NonZeroU32,
     /// Predicted grid count above which the plan degrades / needs consent.
     pub max: NonZeroU32,
+    /// Degradation floor: max seconds one stretched grid may cover before
+    /// running the plan requires explicit consent. The third rung of the
+    /// same consent ladder as `auto_run` and `max`.
+    pub max_stretch_seconds: NonZeroU32,
 }
 
 /// Whisper model selection: a pinned name provisioned by `install-whisper`,
@@ -380,6 +389,7 @@ struct FileDownload {
 struct FileBudget {
     auto_run: Option<u32>,
     max: Option<u32>,
+    max_stretch_seconds: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -464,6 +474,7 @@ pub fn default_config(dirs: &BaseDirs) -> Config {
         budget: BudgetCfg {
             auto_run: nz32(2),
             max: nz32(8),
+            max_stretch_seconds: nz32(600),
         },
         network: NetworkCfg {
             allow_private_hosts: false,
@@ -551,6 +562,12 @@ pub fn parse_config(text: &str, dirs: &BaseDirs) -> Result<Config, ConfigError> 
     }
     if let Some(v) = nz32(file.budget.max, "budget.max")? {
         cfg.budget.max = v;
+    }
+    if let Some(v) = nz32(
+        file.budget.max_stretch_seconds,
+        "budget.max_stretch_seconds",
+    )? {
+        cfg.budget.max_stretch_seconds = v;
     }
     if let Some(v) = file.network.allow_private_hosts {
         cfg.network.allow_private_hosts = v;
@@ -665,6 +682,7 @@ mod tests {
         assert_eq!(cfg.paths.keep, Path::new("/home/u/downloads-base"));
         assert_eq!(cfg.budget.auto_run.get(), 2);
         assert_eq!(cfg.budget.max.get(), 8);
+        assert_eq!(cfg.budget.max_stretch_seconds.get(), 600);
         assert_eq!(cfg.download.max_bytes.get(), 2 * GIB);
         assert_eq!(cfg.download.analysis_max_height.get(), 480);
         assert_eq!(cfg.whisper.model, WhisperModel::LargeV3Turbo);
@@ -700,6 +718,7 @@ mod tests {
             [budget]
             auto_run = 5
             max = 6
+            max_stretch_seconds = 7
             [network]
             allow_private_hosts = true
             "#,
@@ -716,6 +735,7 @@ mod tests {
         assert_eq!(cfg.download.sync_wait_seconds.get(), 4);
         assert_eq!(cfg.budget.auto_run.get(), 5);
         assert_eq!(cfg.budget.max.get(), 6);
+        assert_eq!(cfg.budget.max_stretch_seconds.get(), 7);
         assert!(cfg.network.allow_private_hosts);
     }
 
@@ -813,10 +833,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_unknown_browser() {
-        let err = parse_config("[cookies]\nfrom_browser = \"netscape\"\n", &dirs())
-            .expect_err("unknown browser");
-        assert!(err.0.contains("netscape"), "names the value: {err}");
+    fn accepts_a_browser_this_build_never_heard_of() {
+        // The browser list is yt-dlp's, and yt-dlp updates independently
+        // of this binary: an unlisted-but-shaped name must load, not be
+        // rejected by a stale snapshot.
+        let cfg = parse_config("[cookies]\nfrom_browser = \"ladybird\"\n", &dirs()).expect("valid");
+        assert_eq!(cfg.cookies.from_browser.as_deref(), Some("ladybird"));
+    }
+
+    #[test]
+    fn rejects_a_malformed_from_browser() {
+        for junk in ["", ":Profile 1", "Fire Fox", "fire/fox"] {
+            let err = parse_config(&format!("[cookies]\nfrom_browser = {junk:?}\n"), &dirs())
+                .expect_err("a value with no browser-name shape must fail the load");
+            assert!(err.0.contains("from_browser"), "names the key: {err}");
+        }
     }
 
     #[test]

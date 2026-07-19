@@ -10,13 +10,14 @@ use super::fetch::SourceInfo;
 use super::plan::{Decision, format_bytes};
 use super::schema::{Intent, VideoArgs};
 use super::time::ArgError;
-use super::tokens::{DownloadPlan, Offer, PendingAction};
+use super::tokens::{DownloadPlan, OfferDraft, PendingAction};
 
 /// Model-facing guidance attached to every download offer.
-const CHOICE_GUIDANCE: &str = "dl-analysis fetches a low-res rip plus subtitles into an evictable cache — \
-     enough for you to watch and report on the video. If the user wants the video \
-     for themselves, pick a dl-keep tier instead: never serve them the analysis rip. \
-     Echo exactly one token via confirm.";
+const CHOICE_GUIDANCE: &str = "The analysis option fetches a low-res rip plus subtitles into an evictable \
+     cache — enough for you to watch and report on the video. If the user wants \
+     the video for themselves, pick an option whose effect saves the file for \
+     the user instead: never serve them the analysis rip. Echo exactly one \
+     token via confirm.";
 
 /// First contact with a not-yet-downloaded URL: offer tiers behind tokens,
 /// or refuse. Pure: the offers ride the returned decision.
@@ -34,15 +35,14 @@ pub fn decide_url(args: &VideoArgs, info: &SourceInfo, cfg: &Config) -> Decision
     }
 
     let max_bytes = cfg.download.max_bytes.get();
-    let mut offers: Vec<Offer> = Vec::new();
+    let mut offers: Vec<OfferDraft> = Vec::new();
     let mut dropped: Vec<&str> = Vec::new();
     for opt in &info.options {
         if opt.estimated_bytes.is_some_and(|est| est > max_bytes) {
             dropped.push(&opt.label);
             continue;
         }
-        offers.push(Offer {
-            token: opt.token.clone(),
+        offers.push(OfferDraft {
             effect: opt.effect.clone(),
             action: PendingAction::Download(DownloadPlan {
                 url: args.source.clone(),
@@ -102,19 +102,18 @@ mod tests {
     use crate::config::{default_config, test_dirs};
     use crate::fetch::{DownloadOption, Recipe, direct::DirectRecipe};
     use crate::schema::Look;
-    use crate::tokens::{Dest, Token};
+    use crate::tokens::Dest;
     use std::path::Path;
 
     fn cfg() -> Config {
         default_config(&test_dirs(Path::new("/home/u")))
     }
 
-    fn option(token: &str, dest: Dest, bytes: Option<u64>) -> DownloadOption {
+    fn option(label: &str, dest: Dest, bytes: Option<u64>) -> DownloadOption {
         DownloadOption {
-            token: Token::new(token),
             dest,
-            label: format!("{token} label"),
-            effect: format!("{token} effect"),
+            label: label.to_string(),
+            effect: format!("{label} effect"),
             estimated_bytes: bytes,
             recipe: Recipe::Direct(DirectRecipe {
                 ext: "mp4".to_string(),
@@ -137,8 +136,8 @@ mod tests {
         let d = decide_url(
             &args,
             &info(vec![
-                option("dl-analysis", Dest::Cache, Some(1024)),
-                option("dl-keep-720", Dest::Keep, None),
+                option("analysis", Dest::Cache, Some(1024)),
+                option("keep-720", Dest::Keep, None),
             ]),
             &cfg(),
         );
@@ -151,7 +150,7 @@ mod tests {
         };
         assert_eq!(offers.len(), 2);
         assert!(consequence.contains("A video."));
-        assert_eq!(offers[0].token, Token::new("dl-analysis"));
+        assert_eq!(offers[0].effect, "analysis effect");
         assert!(matches!(offers[0].action, PendingAction::Download(_)));
     }
 
@@ -162,8 +161,8 @@ mod tests {
         let d = decide_url(
             &args,
             &info(vec![
-                option("dl-analysis", Dest::Cache, Some(1024)),
-                option("dl-keep-2160", Dest::Keep, Some(over)),
+                option("analysis", Dest::Cache, Some(1024)),
+                option("keep-2160", Dest::Keep, Some(over)),
             ]),
             &cfg(),
         );
@@ -184,7 +183,7 @@ mod tests {
         let over = cfg().download.max_bytes.get() + 1;
         let d = decide_url(
             &args,
-            &info(vec![option("dl-analysis", Dest::Cache, Some(over))]),
+            &info(vec![option("analysis", Dest::Cache, Some(over))]),
             &cfg(),
         );
         let Decision::Reject { message } = d else {
@@ -211,7 +210,7 @@ mod tests {
         };
         let d = decide_url(
             &args,
-            &info(vec![option("dl-analysis", Dest::Cache, None)]),
+            &info(vec![option("analysis", Dest::Cache, None)]),
             &cfg(),
         );
         let Decision::Confirm { consequence, .. } = d else {

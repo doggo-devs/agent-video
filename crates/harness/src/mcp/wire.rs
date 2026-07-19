@@ -9,7 +9,7 @@ use rmcp::model::{CallToolResult, ContentBlock};
 
 use crate::fault::Fault;
 use crate::plan::format_bytes;
-use crate::schema::{LOOKS, Look, STRATEGIES, Strategy, TimeValue, VideoArgs, VideoBody};
+use crate::schema::{Look, Strategy, TimeValue, VideoArgs, VideoBody, wire_names};
 use agent_video_core::types::{GridImage, format_ts};
 use agent_video_core::wire::Coverage;
 
@@ -75,7 +75,7 @@ pub(super) fn coerce_args(
         Some(v) => Some(serde_json::from_value::<Look>(v.clone()).map_err(|_| {
             Fault::bad_input(format!(
                 r#"look must be one of {}, e.g. {{"look": "overview"}}"#,
-                LOOKS.join(", ")
+                wire_names(&Look::ALL).join(", ")
             ))
         })?),
     };
@@ -84,7 +84,7 @@ pub(super) fn coerce_args(
         Some(v) => Some(serde_json::from_value::<Strategy>(v.clone()).map_err(|_| {
             Fault::bad_input(format!(
                 r#"strategy must be one of {}, e.g. {{"strategy": "uniform"}}"#,
-                STRATEGIES.join(", ")
+                wire_names(&Strategy::ALL).join(", ")
             ))
         })?),
     };

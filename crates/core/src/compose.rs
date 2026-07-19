@@ -80,7 +80,7 @@ pub fn render(
             &FONT,
             rect.x() + inset,
             rect.y() + inset,
-            frame.ts,
+            frame.ts.get(),
         );
     }
 
@@ -166,9 +166,9 @@ mod tests {
     use std::sync::Arc;
 
     fn frame(ts: f32) -> ScoredFrame {
-        use crate::types::{SceneDiff, Score};
+        use crate::types::{SceneDiff, Score, Ts};
         ScoredFrame {
-            ts,
+            ts: Ts::new(ts).expect("finite test ts"),
             gray: GrayImage::new(1, 1),
             rgb: Arc::new(RgbImage::from_pixel(32, 18, Rgb([100, 120, 140]))),
             score: Score::new(0.0).expect("zero score is valid"),

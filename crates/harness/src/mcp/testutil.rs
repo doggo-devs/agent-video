@@ -24,7 +24,7 @@ use crate::fetch::{
 };
 use crate::relay::PolicyRelay;
 use crate::schema::ProbeSummary;
-use crate::tokens::{Dest, DownloadPlan, Token, Tokens};
+use crate::tokens::{Dest, DownloadPlan, Tokens};
 
 // ── fakes ──
 
@@ -304,6 +304,9 @@ pub(crate) fn env_with_fetcher(
         tokens: Tokens::default(),
         downloads: Tracker::default(),
         transcriptions: crate::gate::KeyedGate::default(),
+        // Generous enough that only tests which shrink it observe the
+        // bound; real waits in tests are released in milliseconds.
+        transcribe_wait: std::time::Duration::from_secs(60),
         prober: Box::new(FakeProber(probe_summary)),
         fetcher: Box::new(Arc::clone(&fetcher)),
         whisper: Box::new(Arc::clone(&whisper)),
@@ -322,7 +325,6 @@ pub(crate) fn env_with_fetcher(
 
 pub(crate) fn analysis_option() -> DownloadOption {
     DownloadOption {
-        token: Token::new("dl-analysis"),
         dest: Dest::Cache,
         label: "480p".to_string(),
         effect: "download the analysis rip".to_string(),
@@ -336,7 +338,6 @@ pub(crate) fn analysis_option() -> DownloadOption {
 
 pub(crate) fn keep_option() -> DownloadOption {
     DownloadOption {
-        token: Token::new("dl-keep"),
         dest: Dest::Keep,
         label: "1080p".to_string(),
         effect: "save the full-quality file to the keep dir".to_string(),
@@ -385,4 +386,16 @@ pub(crate) fn text_of(result: &CallToolResult) -> String {
 
 pub(crate) fn body_of(result: &CallToolResult) -> serde_json::Value {
     serde_json::from_str(&text_of(result)).expect("body is JSON")
+}
+
+/// The offered token strings of a `confirm_required` body, in offer order.
+/// Tokens are opaque and minted per commit, so tests read them from the
+/// body the model would see instead of assuming any spelling.
+pub(crate) fn offered_tokens(body: &serde_json::Value) -> Vec<String> {
+    body["tokens"]
+        .as_array()
+        .expect("confirm_required body carries tokens")
+        .iter()
+        .map(|t| t["token"].as_str().expect("token is a string").to_string())
+        .collect()
 }

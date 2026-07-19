@@ -24,7 +24,7 @@ use image::RgbImage;
 use crate::error::{Error, ErrorCode, Result};
 use crate::event::{Event, EventSink};
 use crate::source::Source;
-use crate::types::TimeRange;
+use crate::types::{TimeRange, Ts};
 
 use super::scale::Rescaler;
 use super::{
@@ -35,8 +35,8 @@ use super::{
 /// One sampled RGB frame, already downscaled for composition.
 #[derive(Debug)]
 pub struct RgbFrame {
-    /// Presentation timestamp in seconds, 0-based at the stream start.
-    pub ts: f32,
+    /// Presentation timestamp, 0-based at the stream start.
+    pub ts: Ts,
     /// Downscaled RGB image used later by composition.
     pub rgb: RgbImage,
 }
@@ -467,7 +467,15 @@ impl Worker {
             }
         }
 
-        let _ = self.decoder.send_eof();
+        // The EOF flush squeezes the decoder's buffered tail (B-frame
+        // reordering delay) out; an unchecked failure here would silently
+        // truncate the stream by exactly those frames. `Eof` (already
+        // flushed) is not a failure — the drain below still empties what is
+        // buffered.
+        match self.decoder.send_eof() {
+            Ok(()) | Err(ffmpeg::Error::Eof) => {}
+            Err(e) => return Err(decode_error("flushing decoder at end of stream", e)),
+        }
         self.drain()?;
 
         if self.frames_sent == 0 && self.decode_errors > 0 {
@@ -497,17 +505,22 @@ impl Worker {
                 Err(e) => return Err(decode_error("receiving decoded frame", e)),
             }
 
-            // best-effort timestamp, pts fallback; neither = unplaceable, skip.
+            // best-effort timestamp, pts fallback. No pts at all, or a pts
+            // whose seconds conversion is non-finite (absurd pts × time_base
+            // overflowing f32) = unplaceable, skip. This is the single mint
+            // point of [`Ts`]: past here timestamps are finite by type.
             let Some(pts) = frame.timestamp().or(frame.pts()) else {
                 continue;
             };
-            let ts = self.video.ts_seconds(pts);
+            let Some(ts) = Ts::new(self.video.ts_seconds(pts)) else {
+                continue;
+            };
             if let Some(end) = self.end
-                && ts >= end
+                && ts.get() >= end
             {
                 return Ok(Flow::Stop);
             }
-            if !self.sampler.wants(ts, frame.is_key()) {
+            if !self.sampler.wants(ts.get(), frame.is_key()) {
                 continue;
             }
 

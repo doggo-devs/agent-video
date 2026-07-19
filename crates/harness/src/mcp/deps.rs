@@ -7,6 +7,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::cache::Cache;
 use crate::config::Config;
@@ -125,6 +126,12 @@ pub struct ServerDeps {
     /// critical section, so concurrent requests for the same transcript
     /// run the model once and the rest adopt the cached result.
     pub transcriptions: KeyedGate,
+    /// Per-waiter bound on `transcriptions` admission: how long a rival
+    /// call may wait for an in-flight transcription of the same content
+    /// before answering "in flight — call again" instead of pinning its
+    /// thread for the holder's whole (per-chunk compounding) wall clock.
+    /// [`TRANSCRIBE_WAIT`] in production; a field so tests can shrink it.
+    pub transcribe_wait: Duration,
     pub prober: Box<dyn FileProber>,
     pub fetcher: Box<dyn UrlFetcher>,
     pub whisper: Box<dyn Whisper>,
@@ -170,6 +177,13 @@ impl RelaySlot {
     }
 }
 
+/// The production [`ServerDeps::transcribe_wait`]: long enough that a
+/// rival to a short transcription still answers inline (the one-blocked-
+/// call-over-poll-chains stance of docs/config.md), short enough that a
+/// long-running winner cannot pin every rival's thread for hours. Mirrors
+/// the download sync grace window's default.
+pub const TRANSCRIBE_WAIT: Duration = Duration::from_secs(90);
+
 impl ServerDeps {
     /// Production wiring: disk cache, in-process probe, real sources,
     /// whisper-rs, self-spawned core.
@@ -180,6 +194,7 @@ impl ServerDeps {
             tokens: Tokens::default(),
             downloads: Tracker::default(),
             transcriptions: KeyedGate::default(),
+            transcribe_wait: TRANSCRIBE_WAIT,
             prober: Box::new(RealProber),
             fetcher: Box::new(RealFetcher),
             whisper: Box::new(RealWhisper),

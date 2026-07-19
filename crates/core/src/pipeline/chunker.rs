@@ -20,12 +20,14 @@ use anyhow::Result;
 use image::GrayImage;
 
 use crate::event::EventSink;
-use crate::types::CandidateFrame;
+use crate::types::{CandidateFrame, Ts};
 
 use super::stretch::{Stretch, StretchDetector};
 
-/// Unplaceable-timestamp frames (non-finite or going backwards) tolerated
-/// per run before the input's timeline is declared broken. The same shape as
+/// Backwards-timestamp frames tolerated per run before the input's timeline
+/// is declared broken. Timestamps are finite by construction ([`Ts`]), so
+/// going backwards is the one way a frame can still be unplaceable — a
+/// stream property no single-value constructor can seal. The same shape as
 /// the demux-error cap in [`crate::media`]: bounded badness degrades output,
 /// unbounded badness fails the run.
 const MAX_TS_REGRESSIONS: u32 = 64;
@@ -66,8 +68,8 @@ pub(super) struct Chunker {
     high_water_mark: Option<usize>,
     /// Timestamp of the last placed frame; frames whose ts falls behind it
     /// cannot be placed and are skipped (see [`Chunker::push`]).
-    last_ts: Option<f32>,
-    /// Skipped unplaceable-timestamp frames so far, capped by
+    last_ts: Option<Ts>,
+    /// Skipped backwards-timestamp frames so far, capped by
     /// [`MAX_TS_REGRESSIONS`].
     ts_regressions: u32,
     /// Static-stretch detector, fed every dedup verdict in timestamp order.
@@ -103,7 +105,7 @@ impl Chunker {
     /// carried frames become a [`Event::Chunk`].
     ///
     /// Chunk keying, high-water-mark sealing, and static detection all assume
-    /// finite, non-decreasing timestamps. The decode pass emits frames in
+    /// non-decreasing timestamps. The decode pass emits frames in
     /// presentation order and the pts→seconds mapping preserves that order,
     /// so a violation means the input's own timestamps are broken — the frame
     /// cannot be placed in any chunk and is skipped. More than
@@ -120,36 +122,36 @@ impl Chunker {
         capacity: usize,
         events: &dyn EventSink,
     ) -> Result<Vec<Event>> {
-        if !frame.ts.is_finite() || self.last_ts.is_some_and(|last| frame.ts < last) {
+        if self.last_ts.is_some_and(|last| frame.ts < last) {
             self.ts_regressions += 1;
             if self.ts_regressions > MAX_TS_REGRESSIONS {
                 anyhow::bail!(
-                    "{} frames with unplaceable timestamps (non-finite or backwards, \
-                     last placed {:?}, offending {}); the input's timeline is broken",
+                    "{} frames with backwards timestamps (last placed {:?}, offending {}); \
+                     the input's timeline is broken",
                     self.ts_regressions,
-                    self.last_ts,
-                    frame.ts
+                    self.last_ts.map(Ts::get),
+                    frame.ts.get()
                 );
             }
             if self.ts_regressions == 1 {
                 events.event(crate::event::Event::UnplaceableTimestamp {
-                    ts: frame.ts,
-                    last: self.last_ts,
+                    ts: frame.ts.get(),
+                    last: self.last_ts.map(Ts::get),
                 });
             }
             return Ok(Vec::new());
         }
         self.last_ts = Some(frame.ts);
-        self.duration = self.duration.max(frame.ts + 1.0 / self.base_fps);
+        self.duration = self.duration.max(frame.ts.get() + 1.0 / self.base_fps);
         if kept {
             let mut events = Vec::new();
-            if let Some(stretch) = self.stretches.note_kept(frame.ts, &frame.rgb) {
+            if let Some(stretch) = self.stretches.note_kept(frame.ts.get(), &frame.rgb) {
                 events.push(Event::Static(stretch));
             }
             self.push_chunked_frame(frame, capacity, &mut events);
             Ok(events)
         } else {
-            self.stretches.note_dropped(frame.ts);
+            self.stretches.note_dropped(frame.ts.get());
             Ok(Vec::new())
         }
     }
@@ -177,7 +179,7 @@ impl Chunker {
         // can only arrive before the first placed frame and belong to the
         // first chunk: clamp explicitly instead of leaning on as-usize
         // saturation.
-        let key = (frame.ts / self.chunk_seconds).floor().max(0.0) as usize;
+        let key = (frame.ts.get() / self.chunk_seconds).floor().max(0.0) as usize;
         self.pending.entry(key).or_default().push(frame);
 
         if let Some(hwm) = self.high_water_mark
@@ -229,7 +231,7 @@ mod tests {
     /// `gray`/`rgb` handles (boundary context, static representative).
     fn frame(ts: f32) -> CandidateFrame {
         CandidateFrame {
-            ts,
+            ts: Ts::new(ts).expect("finite test ts"),
             gray: GrayImage::new(1, 1),
             rgb: Arc::new(RgbImage::new(1, 1)),
         }
@@ -240,7 +242,7 @@ mod tests {
         events
             .iter()
             .filter_map(|e| match e {
-                Event::Chunk { frames, .. } => Some(frames.iter().map(|f| f.ts).collect()),
+                Event::Chunk { frames, .. } => Some(frames.iter().map(|f| f.ts.get()).collect()),
                 Event::Static(_) => None,
             })
             .collect()
@@ -358,24 +360,6 @@ mod tests {
             vec![vec![10.0, 11.0]],
             "the backwards frame is skipped, not chunked"
         );
-    }
-
-    #[test]
-    fn skips_non_finite_timestamp_frames() {
-        let mut chunker = Chunker::new(60.0, 1.0);
-
-        chunker
-            .push(frame(0.0), true, 4, &Discard)
-            .expect("place 0.0");
-        chunker
-            .push(frame(f32::NAN), true, 4, &Discard)
-            .expect("a NaN timestamp is skipped, not fatal");
-        chunker
-            .push(frame(1.0), true, 4, &Discard)
-            .expect("place 1.0");
-
-        let events = chunker.finish(4);
-        assert_eq!(chunk_ts(&events), vec![vec![0.0, 1.0]]);
     }
 
     #[test]

@@ -8,7 +8,7 @@ mod support;
 
 use agent_video_core::config::Overrides;
 use agent_video_core::event::Discard;
-use agent_video_core::media::audio::{WHISPER_SAMPLE_RATE, decode_audio_16k_mono};
+use agent_video_core::media::audio::{AudioSamples, WHISPER_SAMPLE_RATE, decode_audio_16k_mono};
 use agent_video_core::pipeline::{self, OutputSink, SubtitleSource, Window};
 use agent_video_core::probe;
 use agent_video_core::source::Source;
@@ -343,5 +343,40 @@ fn follows_mid_stream_sample_rate_change_in_audio_decode() {
         samples.len() as f32 <= 1.15 * expected,
         "decoded {} samples, expected ~{expected} — timeline duplicated?",
         samples.len()
+    );
+}
+
+#[test]
+fn bounded_fills_reproduce_the_whole_decode() {
+    // The streaming contract: pulling the track through small bounded
+    // fills must yield bit-identical samples to the whole-track decode —
+    // same pipeline, same carry-over handling, chunk seams invisible.
+    let fx = require_fixture!(support::fixtures::audio_param_change(6.0));
+    let whole = decode_audio_16k_mono(&source_of(&fx.media))
+        .expect("whole decode succeeds")
+        .expect("the fixture has an audio track");
+
+    let mut stream = AudioSamples::open(&source_of(&fx.media))
+        .expect("stream opens")
+        .expect("the fixture has an audio track");
+    let mut streamed = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        let more = stream.fill(&mut buf, 10_000).expect("fill succeeds");
+        streamed.append(&mut buf);
+        if !more {
+            break;
+        }
+    }
+    assert!(
+        !stream
+            .fill(&mut buf, 1)
+            .expect("post-exhaustion fill is fine"),
+        "exhaustion is final: later fills keep answering false"
+    );
+    assert!(buf.is_empty(), "a drained stream appends nothing");
+    assert_eq!(
+        streamed, whole,
+        "streamed fills and the whole decode are the same samples"
     );
 }

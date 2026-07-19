@@ -126,7 +126,10 @@ mod tests {
             let v = ((x * (3 + seed) + y * (7 + 2 * seed)) % 256) as u8;
             Rgb([v, v, v])
         });
-        RgbFrame { ts, rgb }
+        RgbFrame {
+            ts: crate::types::Ts::new(ts).expect("finite test ts"),
+            rgb,
+        }
     }
 
     /// Ten frames where every third is a near-duplicate of its predecessor,
@@ -145,7 +148,7 @@ mod tests {
         let mut stream = CandidateStream::new(source, deduper, batch_frames, 64, None);
         let mut out = Vec::new();
         while let Some(batch) = stream.next_batch().expect("fake source never fails") {
-            out.extend(batch.into_iter().map(|(f, kept)| (f.ts, kept)));
+            out.extend(batch.into_iter().map(|(f, kept)| (f.ts.get(), kept)));
         }
         out
     }

@@ -39,8 +39,10 @@ enum JobEvent {
 /// optional disowned compensation is the mirror image: it runs exactly
 /// when the settlement is dropped unadopted.
 ///
-/// Contract: an adopted effect runs inside the tracker's critical section
-/// and must not call back into the tracker.
+/// Contract: adoption is decided inside the tracker's critical section,
+/// but the adopted effect executes after it, outside the jobs lock — it
+/// may block on I/O or call back into the tracker without wedging the
+/// session ([`Aftermath`]).
 pub struct Settlement {
     result: CallToolResult,
     on_owned: Option<Box<dyn FnOnce() + Send>>,
@@ -185,9 +187,10 @@ impl JobSlot {
 
     /// Drain pending events into the snapshot; a settled result is stashed
     /// in `done` (checked before liveness by every caller) and its owned
-    /// effect runs here — the settlement was folded by a live slot, so the
-    /// job provably still owned it.
-    fn fold(&mut self) -> Fold {
+    /// effect is adopted into `aftermath` — the settlement was folded by a
+    /// live slot, so the job provably still owned it. The effect executes
+    /// only once the caller drops the aftermath, outside the jobs lock.
+    fn fold(&mut self, aftermath: &mut Aftermath) -> Fold {
         loop {
             match self.events.try_recv() {
                 Ok(JobEvent::Progress { downloaded, total }) => {
@@ -199,13 +202,13 @@ impl JobSlot {
                 }
                 Ok(JobEvent::Settled(settlement)) => {
                     // Folded by a live slot: adopted. The compensation is
-                    // defused before the owned effect runs, so no panic or
-                    // ordering accident can fire both.
+                    // defused before the owned effect can run, so no panic
+                    // or ordering accident can fire both.
                     if let Some(armed) = settlement.on_disowned {
                         armed.defuse();
                     }
                     if let Some(effect) = settlement.on_owned {
-                        effect();
+                        aftermath.effects.push(effect);
                     }
                     self.done = Some(settlement.result);
                 }
@@ -213,6 +216,41 @@ impl JobSlot {
                 Err(mpsc::TryRecvError::Disconnected) => return Fold::Dead,
             }
         }
+    }
+}
+
+/// Everything a critical section decided that must *execute* outside it:
+/// adopted owned effects and evicted slots, whose teardown trips cancel
+/// signals and can fire queued disowned compensations. Both run arbitrary
+/// code — a callback that touched the tracker again would self-deadlock on
+/// the non-reentrant jobs lock, and slow I/O would stall every poll in the
+/// session — so the locked sections only ever *collect* into this value,
+/// and their callers drop it after the guard is gone. Dropping is the
+/// execution: adoption ordering (defuse, then effect) was already settled
+/// under the lock, only the running happens here.
+///
+/// Execution stays in `Drop` rather than an explicit consuming method: one
+/// mechanism covers every exit path, and a `run(self)` would either leave
+/// `Drop` as a second execution path or make "dropped without running" a
+/// reachable state. The classic cost — an effect panicking inside a drop
+/// during an unwind is a double panic — buys nothing here: the workspace
+/// builds with `panic = "abort"`, so the first panic already ends the
+/// process before any unwind reaches this drop.
+#[derive(Default)]
+struct Aftermath {
+    /// Owned effects of settlements adopted in this critical section.
+    effects: Vec<Box<dyn FnOnce() + Send>>,
+    /// Slots removed in this critical section; dropped here so their
+    /// cancel trip and any queued compensations run without the lock.
+    evicted: Vec<JobSlot>,
+}
+
+impl Drop for Aftermath {
+    fn drop(&mut self) {
+        for effect in self.effects.drain(..) {
+            effect();
+        }
+        // `evicted` drops with self, after the effects.
     }
 }
 
@@ -271,14 +309,29 @@ impl Tracker {
     /// hand its response out, dead or stalled → evict), then insert a fresh
     /// job if the slot is free. The liveness check and the insertion share
     /// one critical section, so the loser of a concurrent double confirm
-    /// sees `Running` instead of spawning a second download.
+    /// sees `Running` instead of spawning a second download. Adopted
+    /// effects and evicted slots execute after the lock, before returning.
     pub fn admit(&self, key: &str, stall_limit: Duration) -> Admission {
+        let mut aftermath = Aftermath::default();
+        let admission = self.admit_locked(key, stall_limit, &mut aftermath);
+        drop(aftermath); // the lock is gone: effects and teardown run here
+        admission
+    }
+
+    fn admit_locked(
+        &self,
+        key: &str,
+        stall_limit: Duration,
+        aftermath: &mut Aftermath,
+    ) -> Admission {
         let mut jobs = self.lock();
         if let Some(slot) = jobs.get_mut(key) {
-            let liveness = slot.fold();
+            let liveness = slot.fold(aftermath);
             if slot.done.is_some() {
                 let mut slot = jobs.remove(key).expect("slot was just folded");
-                return Admission::Settled(slot.done.take().expect("checked above"));
+                let result = slot.done.take().expect("checked above");
+                aftermath.evicted.push(slot);
+                return Admission::Settled(result);
             }
             match liveness {
                 // Dead or wedged: nothing to hand out; claim the slot anew.
@@ -294,29 +347,41 @@ impl Tracker {
         }
         let (tx, rx) = mpsc::channel();
         let cancel = CancelSignal::new();
-        jobs.insert(key.to_string(), JobSlot::new(rx, cancel.clone()));
+        aftermath
+            .evicted
+            .extend(jobs.insert(key.to_string(), JobSlot::new(rx, cancel.clone())));
         Admission::Started(JobReporter { events: tx, cancel })
     }
 
     /// Resolve one poll: settled beats dead beats stalled beats running,
-    /// decided in a single critical section.
+    /// decided in a single critical section. Adopted effects and evicted
+    /// slots execute after the lock, before this returns.
     pub fn poll(&self, key: &str, stall_limit: Duration) -> Poll {
+        let mut aftermath = Aftermath::default();
+        let poll = self.poll_locked(key, stall_limit, &mut aftermath);
+        drop(aftermath); // the lock is gone: effects and teardown run here
+        poll
+    }
+
+    fn poll_locked(&self, key: &str, stall_limit: Duration, aftermath: &mut Aftermath) -> Poll {
         let mut jobs = self.lock();
         let Some(slot) = jobs.get_mut(key) else {
             return Poll::Vacant;
         };
-        let liveness = slot.fold();
+        let liveness = slot.fold(aftermath);
         if slot.done.is_some() {
             let mut slot = jobs.remove(key).expect("slot was just folded");
-            return Poll::Settled(slot.done.take().expect("checked above"));
+            let result = slot.done.take().expect("checked above");
+            aftermath.evicted.push(slot);
+            return Poll::Settled(result);
         }
         match liveness {
             Fold::Dead => {
-                jobs.remove(key);
+                aftermath.evicted.extend(jobs.remove(key));
                 Poll::Abandoned
             }
             Fold::Live if slot.last_progress.elapsed() > stall_limit => {
-                jobs.remove(key);
+                aftermath.evicted.extend(jobs.remove(key));
                 Poll::Abandoned
             }
             Fold::Live => Poll::Running {
@@ -346,6 +411,7 @@ mod tests {
     use rmcp::model::ContentBlock;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
 
     /// Generous limit: these tests never exercise abandonment unless they
     /// rewind the clock explicitly.
@@ -485,6 +551,29 @@ mod tests {
             cancel.is_cancelled(),
             "the displaced job must observe its disownment"
         );
+    }
+
+    #[test]
+    fn runs_owned_effects_outside_the_jobs_lock() {
+        // The effect re-enters the tracker: with a non-reentrant mutex this
+        // deadlocks unless the effect provably runs after the lock is
+        // released. The poll runs on a helper thread so a regression fails
+        // the recv timeout instead of hanging the suite.
+        let tracker = Arc::new(Tracker::default());
+        let reporter = start(&tracker, "k");
+        let inner = Arc::clone(&tracker);
+        reporter.settle(Settlement::with_owned_effect(settled_result(), move || {
+            assert!(matches!(inner.poll("other", LIMIT), Poll::Vacant));
+        }));
+        let (tx, rx) = mpsc::channel();
+        let polling = Arc::clone(&tracker);
+        std::thread::spawn(move || {
+            let _ = tx.send(polling.poll("k", LIMIT));
+        });
+        let polled = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("an effect re-entering the tracker must not deadlock the poll");
+        assert!(matches!(polled, Poll::Settled(_)));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use super::super::{DownloadOption, Recipe, SourceInfo, estimate_label};
 use super::YtdlpRecipe;
 use crate::config::Config;
 use crate::plan::format_bytes;
-use crate::tokens::{Dest, Token};
+use crate::tokens::Dest;
 use agent_video_core::types::format_ts;
 
 /// How many keep tiers (distinct heights) to offer at most.
@@ -213,7 +213,6 @@ pub fn site_source_info(info: &SiteUrlInfo, cfg: &Config) -> SourceInfo {
     };
 
     let mut options = vec![DownloadOption {
-        token: Token::new("dl-analysis"),
         dest: Dest::Cache,
         label: match info.analysis_estimated_bytes {
             Some(n) => format!("analysis rip ({})", format_bytes(n)),
@@ -233,22 +232,19 @@ pub fn site_source_info(info: &SiteUrlInfo, cfg: &Config) -> SourceInfo {
     for tier in &info.keep_tiers {
         // A tier without a reported height is still downloadable: the plain
         // best selector fetches it, and the offer states what is known.
-        let (slug, name, bound, selector) = match tier.height {
+        let (name, bound, selector) = match tier.height {
             Some(h) => (
-                h.to_string(),
                 format!("{h}p"),
                 format!("≤{h}p"),
                 format!("bv*[height<={h}]+ba/b[height<={h}]/b"),
             ),
             None => (
-                "best".to_string(),
                 "best available".to_string(),
                 "the source's best quality (height unreported)".to_string(),
                 "bv*+ba/b".to_string(),
             ),
         };
         options.push(DownloadOption {
-            token: Token::new(format!("dl-keep-{slug}")),
             dest: Dest::Keep,
             label: match tier.estimated_bytes {
                 Some(n) => format!("{name} ({})", format_bytes(n)),
@@ -465,8 +461,13 @@ mod tests {
         };
         let si = site_source_info(&info, &cfg);
         assert_eq!(si.options.len(), 2);
-        assert_eq!(si.options[0].token, Token::new("dl-analysis"));
-        assert_eq!(si.options[1].token, Token::new("dl-keep-1080"));
+        assert_eq!(si.options[0].dest, Dest::Cache);
+        assert_eq!(si.options[1].dest, Dest::Keep);
+        assert!(
+            si.options[1].effect.contains("≤1080p"),
+            "{}",
+            si.options[1].effect
+        );
         assert!(si.headline.contains("\"Talk\""));
         assert!(si.headline.contains("subtitles: en"));
         let Recipe::Ytdlp(r) = &si.options[0].recipe else {
@@ -493,7 +494,7 @@ mod tests {
             analysis_estimated_bytes: None,
         };
         let si = site_source_info(&info, &cfg);
-        assert_eq!(si.options[1].token, Token::new("dl-keep-best"));
+        assert_eq!(si.options[1].dest, Dest::Keep);
         assert_eq!(si.options[1].label, "best available");
         let Recipe::Ytdlp(r) = &si.options[1].recipe else {
             panic!("keep recipe is ytdlp");

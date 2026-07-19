@@ -258,7 +258,10 @@ mod tests {
             let v = ((x * (3 + seed) + y * (7 + 2 * seed)) % 256) as u8;
             Rgb([v, v, v])
         });
-        extract::RgbFrame { ts, rgb }
+        extract::RgbFrame {
+            ts: crate::types::Ts::new(ts).expect("finite test ts"),
+            rgb,
+        }
     }
 
     fn pool(threads: usize) -> rayon::ThreadPool {

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Audio decoding for transcription: any input's best audio stream to
 //! 16 kHz mono f32 PCM (what whisper.cpp consumes), in-process via
-//! libswresample.
+//! libswresample. [`AudioSamples`] is a pull stream — the caller decides
+//! how much decoded audio is resident at once, so a consumer that
+//! processes as it pulls holds hours of audio in bounded memory.
 
 use ffmpeg_next as ffmpeg;
 
@@ -17,67 +19,156 @@ use crate::source::Source;
 /// The sample rate whisper.cpp expects.
 pub const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
-/// Decode `source`'s best audio stream to 16 kHz mono f32 samples.
+/// Decode `source`'s best audio stream to 16 kHz mono f32 samples, whole.
 ///
-/// `Ok(None)` when the container carries no audio stream at all: absence
-/// is a fact about the input, not a decode failure, and the caller decides
-/// what "nothing to transcribe" means. Errors are reserved for a container
-/// that cannot be opened or a decode that breaks mid-stream.
+/// The convenience form of [`AudioSamples`] for callers that need the
+/// entire track in memory (VAD wants random access). `Ok(None)` when the
+/// container carries no audio stream at all: absence is a fact about the
+/// input, not a decode failure, and the caller decides what "nothing to
+/// transcribe" means. Errors are reserved for a container that cannot be
+/// opened or a decode that breaks mid-stream.
 pub fn decode_audio_16k_mono(source: &Source) -> Result<Option<Vec<f32>>> {
-    let mut ictx = open_input(source)?;
-
-    let Some(stream) = ictx.streams().best(ffmpeg::media::Type::Audio) else {
+    let Some(mut stream) = AudioSamples::open(source)? else {
         return Ok(None);
     };
-    let stream_index = stream.index();
+    let mut samples = Vec::new();
+    stream.fill(&mut samples, usize::MAX)?;
+    Ok(Some(samples))
+}
 
-    let ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
-        .map_err(|e| super::decode_error("opening audio decoder", e))?;
-    let mut decoder = ctx
-        .decoder()
-        .audio()
-        .map_err(|e| super::decode_error("opening audio decoder", e))?;
+/// A pull stream of 16 kHz mono f32 samples from one audio track.
+///
+/// Owns the demux → decode → resample pipeline; [`Self::fill`] advances it
+/// on demand. Per-packet failures are absorbed by an [`ErrorBudget`], so
+/// only a permanently broken stream surfaces as an error.
+pub struct AudioSamples {
+    ictx: ffmpeg::format::context::Input,
+    stream_index: usize,
+    decoder: ffmpeg::decoder::Audio,
+    sink: MonoSink,
+    /// Reused demux buffer.
+    packet: ffmpeg::Packet,
+    /// Reused decode buffer.
+    frame: frame::Audio,
+    budget: ErrorBudget,
+    stage: Stage,
+}
 
-    // Decoders may leave the layout unset; the resampler needs one.
-    if decoder.channel_layout().is_empty() {
-        decoder.set_channel_layout(ChannelLayout::default(decoder.channels() as i32));
+/// Where the pipeline stands; stages only move forward.
+enum Stage {
+    /// Packets still flow from the demuxer.
+    Demux,
+    /// Demux EOF seen: the decoder's lookahead and the resampler's
+    /// carry-over still owe samples.
+    Flush,
+    /// Everything delivered; [`AudioSamples::fill`] keeps answering
+    /// "no more".
+    Done,
+}
+
+impl AudioSamples {
+    /// Open `source`'s best audio stream as a sample stream. `Ok(None)`
+    /// when the container has no audio stream at all — absence is the
+    /// input's shape, not a decode failure.
+    pub fn open(source: &Source) -> Result<Option<AudioSamples>> {
+        let ictx = open_input(source)?;
+        let Some(stream) = ictx.streams().best(ffmpeg::media::Type::Audio) else {
+            return Ok(None);
+        };
+        let stream_index = stream.index();
+
+        let ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+            .map_err(|e| super::decode_error("opening audio decoder", e))?;
+        let mut decoder = ctx
+            .decoder()
+            .audio()
+            .map_err(|e| super::decode_error("opening audio decoder", e))?;
+
+        // Decoders may leave the layout unset; the resampler needs one.
+        if decoder.channel_layout().is_empty() {
+            decoder.set_channel_layout(ChannelLayout::default(decoder.channels() as i32));
+        }
+
+        let sink = MonoSink::new(decoder.format(), decoder.channel_layout(), decoder.rate())
+            .map_err(|e| super::decode_error("configuring audio resampler", e))?;
+
+        Ok(Some(AudioSamples {
+            ictx,
+            stream_index,
+            decoder,
+            sink,
+            packet: ffmpeg::Packet::empty(),
+            frame: frame::Audio::empty(),
+            budget: ErrorBudget::new("decoding audio packets"),
+            stage: Stage::Demux,
+        }))
     }
 
-    let mut sink = MonoSink::new(decoder.format(), decoder.channel_layout(), decoder.rate())
-        .map_err(|e| super::decode_error("configuring audio resampler", e))?;
-
-    let mut samples: Vec<f32> = Vec::new();
-    let mut budget = ErrorBudget::new("decoding audio packets");
-
-    let mut decoded = frame::Audio::empty();
-    for (stream, packet) in ictx.packets() {
-        if stream.index() != stream_index {
-            continue;
-        }
-        if let Err(e) = decoder.send_packet(&packet) {
-            budget.fail(e)?;
-            continue;
-        }
-        while decoder.receive_frame(&mut decoded).is_ok() {
-            match sink.push(&mut decoded, &mut samples) {
-                Ok(()) => budget.ok(),
-                Err(e) => budget.fail(e)?,
+    /// Append decoded samples to `out` until `out.len() >= min_samples` or
+    /// the track ends. Returns whether more samples may still arrive;
+    /// `false` is final — further calls keep answering `false` without
+    /// touching `out`. `out` may overshoot `min_samples` by the delivery
+    /// granularity (one packet's worth of resampled audio), never by more.
+    pub fn fill(&mut self, out: &mut Vec<f32>, min_samples: usize) -> Result<bool> {
+        while out.len() < min_samples {
+            if !self.step(out)? {
+                return Ok(false);
             }
         }
+        Ok(true)
     }
 
-    let _ = decoder.send_eof();
-    while decoder.receive_frame(&mut decoded).is_ok() {
-        match sink.push(&mut decoded, &mut samples) {
-            Ok(()) => budget.ok(),
-            Err(e) => budget.fail(e)?,
+    /// Advance the pipeline by one increment: one demuxed packet, or the
+    /// end-of-stream flush. `false` means exhausted.
+    fn step(&mut self, out: &mut Vec<f32>) -> Result<bool> {
+        match self.stage {
+            Stage::Demux => {
+                match self.packet.read(&mut self.ictx) {
+                    Ok(()) if self.packet.stream() != self.stream_index => {}
+                    Ok(()) => match self.decoder.send_packet(&self.packet) {
+                        Ok(()) => self.receive_frames(out)?,
+                        Err(e) => self.budget.fail(e)?,
+                    },
+                    Err(ffmpeg::Error::Eof) => {
+                        // The EOF flush is the decoder's last squeeze:
+                        // lookahead frames surface only now, so a refused
+                        // flush spends error budget instead of silently
+                        // dropping the tail.
+                        if let Err(e) = self.decoder.send_eof() {
+                            self.budget.fail(e)?;
+                        }
+                        self.stage = Stage::Flush;
+                    }
+                    // Unlike `PacketIter` (which retries read errors
+                    // unbudgeted, forever), a failed read spends budget, so
+                    // a permanently failing input trips the breaker instead
+                    // of spinning.
+                    Err(e) => self.budget.fail(e)?,
+                }
+                Ok(true)
+            }
+            Stage::Flush => {
+                self.receive_frames(out)?;
+                self.sink
+                    .drain(out)
+                    .map_err(|e| super::decode_error("flushing audio resampler", e))?;
+                self.stage = Stage::Done;
+                Ok(true)
+            }
+            Stage::Done => Ok(false),
         }
     }
 
-    sink.drain(&mut samples)
-        .map_err(|e| super::decode_error("flushing audio resampler", e))?;
-
-    Ok(Some(samples))
+    /// Move every frame the decoder currently holds through the sink.
+    fn receive_frames(&mut self, out: &mut Vec<f32>) -> Result<()> {
+        while self.decoder.receive_frame(&mut self.frame).is_ok() {
+            match self.sink.push(&mut self.frame, out) {
+                Ok(()) => self.budget.ok(),
+                Err(e) => self.budget.fail(e)?,
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Streaming converter to 16 kHz mono f32 that follows mid-stream input

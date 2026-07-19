@@ -57,12 +57,12 @@ fake `0`. `subtitles` lists human-readable descriptions (e.g.
 Consent tokens live in an in-memory registry (`crate::tokens::Tokens`) scoped
 to one MCP stdio session. The design is three invariants:
 
-1. **Commit on offer.** When policy decides a call needs consent, the same
-   offers that render into the `confirm_required` body are committed to the
-   registry in the same step — "the model saw it" and "it is redeemable" are
-   one event, from one set of offers, so the wire rendering and the registry
-   entry cannot drift apart. Offers are keyed by `source`; one live offer set
-   per source.
+1. **Commit on offer.** When policy decides a call needs consent, it emits
+   token-less offer drafts; committing them to the registry mints each token
+   and returns the completed offers that render into the `confirm_required`
+   body — "the model saw it" and "it is redeemable" are one event, from one
+   commit, so the wire rendering and the registry entry cannot drift apart.
+   Offers are keyed by `source`; one live offer set per source.
 
 2. **Idempotent redemption.** Redeeming a token returns the authorized action
    but does not consume the offer. A token stays valid until a newer plan for
@@ -78,8 +78,9 @@ to one MCP stdio session. The design is three invariants:
    `confirm`) to see the current plan and its tokens.
 
 A token authorizes exactly the plan and source it was issued for. Redeeming a
-token against a different source fails. Tokens are opaque: policy mints them,
-the registry keys on them, nothing parses them.
+token against a different source fails. Tokens are opaque: the registry mints
+them from a session-local counter (so distinct plans can never alias), it keys
+on them, and nothing parses them.
 
 `confirm` must be passed alone (only with `source`). Combining it with `raw`,
 any intent argument, or `transcribe` is rejected — it authorizes exactly the

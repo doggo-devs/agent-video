@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Consent token registry, in-memory for one MCP stdio session.
 //!
+//! The registry is the only token mint: policy emits [`OfferDraft`]s and
+//! [`Tokens::commit`] assigns each one a session-unique token from a
+//! monotonic counter, so two distinct plans can never alias — uniqueness
+//! is a registry fact, not a property of any text policy could construct.
+//!
 //! A token only authorizes the plan and source it was issued for. Redemption
 //! is idempotent: an offer stays redeemable until a newer plan for the same
 //! source replaces it, so a failed or repeated attempt never strands the
@@ -9,16 +14,22 @@
 //! [`Redemption::Fresh`] forever, while a completed keep download — the one
 //! action whose repetition duplicates a user-owned file — is recorded via
 //! [`Tokens::fulfill`] so later echoes replay the receipt instead.
+//!
+//! Offer sets are keyed by canonical source identity ([`source_key`]), not
+//! by the model's spelling, and the registry is bounded: past
+//! [`MAX_OFFER_SETS`] live sources the stalest set is evicted, its tokens
+//! answering as stale — a state the model is already told how to leave.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::fetch::Recipe;
 use super::plan::CoreInvocation;
 
 /// A consent token, echoed verbatim by the model to authorize a plan.
-/// Opaque: policy mints it, the registry keys on it, nothing parses it.
+/// Opaque: [`Tokens::commit`] mints it, the registry keys on it, nothing
+/// parses it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Token(String);
 
@@ -38,14 +49,24 @@ impl std::fmt::Display for Token {
     }
 }
 
-/// One consent offer: the token, its model-facing effect line, and the
-/// action it authorizes. The wire rendering and the registry entry both
-/// derive from this — they cannot drift apart.
+/// One consent offer before its token exists: the model-facing effect line
+/// and the action it authorizes. Policy emits drafts; only
+/// [`Tokens::commit`] can turn one into a redeemable [`Offer`], so a
+/// decision layer cannot construct (let alone alias) token text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OfferDraft {
+    pub effect: String,
+    pub action: PendingAction,
+}
+
+/// One committed consent offer: the minted token and its model-facing
+/// effect line, returned by [`Tokens::commit`] for rendering. The wire
+/// rendering and the registry entry both derive from the same commit —
+/// they cannot drift apart.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Offer {
     pub token: Token,
     pub effect: String,
-    pub action: PendingAction,
 }
 
 /// Where a download lands: `cache` = disposable analysis copy under the LRU
@@ -98,34 +119,125 @@ enum Slot {
     Fulfilled(PathBuf),
 }
 
-/// Pending offers keyed by source, behind the one lock that guards them;
-/// guards never escape this type. One live offer set per source.
+/// Ceiling on concurrently live offer sets. A session's live consent
+/// conversation is a handful of sources; the cap only bites in long
+/// sessions that touch many, where the stalest set is evicted instead of
+/// the registry growing for the session's whole lifetime.
+const MAX_OFFER_SETS: usize = 64;
+
+/// One source's live offers plus the sequence number of the commit that
+/// inserted them — the eviction order at capacity.
+#[derive(Debug)]
+struct OfferSet {
+    stamp: u64,
+    slots: HashMap<Token, Slot>,
+}
+
+/// Canonical registry key for a source. The contract — one live offer set
+/// per source — is about the source, not the model's spelling of it:
+/// `/v.mp4`, `/./v.mp4`, and a trailing-space echo must be one
+/// conversation, or a superseded plan would stay redeemable under an
+/// alias. URLs key on their trimmed text (matching the cache side, which
+/// hashes URLs verbatim); local paths are made absolute and lexically
+/// normalized. The registry derives the key itself, so no caller can
+/// mis-key it.
+fn source_key(source: &str) -> String {
+    let source = source.trim();
+    let lower = source.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return source.to_string();
+    }
+    std::path::absolute(source)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| source.to_string())
+}
+
+/// Pending offers keyed by canonical source identity, behind the one lock
+/// that guards them; guards never escape this type. One live offer set
+/// per source, at most [`MAX_OFFER_SETS`] sources.
+///
+/// A cheaply-cloneable shared handle: clones share one registry (and one
+/// mint counter). Owning a `Tokens` pins nothing but the registry itself —
+/// deliberately, so an effect queued into the download tracker (the keep
+/// receipt) can capture a clone without owning the deps graph that owns
+/// the tracker, which would close a strong reference cycle and leak both.
+#[derive(Debug, Clone, Default)]
+pub struct Tokens(Arc<Mutex<Registry>>);
+
+/// Everything the registry knows, under its one lock. The counters live
+/// inside the critical section with the map they describe, so a token's
+/// uniqueness and an offer set's eviction stamp are both facts of the same
+/// serialized insertion event — two racing commits (`spawn_blocking`
+/// threads are genuinely parallel) cannot mint equal or inverted stamps.
 #[derive(Debug, Default)]
-pub struct Tokens {
-    pending: Mutex<HashMap<String, HashMap<Token, Slot>>>,
+struct Registry {
+    pending: HashMap<String, OfferSet>,
+    /// Session-local mint counter; every commit draws fresh values, so no
+    /// two offers of this registry's lifetime ever share a token.
+    minted: u64,
+    /// Commit sequence: each insertion stamps itself with the next value.
+    /// Strictly monotonic under the lock — even for a commit that mints no
+    /// tokens — so "the stalest offer set" is a total order and
+    /// `min_by_key` never has a tie to break.
+    commits: u64,
 }
 
 impl Tokens {
-    /// Register the offers of one decision under `key`, wholesale replacing
-    /// any prior offer set (including fulfilled receipts: a newer plan
-    /// supersedes the whole conversation about this source).
-    pub fn commit(&self, key: &str, offers: Vec<Offer>) {
-        let entry = offers
+    /// Commit the offers of one decision for `source`, minting each draft a
+    /// session-unique token and wholesale replacing any prior offer set
+    /// (including fulfilled receipts: a newer plan supersedes the whole
+    /// conversation about this source). At capacity the stalest *other*
+    /// source's set is evicted first — the fresh commit always survives.
+    /// Returns the completed offers for rendering — the model sees exactly
+    /// what became redeemable.
+    pub fn commit(&self, source: &str, drafts: Vec<OfferDraft>) -> Vec<Offer> {
+        let key = source_key(source);
+        let mut reg = self.lock();
+        let mut slots = HashMap::with_capacity(drafts.len());
+        let offers: Vec<Offer> = drafts
             .into_iter()
-            .map(|o| (o.token, Slot::Offered(o.action)))
+            .map(|draft| {
+                reg.minted += 1;
+                let token = Token(format!("consent-{}", reg.minted));
+                slots.insert(token.clone(), Slot::Offered(draft.action));
+                Offer {
+                    token,
+                    effect: draft.effect,
+                }
+            })
             .collect();
-        self.lock().insert(key.to_string(), entry);
+        if !reg.pending.contains_key(&key) && reg.pending.len() >= MAX_OFFER_SETS {
+            let stalest = reg
+                .pending
+                .iter()
+                .min_by_key(|(_, set)| set.stamp)
+                .map(|(k, _)| k.clone())
+                .expect("registry is at capacity, so it is non-empty");
+            reg.pending.remove(&stalest);
+        }
+        reg.commits += 1;
+        let stamp = reg.commits;
+        reg.pending.insert(key, OfferSet { stamp, slots });
+        offers
     }
 
     /// Redeem: return the authorized action or the receipt of its completed
     /// run, else `None`. The offer set survives — only a newer `commit` for
-    /// the same key invalidates it — so retries after a failed execution
+    /// the same source invalidates it — so retries after a failed execution
     /// redeem the same token again.
-    pub fn take(&self, key: &str, token: &Token) -> Option<Redemption> {
-        Some(match self.lock().get(key)?.get(token)? {
-            Slot::Offered(action) => Redemption::Fresh(action.clone()),
-            Slot::Fulfilled(path) => Redemption::Fulfilled(path.clone()),
-        })
+    pub fn take(&self, source: &str, token: &Token) -> Option<Redemption> {
+        Some(
+            match self
+                .lock()
+                .pending
+                .get(&source_key(source))?
+                .slots
+                .get(token)?
+            {
+                Slot::Offered(action) => Redemption::Fresh(action.clone()),
+                Slot::Fulfilled(path) => Redemption::Fulfilled(path.clone()),
+            },
+        )
     }
 
     /// Record that a redeemed token's action completed with a durable effect
@@ -133,14 +245,19 @@ impl Tokens {
     /// idempotent ones stay `Offered` so retries re-run them. A no-op when a
     /// newer `commit` already replaced the offer set — the receipt would be
     /// stale the moment it landed.
-    pub fn fulfill(&self, key: &str, token: &Token, path: PathBuf) {
-        if let Some(slot) = self.lock().get_mut(key).and_then(|s| s.get_mut(token)) {
+    pub fn fulfill(&self, source: &str, token: &Token, path: PathBuf) {
+        if let Some(slot) = self
+            .lock()
+            .pending
+            .get_mut(&source_key(source))
+            .and_then(|s| s.slots.get_mut(token))
+        {
             *slot = Slot::Fulfilled(path);
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, HashMap<Token, Slot>>> {
-        self.pending.lock().expect("token registry poisoned")
+    fn lock(&self) -> std::sync::MutexGuard<'_, Registry> {
+        self.0.lock().expect("token registry poisoned")
     }
 }
 
@@ -159,10 +276,9 @@ mod tests {
         })
     }
 
-    fn offer(token: &str, tag: u32) -> Offer {
-        Offer {
-            token: Token::new(token),
-            effect: format!("{token} effect"),
+    fn draft(tag: u32) -> OfferDraft {
+        OfferDraft {
+            effect: format!("effect {tag}"),
             action: core_action(tag),
         }
     }
@@ -170,10 +286,10 @@ mod tests {
     #[test]
     fn redeemed_token_stays_valid_for_retries() {
         let reg = Tokens::default();
-        reg.commit("src", vec![offer("t1", 1)]);
-        assert!(reg.take("src", &Token::new("t1")).is_some());
+        let offers = reg.commit("src", vec![draft(1)]);
+        assert!(reg.take("src", &offers[0].token).is_some());
         assert!(
-            reg.take("src", &Token::new("t1")).is_some(),
+            reg.take("src", &offers[0].token).is_some(),
             "a failed execution must be retryable with the same token"
         );
     }
@@ -181,10 +297,10 @@ mod tests {
     #[test]
     fn sibling_offers_survive_redemption() {
         let reg = Tokens::default();
-        reg.commit("src", vec![offer("a", 1), offer("b", 2)]);
-        assert!(reg.take("src", &Token::new("a")).is_some());
+        let offers = reg.commit("src", vec![draft(1), draft(2)]);
+        assert!(reg.take("src", &offers[0].token).is_some());
         assert!(
-            reg.take("src", &Token::new("b")).is_some(),
+            reg.take("src", &offers[1].token).is_some(),
             "picking one tier must not strand the others"
         );
     }
@@ -192,10 +308,10 @@ mod tests {
     #[test]
     fn new_offer_replaces_prior_offer() {
         let reg = Tokens::default();
-        reg.commit("src", vec![offer("old", 1)]);
-        reg.commit("src", vec![offer("new", 2)]);
+        let old = reg.commit("src", vec![draft(1)]);
+        reg.commit("src", vec![draft(2)]);
         assert!(
-            reg.take("src", &Token::new("old")).is_none(),
+            reg.take("src", &old[0].token).is_none(),
             "stale token rejected"
         );
     }
@@ -203,22 +319,80 @@ mod tests {
     #[test]
     fn rejects_foreign_source() {
         let reg = Tokens::default();
-        reg.commit("src-a", vec![offer("t", 1)]);
-        assert!(reg.take("src-b", &Token::new("t")).is_none());
+        let offers = reg.commit("src-a", vec![draft(1)]);
+        assert!(reg.take("src-b", &offers[0].token).is_none());
+    }
+
+    #[test]
+    fn keys_offers_by_source_identity_not_spelling() {
+        let reg = Tokens::default();
+        let offers = reg.commit("/v.mp4", vec![draft(1)]);
+        for spelling in ["/v.mp4 ", " /v.mp4", "/./v.mp4"] {
+            assert!(
+                reg.take(spelling, &offers[0].token).is_some(),
+                "{spelling:?} names the same file as /v.mp4"
+            );
+        }
+    }
+
+    #[test]
+    fn newer_plan_supersedes_offers_across_spellings() {
+        let reg = Tokens::default();
+        let old = reg.commit("/v.mp4", vec![draft(1)]);
+        reg.commit("/./v.mp4", vec![draft(2)]);
+        assert!(
+            reg.take("/v.mp4", &old[0].token).is_none(),
+            "an alias spelling must not keep a superseded plan redeemable"
+        );
+    }
+
+    #[test]
+    fn evicts_the_stalest_offer_set_at_capacity() {
+        let reg = Tokens::default();
+        let first = reg.commit("/v0.mp4", vec![draft(0)]);
+        let mut last = Vec::new();
+        for i in 1..=MAX_OFFER_SETS {
+            last = reg.commit(&format!("/v{i}.mp4"), vec![draft(i as u32)]);
+        }
+        assert!(
+            reg.take("/v0.mp4", &first[0].token).is_none(),
+            "the stalest set leaves at capacity"
+        );
+        assert!(
+            reg.take(&format!("/v{MAX_OFFER_SETS}.mp4"), &last[0].token)
+                .is_some(),
+            "the fresh commit always survives its own eviction"
+        );
+    }
+
+    #[test]
+    fn evicts_in_commit_order_when_a_commit_mints_no_tokens() {
+        // The eviction stamp is the commit's own insertion event, not a
+        // token count: a commit with no drafts (superseding a source with
+        // nothing) still ranks as fresher than every commit before it.
+        // Under a mint-counter stamp it would tie with its predecessor and
+        // min_by_key would break the tie by hash order.
+        let reg = Tokens::default();
+        let first = reg.commit("/first.mp4", vec![draft(1)]);
+        reg.commit("/second.mp4", Vec::new());
+        for i in 2..=MAX_OFFER_SETS {
+            reg.commit(&format!("/v{i}.mp4"), vec![draft(i as u32)]);
+        }
+        assert!(
+            reg.take("/first.mp4", &first[0].token).is_none(),
+            "the first commit is strictly the stalest and leaves first"
+        );
     }
 
     #[test]
     fn fulfilled_token_replays_receipt_instead_of_action() {
         let reg = Tokens::default();
-        reg.commit("src", vec![offer("t", 1)]);
-        let token = Token::new("t");
-        assert!(matches!(
-            reg.take("src", &token),
-            Some(Redemption::Fresh(_))
-        ));
-        reg.fulfill("src", &token, PathBuf::from("/keep/video.mp4"));
+        let offers = reg.commit("src", vec![draft(1)]);
+        let token = &offers[0].token;
+        assert!(matches!(reg.take("src", token), Some(Redemption::Fresh(_))));
+        reg.fulfill("src", token, PathBuf::from("/keep/video.mp4"));
         assert_eq!(
-            reg.take("src", &token),
+            reg.take("src", token),
             Some(Redemption::Fulfilled(PathBuf::from("/keep/video.mp4"))),
             "an echo after completion must serve the receipt, not re-run"
         );
@@ -227,11 +401,11 @@ mod tests {
     #[test]
     fn new_offer_replaces_fulfilled_receipt() {
         let reg = Tokens::default();
-        reg.commit("src", vec![offer("t", 1)]);
-        reg.fulfill("src", &Token::new("t"), PathBuf::from("/keep/video.mp4"));
-        reg.commit("src", vec![offer("t2", 2)]);
+        let offers = reg.commit("src", vec![draft(1)]);
+        reg.fulfill("src", &offers[0].token, PathBuf::from("/keep/video.mp4"));
+        reg.commit("src", vec![draft(2)]);
         assert!(
-            reg.take("src", &Token::new("t")).is_none(),
+            reg.take("src", &offers[0].token).is_none(),
             "a newer plan supersedes receipts along with offers"
         );
     }
@@ -239,12 +413,30 @@ mod tests {
     #[test]
     fn fulfill_after_replacement_is_noop() {
         let reg = Tokens::default();
-        reg.commit("src", vec![offer("old", 1)]);
-        reg.commit("src", vec![offer("new", 2)]);
-        reg.fulfill("src", &Token::new("old"), PathBuf::from("/keep/video.mp4"));
+        let old = reg.commit("src", vec![draft(1)]);
+        reg.commit("src", vec![draft(2)]);
+        reg.fulfill("src", &old[0].token, PathBuf::from("/keep/video.mp4"));
         assert!(
-            reg.take("src", &Token::new("old")).is_none(),
+            reg.take("src", &old[0].token).is_none(),
             "a stale token's completion must not resurrect it"
         );
+    }
+
+    #[test]
+    fn never_aliases_tokens_across_plans() {
+        // Two decisions authorizing the same action for the same source
+        // still mint distinct tokens — even through a clone, which shares
+        // the one counter — so a superseded token dies instead of silently
+        // rebinding to the newer plan.
+        let reg = Tokens::default();
+        let handle = reg.clone();
+        let a = reg.commit("src", vec![draft(1)]);
+        let b = handle.commit("src", vec![draft(1)]);
+        assert_ne!(a[0].token, b[0].token, "distinct plans never share a token");
+        assert!(
+            reg.take("src", &a[0].token).is_none(),
+            "the superseded token is dead, not rebound"
+        );
+        assert!(reg.take("src", &b[0].token).is_some());
     }
 }

@@ -20,7 +20,39 @@ pub enum Look {
     TrackMotion,
 }
 
-pub const LOOKS: [&str; 4] = ["overview", "detailed", "read_text", "track_motion"];
+impl Look {
+    /// Variant count, witnessed by an exhaustive match: a new look fails to
+    /// compile here until it is counted, and [`Look::ALL`]'s array type then
+    /// refuses to build until the variant joins it — the advertised schema
+    /// cannot silently fork from the accepted values.
+    const COUNT: usize = match Look::Overview {
+        Look::Overview | Look::Detailed | Look::ReadText | Look::TrackMotion => 4,
+    };
+
+    /// Every look, in the order the schema advertises them.
+    pub const ALL: [Look; Self::COUNT] = [
+        Look::Overview,
+        Look::Detailed,
+        Look::ReadText,
+        Look::TrackMotion,
+    ];
+}
+
+/// The serde wire names of `all`, read back through serialization: the
+/// `rename_all` attribute stays the single truth for what is advertised
+/// (`tools/list`), what is accepted (deserialization), and what error
+/// messages list.
+pub fn wire_names<T: Serialize>(all: &[T]) -> Vec<String> {
+    all.iter()
+        .map(|v| {
+            serde_json::to_value(v)
+                .expect("wire enums serialize")
+                .as_str()
+                .expect("wire enums serialize to strings")
+                .to_string()
+        })
+        .collect()
+}
 
 /// Temporal sampling choice: which moments become frames. Orthogonal to
 /// [`Look`], which controls frame size/density within the chosen moments.
@@ -35,7 +67,16 @@ pub enum Strategy {
     Uniform,
 }
 
-pub const STRATEGIES: [&str; 3] = ["adaptive", "keyframes", "uniform"];
+impl Strategy {
+    /// Variant count, witnessed by an exhaustive match — see [`Look::COUNT`].
+    const COUNT: usize = match Strategy::Adaptive {
+        Strategy::Adaptive | Strategy::Keyframes | Strategy::Uniform => 3,
+    };
+
+    /// Every strategy, in the order the schema advertises them.
+    pub const ALL: [Strategy; Self::COUNT] =
+        [Strategy::Adaptive, Strategy::Keyframes, Strategy::Uniform];
+}
 
 impl Strategy {
     /// The core `--strategy` value, or `None` for the lenient default.
@@ -211,12 +252,12 @@ pub fn video_input_schema() -> Value {
             },
             "look": {
                 "type": "string",
-                "enum": LOOKS,
+                "enum": Look::ALL,
                 "description": "How to look: overview (fast triage), detailed (miss nothing), read_text (few large frames to read on-screen text/UI), track_motion (dense small frames for fast action). Subtitle text always rides along in metadata regardless; this only affects frame size/density. Omit for a balanced default."
             },
             "strategy": {
                 "type": "string",
-                "enum": STRATEGIES,
+                "enum": Strategy::ALL,
                 "description": "Which moments become frames: adaptive (default: keyframes plus fill in sparse stretches, right for most footage), keyframes (cheapest scan, frames land on cuts — triage for edited footage, blind to changes inside static shots), uniform (evenly spaced in time — use when keyframes mislead: screen recordings, slides, long static takes). Orthogonal to look, which sets frame size/density."
             },
             "raw": {

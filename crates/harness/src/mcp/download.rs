@@ -293,10 +293,16 @@ fn perform_download(
             let response = keep_response(&path, warning.as_deref(), deps);
             let unadopted = path.clone();
             let receipt = {
-                let deps = Arc::clone(deps);
+                // A `Tokens` handle, never `Arc<ServerDeps>`: this closure
+                // is queued into a channel owned by `deps.downloads`, so
+                // capturing the deps graph would close a strong cycle
+                // (deps → tracker → queued settlement → deps) that leaks
+                // the whole graph and defuses the drop bomb below forever.
+                // `Tokens` owns no tracker, so no cycle is constructible.
+                let tokens = deps.tokens.clone();
                 let source = source.to_string();
                 let token = token.clone();
-                move || deps.tokens.fulfill(&source, &token, path)
+                move || tokens.fulfill(&source, &token, path)
             };
             Settlement::with_owned_effect(response, receipt).or_disowned(move || {
                 let _ = std::fs::remove_file(&unadopted);

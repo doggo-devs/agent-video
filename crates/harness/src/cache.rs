@@ -76,10 +76,19 @@ impl Cache {
         }
     }
 
-    /// Persist a probe document; the caller must have verified file stability.
+    /// Persist a probe document; the caller must have verified file
+    /// stability. Staged as `.part` and renamed like every other cache
+    /// write, so a reader never sees a torn document and a crashed
+    /// writer's debris is age-swept.
     pub fn put_probe(&self, fingerprint: &ContentId, doc: &str) -> std::io::Result<()> {
         fs::create_dir_all(&self.probe_dir)?;
-        fs::write(self.probe_path(fingerprint), doc)
+        let dest = self.probe_path(fingerprint);
+        let part = naming::part_path(&dest);
+        fs::write(&part, doc)
+            .and_then(|()| fs::rename(&part, &dest))
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&part);
+            })
     }
 
     fn probe_path(&self, fingerprint: &ContentId) -> PathBuf {
@@ -119,7 +128,7 @@ impl Cache {
     }
 
     fn title_path(&self, fingerprint: &ContentId) -> PathBuf {
-        self.probe_dir.join(format!("{fingerprint}.title"))
+        self.probe_dir.join(format!("{fingerprint}{TITLE_SUFFIX}"))
     }
 
     // ── transcripts ──
@@ -136,21 +145,14 @@ impl Cache {
     }
 
     /// Locate a finished transcript for this content × recipe; hits refresh
-    /// the age clock — the transcript's and its title sidecar's.
-    ///
-    /// Invariant: a living transcript never outlives the sidecar that
-    /// derives its id. Both age independently under [`PROBE_MAX_AGE`], so
-    /// a hit must keep its key's premise alive: bumping the sidecar here
-    /// means the pair expires in the same sweep (clean slate) or not at
-    /// all — never sidecar-gone-transcript-alive, where the next lookup
-    /// re-derives the bare prompt, misses, and re-transcribes while the
-    /// conditioned transcript rots unreachable. [`touch`] is a no-op when
-    /// no sidecar exists (unconditioned ids).
+    /// the transcript's age clock. Its title sidecar — the input its id
+    /// derives from — needs no bump here: the sweep itself never expires
+    /// a sidecar while a transcript for its content lives ([`Cache::evict`]),
+    /// so no read path can reopen the sidecar-gone-transcript-alive window.
     pub fn find_transcript(&self, fingerprint: &ContentId, transcript_id: &str) -> Option<PathBuf> {
         let p = self.transcript_path(fingerprint, transcript_id);
         if p.is_file() {
             touch(&p);
-            touch(&self.title_path(fingerprint));
             Some(p)
         } else {
             None
@@ -165,35 +167,47 @@ impl Cache {
         Ok(&self.downloads_dir)
     }
 
-    /// Locate the finished media download for a URL key (sidecars and `.part`
-    /// never match); hits refresh the LRU clock.
+    /// Locate the finished media download for a URL key; hits refresh the
+    /// LRU clock.
+    ///
+    /// A key's media file has one spelling — `{key}.{ext}` with a single
+    /// dot-free extension outside [`SUBTITLE_EXTS`] — exactly what the
+    /// fetchers publish. Everything else is excluded by shape, not by
+    /// blacklist: staging files (`….<writer>.part`) and promotion temps
+    /// (`….promote`) carry extra dots, sidecars carry subtitle
+    /// extensions. When re-downloads under different containers leave
+    /// rivals (`k.mp4` beside `k.webm`), the newest mtime wins
+    /// deterministically — and the winning touch keeps it winning while
+    /// the loser ages toward eviction.
     pub fn find_download(&self, key: &str) -> Option<PathBuf> {
         let entries = fs::read_dir(&self.downloads_dir).ok()?;
         let prefix = format!("{key}.");
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let is_media = name.starts_with(&prefix)
-                && !naming::is_part_file(name)
-                && !SUBTITLE_EXTS
-                    .iter()
-                    .any(|ext| name.ends_with(&format!(".{ext}")));
-            if is_media {
-                let p = entry.path();
-                touch(&p);
-                return Some(p);
-            }
-        }
-        None
+        let (_, p) = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let ext = name.to_str()?.strip_prefix(&prefix)?;
+                let is_media =
+                    !ext.is_empty() && !ext.contains('.') && !SUBTITLE_EXTS.contains(&ext);
+                let meta = entry.metadata().ok()?;
+                (is_media && meta.is_file()).then(|| {
+                    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    (mtime, entry.path())
+                })
+            })
+            .max()?;
+        touch(&p);
+        Some(p)
     }
 
     // ── eviction ──
 
     /// Evict downloads down to `max_bytes` (oldest first, sparing in-flight
     /// `.part` files and anything younger than [`EVICT_GRACE`]), drop probe
-    /// documents / transcripts past [`PROBE_MAX_AGE`], and clear staging
-    /// files and directories abandoned by crashed writers; returns removed
-    /// paths.
+    /// documents / transcripts past [`PROBE_MAX_AGE`] — except a title
+    /// sidecar whose content still has a living transcript, since the
+    /// transcript's cache id derives from it — and clear staging files and
+    /// directories abandoned by crashed writers; returns removed paths.
     ///
     /// Accounting is honest: a file that cannot be deleted keeps counting
     /// toward the total and never appears in the removed list, so a
@@ -228,14 +242,40 @@ impl Cache {
             removed.push(f.path.clone());
         }
 
-        for dir in [&self.probe_dir, &self.transcripts_dir] {
-            for f in list_with_stats(dir) {
-                let expired = now
-                    .duration_since(f.mtime)
-                    .is_ok_and(|age| age > PROBE_MAX_AGE);
-                if expired && fs::remove_file(&f.path).is_ok() {
-                    removed.push(f.path);
-                }
+        // Age sweep, transcripts first: a transcript that dies here frees
+        // its title sidecar for the probe-dir pass below. The veto makes
+        // the pairing invariant mechanical — a living transcript never
+        // outlives the sidecar its id derives from; the pair expires in
+        // one sweep or not at all — instead of relying on every transcript
+        // read path to remember a compensating sidecar bump.
+        let expired = |f: &Stat| {
+            now.duration_since(f.mtime)
+                .is_ok_and(|age| age > PROBE_MAX_AGE)
+        };
+        let file_name = |f: &Stat| f.path.file_name().map(|n| n.to_string_lossy().into_owned());
+        let mut living_transcripts = Vec::new();
+        for f in list_with_stats(&self.transcripts_dir) {
+            let Some(name) = file_name(&f) else { continue };
+            if naming::is_part_file(&name) {
+                continue; // in flight or crashed: sweep_stale_staging owns it
+            }
+            if expired(&f) && fs::remove_file(&f.path).is_ok() {
+                removed.push(f.path);
+            } else {
+                living_transcripts.push(name);
+            }
+        }
+        for f in list_with_stats(&self.probe_dir) {
+            let Some(name) = file_name(&f) else { continue };
+            if naming::is_part_file(&name) || !expired(&f) {
+                continue;
+            }
+            let vetoed = name.strip_suffix(TITLE_SUFFIX).is_some_and(|fp| {
+                let prefix = format!("{fp}.");
+                living_transcripts.iter().any(|t| t.starts_with(&prefix))
+            });
+            if !vetoed && fs::remove_file(&f.path).is_ok() {
+                removed.push(f.path);
             }
         }
 
@@ -245,13 +285,13 @@ impl Cache {
 
     /// Remove staging entries whose writers crashed, in every directory
     /// writers stage in: `.part` files (direct downloads in `downloads/`,
-    /// whisper output in `transcripts/`) and `.staging-…` directories
-    /// (yt-dlp jobs in `downloads/`). Normal completion and failure both
-    /// remove staging on the spot, so anything past [`STALE_STAGING_AGE`]
-    /// has no owner left; a live writer keeps its entry's mtime fresh, so
-    /// age is the ownership test.
+    /// whisper output in `transcripts/`, probe documents in `probe/`) and
+    /// `.staging-…` directories (yt-dlp jobs in `downloads/`). Normal
+    /// completion and failure both remove staging on the spot, so anything
+    /// past [`STALE_STAGING_AGE`] has no owner left; a live writer keeps
+    /// its entry's mtime fresh, so age is the ownership test.
     fn sweep_stale_staging(&self, now: SystemTime) {
-        for dir in [&self.downloads_dir, &self.transcripts_dir] {
+        for dir in [&self.downloads_dir, &self.transcripts_dir, &self.probe_dir] {
             let Ok(entries) = fs::read_dir(dir) else {
                 continue;
             };
@@ -279,12 +319,30 @@ impl Cache {
     }
 }
 
-/// Refresh the LRU/age clock; best-effort, a failed touch only ages the entry.
+/// Suffix of the write-once title sidecar living beside probe documents;
+/// the eviction sweep parses the content id back out of it to veto
+/// expiring a sidecar whose transcripts still live.
+const TITLE_SUFFIX: &str = ".title";
+
+/// Refresh the LRU/age clock. Best-effort — a hit is a hit even when the
+/// clock write fails — but a failed bump is a lost state transition (the
+/// hot entry keeps aging toward eviction), so it is logged. `NotFound`
+/// stays silent: a concurrent sweep already unlinked the entry, and there
+/// is no clock left to refresh.
 fn touch(p: &Path) {
-    let _ = File::options().append(true).open(p).and_then(|f| {
-        f.set_modified(SystemTime::now())?;
-        Ok(())
-    });
+    let refreshed = File::options()
+        .append(true)
+        .open(p)
+        .and_then(|f| f.set_modified(SystemTime::now()));
+    if let Err(e) = refreshed
+        && e.kind() != ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %p.display(),
+            error = %e,
+            "cache clock refresh failed; the entry keeps aging toward eviction"
+        );
+    }
 }
 
 /// Remove `f` only if its mtime is still the one the sweep ranked it by: a
@@ -366,6 +424,17 @@ mod tests {
     }
 
     #[test]
+    fn put_probe_publishes_atomically_leaving_no_staging() {
+        let (cache, _dir) = cache(1024);
+        cache.put_probe(&ContentId::new("abc"), "{}").expect("put");
+        let names: Vec<String> = std::fs::read_dir(&cache.probe_dir)
+            .expect("probe dir exists")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["abc.json"], "only the published name remains");
+    }
+
+    #[test]
     fn find_download_skips_partials_and_sidecars() {
         let (cache, _dir) = cache(1024);
         let dir = cache.ensure_downloads_dir().expect("mkdir").to_path_buf();
@@ -374,6 +443,42 @@ mod tests {
         assert!(cache.find_download("k1").is_none());
         std::fs::write(dir.join("k1.mp4"), b"x").expect("write");
         assert_eq!(cache.find_download("k1").expect("hit"), dir.join("k1.mp4"));
+    }
+
+    #[test]
+    fn find_download_rejects_multidot_names_as_media() {
+        // A promotion temp (`k.srt.promote`) is neither `.part` nor a
+        // subtitle name; only the one-dot-free-extension shape keeps it
+        // from answering as media.
+        let (cache, _dir) = cache(1024);
+        let dir = cache.ensure_downloads_dir().expect("mkdir").to_path_buf();
+        std::fs::write(dir.join("k1.srt.promote"), b"x").expect("write");
+        assert!(cache.find_download("k1").is_none());
+    }
+
+    #[test]
+    fn find_download_prefers_the_newest_rival_container() {
+        // A re-download under a different container leaves two media
+        // candidates; the answer must be the latest publication, not
+        // whatever readdir yields first.
+        let (cache, _dir) = cache(1024);
+        let dir = cache.ensure_downloads_dir().expect("mkdir").to_path_buf();
+        let stale = dir.join("k1.mp4");
+        let current = dir.join("k1.webm");
+        std::fs::write(&stale, b"x").expect("write");
+        std::fs::write(&current, b"x").expect("write");
+        File::options()
+            .append(true)
+            .open(&stale)
+            .and_then(|f| f.set_modified(SystemTime::now() - Duration::from_secs(3600)))
+            .expect("age the superseded rip");
+
+        assert_eq!(cache.find_download("k1").expect("hit"), current);
+        assert_eq!(
+            cache.find_download("k1").expect("hit"),
+            current,
+            "the winning touch keeps the winner winning"
+        );
     }
 
     #[test]
@@ -501,12 +606,14 @@ mod tests {
         let (cache, _dir) = cache(1024);
         let dl = cache.ensure_downloads_dir().expect("mkdir").to_path_buf();
         // The names real writers stage under, straight from the grammar's
-        // constructor: a direct download and a whisper transcript.
+        // constructor: a direct download, a whisper transcript, a probe doc.
         let dl_part = naming::part_path(&dl.join("k.mp4"));
         let srt = cache.transcript_path(&ContentId::new("fp"), "m");
         std::fs::create_dir_all(srt.parent().expect("parent")).expect("mkdir");
         let srt_part = naming::part_path(&srt);
-        for p in [&dl_part, &srt_part] {
+        std::fs::create_dir_all(&cache.probe_dir).expect("mkdir");
+        let probe_part = naming::part_path(&cache.probe_path(&ContentId::new("fp")));
+        for p in [&dl_part, &srt_part, &probe_part] {
             std::fs::write(p, b"x").expect("write");
         }
 
@@ -514,6 +621,10 @@ mod tests {
         cache.evict(long_ago);
         assert!(!dl_part.exists(), "a crashed download's .part is swept");
         assert!(!srt_part.exists(), "a crashed transcript's .part is swept");
+        assert!(
+            !probe_part.exists(),
+            "a crashed probe write's .part is swept"
+        );
     }
 
     #[test]
@@ -581,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_hit_keeps_its_title_sidecar_alive() {
+    fn sweep_spares_the_title_sidecar_of_a_living_transcript() {
         let (cache, _dir) = cache(1024);
         let fp = ContentId::new("fp");
         cache
@@ -590,10 +701,10 @@ mod tests {
         let srt = cache.transcript_path(&fp, "m-auto-abcd1234");
         std::fs::create_dir_all(srt.parent().expect("parent")).expect("mkdir");
         std::fs::write(&srt, b"cues").expect("write");
-        // Age the sidecar past expiry while the transcript stays in use:
-        // without the hit-side bump the next sweep would leave the
-        // transcript alive but keyless.
-        let title = cache.probe_dir.join(format!("{fp}.title"));
+        // Age the sidecar past expiry while the transcript stays fresh: the
+        // sweep itself — no read-path bump required — must keep the input
+        // the transcript's id derives from.
+        let title = cache.probe_dir.join(format!("{fp}{TITLE_SUFFIX}"));
         File::options()
             .append(true)
             .open(&title)
@@ -602,13 +713,34 @@ mod tests {
             })
             .expect("age the sidecar");
 
-        cache.find_transcript(&fp, "m-auto-abcd1234").expect("hit");
         cache.evict(SystemTime::now());
 
         assert_eq!(
             cache.get_title(&fp).as_deref(),
             Some("Rust Ownership Explained"),
             "a living transcript's key premise survives the sweep"
+        );
+    }
+
+    #[test]
+    fn expired_transcript_takes_its_title_along_in_one_sweep() {
+        let (cache, _dir) = cache(1024);
+        let fp = ContentId::new("fp");
+        cache
+            .put_title(&fp, "Rust Ownership Explained")
+            .expect("put");
+        let srt = cache.transcript_path(&fp, "m-auto-abcd1234");
+        std::fs::create_dir_all(srt.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&srt, b"cues").expect("write");
+
+        let long_ago = SystemTime::now() + PROBE_MAX_AGE + Duration::from_secs(60);
+        cache.evict(long_ago);
+
+        assert!(!srt.exists(), "the transcript expired");
+        assert_eq!(
+            cache.get_title(&fp),
+            None,
+            "the pair expires in the same sweep: no orphaned sidecar lingers"
         );
     }
 

@@ -2,6 +2,12 @@
 //! `look` presets: intent-level names mapped to core knobs.
 
 use super::schema::Look;
+use agent_video_core::config::{Profile, default_chunk_seconds};
+
+/// The action profile's core flags. `Profile::Action` spells the flag
+/// value, so the flag and the chunk-length lookup below cannot name
+/// different profiles.
+const ACTION_FLAGS: &[&str] = &["--profile", Profile::Action.cli_name(), "--quality", "low"];
 
 /// The core knobs behind a single look value.
 #[derive(Debug, Clone)]
@@ -14,17 +20,16 @@ pub struct LookPreset {
 
 /// The preset behind `look` (`None` = balanced default).
 pub fn preset_for(look: Option<Look>) -> LookPreset {
-    use agent_video_core::config::default_chunk_seconds;
     // (flags, the profile a preset rides on — chunk length resolves through
     // core's own table, never a copied number).
-    let (flags, profile): (&'static [&'static str], Option<&str>) = match look {
+    let (flags, profile): (&'static [&'static str], Option<Profile>) = match look {
         None => (&["--detail", "standard", "--quality", "low"], None),
         Some(Look::Overview) => (&["--detail", "coarse", "--quality", "low"], None),
         Some(Look::Detailed) => (&["--detail", "fine", "--quality", "medium"], None),
         Some(Look::ReadText) => (&["--detail", "standard", "--quality", "high"], None),
         // Action profile favors scene changes and tightens min-gap; quality
         // low makes cells small and dense.
-        Some(Look::TrackMotion) => (&["--profile", "action", "--quality", "low"], Some("action")),
+        Some(Look::TrackMotion) => (ACTION_FLAGS, Some(Profile::Action)),
     };
     LookPreset {
         flags,

@@ -89,7 +89,7 @@ mod tests {
     /// Build a frame whose grayscale is a flat fill of `level`.
     fn flat_frame(ts: f32, level: u8) -> CandidateFrame {
         CandidateFrame {
-            ts,
+            ts: crate::types::Ts::new(ts).expect("finite test ts"),
             gray: GrayImage::from_pixel(64, 64, image::Luma([level])),
             rgb: Arc::new(RgbImage::new(1, 1)),
         }
@@ -132,7 +132,8 @@ mod tests {
             flat_frame(2.0, 100),
         ];
         let judged = Deduper::new(8, win(8)).judge(frames);
-        let verdicts: Vec<(f32, bool)> = judged.iter().map(|(f, kept)| (f.ts, *kept)).collect();
+        let verdicts: Vec<(f32, bool)> =
+            judged.iter().map(|(f, kept)| (f.ts.get(), *kept)).collect();
         assert_eq!(
             verdicts,
             vec![(0.0, true), (1.0, false), (2.0, false)],
@@ -153,7 +154,7 @@ mod tests {
             }
         }
         let mk = |ts, g| CandidateFrame {
-            ts,
+            ts: crate::types::Ts::new(ts).expect("finite test ts"),
             gray: g,
             rgb: Arc::new(RgbImage::new(1, 1)),
         };

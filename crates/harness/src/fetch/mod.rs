@@ -21,7 +21,7 @@ use super::fault::{Fault, FaultKind};
 use super::netguard::VettedUrl;
 use super::plan::format_bytes;
 use super::relay::PolicyRelay;
-use super::tokens::{Dest, DownloadPlan, Token};
+use super::tokens::{Dest, DownloadPlan};
 
 /// Version of the download recipe logic. Bump when the bytes a download
 /// produces change for reasons outside the config — e.g. the yt-dlp format
@@ -59,10 +59,11 @@ pub enum Recipe {
     Ytdlp(ytdlp::YtdlpRecipe),
 }
 
-/// One download candidate offered to the model behind a consent token.
+/// One download candidate offered to the model behind a consent token
+/// (minted by the registry at commit time; a source only describes the
+/// candidate, it never spells token text).
 #[derive(Debug, Clone)]
 pub struct DownloadOption {
-    pub token: Token,
     pub dest: Dest,
     /// Short human label, used when the option is withheld for size
     /// (`"720p (1.2 GiB)"`).
