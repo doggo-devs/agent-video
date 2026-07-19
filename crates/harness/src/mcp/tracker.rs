@@ -6,6 +6,17 @@
 //! receiving half plus a folded snapshot, so no state is ever mutated from
 //! two sides. Polls fold pending events, settled jobs hand their stored
 //! response out exactly once.
+//!
+//! Slot ownership has teeth in both directions. Downward: the slot owns
+//! the job's [`CancelSignal`], and every removal — abandonment,
+//! displacement, settled handout — trips it on drop, so a thread whose
+//! slot was taken away observes the disownment instead of working on.
+//! Upward: a [`Settlement`] may carry an effect that runs only if the slot
+//! still owns the job when the settlement is folded — the channel receiver
+//! *is* the ownership, so a disowned thread's late settlement (effect
+//! included) is dropped unexecuted rather than checked against a flag.
+//! Dropping it also fires the settlement's disowned compensation, the undo
+//! of any durable effect the disowned job already published.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, mpsc};
@@ -13,33 +24,131 @@ use std::time::{Duration, Instant};
 
 use rmcp::model::CallToolResult;
 
+use crate::fetch::CancelSignal;
+
 /// What the download thread reports; the thread shares no state.
 enum JobEvent {
     Progress { downloaded: u64, total: Option<u64> },
-    Settled(CallToolResult),
+    Settled(Settlement),
+}
+
+/// A job's final response plus an optional effect that must land only
+/// while the job still owns its slot. The pair travels through the slot's
+/// channel as one event, so the effect can never run without the response
+/// being adopted, nor the response be adopted with the effect lost. An
+/// optional disowned compensation is the mirror image: it runs exactly
+/// when the settlement is dropped unadopted.
+///
+/// Contract: an adopted effect runs inside the tracker's critical section
+/// and must not call back into the tracker.
+pub struct Settlement {
+    result: CallToolResult,
+    on_owned: Option<Box<dyn FnOnce() + Send>>,
+    /// Armed until adoption defuses it in [`JobSlot::fold`]; its `Drop`
+    /// fires on every other path a settlement can take.
+    on_disowned: Option<Unadopted>,
+}
+
+/// Drop bomb carrying a settlement's disowned compensation.
+///
+/// The channel *is* slot ownership, so "this settlement was never adopted"
+/// has no single code path: the send can fail (slot already gone), a sent
+/// event can be dropped with the receiver racing the send, or a queued
+/// event can go down with the tracker at teardown. Owning the compensation
+/// as a `Drop` impl covers all of them with one mechanism — only adoption
+/// ([`JobSlot::fold`]) defuses it.
+struct Unadopted(Option<Box<dyn FnOnce() + Send>>);
+
+impl Unadopted {
+    /// Adoption: the compensation must not run; drop it unexecuted.
+    fn defuse(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Unadopted {
+    fn drop(&mut self) {
+        if let Some(compensate) = self.0.take() {
+            compensate();
+        }
+    }
+}
+
+impl Settlement {
+    /// A settlement with a side effect that runs exactly when the tracker
+    /// adopts the result — never for a job whose slot was abandoned or
+    /// displaced. Used for the keep-download receipt, which a disowned
+    /// zombie must not be able to write over a retry's.
+    pub fn with_owned_effect(
+        result: CallToolResult,
+        effect: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Settlement {
+            result,
+            on_owned: Some(Box::new(effect)),
+            on_disowned: None,
+        }
+    }
+
+    /// Arm `compensate` to run exactly when this settlement is dropped
+    /// without being adopted — its slot was abandoned, displaced, or torn
+    /// down before the fold. Adoption defuses it, so the owned effect and
+    /// the compensation are mutually exclusive by construction. Used by
+    /// keep downloads to remove a published file whose receipt will never
+    /// be written: "the file exists" and "its settlement was adopted" can
+    /// then only diverge across a process crash.
+    pub fn or_disowned(mut self, compensate: impl FnOnce() + Send + 'static) -> Self {
+        self.on_disowned = Some(Unadopted(Some(Box::new(compensate))));
+        self
+    }
+}
+
+impl From<CallToolResult> for Settlement {
+    fn from(result: CallToolResult) -> Self {
+        Settlement {
+            result,
+            on_owned: None,
+            on_disowned: None,
+        }
+    }
 }
 
 /// Write half of one job, owned by its download thread. Dropping it without
 /// settling (a panic unwound the thread) is visible to the next poll as an
 /// abandoned job.
 #[derive(Debug)]
-pub struct JobReporter(mpsc::Sender<JobEvent>);
+pub struct JobReporter {
+    events: mpsc::Sender<JobEvent>,
+    cancel: CancelSignal,
+}
 
 impl JobReporter {
     /// Report live progress; never blocks.
     pub fn progress(&self, downloaded: u64, total: Option<u64>) {
-        let _ = self.0.send(JobEvent::Progress { downloaded, total });
+        let _ = self.events.send(JobEvent::Progress { downloaded, total });
     }
 
-    /// Deliver the final response. A job settles at most once.
-    pub fn settle(self, result: CallToolResult) {
-        let _ = self.0.send(JobEvent::Settled(result));
+    /// The job's cancel signal, tripped by the tracker when the slot is
+    /// given up. The download threads it into work that can observe it.
+    pub fn cancel_signal(&self) -> CancelSignal {
+        self.cancel.clone()
+    }
+
+    /// Deliver the final response. A job settles at most once; a settlement
+    /// sent after the slot was given up is dropped whole, owned effect
+    /// included.
+    pub fn settle(self, settlement: impl Into<Settlement>) {
+        let _ = self.events.send(JobEvent::Settled(settlement.into()));
     }
 }
 
 /// Read half plus folded snapshot of one job; owned by the tracker.
 struct JobSlot {
     events: mpsc::Receiver<JobEvent>,
+    /// Tripped on drop: no removal path can leave the thread unaware that
+    /// its slot is gone. After a settled handout the thread is already done
+    /// and the trip is a no-op.
+    cancel: CancelSignal,
     downloaded: u64,
     total: Option<u64>,
     /// The final response, stashed by [`JobSlot::fold`] and taken exactly
@@ -63,9 +172,10 @@ enum Fold {
 }
 
 impl JobSlot {
-    fn new(events: mpsc::Receiver<JobEvent>) -> Self {
+    fn new(events: mpsc::Receiver<JobEvent>, cancel: CancelSignal) -> Self {
         JobSlot {
             events,
+            cancel,
             downloaded: 0,
             total: None,
             done: None,
@@ -74,7 +184,9 @@ impl JobSlot {
     }
 
     /// Drain pending events into the snapshot; a settled result is stashed
-    /// in `done` (checked before liveness by every caller).
+    /// in `done` (checked before liveness by every caller) and its owned
+    /// effect runs here — the settlement was folded by a live slot, so the
+    /// job provably still owned it.
     fn fold(&mut self) -> Fold {
         loop {
             match self.events.try_recv() {
@@ -85,11 +197,28 @@ impl JobSlot {
                     }
                     self.last_progress = Instant::now();
                 }
-                Ok(JobEvent::Settled(result)) => self.done = Some(result),
+                Ok(JobEvent::Settled(settlement)) => {
+                    // Folded by a live slot: adopted. The compensation is
+                    // defused before the owned effect runs, so no panic or
+                    // ordering accident can fire both.
+                    if let Some(armed) = settlement.on_disowned {
+                        armed.defuse();
+                    }
+                    if let Some(effect) = settlement.on_owned {
+                        effect();
+                    }
+                    self.done = Some(settlement.result);
+                }
                 Err(mpsc::TryRecvError::Empty) => return Fold::Live,
                 Err(mpsc::TryRecvError::Disconnected) => return Fold::Dead,
             }
         }
+    }
+}
+
+impl Drop for JobSlot {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
@@ -107,7 +236,8 @@ pub enum Poll {
     /// Still reporting progress; a snapshot for rendering.
     Running { downloaded: u64, total: Option<u64> },
     /// The job's thread died or stopped reporting past the stall limit; the
-    /// slot is cleared so the caller can start over.
+    /// slot is cleared — tripping the job's cancel signal — so the caller
+    /// can start over without a zombie working underneath it.
     Abandoned,
 }
 
@@ -147,8 +277,8 @@ impl Tracker {
         if let Some(slot) = jobs.get_mut(key) {
             let liveness = slot.fold();
             if slot.done.is_some() {
-                let slot = jobs.remove(key).expect("slot was just folded");
-                return Admission::Settled(slot.done.expect("checked above"));
+                let mut slot = jobs.remove(key).expect("slot was just folded");
+                return Admission::Settled(slot.done.take().expect("checked above"));
             }
             match liveness {
                 // Dead or wedged: nothing to hand out; claim the slot anew.
@@ -163,8 +293,9 @@ impl Tracker {
             }
         }
         let (tx, rx) = mpsc::channel();
-        jobs.insert(key.to_string(), JobSlot::new(rx));
-        Admission::Started(JobReporter(tx))
+        let cancel = CancelSignal::new();
+        jobs.insert(key.to_string(), JobSlot::new(rx, cancel.clone()));
+        Admission::Started(JobReporter { events: tx, cancel })
     }
 
     /// Resolve one poll: settled beats dead beats stalled beats running,
@@ -176,8 +307,8 @@ impl Tracker {
         };
         let liveness = slot.fold();
         if slot.done.is_some() {
-            let slot = jobs.remove(key).expect("slot was just folded");
-            return Poll::Settled(slot.done.expect("checked above"));
+            let mut slot = jobs.remove(key).expect("slot was just folded");
+            return Poll::Settled(slot.done.take().expect("checked above"));
         }
         match liveness {
             Fold::Dead => {
@@ -213,6 +344,8 @@ impl Tracker {
 mod tests {
     use super::*;
     use rmcp::model::ContentBlock;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Generous limit: these tests never exercise abandonment unless they
     /// rewind the clock explicitly.
@@ -322,8 +455,136 @@ mod tests {
     }
 
     #[test]
+    fn abandonment_trips_the_jobs_cancel_signal() {
+        let tracker = Tracker::default();
+        let reporter = start(&tracker, "k");
+        let cancel = reporter.cancel_signal();
+        tracker.age("k", Duration::from_secs(120));
+        assert!(!cancel.is_cancelled(), "live job is not cancelled");
+        assert!(matches!(
+            tracker.poll("k", Duration::from_secs(60)),
+            Poll::Abandoned
+        ));
+        assert!(
+            cancel.is_cancelled(),
+            "giving up the slot must tell the thread"
+        );
+    }
+
+    #[test]
+    fn displacing_admission_trips_the_old_jobs_cancel_signal() {
+        let tracker = Tracker::default();
+        let stalled = start(&tracker, "k");
+        let cancel = stalled.cancel_signal();
+        tracker.age("k", Duration::from_secs(120));
+        assert!(matches!(
+            tracker.admit("k", Duration::from_secs(60)),
+            Admission::Started(_)
+        ));
+        assert!(
+            cancel.is_cancelled(),
+            "the displaced job must observe its disownment"
+        );
+    }
+
+    #[test]
+    fn runs_the_owned_effect_when_a_settlement_is_adopted() {
+        let tracker = Tracker::default();
+        let reporter = start(&tracker, "k");
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        reporter.settle(Settlement::with_owned_effect(settled_result(), move || {
+            flag.store(true, Ordering::SeqCst);
+        }));
+        assert!(matches!(tracker.poll("k", LIMIT), Poll::Settled(_)));
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "an adopted settlement's effect must land with its result"
+        );
+    }
+
+    #[test]
+    fn drops_a_late_settlements_owned_effect_after_abandonment() {
+        let tracker = Tracker::default();
+        let reporter = start(&tracker, "k");
+        tracker.age("k", Duration::from_secs(120));
+        assert!(matches!(
+            tracker.poll("k", Duration::from_secs(60)),
+            Poll::Abandoned
+        ));
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        reporter.settle(Settlement::with_owned_effect(settled_result(), move || {
+            flag.store(true, Ordering::SeqCst);
+        }));
+        assert!(
+            matches!(tracker.poll("k", LIMIT), Poll::Vacant),
+            "a disowned settlement must not resurrect the slot"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a zombie's effect must never run — it would overwrite a retry's receipt"
+        );
+    }
+
+    #[test]
+    fn fires_the_disowned_compensation_when_no_slot_adopts_the_settlement() {
+        let tracker = Tracker::default();
+        let reporter = start(&tracker, "k");
+        tracker.age("k", Duration::from_secs(120));
+        assert!(matches!(
+            tracker.poll("k", Duration::from_secs(60)),
+            Poll::Abandoned
+        ));
+        let compensated = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&compensated);
+        reporter.settle(Settlement::from(settled_result()).or_disowned(move || {
+            flag.store(true, Ordering::SeqCst);
+        }));
+        assert!(
+            compensated.load(Ordering::SeqCst),
+            "a settlement nobody adopts must undo its published effect"
+        );
+    }
+
+    #[test]
+    fn adoption_defuses_the_disowned_compensation() {
+        let tracker = Tracker::default();
+        let reporter = start(&tracker, "k");
+        let compensated = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&compensated);
+        reporter.settle(Settlement::from(settled_result()).or_disowned(move || {
+            flag.store(true, Ordering::SeqCst);
+        }));
+        assert!(matches!(tracker.poll("k", LIMIT), Poll::Settled(_)));
+        assert!(
+            !compensated.load(Ordering::SeqCst),
+            "an adopted settlement's compensation must never fire"
+        );
+    }
+
+    #[test]
+    fn tracker_teardown_fires_a_queued_settlements_compensation() {
+        // The settlement was sent but never folded: dropping the tracker
+        // drops the slot, the channel, and the queued event — the
+        // compensation must ride that drop.
+        let tracker = Tracker::default();
+        let reporter = start(&tracker, "k");
+        let compensated = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&compensated);
+        reporter.settle(Settlement::from(settled_result()).or_disowned(move || {
+            flag.store(true, Ordering::SeqCst);
+        }));
+        drop(tracker);
+        assert!(
+            compensated.load(Ordering::SeqCst),
+            "teardown must not strand a published effect without its receipt"
+        );
+    }
+
+    #[test]
     fn admits_exactly_one_writer_under_contention() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::Barrier;
         let tracker = Arc::new(Tracker::default());
         let barrier = Arc::new(Barrier::new(2));
         let admissions: Vec<Admission> = [(); 2]

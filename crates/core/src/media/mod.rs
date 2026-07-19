@@ -49,7 +49,7 @@ pub fn init() {
 /// HTTP error, non-media payload) stays an input-decade error.
 pub fn open_input(source: &Source) -> Result<ffmpeg::format::context::Input> {
     init();
-    ffmpeg::format::input(source.as_path()).map_err(|e| open_error(source, e))
+    ffmpeg::format::input(&source.ffmpeg_path()).map_err(|e| open_error(source, e))
 }
 
 /// Like [`open_input`], but wires `stop` into libav's interrupt callback and
@@ -67,13 +67,85 @@ pub fn open_input(source: &Source) -> Result<ffmpeg::format::context::Input> {
 /// `("http_proxy", "http://127.0.0.1:port")` to route every connection the
 /// demuxer makes through a forward proxy. This module forwards them
 /// verbatim and never interprets their meaning; pass `&[]` for a plain open.
+///
+/// The returned [`InterruptibleInput`] derefs to the plain input context
+/// and owns the callback's flag reference — nothing leaks per open.
 pub fn open_input_interruptible(
     source: &Source,
     stop: Arc<AtomicBool>,
     options: &[(&str, &str)],
-) -> Result<ffmpeg::format::context::Input> {
+) -> Result<InterruptibleInput> {
     init();
     open_with_interrupt_and_options(source, stop, options).map_err(|e| open_error(source, e))
+}
+
+/// An opened container whose blocking I/O observes a stop flag.
+///
+/// The interrupt callback installed by [`open_input_interruptible`] polls
+/// the `AtomicBool` inside `stop` through a raw pointer, so the flag must
+/// outlive every callback invocation. This wrapper is that proof: field
+/// order drops `input` first — `avformat_close_input` runs, after which
+/// libav never calls back — and only then releases the flag reference.
+/// Unlike `ffmpeg::util::interrupt`'s boxed-closure API (which leaks the
+/// closure per open, unreclaimable because the context has no teardown
+/// hook for it), nothing here outlives the open — which matters in a
+/// long-lived server probing one URL per call.
+///
+/// The proof also pins the inner value's identity: it derefs to `&Input`
+/// but deliberately exposes no `&mut Input` (no `DerefMut`, no accessor),
+/// because a `&mut Input` admits `mem::replace` — safe code could extract
+/// the callback-armed context, outlive the wrapper with it, and leave the
+/// callback polling a freed flag. The mutating operations the pipeline
+/// needs are delegated below ([`Self::seek`], [`Self::read_packet`]), so
+/// the context this wrapper opened is the context it closes.
+pub struct InterruptibleInput {
+    /// Declared (and therefore dropped) first: the context must close
+    /// before the flag it polls is released.
+    input: ffmpeg::format::context::Input,
+    /// Keeps the callback's pointee alive for the context's lifetime.
+    _stop: Arc<AtomicBool>,
+}
+
+impl InterruptibleInput {
+    /// Seek the demuxer; see [`ffmpeg::format::context::Input::seek`].
+    pub fn seek<R: ffmpeg::util::range::Range<i64>>(
+        &mut self,
+        ts: i64,
+        range: R,
+    ) -> std::result::Result<(), ffmpeg::Error> {
+        self.input.seek(ts, range)
+    }
+
+    /// Read the next packet from the container; see [`ffmpeg::Packet::read`].
+    pub fn read_packet(
+        &mut self,
+        packet: &mut ffmpeg::Packet,
+    ) -> std::result::Result<(), ffmpeg::Error> {
+        packet.read(&mut self.input)
+    }
+}
+
+impl std::ops::Deref for InterruptibleInput {
+    type Target = ffmpeg::format::context::Input;
+
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
+}
+
+/// libav's interrupt poll: nonzero aborts the blocking call.
+///
+/// # Safety
+///
+/// `opaque` must point at an `AtomicBool` that outlives every possible
+/// invocation — [`InterruptibleInput`] upholds this by holding the owning
+/// `Arc` until after its context closes.
+unsafe extern "C" fn interrupt_poll(opaque: *mut std::ffi::c_void) -> std::ffi::c_int {
+    // SAFETY: `opaque` is `Arc::as_ptr` of the flag held by the
+    // `InterruptibleInput` that owns this context; the wrapper's drop
+    // order guarantees the pointee is alive whenever libav calls here.
+    let stop = unsafe { &*opaque.cast::<AtomicBool>() };
+    std::ffi::c_int::from(stop.load(Ordering::Relaxed))
 }
 
 /// Open an input with both an interrupt callback and an options dictionary.
@@ -86,13 +158,13 @@ fn open_with_interrupt_and_options(
     source: &Source,
     stop: Arc<AtomicBool>,
     options: &[(&str, &str)],
-) -> std::result::Result<ffmpeg::format::context::Input, ffmpeg::Error> {
+) -> std::result::Result<InterruptibleInput, ffmpeg::Error> {
     use ffmpeg::format::context::Input;
     use std::ffi::CString;
 
     let path = CString::new(
         source
-            .as_path()
+            .ffmpeg_path()
             .as_os_str()
             .to_str()
             .expect("source path is valid UTF-8"),
@@ -106,10 +178,11 @@ fn open_with_interrupt_and_options(
     // SAFETY: `ps` is allocated by libav and handed straight to
     // `avformat_open_input`, which on success adopts it (freed later by the
     // wrapping `Input`'s Drop) and on error frees it via
-    // `avformat_close_input`. The interrupt closure is boxed and
-    // deliberately leaked, exactly as `ffmpeg::format::input_with_interrupt`
-    // does: the context has no teardown hook to reclaim it, so a few bytes
-    // leak per open, bounded by the handful a run performs. `opts` is
+    // `avformat_close_input`. The interrupt callback's opaque pointer
+    // aliases the `AtomicBool` inside `stop`, whose owning `Arc` travels in
+    // the returned `InterruptibleInput` and is released only after the
+    // context closes — see that type's drop-order contract; on every error
+    // path the context is already gone before `stop` drops here. `opts` is
     // disowned into the call and re-owned after so the reclaimed dictionary
     // frees any options libav did not consume.
     unsafe {
@@ -121,8 +194,10 @@ fn open_with_interrupt_and_options(
                 errno: ffmpeg::error::ENOMEM,
             });
         }
-        (*ps).interrupt_callback =
-            ffmpeg::util::interrupt::new(Box::new(move || stop.load(Ordering::Relaxed))).interrupt;
+        (*ps).interrupt_callback = ffmpeg::ffi::AVIOInterruptCB {
+            callback: Some(interrupt_poll),
+            opaque: Arc::as_ptr(&stop).cast_mut().cast(),
+        };
         let mut opts = dict.disown();
         let res = ffmpeg::ffi::avformat_open_input(
             &mut ps,
@@ -135,7 +210,10 @@ fn open_with_interrupt_and_options(
             return Err(ffmpeg::Error::from(res));
         }
         match ffmpeg::ffi::avformat_find_stream_info(ps, std::ptr::null_mut()) {
-            r if r >= 0 => Ok(Input::wrap(ps)),
+            r if r >= 0 => Ok(InterruptibleInput {
+                input: Input::wrap(ps),
+                _stop: stop,
+            }),
             e => {
                 ffmpeg::ffi::avformat_close_input(&mut ps);
                 Err(ffmpeg::Error::from(e))

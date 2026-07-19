@@ -8,7 +8,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 
 use rmcp::model::{CallToolResult, ContentBlock};
 
@@ -19,7 +19,8 @@ use super::tracker::Tracker;
 use crate::config::{Config, default_config, test_dirs};
 use crate::fault::Fault;
 use crate::fetch::{
-    DownloadIo, DownloadOption, Downloaded, ProgressFn, Recipe, SourceInfo, direct::DirectRecipe,
+    CancelSignal, DownloadIo, DownloadOption, Downloaded, ProgressFn, Recipe, SourceInfo,
+    direct::DirectRecipe,
 };
 use crate::relay::PolicyRelay;
 use crate::schema::ProbeSummary;
@@ -73,9 +74,10 @@ impl<T: UrlFetcher> UrlFetcher for Arc<T> {
         io: DownloadIo<'_>,
         cfg: &Config,
         relay: &PolicyRelay,
+        cancel: &CancelSignal,
         progress: ProgressFn<'_>,
     ) -> Result<Downloaded, Fault> {
-        (**self).download(plan, io, cfg, relay, progress)
+        (**self).download(plan, io, cfg, relay, cancel, progress)
     }
 }
 
@@ -101,6 +103,10 @@ pub(crate) struct FakeWhisper {
     /// Decoded-audio seconds the fake reports; `INFINITY` = "covers
     /// everything", so only truncation tests set a finite value.
     pub(crate) audio_seconds: Mutex<f64>,
+    /// When present, `transcribe` announces itself on the sender and then
+    /// blocks on the receiver until released, so tests can hold one whisper
+    /// run open while a concurrent request arrives.
+    pub(crate) gate: Mutex<Option<(Sender<()>, Receiver<()>)>>,
 }
 
 impl Whisper for FakeWhisper {
@@ -116,6 +122,10 @@ impl Whisper for FakeWhisper {
         on_step: &mut dyn FnMut(&str),
     ) -> Result<crate::transcribe::Transcribed, Fault> {
         *self.calls.lock().expect("calls") += 1;
+        if let Some((entered, release)) = &*self.gate.lock().expect("whisper gate") {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
         on_step("transcribing");
         std::fs::create_dir_all(out_srt.parent().expect("parent")).expect("transcripts dir");
         std::fs::write(out_srt, "1\n00:00:00,000 --> 00:00:01,000\nhi\n\n").expect("write srt");
@@ -126,12 +136,19 @@ impl Whisper for FakeWhisper {
 }
 
 /// Downloads block on `gate` when present, making slow downloads
-/// deterministic in tests.
+/// deterministic in tests. Records each job's cancel signal so tests can
+/// observe that abandonment reaches the fetch, and counts finished
+/// fetches so tests can sequence against a download thread they cannot
+/// join.
 pub(crate) struct FakeFetcher {
     pub(crate) info: SourceInfo,
     pub(crate) gate: Option<Mutex<Receiver<()>>>,
     pub(crate) warning: Option<String>,
     pub(crate) downloads: Mutex<u32>,
+    /// Fetches that ran to completion (the file is on disk when this
+    /// ticks); the surrounding settle may still be in flight.
+    pub(crate) finished: Mutex<u32>,
+    pub(crate) last_cancel: Mutex<Option<CancelSignal>>,
 }
 
 impl UrlFetcher for FakeFetcher {
@@ -150,9 +167,11 @@ impl UrlFetcher for FakeFetcher {
         io: DownloadIo<'_>,
         _cfg: &Config,
         _relay: &PolicyRelay,
+        cancel: &CancelSignal,
         progress: ProgressFn<'_>,
     ) -> Result<Downloaded, Fault> {
         *self.downloads.lock().expect("downloads") += 1;
+        *self.last_cancel.lock().expect("last_cancel") = Some(cancel.clone());
         if let Some(gate) = &self.gate {
             progress(1024, Some(4096));
             gate.lock()
@@ -167,6 +186,7 @@ impl UrlFetcher for FakeFetcher {
         let mut f = std::fs::File::create(&dest).expect("create download");
         f.write_all(b"fake video bytes").expect("write");
         progress(16, Some(16));
+        *self.finished.lock().expect("finished") += 1;
         Ok(Downloaded {
             path: dest,
             warning: self.warning.clone(),
@@ -194,16 +214,15 @@ pub(crate) fn core_json() -> String {
         Detail, GridImage, GridPosition, KeyFrameMeta, LayoutKind, Quality, Settings,
     };
     use agent_video_core::wire::{Grid, Metadata};
-    serde_json::to_string(&Metadata {
-        source: "v.mp4".to_string(),
-        duration: 90.0,
-        range: None,
-        settings: Settings {
+    serde_json::to_string(&Metadata::process(
+        "v.mp4".to_string(),
+        90.0,
+        Settings {
             max_edge: 2048,
             quality: Quality::Low,
             detail: Detail::Standard,
         },
-        grids: vec![Grid {
+        vec![Grid {
             image: GridImage::Base64("QUJD".to_string()),
             time_range: "00:00-01:30".to_string(),
             total_frames: 12,
@@ -215,7 +234,7 @@ pub(crate) fn core_json() -> String {
             layout: LayoutKind::Uniform,
             subtitles: Some("00:01 hi".to_string()),
         }],
-    })
+    ))
     .expect("wire metadata serializes")
 }
 
@@ -241,6 +260,8 @@ pub(crate) fn env(probe_summary: ProbeSummary, whisper_available: bool) -> TestE
             gate: None,
             warning: None,
             downloads: Mutex::new(0),
+            finished: Mutex::new(0),
+            last_cancel: Mutex::new(None),
         },
     )
 }
@@ -265,16 +286,18 @@ pub(crate) fn env_with_fetcher(
         available: whisper_available,
         calls: Mutex::new(0),
         audio_seconds: Mutex::new(f64::INFINITY),
+        gate: Mutex::new(None),
     });
     let deps = Arc::new(ServerDeps {
         cache,
         tokens: Tokens::default(),
         downloads: Tracker::default(),
+        transcriptions: crate::gate::KeyedGate::default(),
         prober: Box::new(FakeProber(probe_summary)),
         fetcher: Box::new(Arc::clone(&fetcher)),
         whisper: Box::new(Arc::clone(&whisper)),
         core: Box::new(Arc::clone(&core)),
-        relay: std::sync::OnceLock::new(),
+        relay: crate::mcp::deps::RelaySlot::new(),
         config,
     });
     TestEnv {

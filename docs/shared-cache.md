@@ -53,11 +53,26 @@ filesystem. If two writers race to publish, last-writer-wins is harmless
 with the winner's. Per-writer uniqueness (not per-process) matters: two threads
 of one server must not share a staging path either.
 
+The staging spellings are owned by exactly one module,
+`crate::cache::naming`: writers obtain their `.part` and `.staging-…` names
+from its constructors, and the eviction sweep classifies directory entries
+with its predicates (`is_part_file`, `is_staging_dir`). Constructor and
+predicate are tested as inverses there, and the on-disk spellings are pinned
+against literal strings so existing caches stay sweepable.
+
+A crashed writer leaves its staging entry behind — a `.part` file or a
+`.staging-…` directory. The eviction sweep reclaims both the same way: any
+staging-named entry whose mtime is older than a day, in every directory
+writers stage in (downloads and transcripts), has no owner left and is
+removed. A live writer keeps its entry's mtime fresh, so age is the
+ownership test; in-flight staging is exempt from the LRU budget.
+
 **Members:**
 
 - **Direct-link downloads** — `crate::fetch::direct`. Streams to a
   writer-unique `<dest>.<pid>-<seq>.part`, then `publish` runs `sync_all` on the
-  writer's own handle before an atomic rename to the final cache name.
+  writer's own handle before an atomic rename to the final cache name. A
+  crashed writer's `.part` is left for the eviction sweep.
 - **yt-dlp downloads** — `crate::fetch::ytdlp`. Each job downloads into its own
   `.staging-<key>-<pid>-<seq>/` directory; `adopt_into` fsyncs and renames each
   file up into the shared cache dir. A crashed job leaves its staging directory
@@ -99,9 +114,9 @@ pattern.
 |----------|---------|------------|------------|
 | Probe documents (`cache.rs::put_probe`) | 1 | `fs::create_dir_all` + `fs::write` (direct, non-atomic) | Yes — a non-atomic write is legal under pattern 1: same fingerprint ⇒ same JSON, so an interleave writes identical bytes and a partial read misses and re-probes. |
 | Whisper transcripts (`cache.rs` keying) | 1 | keyed by fingerprint × `model_id`; written via `write_srt` (pattern 2) | Yes — the key guarantees equal bytes; the write itself is even stronger than pattern 1 requires (staged rename). |
-| Direct downloads (`fetch/direct.rs`) | 2 | writer-unique `.part`, `sync_all`, atomic `rename` | Yes. |
-| yt-dlp downloads (`fetch/ytdlp.rs`) | 2 | per-writer `.staging-…` dir, fsync + per-file `rename` in `adopt_into` | Yes. |
-| Whisper SRT (`transcribe.rs::write_srt`) | 2 | pid-suffixed `.part`, `rename` | Yes — verified per prior review, no change needed. |
+| Direct downloads (`fetch/direct.rs`) | 2 | writer-unique `.part` (via `cache::naming`), `sync_all`, atomic `rename` | Yes. |
+| yt-dlp downloads (`fetch/ytdlp.rs`) | 2 | per-writer `.staging-…` dir (via `cache::naming`), fsync + per-file `rename` in `adopt_into` | Yes. |
+| Whisper SRT (`transcribe.rs::write_srt`) | 2 | writer-unique `.part` (via `cache::naming`), `rename` | Yes — verified per prior review, no change needed. |
 | Cookie jar (`cookies.rs`) | 3 | exclusive `.lock`, checkout/commit delta merge, temp + rename publish | Yes. |
 
 No genuinely non-atomic write of a shared artifact outside its declared pattern

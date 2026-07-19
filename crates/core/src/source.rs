@@ -8,6 +8,7 @@
 //! verbatim to `avformat_open_input` — FFmpeg owns protocol resolution, and a
 //! protocol this build lacks surfaces from open as a coded error.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -15,7 +16,10 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub enum Source {
     /// A local file: validated against the filesystem before any media work,
-    /// and scanned for sidecar subtitles.
+    /// and scanned for sidecar subtitles. When a path is already known local
+    /// by type (a cache entry, a temp file), construct this variant directly
+    /// — re-classifying its string form would re-guess settled knowledge and
+    /// misread colon-named files (`clip:1.mp4`) as protocol URLs.
     Local(PathBuf),
     /// A protocol URL, handed verbatim to FFmpeg's demuxer.
     Remote(RemoteUrl),
@@ -49,13 +53,30 @@ impl Source {
         }
     }
 
-    /// The bytes handed verbatim to `avformat_open_input`, shaped as a
-    /// [`Path`] because that is the door `ffmpeg-next` exposes — for a remote
-    /// URL the "path" is simply the URL string.
+    /// The verbatim bytes of the input, shaped as a [`Path`] — for error
+    /// context and display; for a remote URL the "path" is simply the URL
+    /// string.
     pub fn as_path(&self) -> &Path {
         match self {
             Source::Local(path) => path,
             Source::Remote(url) => Path::new(url.as_str()),
+        }
+    }
+
+    /// The path handed to `avformat_open_input`.
+    ///
+    /// A remote URL goes verbatim — FFmpeg owns protocol resolution. A local
+    /// path is already classified, but FFmpeg re-parses whatever string it
+    /// receives with its own protocol grammar, so a relative file named like
+    /// a scheme (`clip:1.mp4`) would be routed to a nonexistent `clip`
+    /// protocol. Such paths are prefixed with `./`, which FFmpeg reads as a
+    /// plain file path — the classification decided here stays decided.
+    pub fn ffmpeg_path(&self) -> Cow<'_, Path> {
+        match self {
+            Source::Local(path) if is_protocol_url(&path.to_string_lossy()) => {
+                Cow::Owned(Path::new(".").join(path))
+            }
+            source => Cow::Borrowed(source.as_path()),
         }
     }
 }
@@ -154,5 +175,31 @@ mod tests {
     fn displays_remote_url_verbatim() {
         let url = "https://example.com/v.mp4?token=a+b.c";
         assert_eq!(Source::classify(url).to_string(), url);
+    }
+
+    #[test]
+    fn shields_scheme_like_local_filename_from_ffmpeg() {
+        // A file literally named `clip:1.mp4`: known local by type, but
+        // FFmpeg would re-parse the bare string as a `clip:` protocol URL.
+        let source = Source::Local(PathBuf::from("clip:1.mp4"));
+        assert_eq!(source.ffmpeg_path().as_ref(), Path::new("./clip:1.mp4"));
+        assert_eq!(
+            source.as_path(),
+            Path::new("clip:1.mp4"),
+            "errors stay verbatim"
+        );
+    }
+
+    #[test]
+    fn hands_unambiguous_paths_to_ffmpeg_verbatim() {
+        for input in [
+            "video.mp4",
+            "/data/clip:1.mp4", // absolute: no leading scheme
+            "dir/clip:1.mp4",   // colon after a separator: no scheme either
+            "https://example.com/v.mp4",
+        ] {
+            let source = Source::classify(input);
+            assert_eq!(source.ffmpeg_path().as_ref(), Path::new(input), "{input}");
+        }
     }
 }

@@ -13,6 +13,7 @@ pub mod config;
 pub mod cookies;
 pub mod fault;
 pub mod fetch;
+pub mod gate;
 pub mod gpu;
 pub mod identity;
 pub mod install;

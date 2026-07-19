@@ -347,35 +347,6 @@ fn strip_ass_markup(text: &str) -> String {
     out.trim().to_string()
 }
 
-/// Render cues back to SRT text — the `subtitles.txt` payload for embedded
-/// sources.
-pub fn cues_to_srt(cues: &[Cue]) -> String {
-    use std::fmt::Write;
-
-    let mut srt = String::new();
-    for (i, cue) in cues.iter().enumerate() {
-        let _ = write!(
-            srt,
-            "{}\n{} --> {}\n{}\n\n",
-            i + 1,
-            srt_timestamp(cue.start),
-            srt_timestamp(cue.end),
-            cue.text
-        );
-    }
-    srt
-}
-
-fn srt_timestamp(secs: f32) -> String {
-    // Cue::visible guarantees start >= 0, so no clamp is needed — a negative
-    // value here would be a bug worth surfacing, not masking.
-    let ms_total = (secs as f64 * 1000.0).round() as u64;
-    let (h, rem) = (ms_total / 3_600_000, ms_total % 3_600_000);
-    let (m, rem) = (rem / 60_000, rem % 60_000);
-    let (s, ms) = (rem / 1000, rem % 1000);
-    format!("{h:02}:{m:02}:{s:02},{ms:03}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,25 +435,5 @@ mod tests {
     #[test]
     fn strips_markup_from_event_text() {
         assert_eq!(strip_ass_markup("{\\an8}Hello\\Nworld"), "Hello world");
-    }
-
-    #[test]
-    fn formats_srt_timestamps() {
-        assert_eq!(srt_timestamp(0.0), "00:00:00,000");
-        assert_eq!(srt_timestamp(83.5), "00:01:23,500");
-        assert_eq!(srt_timestamp(3661.007), "01:01:01,007");
-    }
-
-    #[test]
-    fn renders_cues_as_srt() {
-        let cues = vec![Cue {
-            start: 1.0,
-            end: 2.5,
-            text: "hi".into(),
-        }];
-        assert_eq!(
-            cues_to_srt(&cues),
-            "1\n00:00:01,000 --> 00:00:02,500\nhi\n\n"
-        );
     }
 }

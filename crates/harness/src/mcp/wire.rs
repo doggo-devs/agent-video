@@ -11,6 +11,7 @@ use crate::fault::Fault;
 use crate::plan::format_bytes;
 use crate::schema::{LOOKS, Look, STRATEGIES, Strategy, TimeValue, VideoArgs, VideoBody};
 use agent_video_core::types::{GridImage, format_ts};
+use agent_video_core::wire::Coverage;
 
 /// The document core's `--json` mode emits; one definition for both sides.
 pub(super) use agent_video_core::wire::Metadata as CoreMetadata;
@@ -59,7 +60,8 @@ pub(super) fn coerce_args(
             None => Ok(None),
             Some(serde_json::Value::String(s)) => Ok(Some(TimeValue::Text(s.clone()))),
             Some(v) if v.is_number() => Ok(Some(TimeValue::Number(
-                v.as_f64().expect("serde_json numbers are f64-representable"),
+                v.as_f64()
+                    .expect("serde_json numbers are f64-representable"),
             ))),
             Some(_) => Err(Fault::bad_input(format!(
                 "{key} must be seconds or a timestamp string, e.g. {example}"
@@ -127,6 +129,25 @@ pub(super) fn is_url(source: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
+/// The scheme of a source that names a protocol this layer does not
+/// accept — it parses as a protocol URL by core's classifier (one
+/// definition, not a third), but is not an http(s) URL this server can
+/// fetch. `None` for http(s) URLs and local paths. Without this check an
+/// `rtsp://cam/1` source would fall into the local flow and be diagnosed
+/// as a missing file, which is a lie about what the caller sent.
+pub(super) fn foreign_scheme(source: &str) -> Option<&str> {
+    use agent_video_core::source::Source;
+    if is_url(source) {
+        return None;
+    }
+    match Source::classify(source) {
+        // The comma matters only for `subfile,…`: the split names the
+        // scheme, not the option blob after it.
+        Source::Remote(_) => source.split([':', ',']).next(),
+        Source::Local(_) => None,
+    }
+}
+
 // ── result rendering ──
 
 pub(super) fn failed(fault: &Fault) -> CallToolResult {
@@ -146,20 +167,21 @@ pub(super) fn json_result(body: &VideoBody) -> CallToolResult {
 /// One text block for all grids: ranges, key frames, subtitles, notices.
 fn describe_grids(meta: &CoreMetadata, notices: &[String]) -> String {
     let mut lines: Vec<String> = notices.iter().map(|n| format!("note: {n}")).collect();
-    // A `range` marks an extract: its `duration` is the segment's span, not
-    // the video's total — present it as such.
-    lines.push(match meta.range {
-        Some((start, end)) => format!(
+    // The coverage view is the wire contract's discrimination rule made
+    // type-level: an extract's `duration` is the segment's span, not the
+    // video's total — present it as such.
+    lines.push(match meta.coverage() {
+        Coverage::Segment(seg) => format!(
             "{}: segment {}-{}, {} grid(s) below, read top-left to bottom-right.",
             meta.source,
-            format_ts(start),
-            format_ts(end),
+            format_ts(seg.start()),
+            format_ts(seg.end()),
             meta.grids.len()
         ),
-        None => format!(
+        Coverage::Source(duration) => format!(
             "{}: {}, {} grid(s) below, read top-left to bottom-right.",
             meta.source,
-            format_ts(meta.duration),
+            format_ts(duration),
             meta.grids.len()
         ),
     });

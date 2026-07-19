@@ -28,15 +28,21 @@ Protocol — the response always tells you what to do next:
    Echo a consent token issued by a previous response to authorize the pending action. Tokens stay valid until a newer plan for the same source replaces them; pass confirm alone with source.
 4. `"status": "pending"` — a background download is running; repeat the
    same call to poll.
-5. `"status": "ready"` — grid images plus one text block carrying time
-   ranges, key frames, subtitles, and notices.
+5. `"status": "failed"` — `error` is model-presentable prose, `kind` the
+   machine-readable class (`bad_input`, `environment`, `transient`,
+   `internal`).
+6. Success — a rendered grid is *not* a tagged body: one text block
+   carrying time ranges, key frames, subtitles, and notices, followed by
+   one JPEG image block per grid.
 
 Refining parameters:
 
 - `from` — Window start: seconds (83) or timestamp ("1:23", "1:02:03"). Omit to start from the beginning.
 - `until` — Window end, same formats. Omit to go to the end of the video.
 - `look` — How to look: overview (fast triage), detailed (miss nothing), read_text (few large frames to read on-screen text/UI), track_motion (dense small frames for fast action). Subtitle text always rides along in metadata regardless; this only affects frame size/density. Omit for a balanced default.
+- `strategy` — Which moments become frames: adaptive (default: keyframes plus fill in sparse stretches, right for most footage), keyframes (cheapest scan, frames land on cuts — triage for edited footage, blind to changes inside static shots), uniform (evenly spaced in time — use when keyframes mislead: screen recordings, slides, long static takes). Orthogonal to look, which sets frame size/density.
 - `raw` — Expert escape hatch: verbatim agent-video core CLI arguments starting with the subcommand, e.g. "process --strategy keyframes --base-fps 0.2". Mutually exclusive with from/until/look/strategy. Input/output plumbing is injected by the server.
+- `transcribe` — Set true (alone with source) to generate a whisper transcript of the audio; it is cached and rides along with every grid afterwards. Needs local media: for a URL, download it first (bare call, then confirm), then repeat with transcribe.
 
 ## Bash path (no MCP client)
 

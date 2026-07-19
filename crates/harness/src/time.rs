@@ -73,26 +73,50 @@ fn parse_sexagesimal(s: &str) -> Option<f64> {
     (s.len() <= 2 && v < 60.0).then_some(v)
 }
 
-/// A resolved window of interest, always a valid sub-range of the video.
-#[derive(Debug, Clone, PartialEq)]
+/// A resolved window of interest — a valid sub-range of the video by
+/// construction ([`resolve_window`] is the only door):
+/// `0 <= start < end <= duration`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Window {
-    pub start: f64,
-    pub end: f64,
-    /// True when the window covers the entire video.
-    pub full: bool,
-    pub notices: Vec<String>,
+    start: f64,
+    end: f64,
+    /// The video duration the bounds were validated against; carried so
+    /// fullness is derived on demand instead of cached.
+    duration: f64,
 }
 
-/// Resolve `[from ?? 0, until ?? duration]` against the video duration.
-/// Out-of-bounds `until` is clamped with a notice; out-of-bounds `from`
-/// errors. A zero (or negative) `duration` is the probe reporting a
-/// zero-length video — rejected naming the file, not the arguments, as
-/// the problem.
+impl Window {
+    /// Start in seconds; `< end` by construction.
+    pub fn start(&self) -> f64 {
+        self.start
+    }
+
+    /// End in seconds; `<= duration` by construction.
+    pub fn end(&self) -> f64 {
+        self.end
+    }
+
+    /// Seconds covered; positive by construction.
+    pub fn span(&self) -> f64 {
+        self.end - self.start
+    }
+
+    /// Whether the window covers the entire video.
+    pub fn is_full(&self) -> bool {
+        self.start == 0.0 && self.end == self.duration
+    }
+}
+
+/// Resolve `[from ?? 0, until ?? duration]` against the video duration into
+/// a [`Window`] plus resolution notices. Out-of-bounds `until` is clamped
+/// with a notice; out-of-bounds `from` errors. A zero (or negative)
+/// `duration` is the probe reporting a zero-length video — rejected naming
+/// the file, not the arguments, as the problem.
 pub fn resolve_window(
     from: Option<&TimeValue>,
     until: Option<&TimeValue>,
     duration: f64,
-) -> Result<Window, ArgError> {
+) -> Result<(Window, Vec<String>), ArgError> {
     if duration <= 0.0 {
         return Err(ArgError(
             "the probe reports a zero-length video — the file has no playable duration, \
@@ -131,12 +155,14 @@ pub fn resolve_window(
             format_ts(start as f32)
         )));
     }
-    Ok(Window {
-        start,
-        end,
-        full: start == 0.0 && end == duration,
+    Ok((
+        Window {
+            start,
+            end,
+            duration,
+        },
         notices,
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -189,17 +215,24 @@ mod tests {
 
     #[test]
     fn resolves_full_window_when_unbounded() {
-        let w = resolve_window(None, None, 120.0).expect("valid");
-        assert_eq!((w.start, w.end, w.full), (0.0, 120.0, true));
-        assert!(w.notices.is_empty());
+        let (w, notices) = resolve_window(None, None, 120.0).expect("valid");
+        assert_eq!((w.start(), w.end(), w.is_full()), (0.0, 120.0, true));
+        assert_eq!(w.span(), 120.0);
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn derives_partial_window_as_not_full() {
+        let (w, _) = resolve_window(Some(&text("0:10")), None, 120.0).expect("valid");
+        assert!(!w.is_full(), "a window starting past 0 is not full");
     }
 
     #[test]
     fn clamps_overlong_until_with_notice() {
-        let w = resolve_window(None, Some(&text("10:00")), 120.0).expect("valid");
-        assert_eq!(w.end, 120.0);
-        assert!(w.full, "clamped-to-end window covers the whole video");
-        assert_eq!(w.notices.len(), 1);
+        let (w, notices) = resolve_window(None, Some(&text("10:00")), 120.0).expect("valid");
+        assert_eq!(w.end(), 120.0);
+        assert!(w.is_full(), "clamped-to-end window covers the whole video");
+        assert_eq!(notices.len(), 1);
     }
 
     #[test]

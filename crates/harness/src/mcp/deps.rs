@@ -6,12 +6,13 @@
 //! in fakes without touching the call flow.
 
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::fault::Fault;
-use crate::fetch::{self, DownloadIo, Downloaded, ProgressFn, SourceInfo};
+use crate::fetch::{self, CancelSignal, DownloadIo, Downloaded, ProgressFn, SourceInfo};
+use crate::gate::KeyedGate;
 use crate::mcp::core_run::{CoreRunner, SelfSpawn};
 use crate::mcp::tracker::Tracker;
 use crate::probe::probe_local_file;
@@ -38,6 +39,7 @@ pub trait UrlFetcher: Send + Sync {
         io: DownloadIo<'_>,
         cfg: &Config,
         relay: &PolicyRelay,
+        cancel: &CancelSignal,
         progress: ProgressFn<'_>,
     ) -> Result<Downloaded, Fault>;
 }
@@ -77,13 +79,14 @@ impl UrlFetcher for RealFetcher {
         io: DownloadIo<'_>,
         cfg: &Config,
         relay: &PolicyRelay,
+        cancel: &CancelSignal,
         progress: ProgressFn<'_>,
     ) -> Result<Downloaded, Fault> {
         // Re-vet at execution time: consent may be redeemed long after the
         // probe, and DNS may have moved underneath the plan.
         let vetted =
             crate::netguard::vet(&plan.url, cfg).map_err(|e| Fault::bad_input(e.to_string()))?;
-        fetch::download(&vetted, plan, io, cfg, relay, progress)
+        fetch::download(&vetted, plan, io, cfg, relay, cancel, progress)
     }
 }
 
@@ -112,13 +115,54 @@ pub struct ServerDeps {
     pub cache: Cache,
     pub tokens: Tokens,
     pub downloads: Tracker,
+    /// Single-flight admission for transcription, keyed by content ×
+    /// transcript recipe: the cache check and the whisper run share one
+    /// critical section, so concurrent requests for the same transcript
+    /// run the model once and the rest adopt the cached result.
+    pub transcriptions: KeyedGate,
     pub prober: Box<dyn FileProber>,
     pub fetcher: Box<dyn UrlFetcher>,
     pub whisper: Box<dyn Whisper>,
     pub core: Box<dyn CoreRunner>,
     /// The egress policy relay, bound lazily on first URL use so a
     /// local-file-only session never opens a listener. See [`ServerDeps::relay`].
-    pub(crate) relay: OnceLock<std::io::Result<PolicyRelay>>,
+    pub(crate) relay: RelaySlot,
+}
+
+/// Lazily started [`PolicyRelay`] slot: the first successful start is kept
+/// for the life of the deps, but a start failure is returned to the caller
+/// and never cached, so transient port/fd pressure at first use cannot
+/// poison every later URL request.
+pub(crate) struct RelaySlot {
+    started: OnceLock<PolicyRelay>,
+    /// Serializes start attempts so a lost race cannot bind a second
+    /// listener that would be dropped unused.
+    starting: Mutex<()>,
+}
+
+impl RelaySlot {
+    pub(crate) fn new() -> Self {
+        RelaySlot {
+            started: OnceLock::new(),
+            starting: Mutex::new(()),
+        }
+    }
+
+    /// The started relay, or the outcome of one fresh `start` attempt.
+    fn get_or_start(
+        &self,
+        start: impl FnOnce() -> std::io::Result<PolicyRelay>,
+    ) -> std::io::Result<&PolicyRelay> {
+        if let Some(relay) = self.started.get() {
+            return Ok(relay);
+        }
+        let _starting = self.starting.lock().expect("relay start lock poisoned");
+        if let Some(relay) = self.started.get() {
+            return Ok(relay);
+        }
+        let relay = start()?;
+        Ok(self.started.get_or_init(|| relay))
+    }
 }
 
 impl ServerDeps {
@@ -130,11 +174,12 @@ impl ServerDeps {
             cache,
             tokens: Tokens::default(),
             downloads: Tracker::default(),
+            transcriptions: KeyedGate::default(),
             prober: Box::new(RealProber),
             fetcher: Box::new(RealFetcher),
             whisper: Box::new(RealWhisper),
             core: Box::new(SelfSpawn),
-            relay: OnceLock::new(),
+            relay: RelaySlot::new(),
             config,
         }
     }
@@ -142,11 +187,11 @@ impl ServerDeps {
     /// The policy relay, started on first call and shared thereafter. Every
     /// URL probe and download routes its subprocess/demuxer traffic through
     /// it; local-file sessions never call this, so they never bind a
-    /// listener. A bind failure is the server's environment, not the URL's.
+    /// listener. A bind failure is the server's environment, not the URL's,
+    /// and is retried on the next call rather than cached.
     pub fn relay(&self) -> Result<&PolicyRelay, Fault> {
         self.relay
-            .get_or_init(|| PolicyRelay::start(self.config.network.allow_private_hosts))
-            .as_ref()
+            .get_or_start(|| PolicyRelay::start(self.config.network.allow_private_hosts))
             .map_err(|e| Fault::environment(format!("cannot start the egress policy relay: {e}")))
     }
 }
@@ -158,4 +203,38 @@ pub type Notifier = Arc<dyn Fn(f64, Option<f64>, String) + Send + Sync>;
 /// A notifier that drops everything (no progress token, tests).
 pub fn null_notifier() -> Notifier {
     Arc::new(|_, _, _| {})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_relay_start_after_a_failed_attempt() {
+        let slot = RelaySlot::new();
+        let err = match slot.get_or_start(|| Err(std::io::Error::other("port pressure"))) {
+            Err(err) => err,
+            Ok(_) => panic!("first start must fail"),
+        };
+        assert_eq!(err.to_string(), "port pressure");
+        let url = slot
+            .get_or_start(|| PolicyRelay::start(false))
+            .expect("second attempt starts fresh")
+            .url();
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+    }
+
+    #[test]
+    fn keeps_the_first_started_relay() {
+        let slot = RelaySlot::new();
+        let first = slot
+            .get_or_start(|| PolicyRelay::start(false))
+            .expect("first start succeeds")
+            .url();
+        let second = slot
+            .get_or_start(|| panic!("must not start a second relay"))
+            .expect("cached relay returned")
+            .url();
+        assert_eq!(first, second);
+    }
 }

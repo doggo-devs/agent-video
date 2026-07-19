@@ -65,6 +65,19 @@ impl FaultKind {
     }
 }
 
+/// The wire names, for prose that must carry the kind (a test pins this
+/// rendering to the serde one, so they cannot drift).
+impl std::fmt::Display for FaultKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FaultKind::BadInput => "bad_input",
+            FaultKind::Environment => "environment",
+            FaultKind::Transient => "transient",
+            FaultKind::Internal => "internal",
+        })
+    }
+}
+
 /// A failed harness operation: class for decisions, prose for the model.
 #[derive(Debug)]
 pub struct Fault {
@@ -100,6 +113,13 @@ impl Fault {
     /// A bug in agent-video.
     pub fn internal(message: impl Into<String>) -> Self {
         Fault::new(FaultKind::Internal, message)
+    }
+
+    /// Attach the underlying typed error: `Display` stays the
+    /// model-presentable prose, the chain keeps the evidence.
+    pub fn with_source(mut self, source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        self.source = Some(Box::new(source));
+        self
     }
 }
 
@@ -168,5 +188,18 @@ mod tests {
     fn kind_serializes_snake_case() {
         let json = serde_json::to_string(&FaultKind::BadInput).expect("serializes");
         assert_eq!(json, "\"bad_input\"");
+    }
+
+    #[test]
+    fn kind_display_matches_wire_names() {
+        for kind in [
+            FaultKind::BadInput,
+            FaultKind::Environment,
+            FaultKind::Transient,
+            FaultKind::Internal,
+        ] {
+            let wire = serde_json::to_value(kind).expect("serializes");
+            assert_eq!(wire, serde_json::Value::String(kind.to_string()));
+        }
     }
 }

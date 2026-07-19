@@ -55,13 +55,15 @@ const SUBS_INFIX: &str = "_subs";
 /// Only formats core actually reads are eligible
 /// ([`agent_video_core::subtitle::SIDECAR_SUBTITLE_EXTS`]): an unconverted leftover (`--convert-subs`
 /// can fail) must not become a sidecar core cannot parse.
+///
+/// On failure, no partial file remains under the sidecar's name: the copy
+/// goes to a temp name and is renamed into place only once complete, so
+/// adoption can never publish a truncated sidecar. The error is the
+/// caller's to surface — the media itself is unaffected.
 pub fn promote_subtitle(dir: &Path, key: &str, preferred_langs: &[String]) -> std::io::Result<()> {
     use agent_video_core::subtitle::SIDECAR_SUBTITLE_EXTS;
 
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(());
-    };
-    let mut names: Vec<String> = entries
+    let mut names: Vec<String> = std::fs::read_dir(dir)?
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
@@ -91,10 +93,34 @@ pub fn promote_subtitle(dir: &Path, key: &str, preferred_langs: &[String]) -> st
         return Ok(());
     };
     let target = dir.join(format!("{key}.{ext}"));
-    if !target.exists() {
-        std::fs::copy(dir.join(name), target)?;
+    if target.exists() {
+        return Ok(());
     }
-    Ok(())
+    // Staging publishes every file it holds (`adopt_into`), so a torn copy
+    // must never rest under a publishable sidecar name: copy to a temp
+    // name, rename into place only when complete, delete the temp on error.
+    let tmp = dir.join(format!("{key}.{ext}.promote"));
+    let copied = std::fs::copy(dir.join(name), &tmp)
+        .map(drop)
+        .and_then(|()| std::fs::rename(&tmp, &target));
+    if copied.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    copied
+}
+
+/// Fold a failed sidecar promotion into the caller-facing warning channel
+/// — the same channel [`settle_exit`] uses for degraded extras: the media
+/// is intact, only the subtitle sidecar is affected.
+fn promotion_warning(result: std::io::Result<()>, warning: Option<String>) -> Option<String> {
+    let Err(e) = result else { return warning };
+    let msg = format!(
+        "the downloaded subtitles could not be promoted to a sidecar ({e}); subtitles may be missing"
+    );
+    Some(match warning {
+        Some(prior) => format!("{prior}\n{msg}"),
+        None => msg,
+    })
 }
 
 // ── spawning ──
@@ -288,12 +314,23 @@ pub fn probe(url: &VettedUrl, cfg: &Config, relay: &PolicyRelay) -> Result<Sourc
              metadata is implausibly large; this source cannot be probed"
         )));
     }
-    let doc: YtdlpJson = serde_json::from_slice(&out.stdout.bytes)
-        .map_err(|_| Fault::environment("yt-dlp -J emitted invalid JSON — version too old?"))?;
+    let doc = parse_probe_doc(&out.stdout.bytes)?;
     Ok(site_source_info(
         &site_info(&doc, cfg.download.analysis_max_height.get()),
         cfg,
     ))
+}
+
+/// Parse the `-J` document. A parse failure keeps the serde error — the
+/// actual evidence — in both the message and the source chain; the
+/// version hint is a guess and must not replace it.
+fn parse_probe_doc(bytes: &[u8]) -> Result<YtdlpJson, Fault> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        Fault::environment(format!(
+            "yt-dlp -J emitted invalid JSON ({e}) — yt-dlp may be too old"
+        ))
+        .with_source(e)
+    })
 }
 
 // ── downloading ──
@@ -512,30 +549,23 @@ pub fn parse_progress(line: &str) -> Option<(u64, Option<u64>)> {
 /// A per-writer staging directory inside the shared cache: two jobs
 /// confirming the same URL — whether in one server or two — would
 /// otherwise hand yt-dlp the same output template, and yt-dlp's own
-/// `.part` handling interleaves their writes. Ownership is per writer,
-/// not per process: a pid alone would let two threads of one server
-/// share a directory. Each job downloads into its own directory and
-/// adopts the results into the cache with per-file renames (same
-/// filesystem, atomic per writer; last-writer-wins is safe because equal
-/// keys mean equal recipes). Removed on drop; a crash leaves it for
-/// [`crate::cache::Cache::evict`]'s stale-staging sweep.
+/// `.part` handling interleaves their writes. The name comes from the
+/// cache's one staging grammar
+/// ([`crate::cache::naming::staging_dir_name`]): writer-unique, not
+/// per-process — a pid alone would let two threads of one server share a
+/// directory. Each job downloads into its own directory and adopts the
+/// results into the cache with per-file renames (same filesystem, atomic
+/// per writer; last-writer-wins is safe because equal keys mean equal
+/// recipes). Removed on drop; a crash leaves it for
+/// [`crate::cache::Cache::evict`]'s stale-staging sweep, which recognizes
+/// it through the same grammar's predicate.
 struct StagingDir {
     path: PathBuf,
 }
 
-/// Prefix marking staging directories; the eviction sweep recognizes and
-/// ages them out after a crash.
-pub const STAGING_PREFIX: &str = ".staging-";
-
 impl StagingDir {
     fn create(parent: &Path, key: &str) -> std::io::Result<Self> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static WRITER_SEQ: AtomicU64 = AtomicU64::new(0);
-        let seq = WRITER_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
-            "{STAGING_PREFIX}{key}-{}-{seq}",
-            std::process::id()
-        ));
+        let path = parent.join(crate::cache::naming::staging_dir_name(key));
         std::fs::create_dir_all(&path)?;
         Ok(StagingDir { path })
     }
@@ -812,10 +842,15 @@ pub fn download(
         });
     };
     // Elect the one sidecar before the results become visible to other
-    // processes: adoption must publish a complete entry.
-    if let Some(key) = promote_key {
-        let _ = promote_subtitle(&staging.path, &key, &cfg.subtitles.preferred_langs);
-    }
+    // processes: adoption must publish a complete entry. A failed election
+    // degrades to a warning; the media is already on disk.
+    let warning = match promote_key {
+        Some(key) => promotion_warning(
+            promote_subtitle(&staging.path, &key, &cfg.subtitles.preferred_langs),
+            warning,
+        ),
+        None => warning,
+    };
     let path = staging
         .adopt_into(&dest_dir, &filepath)
         .map_err(|e| Fault::environment(format!("cannot move the download into the cache: {e}")))?;
@@ -1004,6 +1039,54 @@ mod tests {
     }
 
     #[test]
+    fn failed_promotion_leaves_no_partial_file_in_staging() {
+        // A candidate that cannot be copied (a directory stands in for a
+        // mid-copy I/O error): the sidecar name and the temp name must both
+        // stay absent, or adoption would publish a torn subtitle for the
+        // URL's whole cache lifetime.
+        let dir = temp_dir("torn");
+        std::fs::create_dir(dir.join("k_subs.en.srt")).expect("uncopyable candidate");
+        promote_subtitle(&dir, "k", &langs(&["en"])).expect_err("copy must fail");
+        assert!(!dir.join("k.srt").exists(), "no publishable sidecar");
+        assert!(!dir.join("k.srt.promote").exists(), "no temp leftover");
+    }
+
+    #[test]
+    fn failed_promotion_surfaces_a_warning() {
+        let warning = promotion_warning(Err(std::io::Error::other("disk full")), None)
+            .expect("failure reaches the warning channel");
+        assert!(warning.contains("subtitles may be missing"), "{warning}");
+        assert!(warning.contains("disk full"), "cause rides along");
+    }
+
+    #[test]
+    fn promotion_warning_preserves_the_exit_warning() {
+        let warning = promotion_warning(
+            Err(std::io::Error::other("boom")),
+            Some("exit 1: extras failed".to_string()),
+        )
+        .expect("warning present");
+        assert!(warning.contains("exit 1: extras failed"));
+        assert!(warning.contains("boom"));
+        assert_eq!(
+            promotion_warning(Ok(()), Some("prior".to_string())).as_deref(),
+            Some("prior"),
+            "success passes the channel through untouched"
+        );
+    }
+
+    #[test]
+    fn probe_parse_fault_retains_the_serde_source() {
+        let fault = parse_probe_doc(b"not json").expect_err("parse must fail");
+        assert!(fault.to_string().contains("invalid JSON"), "{fault}");
+        let source = std::error::Error::source(&fault).expect("serde error rides in the chain");
+        assert!(
+            source.downcast_ref::<serde_json::Error>().is_some(),
+            "source is the typed serde error"
+        );
+    }
+
+    #[test]
     fn staging_adoption_publishes_every_file_and_cleans_up() {
         let dir = temp_dir("adopt");
         let staging = StagingDir::create(&dir, "k").expect("staging");
@@ -1088,18 +1171,26 @@ mod tests {
         // Chatter faster than the silence limit, never a byte: the old
         // single-clock watchdog lived forever here while the tracker
         // abandoned the slot — the orphan-process bug.
+        //
+        // Load-tolerant limits: the verdict still requires chatter to have
+        // reset the silence clock (silence < no_progress), but the nominal
+        // 50ms chatter gap sits 40× under the silence limit, so a scheduling
+        // stall on a contended machine cannot misread chatter as Stalled.
         let child = sleeping_child();
+        let limits = StallLimits {
+            silence: Duration::from_secs(2),
+            no_progress: Duration::from_secs(5),
+            lifetime: Duration::from_secs(60),
+        };
         let (tx, rx) = mpsc::channel::<Pulse>();
         let chatterer = std::thread::spawn(move || {
-            // Outlives no_progress (250ms) with gaps well under silence (100ms).
-            for _ in 0..40 {
-                if tx.send(Pulse::Chatter).is_err() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
+            // Chatter until the watchdog hangs up (its verdict drops the
+            // receiver) — no fixed count that could fall short under load.
+            while tx.send(Pulse::Chatter).is_ok() {
+                std::thread::sleep(Duration::from_millis(50));
             }
         });
-        let outcome = watch_child(child, rx, TEST_LIMITS);
+        let outcome = watch_child(child, rx, limits);
         chatterer.join().expect("chatterer");
         assert!(matches!(outcome, ChildOutcome::NoProgress), "{outcome:?}");
     }

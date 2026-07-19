@@ -2,7 +2,8 @@
 //! Core invocation and transcription execution: build the core child's
 //! argument vector, run it (JSON captured, exit class recovered from the
 //! published exit-code contract), and the `transcribe: true` flow that
-//! resolves local media, reuses or runs whisper, and answers with a plan.
+//! resolves local media, reuses or runs whisper (single-flight per
+//! transcript key), and answers with a plan.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -113,18 +114,14 @@ fn core_exit_kind(exit: super::core_run::CoreExit) -> FaultKind {
 // ── transcription execution ──
 
 /// The `transcribe: true` flow: resolve local media, reuse a cached
-/// transcript, else run whisper; answer with the refreshed plan.
+/// transcript, else run whisper; answer with the refreshed plan. The
+/// handler routes here on [`crate::schema::Intent::Transcribe`], so
+/// exclusivity with `raw`/`confirm`/grid intent is already proven.
 pub(super) fn transcribe_flow(
     args: &VideoArgs,
     deps: &Arc<ServerDeps>,
     notify: &Notifier,
 ) -> CallToolResult {
-    if args.raw.is_some() || args.has_intent() {
-        return failed(&Fault::bad_input(
-            "transcribe must be passed alone (with source); once the transcript exists it \
-             rides along with every grid call automatically",
-        ));
-    }
     let Some(media) = resolve_media(&args.source, deps) else {
         return failed(&Fault::bad_input(
             "transcription needs local media, and this URL has no cached rip. Call with just \
@@ -149,23 +146,35 @@ pub(super) fn transcribe_flow(
     };
     let transcript_id = transcribe::transcript_id(&deps.config);
     let mut decoded_seconds: Option<f64> = None;
-    if deps
-        .cache
-        .find_transcript(&fingerprint, &transcript_id)
-        .is_none()
     {
-        let out = deps.cache.transcript_path(&fingerprint, &transcript_id);
-        let mut step = 0.0f64;
-        let notify = Arc::clone(notify);
-        let result = deps
-            .whisper
-            .transcribe(&deps.config, &media, &out, &mut |message| {
-                step += 1.0;
-                notify(step, None, message.to_string());
-            });
-        match result {
-            Ok(outcome) => decoded_seconds = Some(outcome.audio_seconds),
-            Err(e) => return failed(&e),
+        // Single-flight per transcript (content × recipe): the cache check
+        // and the whisper run share one keyed critical section, so a
+        // concurrent transcribe for the same content blocks here and then
+        // takes the cache hit instead of running the model — and paying
+        // the GPU load or the API bill — a second time. Blocking is this
+        // flow's own shape: the winner's caller waits out the whole
+        // inference anyway.
+        let _admitted = deps
+            .transcriptions
+            .admit(&format!("{fingerprint}.{transcript_id}"));
+        if deps
+            .cache
+            .find_transcript(&fingerprint, &transcript_id)
+            .is_none()
+        {
+            let out = deps.cache.transcript_path(&fingerprint, &transcript_id);
+            let mut step = 0.0f64;
+            let notify = Arc::clone(notify);
+            let result = deps
+                .whisper
+                .transcribe(&deps.config, &media, &out, &mut |message| {
+                    step += 1.0;
+                    notify(step, None, message.to_string());
+                });
+            match result {
+                Ok(outcome) => decoded_seconds = Some(outcome.audio_seconds),
+                Err(e) => return failed(&e),
+            }
         }
     }
     let (probe, _) = match cached_probe(&media, deps) {
@@ -199,6 +208,54 @@ pub(super) fn transcribe_flow(
 #[cfg(test)]
 mod tests {
     use crate::mcp::testutil::{body_of, call, env, media_file, probe};
+
+    #[test]
+    fn concurrent_transcribes_run_whisper_once() {
+        use std::sync::mpsc;
+        let env = env(probe(3600.0, vec![]), true);
+        let file = media_file(&env, "talk.mp4");
+        let request = serde_json::json!({
+            "source": file.to_string_lossy(),
+            "transcribe": true,
+        });
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *env.whisper.gate.lock().expect("whisper gate") = Some((entered_tx, release_rx));
+
+        let (winner, rival) = std::thread::scope(|s| {
+            let winner = s.spawn(|| call(&env, request.clone()));
+            entered_rx
+                .recv()
+                .expect("the first request reached whisper");
+            let rival = s.spawn(|| call(&env, request.clone()));
+            // Two releases on purpose: if single-flight were broken, the
+            // second whisper run unblocks too and the test fails on the
+            // call count instead of deadlocking.
+            release_tx.send(()).expect("release the winner");
+            let _ = release_tx.send(());
+            (
+                winner.join().expect("winner completes"),
+                rival.join().expect("rival completes"),
+            )
+        });
+
+        assert_eq!(
+            *env.whisper.calls.lock().expect("calls"),
+            1,
+            "one content key, one whisper run — the rival adopts the cached transcript"
+        );
+        for (name, result) in [("winner", &winner), ("rival", &rival)] {
+            let body = body_of(result);
+            assert_eq!(body["status"], "plan", "{name}: {body}");
+            assert!(
+                body["guidance"]
+                    .as_str()
+                    .expect("guidance")
+                    .contains("Transcript ready"),
+                "{name}: {body}"
+            );
+        }
+    }
 
     #[test]
     fn truncated_core_stdout_rejects_as_bad_input() {

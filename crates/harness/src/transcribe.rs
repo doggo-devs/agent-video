@@ -17,9 +17,8 @@
 //! Either way the transcript lands as an SRT whose cue times feed the grid
 //! subtitle ride-along.
 
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "whisper-local")]
 use super::config::Backend;
@@ -27,6 +26,7 @@ use super::config::{Config, WhisperModel};
 use crate::fault::Fault;
 use agent_video_core::media::audio::{WHISPER_SAMPLE_RATE, decode_audio_16k_mono};
 use agent_video_core::source::Source;
+use agent_video_core::subtitle as core_subtitle;
 
 // ── model / path helpers ──
 
@@ -216,7 +216,10 @@ pub fn transcribe(
     let route = Route::resolve(cfg)?;
 
     on_step("extracting audio");
-    let source = Source::classify(&file.to_string_lossy());
+    // `file` is a local path by this function's contract; re-classifying its
+    // string form would misread a colon-named file (`clip:1.mp4`) as an
+    // FFmpeg protocol URL. The typed knowledge is threaded, not re-guessed.
+    let source = Source::Local(file.to_path_buf());
     let t = Instant::now();
     let decoded = decode_audio_16k_mono(&source)?;
     let sample_count = decoded.as_deref().map_or(0, <[f32]>::len);
@@ -266,6 +269,42 @@ const MAX_UPLOAD_BYTES: usize = 24 * 1024 * 1024; // 24 MiB with margin
 /// identity ([`Route::cache_id`]).
 const API_MODEL: &str = "whisper-large-v3-turbo";
 
+/// Connection bound for the whisper API. TCP + TLS to a live endpoint
+/// completes in seconds; only a dead host needs longer, and a dead host
+/// must not pin the MCP call's `spawn_blocking` thread — transcription
+/// runs under a single-flight gate, so one wedged upload would make every
+/// later transcribe of the same content inherit the wait. Matches the
+/// download client's bound (`crate::fetch::direct`).
+const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whole-call ceiling per chunk: upload, server-side recognition, and the
+/// JSON body read all live under this one deadline. Sized to separate
+/// dead from slow, not to police slowness: a full [`MAX_UPLOAD_BYTES`]
+/// chunk on a ~50 KiB/s uplink is ~8 minutes, and recognition of the
+/// ~13 minutes of audio it carries can take minutes more on a loaded
+/// endpoint — 20 minutes covers both with margin, while a hung endpoint
+/// unwedges the gate within one ceiling instead of never. A `StallGuard`
+/// idle bound (as in `crate::fetch::direct`) would be sharper, but it is
+/// private to that module and this path has no cancel signal to feed it;
+/// the constant pair keeps the fix local.
+const API_CALL_CEILING: Duration = Duration::from_secs(20 * 60);
+
+/// Agent for whisper API calls: explicit deadlines, nothing else.
+/// Deliberately only `connect` + `global` — ureq's per-phase timeouts
+/// misbehave across the body phase (see `crate::fetch::direct::agent`),
+/// and `global` already spans the entire exchange, so the response body
+/// read is covered by the same deadline as the upload. Status-as-error
+/// is off because error statuses must surface the response body (the
+/// endpoint's own diagnosis); classification is ours.
+fn api_agent(connect_timeout: Duration, call_ceiling: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(connect_timeout))
+        .timeout_global(Some(call_ceiling))
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+}
+
 fn recognize_api(
     api_key: &str,
     api_url: &str,
@@ -275,6 +314,7 @@ fn recognize_api(
     let chunks = wav_chunks(samples, MAX_UPLOAD_BYTES);
     tracing::info!(total_chunks = chunks.len(), "uploading to API");
 
+    let agent = api_agent(API_CONNECT_TIMEOUT, API_CALL_CEILING);
     let mut all_cues = Vec::new();
     for (i, (wav, offset_samples)) in chunks.iter().enumerate() {
         on_step(&format!(
@@ -283,7 +323,7 @@ fn recognize_api(
             chunks.len()
         ));
         let t = Instant::now();
-        let cues = upload_and_parse(api_key, api_url, wav, *offset_samples)?;
+        let cues = upload_and_parse(&agent, api_key, api_url, wav, *offset_samples)?;
         tracing::info!(
             chunk = i + 1,
             elapsed_ms = t.elapsed().as_millis() as u64,
@@ -347,7 +387,11 @@ fn encode_wav(samples: &[f32]) -> Vec<u8> {
 }
 
 /// POST a WAV chunk to the API, parse the verbose-JSON response into cues.
+/// The agent's deadlines ([`api_agent`]) bound the whole exchange —
+/// including the [`read_to_string`](ureq::Body::read_to_string) below —
+/// so a hung endpoint errors out instead of pinning the thread.
 fn upload_and_parse(
+    agent: &ureq::Agent,
     api_key: &str,
     api_url: &str,
     wav: &[u8],
@@ -378,12 +422,8 @@ fn upload_and_parse(
 
     let content_type = format!("multipart/form-data; boundary={boundary}");
 
-    // Error statuses must surface the response body (the endpoint's own
-    // diagnosis), so status-as-error is off and classification is ours.
-    let response = ureq::post(api_url)
-        .config()
-        .http_status_as_error(false)
-        .build()
+    let response = agent
+        .post(api_url)
         .header("Authorization", &format!("Bearer {api_key}"))
         .header("Content-Type", &content_type)
         .send(&body)
@@ -630,47 +670,34 @@ fn threads() -> i32 {
 
 // ── SRT formatting ──
 
-/// Serialize cues as SRT.
+/// Serialize cues as SRT via core's one SRT writer
+/// ([`agent_video_core::subtitle::serialize_srt`]), so the transcript is
+/// guaranteed to parse back with core's `parse_srt`. Centiseconds embed
+/// exactly in the format's millisecond resolution; negative times (a
+/// hallucinated pre-roll segment) clamp to zero.
 pub fn format_srt(cues: &[Cue]) -> String {
-    let mut out = String::new();
-    for (i, cue) in cues.iter().enumerate() {
-        let _ = writeln!(out, "{}", i + 1);
-        let _ = writeln!(
-            out,
-            "{} --> {}",
-            srt_timestamp(cue.start_cs),
-            srt_timestamp(cue.end_cs)
-        );
-        let _ = writeln!(out, "{}\n", cue.text);
-    }
-    out
-}
-
-/// `HH:MM:SS,mmm` from centiseconds, clamping negatives to zero.
-fn srt_timestamp(cs: i64) -> String {
-    let ms = cs.max(0) * 10;
-    let (h, m, s, ms) = (
-        ms / 3_600_000,
-        ms % 3_600_000 / 60_000,
-        ms % 60_000 / 1000,
-        ms % 1000,
-    );
-    format!("{h:02}:{m:02}:{s:02},{ms:03}")
+    core_subtitle::serialize_srt(cues.iter().map(|cue| core_subtitle::SrtCue {
+        start_ms: cue.start_cs.max(0) as u64 * 10,
+        end_ms: cue.end_cs.max(0) as u64 * 10,
+        text: &cue.text,
+    }))
 }
 
 /// Write the SRT atomically: parent dirs, per-writer `.part`, rename. The
 /// transcript cache is shared across server processes and the destination
 /// name is deterministic (fingerprint × route identity), so the staging
-/// name must be per-writer, not per-process ([`part_path`]) — two writers,
-/// even two threads in one process, must not interleave into one file. A
-/// failed write removes its `.part` rather than leaving it for the
+/// name must be per-writer, not per-process — two writers, even two
+/// threads in one process, must not interleave into one file. The name
+/// comes from the cache's one staging grammar
+/// ([`crate::cache::naming::part_path`], docs/shared-cache.md Pattern 2).
+/// A failed write removes its `.part` rather than leaving it for the
 /// staleness sweep.
 fn write_srt(out_srt: &Path, cues: &[Cue]) -> Result<(), Fault> {
     if let Some(parent) = out_srt.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Fault::environment(format!("cannot create {}: {e}", parent.display())))?;
     }
-    let part = part_path(out_srt);
+    let part = crate::cache::naming::part_path(out_srt);
     std::fs::write(&part, format_srt(cues))
         .map_err(|e| Fault::environment(format!("cannot write {}: {e}", part.display())))
         .and_then(|()| {
@@ -681,22 +708,6 @@ fn write_srt(out_srt: &Path, cues: &[Cue]) -> Result<(), Fault> {
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&part);
         })
-}
-
-/// Per-writer staging path for `dest` (docs/shared-cache.md Pattern 2,
-/// mirroring `fetch::direct`): pid plus a process-wide sequence, so
-/// concurrent writers never share a staging file; the final rename is
-/// atomic per writer and last-writer-wins is safe because equal keys mean
-/// equal recipes.
-fn part_path(dest: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static PART_SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(format!(
-        "{}.{}-{seq}.part",
-        dest.display(),
-        std::process::id()
-    ))
 }
 
 #[cfg(test)]
@@ -812,26 +823,17 @@ mod tests {
     }
 
     #[test]
-    fn stages_srt_under_a_per_writer_name() {
-        let dest = Path::new("/cache/transcripts/k.srt");
-        let a = part_path(dest);
-        assert!(a.to_string_lossy().ends_with(".part"));
+    fn clamps_negative_cue_times_to_zero() {
+        let cues = vec![Cue {
+            start_cs: -5,
+            end_cs: 150,
+            text: "pre-roll".into(),
+        }];
         assert!(
-            a.to_string_lossy().starts_with("/cache/transcripts/k.srt."),
-            "stays next to its destination: {a:?}"
+            format_srt(&cues).contains("00:00:00,000 --> 00:00:01,500"),
+            "negatives clamp: {}",
+            format_srt(&cues)
         );
-        // Two writers (even two threads in one process) must not share a
-        // staging file.
-        let b = part_path(dest);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn formats_srt_timestamps_past_the_hour() {
-        assert_eq!(srt_timestamp(0), "00:00:00,000");
-        assert_eq!(srt_timestamp(123), "00:00:01,230");
-        assert_eq!(srt_timestamp(366_150), "01:01:01,500");
-        assert_eq!(srt_timestamp(-5), "00:00:00,000", "negatives clamp");
     }
 
     #[test]
@@ -854,6 +856,54 @@ mod tests {
             "1\n00:00:00,000 --> 00:00:01,500\nhello\n\n\
              2\n00:00:02,000 --> 00:00:03,500\nworld\n\n"
         );
+    }
+
+    #[test]
+    fn whisper_srt_parses_with_core_parser() {
+        // The cross-crate contract: whatever the whisper writer emits must
+        // round-trip through core's SRT reader with centisecond fidelity.
+        let cues = vec![
+            Cue {
+                start_cs: 7,
+                end_cs: 253,
+                text: "first cue".into(),
+            },
+            Cue {
+                start_cs: 360_099,
+                end_cs: 366_150,
+                text: "past the hour".into(),
+            },
+        ];
+        let parsed = core_subtitle::parse_srt(&format_srt(&cues));
+        assert_eq!(parsed.len(), cues.len());
+        for (ours, theirs) in cues.iter().zip(&parsed) {
+            assert!((ours.start_cs as f32 / 100.0 - theirs.start).abs() < 0.001);
+            assert!((ours.end_cs as f32 / 100.0 - theirs.end).abs() < 0.001);
+            assert_eq!(ours.text, theirs.text);
+        }
+    }
+
+    #[test]
+    fn decodes_colon_named_local_file_as_a_file_not_a_protocol() {
+        // A relative path like `clip:1.mp4` looks like an FFmpeg protocol
+        // URL to string re-classification; transcribe receives a &Path that
+        // is local by contract and must reach the decoder as a file. The
+        // file does not exist, so the failure must be a file-open error
+        // naming the path — never "Protocol not found".
+        let mut cfg = cfg();
+        cfg.whisper.api_key = Some("sk-test".to_string()); // route resolves; decode runs
+        let err = transcribe(
+            &cfg,
+            Path::new("clip:1.mp4"),
+            Path::new("/tmp/out.srt"),
+            &mut |_| {},
+        )
+        .expect_err("the file does not exist");
+        assert!(
+            !err.message.to_lowercase().contains("protocol"),
+            "misclassified as a protocol URL: {err}"
+        );
+        assert!(err.message.contains("clip:1.mp4"), "names the file: {err}");
     }
 
     #[test]
@@ -880,6 +930,39 @@ mod tests {
         for (wav, _) in &chunks {
             assert!(wav.len() <= 2 * 1024 * 1024, "each chunk respects limit");
         }
+    }
+
+    #[test]
+    fn hung_api_endpoint_errors_within_the_call_ceiling() {
+        // A server that accepts, swallows the request, and never answers —
+        // the wedged endpoint that used to pin the spawn_blocking thread
+        // (and, through the single-flight gate, every later transcribe of
+        // the same content). The injected ceiling stands in for
+        // API_CALL_CEILING so the test runs in milliseconds.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = std::io::Read::read(&mut s, &mut [0u8; 64 * 1024]);
+                std::thread::sleep(std::time::Duration::from_secs(20));
+            }
+        });
+        let agent = api_agent(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(300),
+        );
+        let started = Instant::now();
+
+        let err = upload_and_parse(&agent, "sk-test", &format!("http://{addr}/v1"), b"RIFF", 0)
+            .expect_err("a silent endpoint must not pin the call");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the call must end at the ceiling, not hang: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err.kind, crate::fault::FaultKind::Transient);
+        assert!(err.message.contains("whisper API"), "{err}");
     }
 
     #[test]

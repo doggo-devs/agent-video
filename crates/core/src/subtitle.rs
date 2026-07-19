@@ -6,6 +6,12 @@
 //! resolution (explicit path > explicit track > auto-detection), SRT parsing,
 //! and time-range slicing all live behind it, and every failure leaves with a
 //! structured [`Error`] code regardless of which source was used.
+//!
+//! This module also owns the SRT grammar in both directions: [`parse_srt`]
+//! reads it and [`serialize_srt`] writes it. Every producer of SRT text in
+//! the workspace — embedded-track rendering here, the harness's whisper
+//! transcript writer — goes through [`serialize_srt`], so writer and reader
+//! cannot drift apart.
 
 use std::fs;
 use std::path::Path;
@@ -133,7 +139,7 @@ impl Subtitles {
     /// resolution paths reject or degrade on an empty extraction first.
     fn from_cues(cues: Vec<Cue>) -> Self {
         Subtitles {
-            raw: media::subtitle::cues_to_srt(&cues),
+            raw: serialize_srt(cues.iter().map(SrtCue::from)),
             cues,
         }
     }
@@ -355,8 +361,71 @@ fn read_sidecar(path: &Path) -> Result<Option<String>> {
     }
 }
 
+/// One cue at SRT's native resolution — integral milliseconds.
+///
+/// `HH:MM:SS,mmm` carries exactly integral milliseconds, so this is the
+/// canonical currency of [`serialize_srt`]: whisper's centisecond cues embed
+/// exactly (×10), and the pipeline's f32-second [`Cue`]s round to the nearest
+/// millisecond — lossy only below what the format itself can express.
+/// Callers convert at this boundary; the grammar has one writer.
+#[derive(Debug, Clone, Copy)]
+pub struct SrtCue<'a> {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: &'a str,
+}
+
+impl<'a> From<&'a Cue> for SrtCue<'a> {
+    /// Round f32 seconds to the nearest millisecond. Negative times (a
+    /// hand-built cue bypassing [`Cue::visible`]) saturate to 0 via the
+    /// float-to-int cast rather than wrapping.
+    fn from(cue: &'a Cue) -> Self {
+        SrtCue {
+            start_ms: (f64::from(cue.start) * 1000.0).round() as u64,
+            end_ms: (f64::from(cue.end) * 1000.0).round() as u64,
+            text: &cue.text,
+        }
+    }
+}
+
+/// Serialize cues as SRT text: numbered blocks, `HH:MM:SS,mmm --> …` timing
+/// lines with comma milliseconds, blank-line separated.
+///
+/// The inverse of [`parse_srt`] up to the parser's normalizations: text
+/// containing newlines serializes as multiple cue lines and parses back
+/// joined with a single space.
+pub fn serialize_srt<'a>(cues: impl IntoIterator<Item = SrtCue<'a>>) -> String {
+    use std::fmt::Write;
+
+    let mut srt = String::new();
+    for (i, cue) in cues.into_iter().enumerate() {
+        let _ = write!(
+            srt,
+            "{}\n{} --> {}\n{}\n\n",
+            i + 1,
+            srt_timestamp(cue.start_ms),
+            srt_timestamp(cue.end_ms),
+            cue.text
+        );
+    }
+    srt
+}
+
+/// `HH:MM:SS,mmm` from integral milliseconds.
+fn srt_timestamp(ms: u64) -> String {
+    let (h, rem) = (ms / 3_600_000, ms % 3_600_000);
+    let (m, rem) = (rem / 60_000, rem % 60_000);
+    let (s, ms) = (rem / 1000, rem % 1000);
+    format!("{h:02}:{m:02}:{s:02},{ms:03}")
+}
+
 /// Parse SRT text into a list of cues.
-fn parse_srt(srt: &str) -> Vec<Cue> {
+///
+/// The reader half of the SRT contract whose writer is [`serialize_srt`].
+/// Lenient by design: the numeric cue index is optional, `.` and `,`
+/// millisecond separators are both accepted, timing-line settings after the
+/// end time are ignored, and multi-line cue text joins with a space.
+pub fn parse_srt(srt: &str) -> Vec<Cue> {
     // Windows editors write a UTF-8 BOM; left in, it fails the first index
     // line's digit check and silently drops the first cue.
     let srt = srt.trim_start_matches('\u{feff}');
@@ -567,6 +636,100 @@ with continuation
         assert_eq!(slice_for_range(&cues, 4.0, 9.0), Some("two".into()));
         assert_eq!(slice_for_range(&cues, 2.0, 6.0), Some("one two".into()));
         assert_eq!(slice_for_range(&cues, 20.0, 30.0), None);
+    }
+
+    #[test]
+    fn formats_srt_timestamps() {
+        assert_eq!(srt_timestamp(0), "00:00:00,000");
+        assert_eq!(srt_timestamp(83_500), "00:01:23,500");
+        assert_eq!(srt_timestamp(3_661_007), "01:01:01,007");
+    }
+
+    #[test]
+    fn serializes_numbered_srt_blocks() {
+        let cues = [
+            SrtCue {
+                start_ms: 1_000,
+                end_ms: 2_500,
+                text: "hi",
+            },
+            SrtCue {
+                start_ms: 3_000,
+                end_ms: 4_000,
+                text: "there",
+            },
+        ];
+        assert_eq!(
+            serialize_srt(cues),
+            "1\n00:00:01,000 --> 00:00:02,500\nhi\n\n\
+             2\n00:00:03,000 --> 00:00:04,000\nthere\n\n"
+        );
+    }
+
+    /// Serialize, parse back, and assert cue-for-cue equality within the
+    /// format's millisecond resolution.
+    fn assert_round_trips(cues: &[Cue]) {
+        let srt = serialize_srt(cues.iter().map(SrtCue::from));
+        let parsed = parse_srt(&srt);
+        assert_eq!(parsed.len(), cues.len(), "cue count survives:\n{srt}");
+        for (a, b) in cues.iter().zip(&parsed) {
+            assert!(
+                (a.start - b.start).abs() < 0.001,
+                "{} vs {}",
+                a.start,
+                b.start
+            );
+            assert!((a.end - b.end).abs() < 0.001, "{} vs {}", a.end, b.end);
+            assert_eq!(a.text, b.text);
+        }
+    }
+
+    #[test]
+    fn round_trips_comma_millisecond_times() {
+        assert_round_trips(&[Cue {
+            start: 1.007,
+            end: 2.503,
+            text: "precise".into(),
+        }]);
+    }
+
+    #[test]
+    fn round_trips_across_hour_rollover() {
+        assert_round_trips(&[Cue {
+            start: 3599.5,
+            end: 3600.5,
+            text: "straddles the hour".into(),
+        }]);
+    }
+
+    #[test]
+    fn round_trips_blank_line_separated_cues() {
+        assert_round_trips(&[
+            Cue {
+                start: 1.0,
+                end: 2.0,
+                text: "first".into(),
+            },
+            Cue {
+                start: 3.0,
+                end: 4.0,
+                text: "second".into(),
+            },
+        ]);
+    }
+
+    #[test]
+    fn round_trips_multi_line_text_as_space_joined() {
+        // Text with a newline serializes as two cue lines; the parser's
+        // normalization joins them with a space — the documented lossy edge.
+        let srt = serialize_srt([SrtCue {
+            start_ms: 1_000,
+            end_ms: 2_000,
+            text: "line one\nline two",
+        }]);
+        let parsed = parse_srt(&srt);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].text, "line one line two");
     }
 
     #[test]

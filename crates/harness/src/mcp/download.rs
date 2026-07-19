@@ -4,7 +4,10 @@
 //! tracker), verify coverage before caching, sweep, and shape the analysis
 //! or keep response. The tracker is the one channel between the download
 //! thread and the protocol: progress and the final result both land there,
-//! and the inline waiter is just the slot's first poller.
+//! and the inline waiter is just the slot's first poller. Authority flows
+//! the same way: the slot owns the job's cancel signal, and the keep
+//! receipt rides the settlement, so a job that lost its slot can neither
+//! keep working nor record anything.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,28 +18,37 @@ use rmcp::model::CallToolResult;
 use super::deps::{Notifier, ServerDeps};
 use super::handler::offer_transcription;
 use super::probe_cache::cached_probe;
-use super::tracker::{Admission, Poll};
+use super::tracker::{Admission, Poll, Settlement};
 use super::wire::{failed, json_result, pending_result};
 use crate::cache::url_key;
 use crate::fault::Fault;
-use crate::fetch::{DownloadIo, Downloaded, ProgressFn, rip_key};
+use crate::fetch::{CancelSignal, DownloadIo, Downloaded, ProgressFn, rip_key};
 use crate::plan::{format_bytes, plan_response, size_label};
 use crate::schema::{RecommendedCall, VideoArgs, VideoBody};
 use crate::tokens::{Dest, DownloadPlan, Token};
 
 /// A job with no progress for this long is presumed wedged and abandoned on
-/// the next poll. Longer than every downloader-side stall bound (the yt-dlp
-/// watchdog, ureq's phase timeouts), so it only fires when those failed to.
+/// the next poll — and abandonment has teeth: dropping the slot trips the
+/// job's cancel signal, which the direct client observes between reads and
+/// on every stall-guard tick. Longer than every downloader-side stall bound
+/// (the yt-dlp watchdog, the direct client's idle limit — both pinned by
+/// the assertions below), so it only fires when those failed to.
 pub(super) const DOWNLOAD_ABANDON_LIMIT: Duration = Duration::from_secs(10 * 60);
 
 /// Sampling tick of the sync grace window's poll loop.
 const SYNC_POLL_TICK: Duration = Duration::from_millis(200);
 
-// The watchdog's no-progress bound must sit inside the tracker's abandon
-// limit: the child dies before its slot is given up, so an abandoned
-// download can never leave a live yt-dlp (and its staging dir) behind.
+// Each downloader's stall bound must sit inside the tracker's abandon
+// limit, so a network-stalled download always dies (yt-dlp: the watchdog
+// kills the child; direct: the stall guard unblocks the read) before its
+// slot is given up. What the bounds cannot cover — a thread wedged outside
+// its network loop — is defused instead: abandonment trips the slot's
+// cancel signal, and the settlement (keep receipt included) of a job that
+// lost its slot is dropped by the tracker unexecuted.
 const _: () =
     assert!(crate::fetch::ytdlp::NO_PROGRESS_LIMIT.as_secs() <= DOWNLOAD_ABANDON_LIMIT.as_secs());
+const _: () =
+    assert!(crate::fetch::direct::IDLE_LIMIT.as_secs() <= DOWNLOAD_ABANDON_LIMIT.as_secs());
 
 /// Tracker slot key for one download job. An analysis rip and a keep
 /// download of the same URL are different jobs — different destinations,
@@ -92,9 +104,11 @@ pub(super) fn execute_download(
         // never by this thread, whose spawning request (and its progress
         // token) may complete long before the download does.
         std::thread::spawn(move || {
+            let cancel = reporter.cancel_signal();
             let mut progress = |bytes: u64, total: Option<u64>| reporter.progress(bytes, total);
-            let result = perform_download(&source, &plan, &token, &deps, &mut progress);
-            reporter.settle(result);
+            let settlement =
+                perform_download(&source, &plan, &token, &deps, &cancel, &mut progress);
+            reporter.settle(settlement);
         });
     }
     let window = Duration::from_secs(u64::from(deps.config.download.sync_wait_seconds.get()));
@@ -141,17 +155,20 @@ pub(super) fn execute_download(
 }
 
 /// The blocking download flow: fetch, verify coverage, respond, sweep;
-/// known errors become `Failed`.
+/// known errors become `Failed`. Returns a [`Settlement`] because the one
+/// durable side effect — the keep receipt — must ride with the result: the
+/// tracker executes it only if this job still owns its slot.
 fn perform_download(
     source: &str,
     plan: &DownloadPlan,
     token: &Token,
     deps: &Arc<ServerDeps>,
+    cancel: &CancelSignal,
     progress: ProgressFn<'_>,
-) -> CallToolResult {
+) -> Settlement {
     let relay = match deps.relay() {
         Ok(r) => r,
-        Err(e) => return failed(&e),
+        Err(e) => return failed(&e).into(),
     };
     let fetch = |progress: ProgressFn<'_>| -> Result<Downloaded, Fault> {
         match plan.dest {
@@ -168,6 +185,7 @@ fn perform_download(
                         DownloadIo::Cache { dir, key: &key },
                         &deps.config,
                         relay,
+                        cancel,
                         progress,
                     )
                 }),
@@ -186,6 +204,7 @@ fn perform_download(
                         },
                         &deps.config,
                         relay,
+                        cancel,
                         progress,
                     )
                 }),
@@ -196,7 +215,7 @@ fn perform_download(
         mut warning,
     } = match fetch(&mut *progress) {
         Ok(d) => d,
-        Err(e) => return failed(&e),
+        Err(e) => return failed(&e).into(),
     };
     // A container whose tracks stop early was served truncated (an expired
     // CDN session, a flaky segment fetch). Caching it would pin the URL to
@@ -224,14 +243,8 @@ fn perform_download(
                         );
                     }
                 },
-                Err(_) => {
-                    warning = join_warning(
-                        warning,
-                        format!(
-                            "{issue}, and a fresh retry failed — keeping this copy; grids \
-                             and transcription stop where the tracks end"
-                        ),
-                    );
+                Err(fault) => {
+                    warning = join_warning(warning, retry_failure_note(&issue, &fault));
                 }
             },
             // Keep files belong to the user: report, never second-guess.
@@ -247,16 +260,46 @@ fn perform_download(
     // rip that just landed survives via the eviction grace window.
     let _ = deps.cache.evict(SystemTime::now());
     match plan.dest {
-        Dest::Cache => analysis_response(source, &path, warning.as_deref(), deps),
+        Dest::Cache => analysis_response(source, &path, warning.as_deref(), deps).into(),
         Dest::Keep => {
             // The receipt makes future echoes of this token replays instead
             // of duplicate rips — keep is the one non-idempotent action, so
             // its idempotency is manufactured here. Truncation warnings
-            // still fulfill: the file landed and belongs to the user.
-            deps.tokens.fulfill(source, token, path.clone());
-            keep_response(&path, warning.as_deref(), deps)
+            // still fulfill: the file landed and belongs to the user. The
+            // receipt rides the settlement as its owned effect, so a job
+            // whose slot was abandoned can never write it — the tracker
+            // drops a disowned settlement whole, and a zombie cannot
+            // overwrite the receipt a retry just recorded. The disowned
+            // compensation is the receipt's mirror: a file published by a
+            // job that then lost its slot (cancellation can land between
+            // the fetcher's last cancel check and its rename) would orphan
+            // under a name no receipt points to and no retry can take, so
+            // an unadopted settlement removes it — the file exists iff its
+            // settlement was adopted, up to a process crash in between.
+            let response = keep_response(&path, warning.as_deref(), deps);
+            let unadopted = path.clone();
+            let receipt = {
+                let deps = Arc::clone(deps);
+                let source = source.to_string();
+                let token = token.clone();
+                move || deps.tokens.fulfill(&source, &token, path)
+            };
+            Settlement::with_owned_effect(response, receipt).or_disowned(move || {
+                let _ = std::fs::remove_file(&unadopted);
+            })
         }
     }
+}
+
+/// Degradation note for a coverage retry that itself failed: the first
+/// copy is served, but the cause of the failed retry — kind and message —
+/// must survive into the warning instead of being incinerated.
+fn retry_failure_note(issue: &str, fault: &Fault) -> String {
+    format!(
+        "{issue}, and a fresh retry failed ({}: {}) — keeping this copy; grids and \
+         transcription stop where the tracks end",
+        fault.kind, fault.message
+    )
 }
 
 /// Append a degradation note to an optional existing warning.
@@ -330,4 +373,21 @@ pub(super) fn keep_response(
             note: "analyze the saved file".to_string(),
         }],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_failure_note_names_the_fault() {
+        let fault = Fault::transient("connection reset by peer");
+        let note = retry_failure_note("video track ends at 00:31", &fault);
+        assert!(note.contains("video track ends at 00:31"), "{note}");
+        assert!(
+            note.contains("transient: connection reset by peer"),
+            "the retry's cause must survive into the warning: {note}"
+        );
+        assert!(note.contains("keeping this copy"), "{note}");
+    }
 }

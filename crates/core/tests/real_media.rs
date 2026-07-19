@@ -99,10 +99,11 @@ fn covers_full_duration_without_overlap() {
     let meta = support::read_metadata(&dir);
 
     assert!(!meta.grids.is_empty(), "at least one grid");
+    let total = meta.total_duration().expect("process document");
     assert!(
-        (meta.duration - fx.duration).abs() <= ROUNDING,
+        (total - fx.duration).abs() <= ROUNDING,
         "reported duration {} tracks the synthesized {}",
-        meta.duration,
+        total,
         fx.duration
     );
 
@@ -135,10 +136,10 @@ fn covers_full_duration_without_overlap() {
         "coverage starts at the file head"
     );
     assert!(
-        last.1 >= meta.duration - COVERAGE_SLACK,
+        last.1 >= total - COVERAGE_SLACK,
         "coverage reaches the file tail: last grid ends at {} of {}",
         last.1,
-        meta.duration
+        total
     );
 }
 
@@ -251,7 +252,7 @@ fn extracts_single_valid_jpeg_grid() {
     let meta = support::read_metadata(&dir);
     assert_eq!(meta.grids.len(), 1, "extract emits exactly one grid");
     assert_eq!(
-        meta.range,
+        meta.segment().map(|s| (s.start(), s.end())),
         Some((1.0, 3.0)),
         "the document records the harvested range"
     );
@@ -292,11 +293,12 @@ fn survives_mid_stream_audio_param_change_in_process() {
         SubtitleSource::Auto,
         None,
     );
+    let total = meta.total_duration().expect("process document");
     assert!(
-        meta.duration >= fx.duration - ROUNDING,
+        total >= fx.duration - ROUNDING,
         "the concatenated stream demuxes to its full {}s, got {}",
         fx.duration,
-        meta.duration
+        total
     );
     let last_end = meta
         .grids

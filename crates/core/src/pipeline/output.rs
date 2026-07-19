@@ -266,13 +266,12 @@ pub fn write_outputs(
         };
     }
 
-    let meta = wire::Metadata {
-        source: input.to_string(),
+    let meta = wire::Metadata::process(
+        input.to_string(),
         duration,
-        range: None,
-        settings: cfg.settings(),
-        grids: grid_metas.into_iter().map(Into::into).collect(),
-    };
+        cfg.settings(),
+        grid_metas.into_iter().map(Into::into).collect(),
+    );
 
     session.commit(&meta, subs.map(Subtitles::raw), events)
 }
@@ -301,17 +300,16 @@ mod tests {
     }
 
     fn committed_meta() -> wire::Metadata {
-        wire::Metadata {
-            source: "test.mp4".into(),
-            duration: 1.0,
-            range: None,
-            settings: crate::types::Settings {
+        wire::Metadata::process(
+            "test.mp4".into(),
+            1.0,
+            crate::types::Settings {
                 max_edge: 2048,
                 quality: crate::types::Quality::High,
                 detail: crate::types::Detail::Standard,
             },
-            grids: Vec::new(),
-        }
+            Vec::new(),
+        )
     }
 
     #[test]

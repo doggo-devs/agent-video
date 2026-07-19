@@ -22,7 +22,9 @@
 //! may use it. That grants no new authority — the screen applies to every
 //! connection, and a local process could dial out directly anyway — but
 //! traffic through it egresses with this process's identity, worth knowing
-//! on shared machines.
+//! on shared machines. Concurrency is bounded: at most [`MAX_TUNNELS`]
+//! connections are served at once, and anything past the cap is refused
+//! with `503` rather than growing threads without limit.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -31,6 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::gate::Semaphore;
 use crate::netguard::{self, ScreenRefusal};
 
 /// Cap on the request head read before the request line is understood: a
@@ -57,6 +60,17 @@ const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// Connection-establishment bound when dialing a screened upstream.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Hard cap on concurrent proxied connections. yt-dlp is invoked without
+/// `--concurrent-fragments`, so fragments serialize within one download,
+/// but a single download still holds several sockets at once (API calls,
+/// manifests, separate video and audio streams) and multiple downloads can
+/// run concurrently; 64 is an order of magnitude above that legitimate
+/// peak. Past the cap the relay refuses with `503` — the listener is
+/// unauthenticated and tunnels can idle for [`TUNNEL_IDLE_TIMEOUT`], so
+/// without a bound a connection burst grows two threads per tunnel until
+/// the process dies.
+const MAX_TUNNELS: usize = 64;
+
 /// A loopback forward relay applying the netguard address policy to every
 /// connection — the single egress point for subprocess and demuxer traffic,
 /// whose own connections otherwise never re-check the policy after
@@ -73,7 +87,8 @@ pub struct PolicyRelay {
 impl PolicyRelay {
     /// Bind `127.0.0.1:0` and start the accept loop on its own thread. Each
     /// accepted connection is handled on a fresh thread, so concurrent
-    /// downloads (yt-dlp opens many) never serialize behind one another.
+    /// downloads (yt-dlp opens many) never serialize behind one another,
+    /// capped at [`MAX_TUNNELS`] live connections.
     pub fn start(allow_private: bool) -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let local = listener.local_addr()?;
@@ -113,9 +128,14 @@ impl Drop for PolicyRelay {
     }
 }
 
-/// Accept until the shutdown flag is raised, handling each connection on its
-/// own thread.
+/// Accept until the shutdown flag is raised, handling each connection on
+/// its own thread while a permit of the tunnel gate is held for it. The
+/// gate is a [`Semaphore`] used through `try_acquire`: the listener is
+/// unauthenticated, so over-cap connections are refused with `503` rather
+/// than parked — a blocked thread per excess caller would be exactly the
+/// unbounded growth the cap exists to prevent.
 fn accept_loop(listener: TcpListener, shutdown: Arc<AtomicBool>, allow_private: bool) {
+    let gate = Arc::new(Semaphore::new(MAX_TUNNELS));
     for stream in listener.incoming() {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -129,7 +149,25 @@ fn accept_loop(listener: TcpListener, shutdown: Arc<AtomicBool>, allow_private: 
                 continue;
             }
         };
-        std::thread::spawn(move || {
+        let permit = match gate.try_acquire() {
+            Some(permit) => permit,
+            // Refuse over-cap connections inline: the response fits the
+            // socket send buffer so this cannot stall the loop; the write
+            // timeout bounds the pathological case anyway.
+            None => {
+                let _ = stream.set_write_timeout(Some(HEAD_TIMEOUT));
+                let _ = respond(
+                    &stream,
+                    "503 Service Unavailable",
+                    "too many concurrent connections",
+                );
+                continue;
+            }
+        };
+        // A failed spawn (thread exhaustion) drops the unrun closure, and
+        // with it the stream and the permit: that connection alone closes.
+        let _ = std::thread::Builder::new().spawn(move || {
+            let _permit = permit;
             let _ = handle(stream, allow_private);
         });
     }
@@ -324,12 +362,21 @@ fn set_tunnel_timeouts(client: &TcpStream, upstream: &TcpStream) -> std::io::Res
 /// as each source drains. The relay never inspects what flows; this is a
 /// raw byte pump.
 fn splice(a: TcpStream, b: TcpStream) {
-    let a_read = a.try_clone().expect("clone client stream");
-    let b_write = b.try_clone().expect("clone upstream stream");
-    let pump = std::thread::spawn(move || {
+    // `try_clone` is dup(2) and fails under fd exhaustion — likeliest
+    // exactly when many tunnels are open. That is this tunnel's failure
+    // alone: returning drops both streams and closes it, every other
+    // tunnel (and the process) keeps running. Same for a failed pump
+    // spawn under thread exhaustion.
+    let (Ok(a_read), Ok(b_write)) = (a.try_clone(), b.try_clone()) else {
+        return;
+    };
+    let pump = std::thread::Builder::new().spawn(move || {
         let _ = std::io::copy(&mut &a_read, &mut &b_write);
         let _ = b_write.shutdown(Shutdown::Write);
     });
+    let Ok(pump) = pump else {
+        return;
+    };
     let _ = std::io::copy(&mut &b, &mut &a);
     let _ = a.shutdown(Shutdown::Write);
     let _ = pump.join();
@@ -519,6 +566,37 @@ mod tests {
         let _ = client.read_to_end(&mut response);
         let text = String::from_utf8_lossy(&response);
         assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+    }
+
+    #[test]
+    fn refuses_connections_past_the_tunnel_cap_and_frees_slots_on_close() {
+        let relay = PolicyRelay::start(false).expect("relay starts");
+        // Fill every slot with clients that connect and say nothing; each
+        // pins its handler in the head read while holding a permit.
+        let held: Vec<TcpStream> = (0..MAX_TUNNELS)
+            .map(|_| TcpStream::connect(relay.local).expect("connect relay"))
+            .collect();
+        // The listen queue is FIFO, so by the time the loop reaches this
+        // connection every earlier one holds its permit: refused outright.
+        let over_cap = round_trip(&relay, b"");
+        let text = String::from_utf8_lossy(&over_cap);
+        assert!(text.starts_with("HTTP/1.1 503"), "{text}");
+        // Closing the held clients ends their handlers, whose permits drop;
+        // a fresh request must then reach a real handler (400, not 503).
+        drop(held);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = round_trip(&relay, b"PUT /x HTTP/1.1\r\n\r\n");
+            let text = String::from_utf8_lossy(&response).into_owned();
+            if text.starts_with("HTTP/1.1 400") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "slots never freed: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

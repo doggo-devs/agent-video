@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::time::ArgError;
+
 /// Intent-level presets; mapped to core parameters in `look.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,12 +106,86 @@ impl VideoArgs {
         }
     }
 
-    /// Whether any of from/until/look/strategy carries model intent.
-    pub fn has_intent(&self) -> bool {
-        self.from.is_some()
-            || self.until.is_some()
-            || self.look.is_some()
-            || self.strategy.is_some()
+    /// Refine the loose wire struct into its one valid reading. This is the
+    /// single place the exclusivity rules of `docs/protocol.md` are
+    /// enforced (`confirm` alone, `transcribe` alone, `raw` without grid
+    /// intent); every consumer matches on the result instead of
+    /// re-checking. `transcribe: false` reads as absent. The error message
+    /// goes to the model verbatim.
+    pub fn intent(&self) -> Result<Intent<'_>, ArgError> {
+        let grid = GridSpec {
+            from: self.from.as_ref(),
+            until: self.until.as_ref(),
+            look: self.look,
+            strategy: self.strategy,
+        };
+        let transcribe = self.transcribe == Some(true);
+        if let Some(token) = &self.confirm {
+            if self.raw.is_some() || transcribe || !grid.is_bare() {
+                return Err(ArgError(CONFIRM_ALONE.to_string()));
+            }
+            return Ok(Intent::Confirm(token));
+        }
+        if transcribe {
+            if self.raw.is_some() || !grid.is_bare() {
+                return Err(ArgError(TRANSCRIBE_ALONE.to_string()));
+            }
+            return Ok(Intent::Transcribe);
+        }
+        if let Some(raw) = &self.raw {
+            if !grid.is_bare() {
+                return Err(ArgError(RAW_EXCLUSIVE.to_string()));
+            }
+            return Ok(Intent::Raw(raw));
+        }
+        Ok(Intent::Grid(grid))
+    }
+}
+
+/// Rejection for `confirm` combined with anything else; also the story
+/// [`crate::plan`] tells when a confirm reaches it out of band.
+pub const CONFIRM_ALONE: &str = "confirm must be passed alone (with source): it authorizes \
+                                 exactly the pending plan, nothing else";
+
+/// Rejection for `transcribe` combined with `raw` or grid intent.
+pub const TRANSCRIBE_ALONE: &str = "transcribe must be passed alone (with source); once the transcript exists it rides along \
+     with every grid call automatically";
+
+/// Rejection for `raw` combined with grid intent.
+pub const RAW_EXCLUSIVE: &str = "raw is mutually exclusive with from/until/look/strategy: raw \
+                                 callers own the strategy entirely";
+
+/// The four mutually exclusive modes of a `video` call, refined from
+/// [`VideoArgs`] by [`VideoArgs::intent`] — a combination that mixes modes
+/// is not constructible here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Intent<'a> {
+    /// `confirm` alone: redeem a pending consent token.
+    Confirm(&'a str),
+    /// `transcribe: true` alone: generate (or reuse) a whisper transcript.
+    Transcribe,
+    /// `raw` alone: verbatim core CLI passthrough.
+    Raw(&'a str),
+    /// The grid path; every field optional, a bare source when all are.
+    Grid(GridSpec<'a>),
+}
+
+/// The grid-path arguments of one call; all optional.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GridSpec<'a> {
+    pub from: Option<&'a TimeValue>,
+    pub until: Option<&'a TimeValue>,
+    pub look: Option<Look>,
+    pub strategy: Option<Strategy>,
+}
+
+impl GridSpec<'_> {
+    /// Whether no field carries model intent — a bare source.
+    pub fn is_bare(&self) -> bool {
+        self.from.is_none()
+            && self.until.is_none()
+            && self.look.is_none()
+            && self.strategy.is_none()
     }
 }
 
@@ -233,7 +309,10 @@ mod tests {
     fn deserializes_minimal_args() {
         let args: VideoArgs = serde_json::from_str(r#"{"source":"/v.mp4"}"#).expect("valid");
         assert_eq!(args.source, "/v.mp4");
-        assert!(!args.has_intent());
+        assert!(
+            matches!(args.intent(), Ok(Intent::Grid(g)) if g.is_bare()),
+            "a bare source refines to a bare grid"
+        );
     }
 
     #[test]
@@ -261,7 +340,115 @@ mod tests {
     fn strategy_counts_as_intent() {
         let args: VideoArgs =
             serde_json::from_str(r#"{"source":"v","strategy":"uniform"}"#).expect("valid");
-        assert!(args.has_intent());
+        assert!(matches!(args.intent(), Ok(Intent::Grid(g)) if !g.is_bare()));
+    }
+
+    fn expect_rejection(args: &VideoArgs, message: &str) {
+        assert_eq!(args.intent(), Err(ArgError(message.to_string())));
+    }
+
+    #[test]
+    fn rejects_confirm_combined_with_grid_intent() {
+        let args = VideoArgs {
+            confirm: Some("t".into()),
+            look: Some(Look::Overview),
+            ..VideoArgs::bare("v")
+        };
+        expect_rejection(
+            &args,
+            "confirm must be passed alone (with source): it authorizes exactly the pending \
+             plan, nothing else",
+        );
+    }
+
+    #[test]
+    fn rejects_confirm_combined_with_raw() {
+        let args = VideoArgs {
+            confirm: Some("t".into()),
+            raw: Some("process".into()),
+            ..VideoArgs::bare("v")
+        };
+        expect_rejection(&args, CONFIRM_ALONE);
+    }
+
+    #[test]
+    fn rejects_confirm_combined_with_transcribe() {
+        let args = VideoArgs {
+            confirm: Some("t".into()),
+            transcribe: Some(true),
+            ..VideoArgs::bare("v")
+        };
+        expect_rejection(&args, CONFIRM_ALONE);
+    }
+
+    #[test]
+    fn rejects_transcribe_combined_with_grid_intent() {
+        let args = VideoArgs {
+            transcribe: Some(true),
+            from: Some(TimeValue::Number(3.0)),
+            ..VideoArgs::bare("v")
+        };
+        expect_rejection(
+            &args,
+            "transcribe must be passed alone (with source); once the transcript exists it \
+             rides along with every grid call automatically",
+        );
+    }
+
+    #[test]
+    fn rejects_transcribe_combined_with_raw() {
+        let args = VideoArgs {
+            transcribe: Some(true),
+            raw: Some("process".into()),
+            ..VideoArgs::bare("v")
+        };
+        expect_rejection(&args, TRANSCRIBE_ALONE);
+    }
+
+    #[test]
+    fn rejects_raw_combined_with_grid_intent() {
+        let args = VideoArgs {
+            raw: Some("process".into()),
+            strategy: Some(Strategy::Uniform),
+            ..VideoArgs::bare("v")
+        };
+        expect_rejection(
+            &args,
+            "raw is mutually exclusive with from/until/look/strategy: raw callers own the \
+             strategy entirely",
+        );
+    }
+
+    #[test]
+    fn refines_each_lone_mode_to_its_intent() {
+        let confirm = VideoArgs {
+            confirm: Some("tok".into()),
+            ..VideoArgs::bare("v")
+        };
+        assert_eq!(confirm.intent(), Ok(Intent::Confirm("tok")));
+        let transcribe = VideoArgs {
+            transcribe: Some(true),
+            ..VideoArgs::bare("v")
+        };
+        assert_eq!(transcribe.intent(), Ok(Intent::Transcribe));
+        let raw = VideoArgs {
+            raw: Some("extract --range 1-2".into()),
+            ..VideoArgs::bare("v")
+        };
+        assert_eq!(raw.intent(), Ok(Intent::Raw("extract --range 1-2")));
+    }
+
+    #[test]
+    fn reads_transcribe_false_as_absent() {
+        let args = VideoArgs {
+            transcribe: Some(false),
+            look: Some(Look::Overview),
+            ..VideoArgs::bare("v")
+        };
+        assert!(
+            matches!(args.intent(), Ok(Intent::Grid(g)) if !g.is_bare()),
+            "transcribe: false must not claim the call"
+        );
     }
 
     #[test]

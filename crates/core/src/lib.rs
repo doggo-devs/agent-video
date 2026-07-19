@@ -10,6 +10,8 @@
 //! The public surface is what the CLI and
 //! the harness crate consume: [`pipeline`] to run, [`config`] to configure,
 //! [`media`]/[`probe`] to inspect, [`wire`] as the output contract,
+//! [`subtitle`] as the SRT contract (one parser, one serializer — every
+//! SRT the workspace writes must parse back here),
 //! [`event`] as the observability contract, and
 //! [`source`]/[`types`]/[`error`] as shared vocabulary. Everything else is
 //! implementation detail.

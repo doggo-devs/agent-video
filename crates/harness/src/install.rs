@@ -3,13 +3,16 @@
 //!
 //! Fetches the pinned HuggingFace ggml model for the configured (or
 //! overridden) model name plus the Silero VAD model into `paths.models`,
-//! sha256-verified, `.part`-then-rename. Weights are runtime data, not
+//! sha256-verified, staged-then-renamed. Weights are runtime data, not
 //! dependencies: nothing is ever auto-downloaded mid-run, and this command
-//! is the only writer of the models directory.
+//! is the only writer of the models directory — though several instances
+//! of it may run at once, so staging names are writer-unique
+//! ([`crate::cache::naming::part_path`]) and publication is an atomic
+//! last-writer-wins rename of a stream each writer verified alone.
 
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -112,22 +115,41 @@ pub fn install_whisper(cfg: &Config, override_model: Option<&str>) -> Result<(),
     Ok(())
 }
 
-/// Remove leftover `*.part` files before provisioning.
+/// A `.part` in the models dir older than this has no live writer left.
+/// Two installs may run concurrently, so the sweep cannot treat every
+/// partial as debris: a downloading rival touches its staging file with
+/// every 256 KiB chunk — even a crawling link updates the mtime every few
+/// seconds — while a killed run's leftover only ages. One hour is orders
+/// of magnitude past any live write gap, and multi-GiB debris still gets
+/// collected by the next install.
+const STALE_PART_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// Remove abandoned `*.part` files before provisioning.
 ///
-/// `install-whisper` is the sole writer of the models directory and runs
-/// single-threaded to completion, so any partial file present at entry is
-/// the debris of a prior run that was killed mid-download (SIGKILL, power
-/// loss) — never a live transfer. The normal error path already unlinks its
-/// own `.part`; this collects only what a hard kill leaked. Best-effort: a
-/// directory that does not exist yet, or a file we cannot unlink, is skipped.
+/// Staging names are writer-unique, so a partial file here is either a
+/// rival install's live transfer or the debris of a run that was killed
+/// mid-download (SIGKILL, power loss) — the normal error path already
+/// unlinks its own `.part`. The two are told apart by age
+/// ([`STALE_PART_AGE`]): only what no live writer can still be touching
+/// is collected. Best-effort: a directory that does not exist yet, or a
+/// file we cannot stat or unlink, is skipped.
 fn sweep_stale_parts(models_dir: &Path) {
+    let now = SystemTime::now();
     let Ok(entries) = std::fs::read_dir(models_dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "part") && std::fs::remove_file(&path).is_ok()
-        {
+        if path.extension().is_none_or(|ext| ext != "part") {
+            continue;
+        }
+        let abandoned = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age > STALE_PART_AGE);
+        if abandoned && std::fs::remove_file(&path).is_ok() {
             eprintln!("removed stale partial download {}", path.display());
         }
     }
@@ -152,7 +174,15 @@ fn provision(models_dir: &Path, pin: &Pin) -> Result<(), InstallError> {
         pin.filename,
         format_bytes(pin.bytes)
     );
-    let part = PathBuf::from(format!("{}.part", dest.display()));
+    // The staging name comes from the cache's one writer-unique grammar
+    // (crate::cache::naming) rather than a third local spelling: the models
+    // dir is not the cache, but the hazard is the same — two concurrent
+    // installs of one model must never share a staging file, or their
+    // interleaved writes could pass each writer's own checksum and be
+    // renamed into a corrupt final file. With exclusive staging, the
+    // rename below is atomic per writer and last-writer-wins is sound:
+    // both candidates were verified whole against the same pin.
+    let part = crate::cache::naming::part_path(&dest);
     match fetch_verified(pin, &part) {
         Ok(()) => {
             std::fs::rename(&part, &dest)
@@ -168,7 +198,9 @@ fn provision(models_dir: &Path, pin: &Pin) -> Result<(), InstallError> {
 }
 
 /// Stream the artifact to `part`, hashing on the fly; fails on any digest
-/// mismatch so a bad `.part` never survives.
+/// mismatch so a bad `.part` never survives. Verify-during-stream is sound
+/// because `part` is writer-unique: this stream is the only writer of that
+/// file, so the digest covers exactly the bytes on disk.
 fn fetch_verified(pin: &Pin, part: &Path) -> Result<(), InstallError> {
     let mut res = ureq::get(pin.url).call().map_err(|e| match e {
         ureq::Error::StatusCode(code) => {
@@ -240,6 +272,7 @@ fn file_sha256(path: &Path) -> Result<String, InstallError> {
 mod tests {
     use super::*;
     use crate::config::{default_config, test_dirs};
+    use std::path::PathBuf;
 
     fn cfg() -> Config {
         default_config(&test_dirs(Path::new("/home/u")))
@@ -256,21 +289,83 @@ mod tests {
         );
     }
 
+    fn age(path: &Path, by: Duration) {
+        std::fs::File::options()
+            .append(true)
+            .open(path)
+            .and_then(|f| f.set_modified(SystemTime::now() - by))
+            .expect("age the file");
+    }
+
     #[test]
     fn sweeps_stale_part_files_but_keeps_finished_weights() {
         let dir = crate::testutil::TempDir::new("av-sweep");
-        std::fs::write(dir.join("ggml-medium.bin.part"), b"partial").expect("write part");
+        let part = crate::cache::naming::part_path(&dir.join("ggml-medium.bin"));
+        std::fs::write(&part, b"partial").expect("write part");
         std::fs::write(dir.join("ggml-medium.bin"), b"whole").expect("write bin");
+        age(&part, STALE_PART_AGE + Duration::from_secs(60));
 
         sweep_stale_parts(&dir);
 
-        assert!(
-            !dir.join("ggml-medium.bin.part").exists(),
-            "the killed-run partial is collected"
-        );
+        assert!(!part.exists(), "the killed-run partial is collected");
         assert!(
             dir.join("ggml-medium.bin").exists(),
             "a finished weight file is untouched"
+        );
+    }
+
+    #[test]
+    fn sweep_spares_a_live_rivals_fresh_part() {
+        // A concurrent install's transfer keeps its staging file's mtime
+        // fresh; the sweep must not pull it out from under the rival.
+        let dir = crate::testutil::TempDir::new("av-sweep-live");
+        let part = crate::cache::naming::part_path(&dir.join("ggml-medium.bin"));
+        std::fs::write(&part, b"in flight").expect("write part");
+
+        sweep_stale_parts(&dir);
+
+        assert!(part.exists(), "a fresh part is a live rival's download");
+    }
+
+    #[test]
+    fn staging_names_are_writer_unique() {
+        let dest = Path::new("/models/ggml-medium.bin");
+        let a = crate::cache::naming::part_path(dest);
+        let b = crate::cache::naming::part_path(dest);
+        assert_ne!(a, b, "two installs must never share a staging file");
+        for p in [&a, &b] {
+            assert!(
+                p.extension().is_some_and(|e| e == "part"),
+                "the sweep must still recognize the staging name: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_installs_stage_and_publish_without_interleaving() {
+        // The defect scenario at the naming level: two installs of the same
+        // model. Each streams into its own staging file (so each digest
+        // covers exactly its own bytes) and each rename is atomic; the last
+        // writer wins with a file it verified whole.
+        let dir = crate::testutil::TempDir::new("av-install-race");
+        let dest = dir.join("ggml-medium.bin");
+        let a = crate::cache::naming::part_path(&dest);
+        let b = crate::cache::naming::part_path(&dest);
+
+        std::fs::write(&a, b"writer-a bytes").expect("stage a");
+        std::fs::write(&b, b"writer-b bytes").expect("stage b");
+        assert_eq!(
+            std::fs::read(&a).expect("read a"),
+            b"writer-a bytes",
+            "a rival's writes never reach this writer's stream"
+        );
+        std::fs::rename(&a, &dest).expect("a publishes");
+        std::fs::rename(&b, &dest).expect("b publishes over a");
+
+        assert_eq!(
+            std::fs::read(&dest).expect("read final"),
+            b"writer-b bytes",
+            "last writer wins with an unmixed file"
         );
     }
 

@@ -32,6 +32,58 @@ fn forbidden_flag(token: &str) -> Option<&'static str> {
     })
 }
 
+/// One occurrence of an observed user flag, in either clap spelling:
+/// `--flag value` (two tokens) or `--flag=value` (one token).
+///
+/// `span` covers exactly the tokens the occurrence owns, so removal via
+/// [`FlagOccurrence::remove_from`] cannot leave residue or eat a
+/// neighbour: one token for the `=` form, two for the space form.
+struct FlagOccurrence {
+    span: std::ops::Range<usize>,
+    /// The flag's argument: the text after `=`, or the following token
+    /// in the space form (`None` when the flag is the last token).
+    value: Option<String>,
+}
+
+impl FlagOccurrence {
+    /// Remove the occurrence from the token stream it was found in,
+    /// yielding its value.
+    fn remove_from(self, flags: &mut Vec<String>) -> Option<String> {
+        flags.drain(self.span);
+        self.value
+    }
+}
+
+/// The first occurrence of `name` in `flags`, matching both clap
+/// spellings. Exact-or-`=`-attached, never a bare prefix: `--profile`
+/// does not match a hypothetical `--profilex`.
+fn find_flag(flags: &[String], name: &str) -> Option<FlagOccurrence> {
+    let i = flags.iter().position(|t| {
+        t == name
+            || t.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('='))
+    })?;
+    match flags[i]
+        .strip_prefix(name)
+        .and_then(|r| r.strip_prefix('='))
+    {
+        Some(attached) => Some(FlagOccurrence {
+            span: i..i + 1,
+            value: Some(attached.to_string()),
+        }),
+        None => match flags.get(i + 1) {
+            Some(next) => Some(FlagOccurrence {
+                span: i..i + 2,
+                value: Some(next.clone()),
+            }),
+            None => Some(FlagOccurrence {
+                span: i..i + 1,
+                value: None,
+            }),
+        },
+    }
+}
+
 /// The core subcommand a raw string may start with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawSubcommand {
@@ -117,26 +169,27 @@ pub fn parse_raw(raw: &str) -> Result<RawInvocation, ArgError> {
     // transcript rides along otherwise), so `--subtitle` is lifted out of
     // the opaque flags into a typed field; last occurrence wins.
     let mut subtitle: Option<PathBuf> = None;
-    while let Some(i) = flags.iter().position(|t| t == "--subtitle") {
-        let Some(path) = flags.get(i + 1).filter(|p| !p.starts_with('-')) else {
+    while let Some(occurrence) = find_flag(&flags, "--subtitle") {
+        let Some(path) = occurrence
+            .remove_from(&mut flags)
+            .filter(|p| !p.is_empty() && !p.starts_with('-'))
+        else {
             return Err(ArgError(
                 "--subtitle needs a file path, e.g. --subtitle captions.srt".to_string(),
             ));
         };
         subtitle = Some(PathBuf::from(path));
-        flags.drain(i..=i + 1);
     }
 
     // Profile resolution goes through core's own table, so the predicted
     // grid-count denominator cannot drift from what the run will do.
     let mut chunk_seconds = f64::from(DEFAULT_CHUNK_SECONDS);
-    if let Some(i) = flags.iter().position(|t| t == "--profile")
-        && let Some(profile) = flags.get(i + 1)
-    {
-        chunk_seconds = f64::from(default_chunk_seconds(Some(profile)));
+    if let Some(profile) = find_flag(&flags, "--profile").and_then(|o| o.value) {
+        chunk_seconds = f64::from(default_chunk_seconds(Some(&profile)));
     }
-    if let Some(i) = flags.iter().position(|t| t == "--chunk-seconds")
-        && let Some(v) = flags.get(i + 1).and_then(|s| s.parse::<f64>().ok())
+    if let Some(v) = find_flag(&flags, "--chunk-seconds")
+        .and_then(|o| o.value)
+        .and_then(|s| s.parse::<f64>().ok())
         && v.is_finite()
         && v > 0.0
     {
@@ -253,5 +306,53 @@ mod tests {
             let err = parse_raw(raw).expect_err("dangling --subtitle");
             assert!(err.0.contains("file path"), "{}", err.0);
         }
+    }
+
+    #[test]
+    fn reads_equals_form_chunk_seconds() {
+        let inv = parse_raw("process --chunk-seconds=1").expect("valid");
+        assert_eq!(inv.chunk_seconds, 1.0);
+    }
+
+    #[test]
+    fn derives_chunk_seconds_from_equals_form_profile() {
+        assert_eq!(
+            parse_raw("process --profile=fast")
+                .expect("valid")
+                .chunk_seconds,
+            f64::from(default_chunk_seconds(Some("fast")))
+        );
+    }
+
+    #[test]
+    fn lifts_equals_form_subtitle_out_of_flags() {
+        let inv = parse_raw("process --subtitle=captions.srt --strategy keyframes").expect("valid");
+        assert_eq!(inv.subtitle, Some(PathBuf::from("captions.srt")));
+        assert_eq!(inv.flags, ["--strategy", "keyframes"], "no residue");
+    }
+
+    #[test]
+    fn lifts_last_subtitle_across_mixed_spellings() {
+        let inv = parse_raw("process --subtitle a.srt --subtitle=b.srt").expect("valid");
+        assert_eq!(inv.subtitle, Some(PathBuf::from("b.srt")));
+        assert!(inv.flags.is_empty(), "no residue: {:?}", inv.flags);
+    }
+
+    #[test]
+    fn space_form_chunk_seconds_wins_over_equals_form_profile() {
+        let inv = parse_raw("process --profile=fast --chunk-seconds 30").expect("valid");
+        assert_eq!(inv.chunk_seconds, 30.0);
+    }
+
+    #[test]
+    fn ignores_equals_form_chunk_seconds_with_empty_value() {
+        let inv = parse_raw("process --chunk-seconds=").expect("valid");
+        assert_eq!(inv.chunk_seconds, f64::from(DEFAULT_CHUNK_SECONDS));
+    }
+
+    #[test]
+    fn rejects_equals_form_subtitle_with_empty_value() {
+        let err = parse_raw("process --subtitle=").expect_err("empty subtitle path");
+        assert!(err.0.contains("file path"), "{}", err.0);
     }
 }

@@ -19,12 +19,13 @@ use super::download::{
 use super::invoke::{run_invocation, transcribe_flow};
 use super::probe_cache::cached_probe;
 use super::tracker::Poll;
-use super::wire::{coerce_args, failed, is_url, json_result, pending_result};
+use super::wire::{coerce_args, failed, foreign_scheme, is_url, json_result, pending_result};
 use crate::fault::Fault;
 use crate::fetch::rip_key;
 use crate::plan::{Decision, PlanDecision, decide, redeem};
 use crate::schema::OfferedToken;
-use crate::schema::{RecommendedCall, VideoArgs, VideoBody};
+use crate::schema::{Intent, RecommendedCall, VideoArgs, VideoBody};
+use crate::time::ArgError;
 use crate::tokens::Dest;
 use crate::url_policy::decide_url;
 
@@ -42,20 +43,34 @@ pub fn handle_video_call(
         Err(e) => return failed(&e),
     };
 
-    // Consent first: a confirm names its own plan, and the slot poll below
-    // must not swallow it — a keep confirm during a running analysis
-    // download starts the keep job, it does not observe the analysis one.
-    // A confirm for a plan whose own download already runs converges inside
-    // `execute_download` (same slot, one writer).
-    if args.confirm.is_some() {
-        let decision = redeem(&args, &deps.tokens);
-        return render_decision(&args, decision, None, Vec::new(), deps, notify);
+    // A protocol URL this layer does not fetch (rtsp, rtmp, …) is rejected
+    // by name, before any flow can misread it as a local path and diagnose
+    // a missing file.
+    if let Some(scheme) = foreign_scheme(&args.source) {
+        return failed(&Fault::bad_input(format!(
+            "\"{}\" is a {scheme}:// URL, and this tool cannot fetch {scheme} sources — only \
+             http(s) URLs and local file paths are accepted",
+            args.source
+        )));
     }
 
-    // Transcription is an explicit request, not a consent dance: the
-    // argument itself is the intent.
-    if args.transcribe == Some(true) {
-        return transcribe_flow(&args, deps, notify);
+    // Refine once: the exclusivity rules live in `VideoArgs::intent`, and
+    // every route below matches a mode that is valid by construction.
+    match args.intent() {
+        Err(ArgError(message)) => return failed(&Fault::bad_input(message)),
+        // Consent first: a confirm names its own plan, and the slot poll
+        // below must not swallow it — a keep confirm during a running
+        // analysis download starts the keep job, it does not observe the
+        // analysis one. A confirm for a plan whose own download already
+        // runs converges inside `execute_download` (same slot, one writer).
+        Ok(Intent::Confirm(_)) => {
+            let decision = redeem(&args, &deps.tokens);
+            return render_decision(&args, decision, None, Vec::new(), deps, notify);
+        }
+        // Transcription is an explicit request, not a consent dance: the
+        // argument itself is the intent.
+        Ok(Intent::Transcribe) => return transcribe_flow(&args, deps, notify),
+        Ok(Intent::Raw(_) | Intent::Grid(_)) => {}
     }
 
     // Background downloads: one poll per destination resolves each slot's
@@ -301,6 +316,23 @@ mod tests {
     }
 
     #[test]
+    fn rtsp_source_is_diagnosed_as_unsupported_scheme() {
+        let env = env(probe(90.0, vec![]), false);
+        let r = call(&env, serde_json::json!({"source": "rtsp://cam/1"}));
+        let body = body_of(&r);
+        assert_eq!(body["kind"], "bad_input", "{body}");
+        let error = body["error"].as_str().expect("error text");
+        assert!(
+            error.contains("rtsp") && error.contains("http"),
+            "the diagnosis names the scheme and what is accepted: {error}"
+        );
+        assert!(
+            !error.contains("file not found"),
+            "a protocol URL must not be misdiagnosed as a missing file: {error}"
+        );
+    }
+
+    #[test]
     fn short_video_runs_and_renders_grids() {
         let env = env(probe(90.0, vec![]), false);
         let file = media_file(&env, "v.mp4");
@@ -526,6 +558,8 @@ mod tests {
                 gate: None,
                 warning: Some("subtitles could not be fetched (login required)".to_string()),
                 downloads: Mutex::new(0),
+                finished: Mutex::new(0),
+                last_cancel: Mutex::new(None),
             },
         );
         let url = "https://example.com/v.mp4";
@@ -594,6 +628,8 @@ mod tests {
                 gate: Some(Mutex::new(gate)),
                 warning: None,
                 downloads: Mutex::new(0),
+                finished: Mutex::new(0),
+                last_cancel: Mutex::new(None),
             },
         );
         // Shortest representable grace window keeps the test fast.
@@ -650,6 +686,8 @@ mod tests {
                 gate: Some(Mutex::new(gate)),
                 warning: None,
                 downloads: Mutex::new(0),
+                finished: Mutex::new(0),
+                last_cancel: Mutex::new(None),
             },
         );
         Arc::get_mut(&mut env.deps)
@@ -684,6 +722,97 @@ mod tests {
     }
 
     #[test]
+    fn abandonment_cancels_the_in_flight_download() {
+        let (env, release) = gated_env(vec![analysis_option()]);
+        let url = "https://example.com/v.mp4";
+
+        let offer = body_of(&call(&env, serde_json::json!({"source": url})));
+        assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let pending = body_of(&call(
+            &env,
+            serde_json::json!({"source": url, "confirm": "dl-analysis"}),
+        ));
+        assert_eq!(pending["status"], "pending", "{pending}");
+        let cancel = env
+            .fetcher
+            .last_cancel
+            .lock()
+            .expect("last_cancel")
+            .clone()
+            .expect("download started");
+        assert!(!cancel.is_cancelled(), "a live job is not cancelled");
+
+        env.deps.downloads.age(
+            &slot_key(url, Dest::Cache),
+            DOWNLOAD_ABANDON_LIMIT + Duration::from_secs(60),
+        );
+        let r = call(&env, serde_json::json!({"source": url}));
+        assert!(text_of(&r).contains("abandoned"), "{}", text_of(&r));
+
+        assert!(
+            cancel.is_cancelled(),
+            "abandoning the slot must reach the fetch's cancel signal"
+        );
+        drop(release);
+    }
+
+    #[test]
+    fn zombie_keep_settle_cannot_fulfill_after_abandonment() {
+        use crate::tokens::{Redemption, Token};
+        let (env, release) = gated_env(vec![keep_option()]);
+        let url = "https://example.com/v.mp4";
+
+        let offer = body_of(&call(&env, serde_json::json!({"source": url})));
+        assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let pending = body_of(&call(
+            &env,
+            serde_json::json!({"source": url, "confirm": "dl-keep"}),
+        ));
+        assert_eq!(pending["status"], "pending", "{pending}");
+
+        env.deps.downloads.age(
+            &slot_key(url, Dest::Keep),
+            DOWNLOAD_ABANDON_LIMIT + Duration::from_secs(60),
+        );
+        let r = call(&env, serde_json::json!({"source": url}));
+        assert!(text_of(&r).contains("abandoned"), "{}", text_of(&r));
+
+        // Let the zombie finish: it writes the keep file and settles into a
+        // channel whose receiving slot is gone. The fetch counter is the
+        // barrier — the file itself is transient now, because the disowned
+        // settlement's compensation removes what the zombie published.
+        release.send(()).expect("release the zombie");
+        let keep_file = env.deps.config.paths.keep.join("v.mp4");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while *env.fetcher.finished.lock().expect("finished") == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the zombie never finished its download"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The compensation runs inside the failed settle, so once the file
+        // is gone the settle has provably completed and the receipt check
+        // below cannot race it.
+        while keep_file.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a disowned keep settlement must remove the file it published"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            matches!(
+                env.deps.tokens.take(url, &Token::new("dl-keep")),
+                Some(Redemption::Fresh(_))
+            ),
+            "a job that lost its slot must not record a receipt — the token \
+             stays fresh for a retry"
+        );
+    }
+
+    #[test]
     fn stale_confirm_token_rejects() {
         let env = env(probe(90.0, vec![]), false);
         let file = media_file(&env, "v.mp4");
@@ -715,6 +844,8 @@ mod tests {
                 gate: Some(Mutex::new(gate)),
                 warning: None,
                 downloads: Mutex::new(0),
+                finished: Mutex::new(0),
+                last_cancel: Mutex::new(None),
             },
         );
         Arc::get_mut(&mut env.deps)

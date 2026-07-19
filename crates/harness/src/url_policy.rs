@@ -8,7 +8,8 @@
 use super::config::Config;
 use super::fetch::SourceInfo;
 use super::plan::{Decision, format_bytes};
-use super::schema::VideoArgs;
+use super::schema::{Intent, VideoArgs};
+use super::time::ArgError;
 use super::tokens::{DownloadPlan, Offer, PendingAction};
 
 /// Model-facing guidance attached to every download offer.
@@ -20,7 +21,11 @@ const CHOICE_GUIDANCE: &str = "dl-analysis fetches a low-res rip plus subtitles 
 /// First contact with a not-yet-downloaded URL: offer tiers behind tokens,
 /// or refuse. Pure: the offers ride the returned decision.
 pub fn decide_url(args: &VideoArgs, info: &SourceInfo, cfg: &Config) -> Decision {
-    if args.raw.is_some() {
+    let intent = match args.intent() {
+        Ok(intent) => intent,
+        Err(ArgError(message)) => return Decision::Reject { message },
+    };
+    if matches!(intent, Intent::Raw(_)) {
         return Decision::Reject {
             message: "raw needs a local file. Call with just the URL first, confirm a download, \
                       then repeat the raw call."
@@ -75,7 +80,7 @@ pub fn decide_url(args: &VideoArgs, info: &SourceInfo, cfg: &Config) -> Decision
             labels.join(", ")
         ));
     }
-    if args.has_intent() {
+    if matches!(intent, Intent::Grid(grid) if !grid.is_bare()) {
         notes.push(
             "Your from/until/look cannot apply yet — the download comes first. Repeat them in \
              the call after it completes."

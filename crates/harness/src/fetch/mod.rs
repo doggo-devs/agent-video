@@ -13,8 +13,6 @@
 pub mod direct;
 pub mod ytdlp;
 
-pub use ytdlp::STAGING_PREFIX;
-
 use std::path::{Path, PathBuf};
 
 use super::cache::url_key;
@@ -86,6 +84,31 @@ pub struct SourceInfo {
 /// Byte-level progress callback; total is set when the server reveals it.
 pub type ProgressFn<'a> = &'a mut (dyn FnMut(u64, Option<u64>) + Send);
 
+/// Cooperative cancellation for one in-flight download. Clones share a
+/// flag whose one writer is the owner of the job's tracker slot: tripping
+/// it tells the download thread its work has been disowned. The direct
+/// client checks it between reads and inside its stall guard; yt-dlp does
+/// not need it — its watchdog kills the child on its own stall bound.
+#[derive(Debug, Clone, Default)]
+pub struct CancelSignal(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelSignal {
+    /// A fresh, untripped signal.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Trip the signal; every clone observes it. Irreversible.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the job this signal belongs to has been disowned.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// A completed download: the final media path plus an optional degradation
 /// note. The note reports best-effort side work that failed without
 /// invalidating the media — e.g. subtitles that could not be fetched or
@@ -152,13 +175,17 @@ pub fn download(
     io: DownloadIo<'_>,
     cfg: &Config,
     relay: &PolicyRelay,
+    cancel: &CancelSignal,
     progress: ProgressFn<'_>,
 ) -> Result<Downloaded, Fault> {
     match &plan.recipe {
         // The direct client owns its own per-connection screen via
         // `GuardedResolver`, so it needs no relay; only the subprocess path
         // does.
-        Recipe::Direct(recipe) => direct::download(url, recipe, io, cfg, progress),
+        Recipe::Direct(recipe) => direct::download(url, recipe, io, cfg, cancel, progress),
+        // yt-dlp takes no cancel signal: its watchdog kills a stalled child
+        // within `ytdlp::NO_PROGRESS_LIMIT`, which a compile-time assertion
+        // in `mcp::download` keeps inside the tracker's abandon limit.
         Recipe::Ytdlp(recipe) => ytdlp::download(url, recipe, io, cfg, relay, progress),
     }
 }

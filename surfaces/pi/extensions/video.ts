@@ -21,6 +21,12 @@ const require = createRequire(import.meta.url);
 
 const RELEASES_URL = "https://github.com/durvia/agent-video/releases";
 
+/** Bound on the initialize handshake. Generous — startup is local process
+ * spawn plus one JSON round-trip — so it only fires on a binary that wedges
+ * before speaking MCP, which would otherwise block every video call forever
+ * (the abort signal covers tool-call waiters, not the shared handshake). */
+const INIT_TIMEOUT_MS = 30_000;
+
 function resolveBinary(): string {
 	const override = process.env["AGENT_VIDEO_BIN"];
 	if (override) return override;
@@ -122,11 +128,15 @@ class VideoServer {
 		});
 		child.stderr?.on("error", () => {});
 		child.once("exit", (code, signal) => {
+			if (this.child !== child) return; // superseded; a respawn owns the state now
 			const tail = stderrTail.trim();
 			const why = tail === "" ? "" : `\nstderr tail:\n${tail}`;
 			this.fail(new Error(`agent-video mcp exited (code ${code}, signal ${signal})${why}`));
 		});
-		child.once("error", (e) => this.fail(new Error(`agent-video mcp failed: ${e.message}`)));
+		child.once("error", (e) => {
+			if (this.child !== child) return;
+			this.fail(new Error(`agent-video mcp failed: ${e.message}`));
+		});
 		// A write into the window between server death and the 'exit' event
 		// surfaces as a stream error; without a listener Node throws it as an
 		// uncaught exception into the host. The 'exit' handler owns recovery.
@@ -134,12 +144,27 @@ class VideoServer {
 		child.stdout?.on("error", () => {});
 
 		this.ready = new Promise<void>((resolve, reject) => {
+			// A binary that hangs at startup must not pin the first call (and
+			// every call behind it) forever: kill it and fail the handshake;
+			// `fail` clears the state, so the next call respawns cleanly.
+			const deadline = setTimeout(() => {
+				child.kill();
+				this.fail(
+					new Error(
+						`agent-video mcp did not answer initialize within ${INIT_TIMEOUT_MS / 1000}s — killed; the next call restarts it`,
+					),
+				);
+			}, INIT_TIMEOUT_MS);
 			this.pending.set(1, {
 				resolve: () => {
+					clearTimeout(deadline);
 					this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
 					resolve();
 				},
-				reject,
+				reject: (error) => {
+					clearTimeout(deadline);
+					reject(error);
+				},
 			});
 			this.send({
 				jsonrpc: "2.0",

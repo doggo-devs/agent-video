@@ -574,8 +574,7 @@ mod tests {
         fs::write(&cfg.jar, &before).expect("write");
 
         let lease = JarLease::checkout(&cfg.jar).expect("checkout");
-        fs::write(lease.staged(), format!("{}\n", line(".c.com", "k", "x")))
-            .expect("write staged");
+        fs::write(lease.staged(), format!("{}\n", line(".c.com", "k", "x"))).expect("write staged");
         fs::set_permissions(&cfg.jar, fs::Permissions::from_mode(0o000)).expect("chmod");
         if fs::read_to_string(&cfg.jar).is_ok() {
             return; // privileged (e.g. root): unreadable cannot be simulated

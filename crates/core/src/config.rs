@@ -322,6 +322,12 @@ impl StrategyCfg {
                 format!("{} (must be finite and > 0)", opts.max_duration),
             );
         }
+        // `min_keyframes` needs no floor: 0 merely disables the
+        // keyframe-poor degrade/reject checks, and the downstream math is
+        // total — `mean_gap`/`max_gap` return 0 below two keyframes, and a
+        // run whose keyframe selection comes up empty fails with
+        // `NoFramesExtracted` (`pipeline::reject_empty_run`) instead of
+        // rendering an empty grid.
         Ok(Self {
             strategy: opts.strategy.unwrap_or(StrategyOpts::DEFAULT_STRATEGY),
             explicit: opts.strategy.is_some(),

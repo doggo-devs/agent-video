@@ -6,11 +6,16 @@
 //! belongs to the MCP stdio transport, and this crate builds with
 //! `panic = "abort"`, so an in-process decode panic would take the whole
 //! server down. Self-spawn buys stdout isolation and crash containment for
-//! the cost of one fork.
+//! the cost of one fork. Children are admitted through a small gate
+//! ([`MAX_CORE_CHILDREN`]): each one scales to every core, so running them
+//! unbounded would trample the machine, not parallelize it.
 
 use std::num::NonZeroI32;
 use std::process::{Command, ExitStatus};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+use crate::gate::Semaphore;
 
 /// How long one core run may take before it is killed. Server-side core
 /// work is local decode/compose on an already-fetched file — no network —
@@ -18,6 +23,24 @@ use std::time::Duration;
 /// child alive past it is wedged, and unbounded it would pin its server
 /// thread (and the MCP call riding on it) until process exit.
 const CORE_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+/// How many core children may run at once. Each child is sized to the
+/// whole machine — its ffmpeg decode threads and rayon compose pool both
+/// scale to every core — so parallel children multiply oversubscription,
+/// not throughput. Two lets one child's compute run under another's I/O
+/// stalls without letting N parallel grid calls schedule N × cores of
+/// work. Excess callers block on the gate (one blocked call is cheaper
+/// than a poll chain — the `sync_wait_seconds` stance in docs/config.md),
+/// and every holder is bounded by [`CORE_DEADLINE`], so slots keep
+/// turning over; admission order is the condvar's, not FIFO, so no
+/// per-waiter bound is promised — with two slots and callers that are
+/// themselves serialized agents, overtaking stays theoretical.
+const MAX_CORE_CHILDREN: usize = 2;
+
+/// Admission for [`SelfSpawn`] children. Lives at the spawn seam so every
+/// production core run is gated while the trait's test fakes stay free.
+static CORE_CHILDREN: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CORE_CHILDREN)));
 
 /// How a core child terminated. `Failure(0)` is unrepresentable, so
 /// "succeeded" and "has exit code 0" cannot drift apart.
@@ -83,6 +106,9 @@ pub struct SelfSpawn;
 
 impl CoreRunner for SelfSpawn {
     fn run(&self, args: &[String]) -> std::io::Result<CoreRun> {
+        // RAII permit: held across the child's whole life, freed on drop —
+        // panics included — so a failed run can never leak a slot.
+        let _slot = CORE_CHILDREN.acquire();
         let exe = std::env::current_exe()?;
         // Deadline-bounded with capped captures (see [`crate::proc`]): a
         // wedged child cannot pin this thread, and runaway stderr cannot

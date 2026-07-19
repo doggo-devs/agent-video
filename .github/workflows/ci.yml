@@ -63,7 +63,9 @@ jobs:
           fi
           grep -q "core binary not found" err.log
 
-  # Generated discovery surfaces must match tool/schema.ts + the version.
+  # Generated discovery surfaces must match the Rust tool schema (pinned as
+  # surfaces/video.schema.json by the pinned_surface_schema_is_current test)
+  # + the version.
   surfaces:
     runs-on: ubuntu-latest
     steps:

@@ -83,15 +83,21 @@ Protocol — the response always tells you what to do next:
    ${desc('confirm')}
 4. \`"status": "pending"\` — a background download is running; repeat the
    same call to poll.
-5. \`"status": "ready"\` — grid images plus one text block carrying time
-   ranges, key frames, subtitles, and notices.
+5. \`"status": "failed"\` — \`error\` is model-presentable prose, \`kind\` the
+   machine-readable class (\`bad_input\`, \`environment\`, \`transient\`,
+   \`internal\`).
+6. Success — a rendered grid is *not* a tagged body: one text block
+   carrying time ranges, key frames, subtitles, and notices, followed by
+   one JPEG image block per grid.
 
 Refining parameters:
 
 - \`from\` — ${desc('from')}
 - \`until\` — ${desc('until')}
 - \`look\` — ${desc('look')}
+- \`strategy\` — ${desc('strategy')}
 - \`raw\` — ${desc('raw')}
+- \`transcribe\` — ${desc('transcribe')}
 
 ## Bash path (no MCP client)
 

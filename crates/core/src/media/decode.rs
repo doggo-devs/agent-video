@@ -400,7 +400,7 @@ impl PacketGate {
 
 /// The decode thread's state; consumed by [`Worker::run`].
 struct Worker {
-    ictx: ffmpeg::format::context::Input,
+    ictx: super::InterruptibleInput,
     video: VideoStream,
     decoder: ffmpeg::decoder::Video,
     sampler: Sampler,
@@ -437,7 +437,7 @@ impl Worker {
             if self.stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            match packet.read(&mut self.ictx) {
+            match self.ictx.read_packet(&mut packet) {
                 Ok(()) => read_budget.ok(),
                 Err(ffmpeg::Error::Eof) => break,
                 // Interrupt callback tripped: a requested stop, not a failure.

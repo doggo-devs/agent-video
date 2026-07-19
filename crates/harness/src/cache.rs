@@ -4,6 +4,11 @@
 //! `downloads/` holds analysis rips (LRU by size), `probe/` holds probe
 //! documents and `transcripts/` whisper output (both evicted by age);
 //! mtime is the LRU clock, disk is the index — no manifest to corrupt.
+//! Staging names — what the sweep must spare or collect — are classified
+//! by [`naming`]'s predicates, the same module the writers construct them
+//! from.
+
+pub mod naming;
 
 use std::fs;
 use std::fs::File;
@@ -25,7 +30,8 @@ pub const PROBE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// budget is a soft target; correctness of just-published entries is not.
 pub const EVICT_GRACE: Duration = Duration::from_secs(5 * 60);
 
-/// Staging directories (crashed downloads) older than this are removed.
+/// Staging entries (`.part` files and `.staging-…` directories) older than
+/// this are removed: their writer crashed and no owner is left.
 const STALE_STAGING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Subtitle sidecar extensions living next to cached downloads.
@@ -121,7 +127,7 @@ impl Cache {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let is_media = name.starts_with(&prefix)
-                && !name.ends_with(".part")
+                && !naming::is_part_file(name)
                 && !SUBTITLE_EXTS
                     .iter()
                     .any(|ext| name.ends_with(&format!(".{ext}")));
@@ -139,7 +145,8 @@ impl Cache {
     /// Evict downloads down to `max_bytes` (oldest first, sparing in-flight
     /// `.part` files and anything younger than [`EVICT_GRACE`]), drop probe
     /// documents / transcripts past [`PROBE_MAX_AGE`], and clear staging
-    /// directories abandoned by crashed downloads; returns removed paths.
+    /// files and directories abandoned by crashed writers; returns removed
+    /// paths.
     ///
     /// Accounting is honest: a file that cannot be deleted keeps counting
     /// toward the total and never appears in the removed list, so a
@@ -153,7 +160,7 @@ impl Cache {
         let is_in_flight = |f: &Stat| {
             f.path.file_name().is_some_and(|n| {
                 let n = n.to_string_lossy();
-                n.ends_with(".part") || n.starts_with(crate::fetch::STAGING_PREFIX)
+                naming::is_part_file(&n) || naming::is_staging_dir(&n)
             })
         };
         let mut downloads = list_with_stats(&self.downloads_dir);
@@ -189,27 +196,37 @@ impl Cache {
         removed
     }
 
-    /// Remove staging directories whose downloads crashed: normal completion
-    /// (and failure) removes them on drop, so anything past
-    /// [`STALE_STAGING_AGE`] has no owner left.
+    /// Remove staging entries whose writers crashed, in every directory
+    /// writers stage in: `.part` files (direct downloads in `downloads/`,
+    /// whisper output in `transcripts/`) and `.staging-…` directories
+    /// (yt-dlp jobs in `downloads/`). Normal completion and failure both
+    /// remove staging on the spot, so anything past [`STALE_STAGING_AGE`]
+    /// has no owner left; a live writer keeps its entry's mtime fresh, so
+    /// age is the ownership test.
     fn sweep_stale_staging(&self, now: SystemTime) {
-        let Ok(entries) = fs::read_dir(&self.downloads_dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let is_staging = name
-                .to_string_lossy()
-                .starts_with(crate::fetch::STAGING_PREFIX);
-            let abandoned = entry.metadata().is_ok_and(|m| {
-                m.is_dir()
-                    && m.modified().is_ok_and(|mtime| {
-                        now.duration_since(mtime)
-                            .is_ok_and(|age| age > STALE_STAGING_AGE)
-                    })
-            });
-            if is_staging && abandoned {
-                let _ = fs::remove_dir_all(entry.path());
+        for dir in [&self.downloads_dir, &self.transcripts_dir] {
+            let Ok(entries) = fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !naming::is_part_file(&name) && !naming::is_staging_dir(&name) {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else { continue };
+                let abandoned = meta.modified().is_ok_and(|mtime| {
+                    now.duration_since(mtime)
+                        .is_ok_and(|age| age > STALE_STAGING_AGE)
+                });
+                if !abandoned {
+                    continue;
+                }
+                let _ = if meta.is_dir() {
+                    fs::remove_dir_all(entry.path())
+                } else {
+                    fs::remove_file(entry.path())
+                };
             }
         }
     }
@@ -418,7 +435,9 @@ mod tests {
     fn evict_clears_abandoned_staging_dirs() {
         let (cache, _dir) = cache(1024);
         let dir = cache.ensure_downloads_dir().expect("mkdir").to_path_buf();
-        let staging = dir.join(format!("{}k-999", crate::fetch::STAGING_PREFIX));
+        // The name a real writer would stage under, straight from the
+        // grammar's constructor: the sweep must recognize its own inverse.
+        let staging = dir.join(naming::staging_dir_name("k"));
         std::fs::create_dir_all(&staging).expect("mkdir staging");
         std::fs::write(staging.join("k.mp4.part"), b"x").expect("write");
 
@@ -428,6 +447,56 @@ mod tests {
         let long_ago = SystemTime::now() + Duration::from_secs(2 * 24 * 60 * 60);
         cache.evict(long_ago);
         assert!(!staging.exists(), "a crashed download's staging is swept");
+    }
+
+    #[test]
+    fn sweeps_aged_crashed_part_files_in_every_staging_dir() {
+        let (cache, _dir) = cache(1024);
+        let dl = cache.ensure_downloads_dir().expect("mkdir").to_path_buf();
+        // The names real writers stage under, straight from the grammar's
+        // constructor: a direct download and a whisper transcript.
+        let dl_part = naming::part_path(&dl.join("k.mp4"));
+        let srt = cache.transcript_path(&ContentId::new("fp"), "m");
+        std::fs::create_dir_all(srt.parent().expect("parent")).expect("mkdir");
+        let srt_part = naming::part_path(&srt);
+        for p in [&dl_part, &srt_part] {
+            std::fs::write(p, b"x").expect("write");
+        }
+
+        let long_ago = SystemTime::now() + Duration::from_secs(2 * 24 * 60 * 60);
+        cache.evict(long_ago);
+        assert!(!dl_part.exists(), "a crashed download's .part is swept");
+        assert!(!srt_part.exists(), "a crashed transcript's .part is swept");
+    }
+
+    #[test]
+    fn spares_fresh_part_files_from_the_staleness_sweep() {
+        let (cache, _dir) = cache(1024);
+        let srt = cache.transcript_path(&ContentId::new("fp"), "m");
+        std::fs::create_dir_all(srt.parent().expect("parent")).expect("mkdir");
+        let part = naming::part_path(&srt);
+        std::fs::write(&part, b"x").expect("write");
+
+        cache.evict(SystemTime::now());
+        assert!(part.exists(), "a fresh .part may be in flight");
+    }
+
+    #[test]
+    fn staleness_sweep_leaves_published_entries_untouched() {
+        let (cache, _dir) = cache(1024);
+        let dl = cache.ensure_downloads_dir().expect("mkdir").to_path_buf();
+        let media = dl.join("k.mp4");
+        std::fs::write(&media, b"x").expect("write");
+        let srt = cache.transcript_path(&ContentId::new("fp"), "m");
+        std::fs::create_dir_all(srt.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&srt, b"cues").expect("write");
+
+        // Past STALE_STAGING_AGE but inside PROBE_MAX_AGE: only staging
+        // names may go, and there are none.
+        let later = SystemTime::now() + STALE_STAGING_AGE + Duration::from_secs(60);
+        let removed = cache.evict(later);
+        assert!(removed.is_empty());
+        assert!(media.exists() && srt.exists());
     }
 
     #[test]

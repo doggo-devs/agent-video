@@ -9,7 +9,9 @@
 use super::config::Config;
 use super::look::preset_for;
 use super::raw::{RawSubcommand, parse_raw};
-use super::schema::{Look, ProbeSummary, RecommendedCall, Strategy, VideoArgs};
+use super::schema::{
+    CONFIRM_ALONE, GridSpec, Intent, Look, ProbeSummary, RecommendedCall, Strategy, VideoArgs,
+};
 use super::time::{ArgError, Window, resolve_window};
 use super::tokens::{DownloadPlan, Offer, PendingAction, Redemption, Token, Tokens};
 use agent_video_core::types::format_ts;
@@ -84,15 +86,17 @@ pub fn decide(args: &VideoArgs, probe: &ProbeSummary, cfg: &Config) -> Decision 
 
 /// Redeem a consent token: a lookup against the pending store, no probe
 /// needed (a URL source may not exist locally until its download runs).
+/// Only a pure confirm redeems; anything else is told to pass it alone
+/// (the handler routes here exactly when `confirm` is present).
 pub fn redeem(args: &VideoArgs, store: &Tokens) -> Decision {
-    if args.raw.is_some() || args.has_intent() || args.transcribe == Some(true) {
-        return Decision::Reject {
-            message: "confirm must be passed alone (with source): it authorizes exactly the \
-                      pending plan, nothing else"
-                .to_string(),
-        };
-    }
-    let token = Token::new(args.confirm.as_deref().unwrap_or(""));
+    let token = match args.intent() {
+        Ok(Intent::Confirm(token)) => Token::new(token),
+        _ => {
+            return Decision::Reject {
+                message: CONFIRM_ALONE.to_string(),
+            };
+        }
+    };
     let Some(redemption) = store.take(&args.source, &token) else {
         return Decision::Reject {
             message: format!(
@@ -122,46 +126,38 @@ fn decide_inner(
     probe: &ProbeSummary,
     cfg: &Config,
 ) -> Result<Decision, ArgError> {
-    // The caller redeems consent before deciding; the message matches
-    // redeem's own guard so the model sees one story either way.
-    if args.confirm.is_some() {
-        return Err(ArgError(
-            "confirm must be passed alone (with source): it authorizes exactly the \
-             pending plan, nothing else"
-                .to_string(),
-        ));
-    }
+    let grid = match args.intent()? {
+        // The caller redeems consent before deciding; a confirm reaching
+        // the decision engine — even alone — is out of band and told the
+        // same story as redeem's, so the model sees one message either way.
+        Intent::Confirm(_) => return Err(ArgError(CONFIRM_ALONE.to_string())),
+        Intent::Raw(raw) => return decide_raw(raw, probe, cfg),
+        // The caller routes transcription before deciding; a stray
+        // transcribe carries no grid fields (`intent` guarantees it), so it
+        // decides as a bare source.
+        Intent::Transcribe => GridSpec::default(),
+        Intent::Grid(grid) => grid,
+    };
 
-    if args.raw.is_some() {
-        if args.has_intent() {
-            return Err(ArgError(
-                "raw is mutually exclusive with from/until/look/strategy: raw callers own the \
-                 strategy entirely"
-                    .to_string(),
-            ));
-        }
-        return decide_raw(args, probe, cfg);
-    }
-
-    let window = resolve_window(args.from.as_ref(), args.until.as_ref(), probe.duration)?;
-    let preset = preset_for(args.look);
-    let span = window.end - window.start;
+    let (window, mut notices) = resolve_window(grid.from, grid.until, probe.duration)?;
+    let preset = preset_for(grid.look);
+    let span = window.span();
     let natural = ((span / preset.chunk_seconds).ceil() as u32).max(1);
 
     // Bare source on anything non-trivial: plan first, decode later.
-    if !args.has_intent() && natural > cfg.budget.auto_run.get() {
+    if grid.is_bare() && natural > cfg.budget.auto_run.get() {
         return Ok(Decision::Plan(plan_response(&args.source, probe, cfg)));
     }
 
     let mut preset_flags: Vec<String> = preset.flags.iter().map(|s| s.to_string()).collect();
-    if let Some(flag) = args.strategy.and_then(Strategy::core_flag) {
+    if let Some(flag) = grid.strategy.and_then(Strategy::core_flag) {
         preset_flags.extend(["--strategy".to_string(), flag.to_string()]);
     }
 
     // An explicit strategy is a temporal-selection request extract's dense
     // range sampling would ignore, so it stays on the process path.
-    if natural == 1 && args.strategy.is_none() {
-        let range = format!("{}-{}", window.start.floor(), window.end.ceil());
+    if natural == 1 && grid.strategy.is_none() {
+        let range = format!("{}-{}", window.start().floor(), window.end().ceil());
         let mut flags = preset_flags;
         flags.extend(["--range".to_string(), range]);
         return Ok(Decision::Run {
@@ -172,15 +168,15 @@ fn decide_inner(
                 window: None,
                 predicted_grids: 1,
             },
-            notices: window.notices,
+            notices,
         });
     }
 
     let max = cfg.budget.max.get();
     if natural <= max {
         return Ok(Decision::Run {
-            invocation: process_invocation(preset_flags, &window, natural),
-            notices: window.notices,
+            invocation: process_invocation(preset_flags, window, natural),
+            notices,
         });
     }
 
@@ -188,9 +184,8 @@ fn decide_inner(
     let stretched = (span / f64::from(max)).ceil();
     let mut flags = preset_flags;
     flags.extend(["--chunk-seconds".to_string(), format!("{stretched}")]);
-    let invocation = process_invocation(flags, &window, max);
+    let invocation = process_invocation(flags, window, max);
     if stretched <= MAX_CHUNK_STRETCH_S {
-        let mut notices = window.notices;
         notices.push(format!(
             "budget: {natural} grids at requested density exceeds the {max}-grid budget; each \
              grid now covers ~{stretched}s (degraded temporal resolution). Zoom into ranges \
@@ -218,7 +213,8 @@ fn decide_inner(
             // newer plan.
             token: Token::new(format!(
                 "force-stretch-{max}-grids-{}-{}",
-                window.start as u64, window.end as u64
+                window.start() as u64,
+                window.end() as u64
             )),
             effect: format!("run anyway: {max} grids, ~{stretched}s of video per grid"),
             action: PendingAction::Core(invocation),
@@ -226,8 +222,8 @@ fn decide_inner(
     })
 }
 
-fn decide_raw(args: &VideoArgs, probe: &ProbeSummary, cfg: &Config) -> Result<Decision, ArgError> {
-    let raw = parse_raw(args.raw.as_deref().unwrap_or(""))?;
+fn decide_raw(raw: &str, probe: &ProbeSummary, cfg: &Config) -> Result<Decision, ArgError> {
+    let raw = parse_raw(raw)?;
     if raw.subcommand == RawSubcommand::Extract {
         return Ok(Decision::Run {
             invocation: CoreInvocation {
@@ -284,12 +280,12 @@ fn flags_fingerprint(flags: &[String]) -> u16 {
     (h.finish() & 0xffff) as u16
 }
 
-fn process_invocation(flags: Vec<String>, window: &Window, predicted_grids: u32) -> CoreInvocation {
+fn process_invocation(flags: Vec<String>, window: Window, predicted_grids: u32) -> CoreInvocation {
     CoreInvocation {
         subcommand: RawSubcommand::Process,
         flags,
         subtitle: None,
-        window: (!window.full).then_some((window.start, window.end)),
+        window: (!window.is_full()).then_some((window.start(), window.end())),
         predicted_grids,
     }
 }

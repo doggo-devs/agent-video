@@ -404,10 +404,17 @@ pub fn format_ts(ts: f32) -> String {
     }
 }
 
-/// Metadata for a single key (hero) frame inside a grid.
+/// Metadata for a single key (hero) frame inside a grid. Rides the wire
+/// unchanged inside [`crate::wire::Grid`], so both value fields are frozen
+/// presentation, not pipeline data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyFrameMeta {
+    /// Presentation timestamp, frozen at grid-build time by [`format_ts`]
+    /// (`MM:SS`, `H:MM:SS` past an hour) — wire-frozen display text, not a
+    /// number to compute with.
     pub timestamp: String,
+    /// [`Score`] rounded to the nearest integer, so `0..=100` by
+    /// provenance.
     pub score: u32,
     pub grid_position: GridPosition,
 }

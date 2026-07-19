@@ -11,23 +11,132 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{GridImage, GridMeta, GridSubtitles, KeyFrameMeta, LayoutKind, Settings};
+use crate::types::{
+    GridImage, GridMeta, GridSubtitles, KeyFrameMeta, LayoutKind, Settings, TimeRange,
+};
 
 /// Top-level output document of one run.
+///
+/// `duration` and `range` are a mode pair — the discrimination rule is the
+/// wire contract: `range` present marks an `extract` document and `duration`
+/// is that segment's span; `range` absent marks a `process` document and
+/// `duration` is the total source duration in seconds (probed when
+/// available, floored by the frame-derived estimate). The pair is private so
+/// the two readings cannot be confused: construct through
+/// [`Metadata::process`] / [`Metadata::extract`], read through
+/// [`Metadata::coverage`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     pub source: String,
-    /// `process`: total source duration in seconds (probed when available,
-    /// floored by the frame-derived estimate). `extract`: the span of
-    /// [`Self::range`].
-    pub duration: f32,
-    /// The harvested sub-range `(start, end)` in seconds; present exactly
-    /// when the document came from `extract`, so consumers can tell a
-    /// segment's span from a video's total duration.
+    duration: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range: Option<(f32, f32)>,
+    range: Option<Segment>,
     pub settings: Settings,
     pub grids: Vec<Grid>,
+}
+
+impl Metadata {
+    /// A `process` document: `duration` is the total source duration.
+    pub fn process(source: String, duration: f32, settings: Settings, grids: Vec<Grid>) -> Self {
+        Metadata {
+            source,
+            duration,
+            range: None,
+            settings,
+            grids,
+        }
+    }
+
+    /// An `extract` document: the wire `duration` is derived here from the
+    /// segment — always the harvested span, never a source total.
+    pub fn extract(source: String, segment: Segment, settings: Settings, grids: Vec<Grid>) -> Self {
+        Metadata {
+            source,
+            duration: segment.span(),
+            range: Some(segment),
+            settings,
+            grids,
+        }
+    }
+
+    /// The mode-discriminated reading of the `duration`/`range` pair.
+    pub fn coverage(&self) -> Coverage {
+        match self.range {
+            Some(segment) => Coverage::Segment(segment),
+            None => Coverage::Source(self.duration),
+        }
+    }
+
+    /// Total source duration; `None` for `extract` documents, whose
+    /// `duration` is a segment span, not a total.
+    pub fn total_duration(&self) -> Option<f32> {
+        self.range.is_none().then_some(self.duration)
+    }
+
+    /// The harvested segment; `None` for `process` documents.
+    pub fn segment(&self) -> Option<Segment> {
+        self.range
+    }
+}
+
+/// What a document's `duration` measures, discriminated by `range`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Coverage {
+    /// A `process` document: the total source duration in seconds.
+    Source(f32),
+    /// An `extract` document: one harvested segment of the source.
+    Segment(Segment),
+}
+
+/// A harvested sub-range of the source, in seconds. On the wire it is the
+/// `[start, end]` two-element array `metadata.json` has always carried;
+/// deserialization enforces what construction guarantees: both bounds
+/// finite, `start <= end`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "(f32, f32)", into = "(f32, f32)")]
+pub struct Segment {
+    start: f32,
+    end: f32,
+}
+
+impl Segment {
+    pub fn start(self) -> f32 {
+        self.start
+    }
+
+    pub fn end(self) -> f32 {
+        self.end
+    }
+
+    /// Seconds covered; non-negative by construction.
+    pub fn span(self) -> f32 {
+        self.end - self.start
+    }
+}
+
+impl From<TimeRange> for Segment {
+    fn from(r: TimeRange) -> Self {
+        Segment {
+            start: r.start(),
+            end: r.end(),
+        }
+    }
+}
+
+impl From<Segment> for (f32, f32) {
+    fn from(s: Segment) -> (f32, f32) {
+        (s.start, s.end)
+    }
+}
+
+impl TryFrom<(f32, f32)> for Segment {
+    type Error = String;
+
+    fn try_from((start, end): (f32, f32)) -> Result<Self, Self::Error> {
+        TimeRange::new(start, end)
+            .map(Segment::from)
+            .ok_or_else(|| format!("range [{start}, {end}] must be finite and ordered"))
+    }
 }
 
 /// One rendered grid image and its description.
@@ -68,7 +177,7 @@ impl From<GridMeta> for Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Detail, GridPosition, Quality, TimeRange};
+    use crate::types::{Detail, GridPosition, Quality};
 
     fn grid_meta(image: GridImage) -> GridMeta {
         GridMeta {
@@ -85,18 +194,20 @@ mod tests {
         }
     }
 
-    fn doc(grids: Vec<Grid>) -> Metadata {
-        Metadata {
-            source: "v.mp4".to_string(),
-            duration: 90.0,
-            range: None,
-            settings: Settings {
-                max_edge: 2048,
-                quality: Quality::Low,
-                detail: Detail::Standard,
-            },
-            grids,
+    fn settings() -> Settings {
+        Settings {
+            max_edge: 2048,
+            quality: Quality::Low,
+            detail: Detail::Standard,
         }
+    }
+
+    fn doc(grids: Vec<Grid>) -> Metadata {
+        Metadata::process("v.mp4".to_string(), 90.0, settings(), grids)
+    }
+
+    fn segment(start: f32, end: f32) -> Segment {
+        Segment::try_from((start, end)).expect("valid segment")
     }
 
     #[test]
@@ -107,8 +218,9 @@ mod tests {
         let json = serde_json::to_string(&meta).expect("serialize");
         let back: Metadata = serde_json::from_str(&json).expect("deserialize own output");
         assert_eq!(back.source, "v.mp4");
-        assert_eq!(back.duration, 90.0);
-        assert_eq!(back.range, None);
+        assert_eq!(back.coverage(), Coverage::Source(90.0));
+        assert_eq!(back.total_duration(), Some(90.0));
+        assert_eq!(back.segment(), None);
         assert_eq!(back.grids.len(), 1);
         let grid = &back.grids[0];
         assert!(matches!(&grid.image, GridImage::Base64(b) if b == "QUJD"));
@@ -157,5 +269,60 @@ mod tests {
         // and `base64` is not representable.
         let json = r#"{"time_range": "00:00-01:30", "total_frames": 1, "layout": "UNIFORM"}"#;
         assert!(serde_json::from_str::<Grid>(json).is_err());
+    }
+
+    /// Byte-for-byte pin of a `process` document, captured before `duration`
+    /// and `range` went private — the compatibility proof for the public
+    /// `metadata.json` / `--json` contract.
+    #[test]
+    fn keeps_process_wire_json_byte_identical() {
+        let meta = doc(vec![Grid::from(grid_meta(GridImage::File(
+            "grid_001.jpg".to_string(),
+        )))]);
+        assert_eq!(
+            serde_json::to_string(&meta).expect("serialize"),
+            r#"{"source":"v.mp4","duration":90.0,"settings":{"max_edge":2048,"quality":"low","detail":"standard"},"grids":[{"file":"grid_001.jpg","time_range":"00:00-01:30","total_frames":12,"key_frames":[{"timestamp":"00:10","score":5,"grid_position":"hero"}],"layout":"UNIFORM","subtitles":"00:01 hi"}]}"#
+        );
+    }
+
+    /// Byte-for-byte pin of an `extract` document: `range` stays a bare
+    /// `[start, end]` array and `duration` its span.
+    #[test]
+    fn keeps_extract_wire_json_byte_identical() {
+        let meta = Metadata::extract(
+            "v.mp4".to_string(),
+            segment(1.0, 3.0),
+            settings(),
+            vec![Grid::from(grid_meta(GridImage::File(
+                "grid_001.jpg".to_string(),
+            )))],
+        );
+        assert_eq!(
+            serde_json::to_string(&meta).expect("serialize"),
+            r#"{"source":"v.mp4","duration":2.0,"range":[1.0,3.0],"settings":{"max_edge":2048,"quality":"low","detail":"standard"},"grids":[{"file":"grid_001.jpg","time_range":"00:00-01:30","total_frames":12,"key_frames":[{"timestamp":"00:10","score":5,"grid_position":"hero"}],"layout":"UNIFORM","subtitles":"00:01 hi"}]}"#
+        );
+    }
+
+    #[test]
+    fn round_trips_segment_as_tuple() {
+        let json = serde_json::to_string(&segment(1.0, 3.0)).expect("serialize");
+        assert_eq!(json, "[1.0,3.0]");
+        let back: Segment = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!((back.start(), back.end(), back.span()), (1.0, 3.0, 2.0));
+    }
+
+    #[test]
+    fn rejects_inverted_segment_on_deserialize() {
+        assert!(serde_json::from_str::<Segment>("[3.0,1.0]").is_err());
+    }
+
+    #[test]
+    fn reads_extract_coverage_as_segment() {
+        let meta = Metadata::extract("v.mp4".to_string(), segment(1.0, 3.0), settings(), vec![]);
+        assert_eq!(meta.total_duration(), None, "span is not a total");
+        let Coverage::Segment(seg) = meta.coverage() else {
+            panic!("extract documents read as segments");
+        };
+        assert_eq!((seg.start(), seg.end()), (1.0, 3.0));
     }
 }

@@ -160,15 +160,15 @@ pub fn extract_range(
         None => crate::types::GridSubtitles::NoSource,
     };
 
-    // `duration` carries the harvested span; `range` marks the document as
-    // an extract, so consumers cannot mistake the span for a total duration.
-    let meta = wire::Metadata {
-        source: input.to_string(),
-        duration: range.duration(),
-        range: Some((range.start(), range.end())),
-        settings: cfg.settings(),
-        grids: vec![grid_meta.into()],
-    };
+    // `range` marks the document as an extract; the constructor derives the
+    // wire `duration` from the segment, so consumers cannot mistake the
+    // harvested span for a total duration.
+    let meta = wire::Metadata::extract(
+        input.to_string(),
+        wire::Segment::from(range),
+        cfg.settings(),
+        vec![grid_meta.into()],
+    );
 
     // No subtitles.txt: the range-sliced cues already travel in the metadata.
     session.commit(&meta, None, events)?;

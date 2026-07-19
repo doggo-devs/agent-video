@@ -83,8 +83,8 @@ the registry keys on them, nothing parses them.
 
 `confirm` must be passed alone (only with `source`). Combining it with `raw`,
 any intent argument, or `transcribe` is rejected — it authorizes exactly the
-pending plan, nothing else, and both the redeem path and the decision engine
-enforce the same rule so the model sees one story either way.
+pending plan, nothing else; the rule is enforced once, where arguments are
+refined into an intent, so the model sees one story on every path.
 
 ## Fault classification
 

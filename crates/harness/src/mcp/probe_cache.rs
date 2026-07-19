@@ -70,8 +70,16 @@ pub(super) fn cached_probe(
             let p = deps.prober.probe(file)?;
             if fp.stable
                 && let Some(doc) = render_probe_doc(&p)
+                && let Err(e) = deps.cache.put_probe(&fp.id, &doc)
             {
-                let _ = deps.cache.put_probe(&fp.id, &doc);
+                // Miss semantics stay (a fresh probe answered the call), but
+                // a permanently broken cache dir would otherwise degrade to
+                // a full re-probe on every call with no trace.
+                tracing::warn!(
+                    file = %file.display(),
+                    error = %e,
+                    "probe cache write failed; probing fresh until it heals"
+                );
             }
             p
         }
@@ -126,7 +134,10 @@ mod tests {
 
     #[test]
     fn sidecars_never_enter_the_cached_doc() {
-        let env = env(probe(90.0, vec!["embedded #0 (eng, subrip)".to_string()]), false);
+        let env = env(
+            probe(90.0, vec!["embedded #0 (eng, subrip)".to_string()]),
+            false,
+        );
         let file = media_file(&env, "talk.mp4");
         std::fs::write(env.dir.join("talk.srt"), b"").expect("write sidecar");
 
@@ -161,7 +172,10 @@ mod tests {
         // second call was a hit, not a fresh probe.
         let marker = render_probe_doc(&probe(90.0, vec!["embedded #0 (marker)".to_string()]))
             .expect("renders");
-        env.deps.cache.put_probe(&id, &marker).expect("seed marker doc");
+        env.deps
+            .cache
+            .put_probe(&id, &marker)
+            .expect("seed marker doc");
 
         let (hit, _) = cached_probe(&file_b, &env.deps).expect("second probe");
 
