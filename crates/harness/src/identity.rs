@@ -123,8 +123,6 @@ mod tests {
         // Cross-language pin: bun -e 'digestParts(Buffer.from("head"), Buffer.from("tail"), 8)'
         // must produce the same hex, keeping existing caches valid.
         let hex = digest_parts(b"head", b"tail", 8);
-        // Pinned against the TS harness (`digestParts`) — equality keeps
-        // caches written by the old harness valid.
         assert_eq!(hex.as_str(), "34c1f7afec88cc36dc043f6bcdeafd05");
         assert_ne!(digest_parts(b"head", b"tail", 9), hex, "size feeds digest");
         assert_ne!(digest_parts(b"heap", b"tail", 8), hex, "head feeds digest");
@@ -174,7 +172,7 @@ mod tests {
         assert_eq!(a.id, b.id, "sampled identity ignores middle bytes");
     }
 
-    fn tempdir() -> crate::testutil::TempDir {
-        crate::testutil::TempDir::new("av-identity")
+    fn tempdir() -> crate::tempdir::TempDir {
+        crate::tempdir::TempDir::new("av-identity")
     }
 }

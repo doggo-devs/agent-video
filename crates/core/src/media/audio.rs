@@ -39,7 +39,7 @@ pub fn decode_audio_16k_mono(source: &Source) -> Result<Option<Vec<f32>>> {
 /// A pull stream of 16 kHz mono f32 samples from one audio track.
 ///
 /// Owns the demux → decode → resample pipeline; [`Self::fill`] advances it
-/// on demand. Per-packet failures are absorbed by an [`ErrorBudget`], so
+/// on demand. Per-packet failures are absorbed by an `ErrorBudget`, so
 /// only a permanently broken stream surfaces as an error.
 pub struct AudioSamples {
     ictx: ffmpeg::format::context::Input,
@@ -180,7 +180,7 @@ impl AudioSamples {
 /// frame with nonsense parameters. A fixed swresample context answers all
 /// of those with `AVERROR_INPUT_CHANGED` and would kill the stream; this
 /// sink instead reconfigures for coherent changes and reports garbage
-/// frames as per-frame errors the caller's [`ErrorBudget`] can absorb.
+/// frames as per-frame errors the caller's `ErrorBudget` can absorb.
 struct MonoSink {
     ctx: resampling::Context,
     format: Sample,

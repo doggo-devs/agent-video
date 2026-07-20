@@ -210,8 +210,8 @@ impl Rect {
 /// DUAL_HERO / TOP_STRIP) label composed grids for metadata; STATIC marks a
 /// static stretch collapsed into a single representative image.
 ///
-/// Serializes as the SCREAMING_SNAKE_CASE name, so the JSON contract is
-/// byte-identical to the old string constants.
+/// Serializes as the SCREAMING_SNAKE_CASE name; the wire strings are a
+/// compatibility contract and must not move (locked by test).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum LayoutKind {
@@ -541,8 +541,8 @@ mod tests {
     }
 
     #[test]
-    fn serializes_layout_and_position_as_legacy_strings() {
-        // JSON payload must not move from the legacy string constants.
+    fn serializes_layout_and_position_as_wire_strings() {
+        // Wire compatibility: the serialized strings must not move.
         for (kind, expected) in [
             (LayoutKind::Uniform, "UNIFORM"),
             (LayoutKind::HeroLeft, "HERO_LEFT"),

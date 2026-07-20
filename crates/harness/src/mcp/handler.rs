@@ -2,7 +2,7 @@
 //! The `video` call flow, from coerced arguments to a wire result.
 //!
 //! Couriers one call through cached probe, policy ([`crate::plan`],
-//! [`crate::url_policy`]), and execution: core runs (self-spawned, JSON
+//! [`crate::offer`]), and execution: core runs (self-spawned, JSON
 //! captured), downloads (grace window then detach into the
 //! [`crate::mcp::tracker::Tracker`]), and whisper transcription. Everything
 //! here is synchronous; the rmcp server hosts it via `spawn_blocking`.
@@ -22,12 +22,12 @@ use super::tracker::Poll;
 use super::wire::{coerce_args, failed, foreign_scheme, is_url, json_result, pending_result};
 use crate::fault::Fault;
 use crate::fetch::rip_key;
+use crate::offer::decide_url;
 use crate::plan::{Decision, PlanDecision, decide, redeem};
 use crate::schema::OfferedToken;
 use crate::schema::{Intent, RecommendedCall, VideoArgs, VideoBody};
 use crate::time::ArgError;
 use crate::tokens::{Dest, OfferDraft};
-use crate::url_policy::decide_url;
 
 // ── tool handler ──
 

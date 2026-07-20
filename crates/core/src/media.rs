@@ -13,8 +13,8 @@
 
 pub mod audio;
 pub mod decode;
+pub mod embedded_subtitle;
 mod scale;
-pub mod subtitle;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
@@ -76,7 +76,29 @@ pub fn open_input_interruptible(
     options: &[(&str, &str)],
 ) -> Result<InterruptibleInput> {
     init();
-    open_with_interrupt_and_options(source, stop, options).map_err(|e| open_error(source, e))
+    let path = path_cstring(source)?;
+    open_with_interrupt_and_options(&path, stop, options).map_err(|e| open_error(source, e))
+}
+
+/// The source path as the C string libav's open call takes.
+///
+/// Rejecting a non-UTF-8 or interior-NUL path here — rather than asserting
+/// invariants maintained layers away (URL vetting upstream, file opens that
+/// reject NUL) — keeps a new call path from turning a weird filename into a
+/// process abort: this library's servers build with `panic = "abort"`.
+fn path_cstring(source: &Source) -> Result<std::ffi::CString> {
+    let path = source.ffmpeg_path();
+    path.as_os_str()
+        .to_str()
+        .ok_or("is not valid UTF-8")
+        .and_then(|text| std::ffi::CString::new(text).map_err(|_| "contains an interior NUL byte"))
+        .map_err(|why| {
+            Error::new(
+                ErrorCode::InputUnreadable,
+                format!("cannot open {source}: the path {why}"),
+            )
+            .with_context(ErrorContext::default().with_input(source.as_path()))
+        })
 }
 
 /// An opened container whose blocking I/O observes a stop flag.
@@ -155,21 +177,12 @@ unsafe extern "C" fn interrupt_poll(opaque: *mut std::ffi::c_void) -> std::ffi::
 /// and pass the options dictionary on one `AVFormatContext`. Returning
 /// libav's raw error keeps the coded mapping in one place ([`open_error`]).
 fn open_with_interrupt_and_options(
-    source: &Source,
+    path: &std::ffi::CStr,
     stop: Arc<AtomicBool>,
     options: &[(&str, &str)],
 ) -> std::result::Result<InterruptibleInput, ffmpeg::Error> {
     use ffmpeg::format::context::Input;
-    use std::ffi::CString;
 
-    let path = CString::new(
-        source
-            .ffmpeg_path()
-            .as_os_str()
-            .to_str()
-            .expect("source path is valid UTF-8"),
-    )
-    .expect("source path has no interior NUL");
     let mut dict = ffmpeg::Dictionary::new();
     for (key, value) in options {
         dict.set(key, value);
@@ -565,6 +578,13 @@ pub fn decode_error(context: &str, e: ffmpeg::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_path_with_interior_nul() {
+        let source = Source::Local(std::path::PathBuf::from("/tmp/vid\0eo.mp4"));
+        let err = path_cstring(&source).expect_err("an interior NUL cannot reach libav");
+        assert_eq!(err.code, ErrorCode::InputUnreadable);
+    }
 
     #[test]
     fn rebases_pts_to_the_video_clock() {

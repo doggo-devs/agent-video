@@ -102,10 +102,10 @@ impl fmt::Display for UrlRejection {
 impl std::error::Error for UrlRejection {}
 
 /// The one mapping from egress verdicts into harness fault classes: a
-/// malformed or forbidden URL is the caller's ([`Fault::bad_input`] —
+/// malformed or forbidden URL is the caller's (`Fault::bad_input` —
 /// retrying the identical call cannot succeed), but a name that failed to
 /// resolve may be a resolver outage or a network blip, so it is
-/// [`Fault::transient`]. The typed rejection survives in the source chain.
+/// `Fault::transient`. The typed rejection survives in the source chain.
 impl From<UrlRejection> for crate::fault::Fault {
     fn from(rejection: UrlRejection) -> Self {
         use crate::fault::Fault;

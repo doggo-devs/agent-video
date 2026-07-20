@@ -22,7 +22,7 @@
 //! may use it. That grants no new authority — the screen applies to every
 //! connection, and a local process could dial out directly anyway — but
 //! traffic through it egresses with this process's identity, worth knowing
-//! on shared machines. Concurrency is bounded: at most [`MAX_TUNNELS`]
+//! on shared machines. Concurrency is bounded: at most `MAX_TUNNELS`
 //! connections are served at once, and anything past the cap is refused
 //! with `503` rather than growing threads without limit.
 
@@ -49,9 +49,9 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Idle bound per direction on an established tunnel. A client that
 /// vanished without FIN/RST (a hard-killed subprocess, a dropped link)
-/// used to pin its handler thread and both sockets until process exit;
-/// with the bound, a direction that moves no bytes for this long errors
-/// out of its `io::copy` and the tunnel closes. Far above every consumer's
+/// would otherwise pin its handler thread and both sockets until process
+/// exit; a direction that moves no bytes for this long errors out of its
+/// `io::copy` and the tunnel closes. Far above every consumer's
 /// own liveness bound (yt-dlp's watchdog aborts at 480s of no progress,
 /// CDNs idle out well under this), so it only reaps connections nothing is
 /// waiting on.
@@ -88,7 +88,7 @@ impl PolicyRelay {
     /// Bind `127.0.0.1:0` and start the accept loop on its own thread. Each
     /// accepted connection is handled on a fresh thread, so concurrent
     /// downloads (yt-dlp opens many) never serialize behind one another,
-    /// capped at [`MAX_TUNNELS`] live connections.
+    /// capped at `MAX_TUNNELS` live connections.
     pub fn start(allow_private: bool) -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let local = listener.local_addr()?;

@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn hashes_file_contents() {
-        let dir = crate::testutil::TempDir::new("av-install");
+        let dir = crate::tempdir::TempDir::new("av-install");
         let p = dir.join("x.bin");
         std::fs::write(&p, b"abc").expect("write");
         assert_eq!(
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn sweeps_stale_part_files_but_keeps_finished_weights() {
-        let dir = crate::testutil::TempDir::new("av-sweep");
+        let dir = crate::tempdir::TempDir::new("av-sweep");
         let part = crate::cache::naming::part_path(&dir.join("ggml-medium.bin"));
         std::fs::write(&part, b"partial").expect("write part");
         std::fs::write(dir.join("ggml-medium.bin"), b"whole").expect("write bin");
@@ -318,7 +318,7 @@ mod tests {
     fn sweep_spares_a_live_rivals_fresh_part() {
         // A concurrent install's transfer keeps its staging file's mtime
         // fresh; the sweep must not pull it out from under the rival.
-        let dir = crate::testutil::TempDir::new("av-sweep-live");
+        let dir = crate::tempdir::TempDir::new("av-sweep-live");
         let part = crate::cache::naming::part_path(&dir.join("ggml-medium.bin"));
         std::fs::write(&part, b"in flight").expect("write part");
 
@@ -347,7 +347,7 @@ mod tests {
         // model. Each streams into its own staging file (so each digest
         // covers exactly its own bytes) and each rename is atomic; the last
         // writer wins with a file it verified whole.
-        let dir = crate::testutil::TempDir::new("av-install-race");
+        let dir = crate::tempdir::TempDir::new("av-install-race");
         let dest = dir.join("ggml-medium.bin");
         let a = crate::cache::naming::part_path(&dest);
         let b = crate::cache::naming::part_path(&dest);

@@ -51,7 +51,7 @@ pub fn grid_capacity(spec: &CanvasSpec, aspect: f32) -> usize {
 
 /// Guard against a degenerate aspect (0, negative, NaN, inf), which would
 /// round the whole geometry into zero-sized rects or a NaN canvas. Frames
-/// decoded by [`crate::extract`] always yield a finite positive aspect, so the
+/// decoded by [`crate::sample`] always yield a finite positive aspect, so the
 /// square fallback is defense in depth for other callers, not a normal path.
 fn sane_aspect(aspect: f32) -> f32 {
     if aspect.is_finite() && aspect > 0.0 {

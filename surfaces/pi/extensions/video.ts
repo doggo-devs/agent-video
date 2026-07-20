@@ -64,6 +64,19 @@ interface Pending {
 	onProgress?: (message: string) => void;
 }
 
+/** The one result an aborted call resolves to. The contract: the server
+ * keeps working (downloads stay pollable; a late response finds no waiter
+ * and is dropped) — cancellation only detaches this call's waiter, never
+ * the shared child or other pending calls. */
+const CANCELLED: McpCallResult = {
+	content: [
+		{
+			type: "text",
+			text: "call cancelled — the server keeps working; repeat the same source to pick up the result",
+		},
+	],
+};
+
 /** One MCP server child per pi session, restarted on death at the next call. */
 class VideoServer {
 	private child: ChildProcess | undefined;
@@ -77,7 +90,14 @@ class VideoServer {
 		onProgress: ((message: string) => void) | undefined,
 		signal: AbortSignal | undefined,
 	): Promise<McpCallResult> {
+		// A listener added to an already-aborted signal never fires, so aborts
+		// that land before the listener below exists are answered by checks:
+		// once on entry, once after the shared handshake (which an abort must
+		// ride out, not kill — other calls share the spawn). Either way the
+		// request is never sent and no pending entry is left behind.
+		if (signal?.aborted) return CANCELLED;
 		await this.start();
+		if (signal?.aborted) return CANCELLED;
 		const id = this.nextId++;
 		const result = new Promise<McpCallResult>((resolve, reject) => {
 			this.pending.set(id, { resolve, reject, onProgress });
@@ -88,23 +108,17 @@ class VideoServer {
 				params: { name: "video", arguments: args, _meta: { progressToken: id } },
 			});
 		});
-		// On abort the server keeps working (downloads stay pollable; a late
-		// response finds no waiter and is dropped) — the waiter itself is
-		// resolved with the cancel notice, so no promise is left dangling.
+		// No await separates the post-handshake check from this attachment, so
+		// an abort cannot slip between: every abort either returned above or
+		// fires here, detaching the waiter and resolving it with the cancel
+		// notice — no promise is left dangling.
 		signal?.addEventListener(
 			"abort",
 			() => {
 				const waiter = this.pending.get(id);
 				if (waiter === undefined) return; // already settled
 				this.pending.delete(id);
-				waiter.resolve({
-					content: [
-						{
-							type: "text",
-							text: "call cancelled — the server keeps working; repeat the same source to pick up the result",
-						},
-					],
-				});
+				waiter.resolve(CANCELLED);
 			},
 			{ once: true },
 		);

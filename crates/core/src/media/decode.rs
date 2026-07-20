@@ -70,9 +70,8 @@ pub enum SampleSpec {
 
 /// Frames buffered in the channel between the decode thread and the consumer.
 ///
-/// This is the backpressure knob the OS pipe used to provide: large enough to
-/// keep both sides busy, small enough that a stalled consumer bounds memory
-/// at a few small frames.
+/// The backpressure knob: large enough to keep both sides busy, small
+/// enough that a stalled consumer bounds memory at a few small frames.
 const CHANNEL_FRAMES: usize = 8;
 
 /// A stream of sampled frames decoded on a background thread.

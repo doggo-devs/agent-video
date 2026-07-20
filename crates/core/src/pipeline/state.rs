@@ -216,7 +216,7 @@ mod tests {
     use crate::config::{Overrides, StrategyOpts};
     use crate::event::Discard;
     use crate::types::{Detail, GridImage, GridMeta, Quality};
-    use crate::{dedup, extract};
+    use crate::{dedup, sample};
     use image::{Rgb, RgbImage};
 
     /// Config with explicit 60s chunks at 1 fps and the high quality tier
@@ -253,12 +253,12 @@ mod tests {
 
     /// Build a 64x64 frame whose pixels form a seed-dependent diagonal ramp, so
     /// distinct seeds hash far enough apart to survive perceptual dedup.
-    fn distinct_frame(ts: f32, seed: u32) -> extract::RgbFrame {
+    fn distinct_frame(ts: f32, seed: u32) -> sample::RgbFrame {
         let rgb = RgbImage::from_fn(64, 64, |x, y| {
             let v = ((x * (3 + seed) + y * (7 + 2 * seed)) % 256) as u8;
             Rgb([v, v, v])
         });
-        extract::RgbFrame {
+        sample::RgbFrame {
             ts: crate::types::Ts::new(ts).expect("finite test ts"),
             rgb,
         }
@@ -278,7 +278,7 @@ mod tests {
             .iter()
             .map(|&(ts, seed)| distinct_frame(ts, seed))
             .collect();
-        let candidates = extract::candidate_frames_from_rgbs(rgbs, cfg.score_edge());
+        let candidates = sample::candidate_frames_from_rgbs(rgbs, cfg.score_edge());
         dedup::Deduper::new(cfg.hash_threshold(), cfg.dedup_window()).judge(candidates)
     }
 

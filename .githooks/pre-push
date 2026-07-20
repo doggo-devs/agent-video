@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# The same documentation gate ci.yml enforces server-side: rustdoc under
+# -D warnings rejects broken and private intra-doc links. Wired via
+# `git config core.hooksPath .githooks` (root package.json `prepare`).
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --quiet || {
+    echo "pre-push: rustdoc gate failed — fix doc links before pushing" >&2
+    exit 1
+}

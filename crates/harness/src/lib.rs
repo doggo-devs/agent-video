@@ -20,6 +20,7 @@ pub mod install;
 pub mod look;
 pub mod mcp;
 pub mod netguard;
+pub mod offer;
 pub mod plan;
 pub mod probe;
 pub mod proc;
@@ -27,8 +28,7 @@ pub mod raw;
 pub mod relay;
 pub mod schema;
 #[cfg(test)]
-pub(crate) mod testutil;
+pub(crate) mod tempdir;
 pub mod time;
 pub mod tokens;
 pub mod transcribe;
-pub mod url_policy;

@@ -7,7 +7,7 @@
 //! `panic = "abort"`, so an in-process decode panic would take the whole
 //! server down. Self-spawn buys stdout isolation and crash containment for
 //! the cost of one fork. Children are admitted through a small gate
-//! ([`MAX_CORE_CHILDREN`]): each one scales to every core, so running them
+//! (`MAX_CORE_CHILDREN`): each one scales to every core, so running them
 //! unbounded would trample the machine, not parallelize it.
 
 use std::num::NonZeroI32;

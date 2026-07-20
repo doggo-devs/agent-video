@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Pipeline orchestration: extract → dedup → chunk → (per-chunk) score → select
+//! Pipeline orchestration: sample → dedup → chunk → (per-chunk) score → select
 //! → layout → compose, then write grids, `metadata.json`, and subtitles.
 //!
 //! Rank normalization and selection are deliberately per-chunk: scores are only
@@ -31,7 +31,7 @@ use crate::probe::{KeyframeInfo, SampleStrategy};
 use crate::source::Source;
 use crate::subtitle::Subtitles;
 use crate::types::{GridMeta, TimeRange};
-use crate::{dedup, extract as extract_frames, probe};
+use crate::{dedup, probe, sample};
 
 use candidates::CandidateStream;
 use output::OutputSession;
@@ -70,8 +70,8 @@ struct RunCtx<'a> {
 impl<'a> RunCtx<'a> {
     /// The extractor knobs every sampling shape shares, derived once from
     /// the run's config and thread cap.
-    fn stream_params(&self) -> extract_frames::StreamParams<'a> {
-        extract_frames::StreamParams {
+    fn stream_params(&self) -> sample::StreamParams<'a> {
+        sample::StreamParams {
             cell_min_edge: self.cfg.min_frame_size(),
             score_edge: self.cfg.score_edge(),
             threads: self.ffmpeg_threads,
@@ -195,7 +195,7 @@ pub fn process(
                     start: w.start(),
                     end: w.end(),
                 });
-                extract_frames::stream_window(
+                sample::stream_window(
                     input,
                     cfg.base_fps(),
                     w.start(),
@@ -207,7 +207,7 @@ pub fn process(
                 events.event(Event::FixedFps {
                     fps: cfg.base_fps(),
                 });
-                extract_frames::stream_frames(input, cfg.base_fps(), ctx.stream_params())?
+                sample::stream_frames(input, cfg.base_fps(), ctx.stream_params())?
             }
         },
         ResolvedPlan::Keyframes(info) => {
@@ -217,7 +217,7 @@ pub fn process(
                 mean_gap: info.mean_gap(),
                 max_gap: info.max_gap(),
             });
-            extract_frames::stream_keyframes(input, ctx.stream_params())?
+            sample::stream_keyframes(input, ctx.stream_params())?
         }
         ResolvedPlan::Adaptive(info) => adaptive_stream(&ctx, &info)?,
     };
@@ -229,7 +229,7 @@ pub fn process(
 /// executes the plan; no per-region sub-streams to interleave).
 ///
 /// [`SampleSpec::Mixed`]: crate::media::decode::SampleSpec::Mixed
-fn adaptive_stream(ctx: &RunCtx<'_>, info: &KeyframeInfo) -> Result<extract_frames::FrameStream> {
+fn adaptive_stream(ctx: &RunCtx<'_>, info: &KeyframeInfo) -> Result<sample::FrameStream> {
     let cfg = ctx.cfg;
     let fill = merge_regions(
         info.sparse_regions(cfg.gap_threshold()),
@@ -249,7 +249,7 @@ fn adaptive_stream(ctx: &RunCtx<'_>, info: &KeyframeInfo) -> Result<extract_fram
         ctx.events.event(Event::AdaptiveFallbackFixedFps {
             coverage_percent: 100.0 * covered / info.duration,
         });
-        return Ok(extract_frames::stream_frames(
+        return Ok(sample::stream_frames(
             ctx.input,
             cfg.base_fps(),
             ctx.stream_params(),
@@ -262,7 +262,7 @@ fn adaptive_stream(ctx: &RunCtx<'_>, info: &KeyframeInfo) -> Result<extract_fram
             end: region.end(),
         });
     }
-    Ok(extract_frames::stream_mixed(
+    Ok(sample::stream_mixed(
         ctx.input,
         cfg.base_fps(),
         fill,
@@ -295,8 +295,7 @@ fn resolve_windowed_strategy(cfg: &Config, window: Option<Window>) -> Result<Sam
 /// against the window, probe the input, degrade a keyframe-poor default to
 /// fixed-fps, and validate — folded so every returned plan is already valid
 /// and no caller has to re-establish the "keyframe strategy implies probe
-/// data" invariant. The four legacy steps survive as private helpers below,
-/// preserving their exact order and every diagnostic.
+/// data" invariant.
 fn resolve_plan(
     input: &Source,
     cfg: &Config,
@@ -471,7 +470,7 @@ pub(crate) fn validate_input(input: &Source) -> Result<()> {
 fn process_stream(
     ctx: &RunCtx<'_>,
     session: OutputSession<'_>,
-    stream: extract_frames::FrameStream,
+    stream: sample::FrameStream,
 ) -> Result<()> {
     let cfg = ctx.cfg;
     let mut stream = CandidateStream::new(

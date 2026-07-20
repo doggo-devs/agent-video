@@ -443,8 +443,8 @@ pub fn clear(cfg: &CookiesCfg, domain: Option<&str>) -> Result<usize, CookieErro
 mod tests {
     use super::*;
 
-    fn temp_cfg(tag: &str) -> (CookiesCfg, crate::testutil::TempDir) {
-        let dir = crate::testutil::TempDir::new(&format!("av-cookies-{tag}"));
+    fn temp_cfg(tag: &str) -> (CookiesCfg, crate::tempdir::TempDir) {
+        let dir = crate::tempdir::TempDir::new(&format!("av-cookies-{tag}"));
         let cfg = CookiesCfg {
             from_browser: None,
             jar: dir.join("cookies.txt"),

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! URL-source decisions.
+//! Download offers: first contact with a not-yet-downloaded URL.
 //!
 //! Turns source facts into download tiers behind consent tokens, or refusals.
 //! Nothing is downloaded without an echoed token; tiers over

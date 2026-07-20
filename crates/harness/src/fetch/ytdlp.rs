@@ -661,8 +661,8 @@ fn settle_exit(
 /// owns `.part` handling and atomic renames within the staging directory.
 ///
 /// One straight pipeline, destination-blind between its ends: prepare the
-/// [`Landing`], assemble [`download_args`], pump the child ([`run_child`]),
-/// judge its verdict ([`settle_outcome`]), publish ([`Landing::publish`]).
+/// `Landing`, assemble `download_args`, pump the child (`run_child`),
+/// judge its verdict (`settle_outcome`), publish (`Landing::publish`).
 pub fn download(
     url: &VettedUrl,
     recipe: &YtdlpRecipe,
@@ -699,7 +699,7 @@ pub fn download(
 
 /// Where a yt-dlp run's files land and how they are published once the
 /// child settles. Constructed before the spawn and consumed by
-/// [`Landing::publish`], so the whole Cache/Keep divergence — staging vs
+/// `Landing::publish`, so the whole Cache/Keep divergence — staging vs
 /// direct write, subtitle side work, sidecar promotion, adoption — lives
 /// at this type's two ends; the pipeline between (argument assembly,
 /// spawn, watchdog, verdict) is destination-blind.
@@ -1128,8 +1128,8 @@ mod tests {
         assert_eq!(parse_progress("AVDL NA NA NA"), None);
     }
 
-    fn temp_dir(tag: &str) -> crate::testutil::TempDir {
-        crate::testutil::TempDir::new(&format!("av-ytdlp-{tag}"))
+    fn temp_dir(tag: &str) -> crate::tempdir::TempDir {
+        crate::tempdir::TempDir::new(&format!("av-ytdlp-{tag}"))
     }
 
     fn langs(prefs: &[&str]) -> Vec<String> {

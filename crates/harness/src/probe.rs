@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn advertises_only_what_core_discovers() {
-        let dir = crate::testutil::TempDir::new("av-probe");
+        let dir = crate::tempdir::TempDir::new("av-probe");
         let video = dir.join("talk.mp4");
         std::fs::write(&video, b"").expect("write");
         std::fs::write(dir.join("talk.srt"), b"").expect("write");

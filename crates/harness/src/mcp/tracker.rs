@@ -42,7 +42,7 @@ enum JobEvent {
 /// Contract: adoption is decided inside the tracker's critical section,
 /// but the adopted effect executes after it, outside the jobs lock — it
 /// may block on I/O or call back into the tracker without wedging the
-/// session ([`Aftermath`]).
+/// session (`Aftermath`).
 pub struct Settlement {
     result: CallToolResult,
     on_owned: Option<Box<dyn FnOnce() + Send>>,

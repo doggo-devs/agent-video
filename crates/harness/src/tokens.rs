@@ -15,9 +15,9 @@
 //! action whose repetition duplicates a user-owned file — is recorded via
 //! [`Tokens::fulfill`] so later echoes replay the receipt instead.
 //!
-//! Offer sets are keyed by canonical source identity ([`source_key`]), not
+//! Offer sets are keyed by canonical source identity (`source_key`), not
 //! by the model's spelling, and the registry is bounded: past
-//! [`MAX_OFFER_SETS`] live sources the stalest set is evicted, its tokens
+//! `MAX_OFFER_SETS` live sources the stalest set is evicted, its tokens
 //! answering as stale — a state the model is already told how to leave.
 
 use std::collections::HashMap;
@@ -154,7 +154,7 @@ fn source_key(source: &str) -> String {
 
 /// Pending offers keyed by canonical source identity, behind the one lock
 /// that guards them; guards never escape this type. One live offer set
-/// per source, at most [`MAX_OFFER_SETS`] sources.
+/// per source, at most `MAX_OFFER_SETS` sources.
 ///
 /// A cheaply-cloneable shared handle: clones share one registry (and one
 /// mint counter). Owning a `Tokens` pins nothing but the registry itself —

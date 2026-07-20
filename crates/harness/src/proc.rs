@@ -345,7 +345,7 @@ mod tests {
     fn graceful_kill_lets_the_child_run_its_int_trap() {
         // Models yt-dlp's KeyboardInterrupt cleanup (cookie jar save): the
         // trap must run to completion before the process dies.
-        let dir = crate::testutil::TempDir::new("av-proc-int");
+        let dir = crate::tempdir::TempDir::new("av-proc-int");
         let marker = dir.join("saved");
         let ready = dir.join("ready");
         let mut child = isolate_group(Command::new("sh").args([

@@ -7,11 +7,11 @@
 //! always whole.
 //!
 //! Stall discipline: ureq's per-phase timeouts cannot express "abort when
-//! the peer goes silent" (see [`agent`]), so every connection is wrapped in
-//! a [`StallGuard`] transport that bounds each receive wait to a short
+//! the peer goes silent" (see `agent`), so every connection is wrapped in
+//! a `StallGuard` transport that bounds each receive wait to a short
 //! tick. Sends are not guarded — request heads fit the socket buffer and
 //! the whole-call ceiling still bounds them. The guard aborts a transfer
-//! whose peer sent nothing for [`IDLE_LIMIT`]
+//! whose peer sent nothing for `IDLE_LIMIT`
 //! and observes the job's [`CancelSignal`] every tick, so a download whose
 //! tracker slot was abandoned stops promptly instead of pinning its thread,
 //! socket, `.part` file, and reserved keep filename.
@@ -47,20 +47,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A peer that sends nothing for this long is presumed dead and the
 /// transfer is aborted — the direct client's stall bound, enforced by
-/// [`StallGuard`] on every receive wait (headers and body alike). Kept
+/// `StallGuard` on every receive wait (headers and body alike). Kept
 /// inside the tracker's abandon limit by a compile-time assertion in
 /// `crate::mcp::download`, so a stalled read always unblocks before the
 /// slot it reports to is given up.
 pub(crate) const IDLE_LIMIT: Duration = Duration::from_secs(60);
 
-/// Granularity of [`StallGuard`]'s waits: the longest a blocked socket
+/// Granularity of `StallGuard`'s waits: the longest a blocked socket
 /// read can go without re-checking the job's [`CancelSignal`], and thus
 /// the bound on how long a cancelled transfer keeps waiting on the peer.
 const CANCEL_TICK: Duration = Duration::from_secs(2);
 
 /// Whole-call ceiling for a download (connect through last body byte). A
 /// termination guarantee against a peer that dribbles forever, not stall
-/// detection — [`IDLE_LIMIT`] handles silence. Sized for
+/// detection — `IDLE_LIMIT` handles silence. Sized for
 /// `download.max_bytes` on slow links.
 const BODY_CEILING: Duration = Duration::from_secs(4 * 60 * 60);
 
@@ -70,7 +70,7 @@ const CANCELLED_NOTE: &str = "download cancelled: its tracker slot was abandoned
 /// Agent wired for one download job: explicit deadlines, the
 /// egress-screening resolver (every connection this client makes —
 /// redirect targets included — passes the host policy), and a
-/// [`StallGuard`] wrapping every transport.
+/// `StallGuard` wrapping every transport.
 ///
 /// Deadlines are deliberately only `connect` + `global`. ureq 3 has no
 /// idle timeout, and its phase timeouts cannot fill in: `recv_body` is
@@ -78,8 +78,8 @@ const CANCELLED_NOTE: &str = "download cancelled: its tracker slot was abandoned
 /// and a configured `recv_response` leaks a stale `headers_end +
 /// recv_response` deadline into the body phase, killing any transfer that
 /// pauses ≥ 1s past that mark (verified against ureq 3.3.0). So the agent
-/// keeps ureq's phase timeouts off and the [`StallGuard`] owns stall
-/// detection uniformly: no receive wait outlives [`IDLE_LIMIT`] of peer
+/// keeps ureq's phase timeouts off and the `StallGuard` owns stall
+/// detection uniformly: no receive wait outlives `IDLE_LIMIT` of peer
 /// silence.
 fn agent(cfg: &Config, cancel: &CancelSignal) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
@@ -91,7 +91,7 @@ fn agent(cfg: &Config, cancel: &CancelSignal) -> ureq::Agent {
 }
 
 /// Terminal link of the connector chain: wraps whatever transport the
-/// default chain produced (TCP or TLS) in a [`StallGuard`] sharing the
+/// default chain produced (TCP or TLS) in a `StallGuard` sharing the
 /// job's cancel signal.
 #[derive(Debug)]
 struct StallGuardConnector(CancelSignal);
@@ -647,7 +647,7 @@ mod tests {
 
     #[test]
     fn reservation_skips_taken_names() {
-        let dir = crate::testutil::TempDir::new("av-direct");
+        let dir = crate::tempdir::TempDir::new("av-direct");
         let p = dir.join("v.mp4");
         std::fs::write(&p, b"x").expect("write");
         let next = reserve_available_path(&p).expect("free name");
@@ -659,7 +659,7 @@ mod tests {
         // The atomicity contract, observed: once a caller holds a reserved
         // path, a second probe of the same name cannot win it — the old
         // exists()-based probe handed both callers "v.mp4".
-        let dir = crate::testutil::TempDir::new("av-direct-claim");
+        let dir = crate::tempdir::TempDir::new("av-direct-claim");
         let p = dir.join("v.mp4");
         let first = reserve_available_path(&p).expect("free name");
         assert_eq!(first, p);
@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn cancellation_stops_the_stream_between_reads() {
-        let dir = crate::testutil::TempDir::new("av-direct-stop");
+        let dir = crate::tempdir::TempDir::new("av-direct-stop");
         let cancel = CancelSignal::new();
         let mut reader = TrippingReader {
             cancel: cancel.clone(),
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn cancelled_keep_download_releases_the_reserved_name() {
-        let dir = crate::testutil::TempDir::new("av-direct-cancel");
+        let dir = crate::tempdir::TempDir::new("av-direct-cancel");
         let mut cfg = crate::config::default_config(&crate::config::test_dirs(Path::new("/h/u")));
         cfg.network.allow_private_hosts = true;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");

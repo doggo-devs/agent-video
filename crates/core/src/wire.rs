@@ -259,7 +259,7 @@ mod tests {
         );
         assert!(
             json["grids"][0].get("subtitles").is_none(),
-            "non-text subtitle states stay absent, matching the old contract"
+            "non-text subtitle states serialize as absent"
         );
     }
 
@@ -271,9 +271,8 @@ mod tests {
         assert!(serde_json::from_str::<Grid>(json).is_err());
     }
 
-    /// Byte-for-byte pin of a `process` document, captured before `duration`
-    /// and `range` went private — the compatibility proof for the public
-    /// `metadata.json` / `--json` contract.
+    /// Byte-for-byte pin of a `process` document — the compatibility proof
+    /// for the public `metadata.json` / `--json` contract.
     #[test]
     fn keeps_process_wire_json_byte_identical() {
         let meta = doc(vec![Grid::from(grid_meta(GridImage::File(

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Test-only filesystem scaffolding.
+//! RAII temp directories for tests.
 
 use std::ops::Deref;
 use std::path::{Path, PathBuf};

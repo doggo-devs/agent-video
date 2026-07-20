@@ -386,8 +386,8 @@ fn list_with_stats(dir: &Path) -> Vec<Stat> {
 mod tests {
     use super::*;
 
-    fn cache(max_bytes: u64) -> (Cache, crate::testutil::TempDir) {
-        let dir = crate::testutil::TempDir::new("av-cache");
+    fn cache(max_bytes: u64) -> (Cache, crate::tempdir::TempDir) {
+        let dir = crate::tempdir::TempDir::new("av-cache");
         (
             Cache::new(&dir, NonZeroU64::new(max_bytes).expect("non-zero")),
             dir,

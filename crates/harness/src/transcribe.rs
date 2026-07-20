@@ -2,23 +2,23 @@
 //! Whisper transcription behind a resolved [`Route`]: local GPU inference
 //! when compiled and provisioned, an OpenAI-compatible API otherwise.
 //!
-//! **Local** ([`local`], `whisper-local` feature + GPU backend):
+//! **Local** (`local`, `whisper-local` feature + GPU backend):
 //! in-process whisper.cpp; Silero VAD trims silence and music before
 //! recognition. Weights are provisioned by `install-whisper` and never
 //! fetched here.
 //!
-//! **API** ([`api`]): audio is decoded, encoded as 16-bit WAV, and POSTed
+//! **API** (`api`): audio is decoded, encoded as 16-bit WAV, and POSTed
 //! one bounded chunk at a time (~13 min each) — no VAD pre-filtering; the
 //! endpoint owns hallucination suppression. Only the chunk in flight is
 //! resident, so peak memory is one chunk, never the track. Chunks split
 //! at hard byte boundaries, so a cue spanning a cut may lose or repeat a
 //! word: accepted for the simplicity of stateless uploads. Each chunk
 //! after the first is conditioned on the tail of the previous chunk's
-//! transcript ([`prompt`]), so vocabulary, casing, and script choice
+//! transcript (`prompt`), so vocabulary, casing, and script choice
 //! carry across the cut instead of lurching.
 //!
 //! This module owns the policy seams — route resolution, cache identity,
-//! the entry point, SRT publication; [`wav`] and [`multipart`] are
+//! the entry point, SRT publication; `wav` and `multipart` are
 //! generic codecs with no transcription knowledge.
 
 mod api;

@@ -33,10 +33,11 @@ regenerates. The write need not be atomic; correctness does not depend on it.
   video's directory, not its bytes) are rescanned live on every lookup and
   appended to the summary after the cache read, alongside the
   whisper-transcript decoration — they never enter the cached document.
-- **Whisper transcripts** — keyed by content fingerprint × model identity
-  (`crate::config::WhisperModel::cache_id`). A transcript from one model must
-  never answer for another, so the model is part of the key; the same
-  content × model always produces the same cues.
+  The write path is stronger than the pattern requires: a writer-unique
+  `.part` (via `cache::naming`) plus atomic rename, so a reader never sees a
+  torn document at all. Classification follows the content guarantee —
+  determinism alone would carry safety; the staged rename is defense in
+  depth, not what safety rests on.
 
 ## Pattern 2 — Per-writer staging + atomic rename + last-writer-wins
 
@@ -63,8 +64,8 @@ against literal strings so existing caches stay sweepable.
 A crashed writer leaves its staging entry behind — a `.part` file or a
 `.staging-…` directory. The eviction sweep reclaims both the same way: any
 staging-named entry whose mtime is older than a day, in every directory
-writers stage in (downloads and transcripts), has no owner left and is
-removed. A live writer keeps its entry's mtime fresh, so age is the
+writers stage in (downloads, transcripts, and probe documents), has no owner
+left and is removed. A live writer keeps its entry's mtime fresh, so age is the
 ownership test; in-flight staging is exempt from the LRU budget.
 
 **Members:**
@@ -77,9 +78,15 @@ ownership test; in-flight staging is exempt from the LRU budget.
   `.staging-<key>-<pid>-<seq>/` directory; `adopt_into` fsyncs and renames each
   file up into the shared cache dir. A crashed job leaves its staging directory
   for the eviction sweep.
-- **Whisper SRT output** — `crate::transcribe::write_srt`. The destination name
-  is deterministic (fingerprint × route identity) and the cache is shared, so
-  the staging file carries the pid; write, then rename.
+- **Whisper transcripts** — `crate::transcribe::write_srt`. Keyed by content
+  fingerprint × transcript identity (`crate::transcribe::transcript_id`:
+  engine × model × conditioning), so one recipe's cues never answer for
+  another's. Decoding is not byte-deterministic — GPU scheduling, beam
+  search, and temperature fallback can all vary the cues — so equal key
+  means equal recipe, not equal bytes: safety rests entirely on the write
+  path. The destination name is deterministic and the cache is shared, so
+  the staging file carries the writer id; write, then rename, removing the
+  `.part` on failure.
 
 ## Pattern 3 — Three-way merge protocol
 
@@ -112,13 +119,13 @@ pattern.
 
 | Artifact | Pattern | Write path | Conformant |
 |----------|---------|------------|------------|
-| Probe documents (`cache.rs::put_probe`) | 1 | `fs::create_dir_all` + `fs::write` (direct, non-atomic) | Yes — a non-atomic write is legal under pattern 1: same fingerprint ⇒ same JSON, so an interleave writes identical bytes and a partial read misses and re-probes. |
-| Whisper transcripts (`cache.rs` keying) | 1 | keyed by fingerprint × `model_id`; written via `write_srt` (pattern 2) | Yes — the key guarantees equal bytes; the write itself is even stronger than pattern 1 requires (staged rename). |
+| Probe documents (`cache.rs::put_probe`) | 1 | writer-unique `.part` (via `cache::naming`), atomic `rename`, `.part` removed on failure | Yes — pattern 1 already licenses a plain write (same fingerprint ⇒ same JSON, so a torn interleave is harmless); the staged rename is stronger than the pattern requires, and a crashed writer's `.part` is age-swept. |
+| Whisper transcripts (`cache.rs` keying + `transcribe::write_srt`) | 2 | keyed by fingerprint × `transcript_id`; writer-unique `.part` (via `cache::naming`), `rename`, `.part` removed on failure | Yes — the key rules out cross-recipe answers, but decoding is not byte-deterministic, so safety rests on the staged rename: exactly what pattern 2 provides. |
 | Direct downloads (`fetch/direct.rs`) | 2 | writer-unique `.part` (via `cache::naming`), `sync_all`, atomic `rename` | Yes. |
 | yt-dlp downloads (`fetch/ytdlp.rs`) | 2 | per-writer `.staging-…` dir (via `cache::naming`), fsync + per-file `rename` in `adopt_into` | Yes. |
-| Whisper SRT (`transcribe::write_srt`) | 2 | writer-unique `.part` (via `cache::naming`), `rename` | Yes — verified per prior review, no change needed. |
 | Cookie jar (`cookies.rs`) | 3 | exclusive `.lock`, checkout/commit delta merge, temp + rename publish | Yes. |
 
-No genuinely non-atomic write of a shared artifact outside its declared pattern
-was found. The one direct `fs::write` (probe documents) is intentional and legal
-under pattern 1.
+Every write path meets or exceeds its declared pattern. The one over-strength
+member is probe documents: pattern 1 licenses a plain write, but the code
+stages and renames anyway — the pattern names why the *content* is safe, the
+audit records the stronger path actually taken.

@@ -17,7 +17,7 @@ use crate::event::EventSink;
 use crate::source::Source;
 use crate::subtitle::Subtitles;
 use crate::types::{CandidateFrame, CanvasSpec, ScoredFrame, TimeRange, format_ts};
-use crate::{compose, dedup, extract, layout, score, wire};
+use crate::{compose, dedup, layout, sample, score, wire};
 
 use super::candidates::CandidateStream;
 use super::chunk::{build_grid_draft, extract_selected};
@@ -51,11 +51,11 @@ pub fn extract_range(
 
     let fps = cfg.extract_fps();
     // `extract` exposes no --threads flag; the decoder auto-sizes its pool.
-    let stream = extract::stream_range(
+    let stream = sample::stream_range(
         input,
         fps,
         range,
-        extract::StreamParams {
+        sample::StreamParams {
             cell_min_edge: cfg.min_frame_size(),
             score_edge: cfg.score_edge(),
             threads: None,

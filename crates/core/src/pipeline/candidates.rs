@@ -11,7 +11,7 @@
 use anyhow::Result;
 
 use crate::dedup::Deduper;
-use crate::extract::{self, RgbFrame};
+use crate::sample::{self, RgbFrame};
 use crate::types::CandidateFrame;
 
 /// One judged frame: the candidate and whether dedup kept it.
@@ -19,7 +19,7 @@ pub type Judged = (CandidateFrame, bool);
 
 /// A pull source of decoded RGB frames.
 ///
-/// [`extract::FrameStream`] is the production implementation; tests feed
+/// [`sample::FrameStream`] is the production implementation; tests feed
 /// synthetic frames through a hand-written fake.
 pub trait RgbSource {
     /// The next decoded frame, or `None` after a clean end of stream.
@@ -28,14 +28,14 @@ pub trait RgbSource {
     fn aspect(&self) -> Option<f32>;
 }
 
-impl RgbSource for extract::FrameStream {
+impl RgbSource for sample::FrameStream {
     fn next_frame(&mut self) -> Result<Option<RgbFrame>> {
         // `?` lifts the typed `error::Error` into `anyhow::Error`, keeping it
         // downcastable so the CLI can still recover the exit code.
-        Ok(extract::FrameStream::next_frame(self)?)
+        Ok(sample::FrameStream::next_frame(self)?)
     }
     fn aspect(&self) -> Option<f32> {
-        extract::FrameStream::aspect(self)
+        sample::FrameStream::aspect(self)
     }
 }
 
@@ -93,7 +93,7 @@ impl<'a, S: RgbSource> CandidateStream<'a, S> {
 
         let score_edge = self.score_edge;
         let deduper = &mut self.deduper;
-        let judge = move || deduper.judge(extract::candidate_frames_from_rgbs(rgbs, score_edge));
+        let judge = move || deduper.judge(sample::candidate_frames_from_rgbs(rgbs, score_edge));
         Ok(Some(match self.pool {
             Some(pool) => pool.install(judge),
             None => judge(),

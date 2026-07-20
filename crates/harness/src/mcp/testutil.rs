@@ -254,7 +254,7 @@ pub(crate) struct TestEnv {
     pub(crate) whisper: Arc<FakeWhisper>,
     // Last field: dropped after everything above so its files outlive
     // any path-holding dependency during teardown.
-    pub(crate) dir: crate::testutil::TempDir,
+    pub(crate) dir: crate::tempdir::TempDir,
 }
 
 pub(crate) fn env(probe_summary: ProbeSummary, whisper_available: bool) -> TestEnv {
@@ -281,7 +281,7 @@ pub(crate) fn env_with_fetcher(
     whisper_available: bool,
     fetcher: FakeFetcher,
 ) -> TestEnv {
-    let dir = crate::testutil::TempDir::new("av-server");
+    let dir = crate::tempdir::TempDir::new("av-server");
     let mut config = default_config(&test_dirs(&dir));
     config.paths.cache = dir.join("cache");
     config.paths.keep = dir.join("keep");

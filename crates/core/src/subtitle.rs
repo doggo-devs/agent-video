@@ -102,7 +102,7 @@ impl Subtitles {
         match source {
             SubtitleSource::File(p) => Ok(Some(Self::from_srt_text(input, extract_from_file(p)?)?)),
             SubtitleSource::Track(t) => {
-                let cues = media::subtitle::extract_track(input, t, "subtitle track")?;
+                let cues = media::embedded_subtitle::extract_track(input, t, "subtitle track")?;
                 if cues.is_empty() {
                     return Err(Error::new(
                         ErrorCode::InputCorrupt,
@@ -192,7 +192,7 @@ fn auto_detect(input: &Source, events: &dyn EventSink) -> Result<Option<AutoSour
         Source::Local(path) => find_sidecars_inner(path, events),
         Source::Remote(_) => Vec::new(),
     };
-    let embedded = media::subtitle::list_tracks(input)?;
+    let embedded = media::embedded_subtitle::list_tracks(input)?;
 
     let total = sidecars.len() + embedded.len();
     if total > 1 {
@@ -224,7 +224,7 @@ fn auto_detect(input: &Source, events: &dyn EventSink) -> Result<Option<AutoSour
     }
 
     if embedded.len() == 1 {
-        let cues = media::subtitle::extract_track(input, 0, "embedded subtitle stream")?;
+        let cues = media::embedded_subtitle::extract_track(input, 0, "embedded subtitle stream")?;
         if cues.is_empty() {
             // A present-but-empty text track is a legal container state, not
             // corruption; unrequested, the auto path degrades to no subtitles.
