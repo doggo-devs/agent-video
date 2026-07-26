@@ -9,17 +9,17 @@
 //! from.
 
 pub mod naming;
+pub mod source;
 
 use std::fs;
 use std::fs::File;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use sha2::{Digest, Sha256};
-
-use super::identity::{ContentId, hex};
+use self::source::SourceId;
+use super::identity::ContentId;
 
 /// Probe documents and transcripts older than this are dropped during sweeps.
 pub const PROBE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -37,9 +37,16 @@ const STALE_STAGING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Subtitle sidecar extensions living next to cached downloads.
 pub const SUBTITLE_EXTS: [&str; 3] = ["srt", "ass", "vtt"];
 
-/// Stable cache key for a URL: sha256 truncated to 16 bytes hex.
+/// Stable cache key for a source spelling: the canonical [`SourceId`]'s
+/// hash — the same identity the token registry keys offer sets on, so the
+/// two sides cannot disagree about which spellings share an entry.
+///
+/// Canonical spellings hash to the same key they always did; keys that
+/// existed only under non-canonical spellings now miss and their entries
+/// age out via the LRU — a natural miss (the key *input* converged), not a
+/// recipe change, so no `RECIPE_VERSION` bump.
 pub fn url_key(url: &str) -> String {
-    hex(&Sha256::digest(url.as_bytes())[..16])
+    SourceId::from_spelling(url).cache_key()
 }
 
 /// Disk cache rooted at `paths.cache`; all methods create dirs lazily.
@@ -109,20 +116,47 @@ impl Cache {
     /// re-transcription fragmentation window. A repeated put is a
     /// successful no-op. Lives beside the probe documents and ages out
     /// with them.
+    ///
+    /// Publication is atomic first-writer-wins (docs/shared-cache.md,
+    /// Pattern 2a): the title is staged to a writer-unique `.part` and
+    /// hard-linked into place — the link installs the complete staged
+    /// bytes or fails because a winner already exists — so a reader can
+    /// never observe a torn or empty sidecar, and a crash leaves only
+    /// age-swept staging, never a poisoned winner. A blank title records
+    /// nothing, and a blank on-disk winner (a legacy torn write from the
+    /// pre-atomic path) is no winner: it is unlinked and the publish
+    /// contested again, so the next sighting heals it. On filesystems
+    /// without hard links (exFAT/FAT, some SMB/NFS mounts) publication
+    /// falls back to a same-directory rename — still an atomic install of
+    /// complete bytes, but first-writer-wins weakens to last-writer-wins
+    /// inside the racing window; any existing non-blank winner is
+    /// deferred to first, so the freeze argument survives.
     pub fn put_title(&self, fingerprint: &ContentId, title: &str) -> std::io::Result<()> {
-        fs::create_dir_all(&self.probe_dir)?;
-        match File::create_new(self.title_path(fingerprint)) {
-            Ok(mut f) => f.write_all(title.as_bytes()),
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
-            Err(e) => Err(e),
+        if title.trim().is_empty() {
+            return Ok(());
         }
+        fs::create_dir_all(&self.probe_dir)?;
+        let dest = self.title_path(fingerprint);
+        let part = naming::part_path(&dest);
+        let published = fs::write(&part, title)
+            .and_then(|()| publish_write_once(&part, &dest, |p, d| fs::hard_link(p, d)));
+        // A successful rename fallback already consumed the staging;
+        // `NotFound` here is the harmless residue of that path.
+        let _ = fs::remove_file(&part);
+        published
     }
 
     /// The recorded title for this content, refreshing its age clock;
     /// `None` when nothing was recorded (local files, pre-title rips).
+    /// A blank sidecar — a legacy torn write — is not a title: it answers
+    /// `None` and its clock is left alone, so it ages out instead of
+    /// living forever as an unreadable winner.
     pub fn get_title(&self, fingerprint: &ContentId) -> Option<String> {
         let p = self.title_path(fingerprint);
         let title = fs::read_to_string(&p).ok()?;
+        if title.trim().is_empty() {
+            return None;
+        }
         touch(&p);
         Some(title)
     }
@@ -179,6 +213,16 @@ impl Cache {
     /// rivals (`k.mp4` beside `k.webm`), the newest mtime wins
     /// deterministically — and the winning touch keeps it winning while
     /// the loser ages toward eviction.
+    ///
+    /// A hit refreshes the key's subtitle sidecars too: a grid served
+    /// from this rip reads them alongside the media, so they share its
+    /// LRU clock — otherwise budget pressure evicts the subtitles out
+    /// from under a hot rip and every later grid silently loses them.
+    /// Eviction stays per-file: with coupled clocks the pair occupies
+    /// adjacent ranks, and the media is touched first, so a budget
+    /// cutoff that splits them tends to orphan a sidecar (harmless —
+    /// re-fetched with the next rip, aged out by the LRU) rather than
+    /// strip subtitles from a still-cached rip.
     pub fn find_download(&self, key: &str) -> Option<PathBuf> {
         let entries = fs::read_dir(&self.downloads_dir).ok()?;
         let prefix = format!("{key}.");
@@ -197,6 +241,9 @@ impl Cache {
             })
             .max()?;
         touch(&p);
+        for ext in SUBTITLE_EXTS {
+            touch(&self.downloads_dir.join(format!("{prefix}{ext}")));
+        }
         Some(p)
     }
 
@@ -208,6 +255,11 @@ impl Cache {
     /// sidecar whose content still has a living transcript, since the
     /// transcript's cache id derives from it — and clear staging files and
     /// directories abandoned by crashed writers; returns removed paths.
+    ///
+    /// Every LRU/age removal goes through the mtime recheck
+    /// (`remove_if_unbumped`): a concurrent process's cache hit between
+    /// this sweep's listing and its unlink bumps the clock and vetoes the
+    /// deletion, for age-swept families exactly as for downloads.
     ///
     /// Accounting is honest: a file that cannot be deleted keeps counting
     /// toward the total and never appears in the removed list, so a
@@ -259,9 +311,12 @@ impl Cache {
             if naming::is_part_file(&name) {
                 continue; // in flight or crashed: sweep_stale_staging owns it
             }
-            if expired(&f) && fs::remove_file(&f.path).is_ok() {
+            if expired(&f) && remove_if_unbumped(&f) {
                 removed.push(f.path);
             } else {
+                // A veto (a rival's hit landed after ranking) keeps the
+                // transcript living — and with it the sidecar it derives
+                // from, via the pairing below.
                 living_transcripts.push(name);
             }
         }
@@ -274,7 +329,7 @@ impl Cache {
                 let prefix = format!("{fp}.");
                 living_transcripts.iter().any(|t| t.starts_with(&prefix))
             });
-            if !vetoed && fs::remove_file(&f.path).is_ok() {
+            if !vetoed && remove_if_unbumped(&f) {
                 removed.push(f.path);
             }
         }
@@ -324,6 +379,52 @@ impl Cache {
 /// expiring a sidecar whose transcripts still live.
 const TITLE_SUFFIX: &str = ".title";
 
+/// Install fully-staged `part` at `dest`, write-once. `link` is the
+/// hard-link primitive (injected so tests can model filesystems without
+/// one): it installs the complete staged bytes or fails because a winner
+/// already exists. A blank winner is a legacy torn write, not a title —
+/// it is dethroned and the publish contested once more; losing that
+/// second link means a rival published a real title meanwhile, and theirs
+/// serves the freeze as well as ours. Any other link error means the
+/// filesystem cannot hard-link at all and falls back to
+/// [`publish_by_rename`].
+fn publish_write_once(
+    part: &Path,
+    dest: &Path,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match link(part, dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            if fs::read_to_string(dest).is_ok_and(|t| t.trim().is_empty()) {
+                let _ = fs::remove_file(dest);
+                match link(part, dest) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+                    Err(_) => publish_by_rename(part, dest),
+                }
+            } else {
+                Ok(())
+            }
+        }
+        Err(_) => publish_by_rename(part, dest),
+    }
+}
+
+/// Publication for filesystems without hard links: a same-directory
+/// rename is still an atomic install of the complete staged bytes, so a
+/// reader never sees a torn sidecar — but rename replaces, so the
+/// write-once freeze weakens to last-writer-wins inside the racing
+/// window. An existing non-blank winner is deferred to first, exactly
+/// like a lost link, keeping the weakening confined to concurrent racers
+/// (each holding a complete title that serves the freeze equally well).
+fn publish_by_rename(part: &Path, dest: &Path) -> std::io::Result<()> {
+    if fs::read_to_string(dest).is_ok_and(|t| !t.trim().is_empty()) {
+        return Ok(());
+    }
+    fs::rename(part, dest)
+}
+
 /// Refresh the LRU/age clock. Best-effort — a hit is a hit even when the
 /// clock write fails — but a failed bump is a lost state transition (the
 /// hot entry keeps aging toward eviction), so it is logged. `NotFound`
@@ -349,9 +450,11 @@ fn touch(p: &Path) {
 /// concurrent [`touch`] (another process's cache hit) moves the mtime
 /// forward and vetoes the deletion. The re-check-to-unlink window that
 /// remains is accepted: on Unix an open reader keeps the unlinked file
-/// readable, so the worst case is a re-download, never corruption. A veto
-/// keeps the file counting toward the budget, consistent with the honest
-/// accounting above.
+/// readable, and a caller holding only a *path* re-derives the entry (a
+/// re-download, a re-transcribe, a fresh probe) — never corruption. A veto
+/// keeps a download counting toward the budget, consistent with the honest
+/// accounting above, and keeps a transcript in the living set that shields
+/// its title sidecar.
 fn remove_if_unbumped(f: &Stat) -> bool {
     fs::metadata(&f.path)
         .and_then(|m| m.modified())
@@ -400,6 +503,17 @@ mod tests {
         assert_eq!(k.len(), 32);
         assert_eq!(k, url_key("https://example.com/v.mp4"));
         assert_ne!(k, url_key("https://example.com/w.mp4"));
+    }
+
+    #[test]
+    fn url_key_converges_spellings_of_one_source() {
+        let k = url_key("https://example.com/v.mp4");
+        assert_eq!(k, url_key("HTTPS://Example.COM/v.mp4"));
+        assert_ne!(
+            k,
+            url_key("https://example.com/V.mp4"),
+            "path case names a different resource"
+        );
     }
 
     #[test]
@@ -479,6 +593,36 @@ mod tests {
             current,
             "the winning touch keeps the winner winning"
         );
+    }
+
+    #[test]
+    fn find_download_moves_sidecar_clocks_with_the_media() {
+        // A grid served from this hit reads the sidecars too: their LRU
+        // clock must move with the media's, or budget pressure evicts the
+        // subtitles out from under a hot rip.
+        let (cache, _dir) = cache(1024);
+        let dir = cache.ensure_downloads_dir().expect("mkdir").to_path_buf();
+        let media = dir.join("k1.mp4");
+        let srt = dir.join("k1.srt");
+        let vtt = dir.join("k1.vtt");
+        let foreign = dir.join("k2.srt");
+        let past = SystemTime::now() - Duration::from_secs(3600);
+        for p in [&media, &srt, &vtt, &foreign] {
+            std::fs::write(p, b"x").expect("write");
+            File::options()
+                .append(true)
+                .open(p)
+                .and_then(|f| f.set_modified(past))
+                .expect("age the file");
+        }
+
+        cache.find_download("k1").expect("hit");
+
+        let mtime = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).expect("mtime");
+        for p in [&media, &srt, &vtt] {
+            assert!(mtime(p) > past, "{} clock moved with the hit", p.display());
+        }
+        assert_eq!(mtime(&foreign), past, "another key's sidecar is left alone");
     }
 
     #[test]
@@ -581,6 +725,33 @@ mod tests {
             "an unbumped ranking still deletes"
         );
         assert!(!p.exists());
+    }
+
+    #[test]
+    fn age_sweep_removal_is_vetoed_by_a_touch_after_ranking() {
+        // Models the cross-process race for the age-swept families: a
+        // rival's `find_transcript` hit bumps the mtime between this
+        // sweep's listing and its unlink. The stale stat must not
+        // authorize the deletion — the same veto downloads enjoy.
+        let (cache, _dir) = cache(1024);
+        let p = cache.transcript_path(&ContentId::new("fp"), "m");
+        std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&p, b"cues").expect("write");
+        let past = SystemTime::now() - PROBE_MAX_AGE - Duration::from_secs(60);
+        File::options()
+            .append(true)
+            .open(&p)
+            .and_then(|f| f.set_modified(past))
+            .expect("age the transcript");
+        let stale = Stat {
+            path: p.clone(),
+            size: 4,
+            mtime: past,
+        };
+        touch(&p); // the concurrent cache hit
+
+        assert!(!remove_if_unbumped(&stale), "bumped mtime vetoes");
+        assert!(p.exists(), "the just-served transcript survives");
     }
 
     #[test]
@@ -688,6 +859,172 @@ mod tests {
             cache.get_title(&ContentId::new("fp")).as_deref(),
             Some("First Sighted Title"),
             "first writer wins: the recorded title is frozen"
+        );
+    }
+
+    #[test]
+    fn publishes_titles_atomically_leaving_no_staging() {
+        let (cache, _dir) = cache(1024);
+        cache
+            .put_title(&ContentId::new("fp"), "Rust Ownership Explained")
+            .expect("put");
+        let names: Vec<String> = std::fs::read_dir(&cache.probe_dir)
+            .expect("probe dir exists")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["fp.title"], "only the published name remains");
+    }
+
+    #[test]
+    fn freezes_the_winning_title_under_racing_writers() {
+        // Two processes sight the same content under different titles and
+        // publish concurrently: exactly one link wins, the loser reports
+        // success, and the winner is frozen — never torn, never blank.
+        let (cache, _dir) = cache(1024);
+        let fp = ContentId::new("fp");
+        let titles = ["First Sighting", "Rival Sighting"];
+        std::thread::scope(|s| {
+            for title in titles {
+                let cache = &cache;
+                let fp = &fp;
+                s.spawn(move || cache.put_title(fp, title).expect("a loser is a no-op"));
+            }
+        });
+        let won = cache.get_title(&fp).expect("one racer published");
+        assert!(
+            titles.contains(&won.as_str()),
+            "a complete title won: {won}"
+        );
+        cache.put_title(&fp, "Late Arrival").expect("no-op");
+        assert_eq!(cache.get_title(&fp), Some(won), "the winner stays frozen");
+        let names: Vec<String> = std::fs::read_dir(&cache.probe_dir)
+            .expect("probe dir exists")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["fp.title"], "losers remove their staging");
+    }
+
+    #[test]
+    fn falls_back_to_rename_when_hard_links_are_unsupported() {
+        // exFAT/FAT and some SMB/NFS mounts fail hard_link permanently
+        // with a non-AlreadyExists error; publication must still land —
+        // silently losing every title splits the shared transcript cache.
+        let (cache, _dir) = cache(1024);
+        fs::create_dir_all(&cache.probe_dir).expect("mkdir");
+        let dest = cache.title_path(&ContentId::new("fp"));
+        let part = naming::part_path(&dest);
+        fs::write(&part, "Rust Ownership Explained").expect("stage");
+
+        publish_write_once(&part, &dest, |_, _| {
+            Err(std::io::Error::from(ErrorKind::Unsupported))
+        })
+        .expect("rename fallback publishes");
+
+        assert_eq!(
+            cache.get_title(&ContentId::new("fp")).as_deref(),
+            Some("Rust Ownership Explained")
+        );
+        assert!(!part.exists(), "the rename consumed the staging");
+    }
+
+    #[test]
+    fn rename_fallback_defers_to_an_existing_winner() {
+        // The fallback must not weaken write-once beyond the racing
+        // window: a winner that already exists stays frozen, exactly as
+        // a lost hard link would leave it.
+        let (cache, _dir) = cache(1024);
+        fs::create_dir_all(&cache.probe_dir).expect("mkdir");
+        let dest = cache.title_path(&ContentId::new("fp"));
+        fs::write(&dest, "First Sighted Title").expect("winner");
+        let part = naming::part_path(&dest);
+        fs::write(&part, "Retitled Upload").expect("stage");
+
+        publish_write_once(&part, &dest, |_, _| {
+            Err(std::io::Error::from(ErrorKind::Unsupported))
+        })
+        .expect("deferring is a successful no-op");
+
+        assert_eq!(
+            cache.get_title(&ContentId::new("fp")).as_deref(),
+            Some("First Sighted Title"),
+            "the recorded title stays frozen"
+        );
+    }
+
+    #[test]
+    fn rename_fallback_dethrones_a_blank_legacy_winner() {
+        // A blank winner is no winner on the fallback path either: the
+        // healing put must land instead of deferring to poison forever.
+        let (cache, _dir) = cache(1024);
+        fs::create_dir_all(&cache.probe_dir).expect("mkdir");
+        let dest = cache.title_path(&ContentId::new("fp"));
+        fs::write(&dest, "").expect("legacy poison");
+        let part = naming::part_path(&dest);
+        fs::write(&part, "Rust Ownership Explained").expect("stage");
+
+        publish_write_once(&part, &dest, |_, _| {
+            Err(std::io::Error::from(ErrorKind::Unsupported))
+        })
+        .expect("rename fallback publishes over poison");
+
+        assert_eq!(
+            cache.get_title(&ContentId::new("fp")).as_deref(),
+            Some("Rust Ownership Explained")
+        );
+    }
+
+    #[test]
+    fn records_nothing_for_a_blank_title() {
+        let (cache, _dir) = cache(1024);
+        cache
+            .put_title(&ContentId::new("fp"), "  \n")
+            .expect("a blank put is a successful no-op");
+        assert_eq!(cache.get_title(&ContentId::new("fp")), None);
+        assert!(
+            !cache.probe_dir.join("fp.title").exists(),
+            "a blank title never reaches disk"
+        );
+    }
+
+    #[test]
+    fn blank_legacy_title_answers_none_and_ages_out() {
+        // A pre-atomic-path cache may hold an empty sidecar. It must not
+        // answer as a title, and reading it must not refresh its clock:
+        // left alone, the age sweep retires it.
+        let (cache, _dir) = cache(1024);
+        std::fs::create_dir_all(&cache.probe_dir).expect("mkdir");
+        let poisoned = cache.probe_dir.join("fp.title");
+        std::fs::write(&poisoned, b"").expect("write");
+        let past = SystemTime::now() - PROBE_MAX_AGE - Duration::from_secs(60);
+        File::options()
+            .append(true)
+            .open(&poisoned)
+            .and_then(|f| f.set_modified(past))
+            .expect("age the sidecar");
+
+        assert_eq!(cache.get_title(&ContentId::new("fp")), None);
+
+        let removed = cache.evict(SystemTime::now());
+        assert_eq!(removed, vec![poisoned.clone()], "the read did not bump it");
+        assert!(!poisoned.exists(), "the poison self-retires");
+    }
+
+    #[test]
+    fn dethrones_a_blank_legacy_winner_on_put() {
+        // An empty winner is no winner: the next sighting replaces it
+        // instead of deferring to it forever.
+        let (cache, _dir) = cache(1024);
+        std::fs::create_dir_all(&cache.probe_dir).expect("mkdir");
+        std::fs::write(cache.probe_dir.join("fp.title"), b"").expect("write");
+
+        cache
+            .put_title(&ContentId::new("fp"), "Rust Ownership Explained")
+            .expect("put");
+
+        assert_eq!(
+            cache.get_title(&ContentId::new("fp")).as_deref(),
+            Some("Rust Ownership Explained"),
+            "the healing put wins over legacy poison"
         );
     }
 

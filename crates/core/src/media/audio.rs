@@ -12,28 +12,72 @@ use ffmpeg::util::channel_layout::ChannelLayout;
 use ffmpeg::util::format::sample::{Sample, Type};
 use ffmpeg::util::frame;
 
-use super::{ErrorBudget, open_input};
-use crate::error::Result;
+use super::{ErrorBudget, InterruptibleInput, Recv, Stop, classify_receive, open_input};
+use crate::error::{Error, ErrorCode, Result};
 use crate::source::Source;
 
 /// The sample rate whisper.cpp expects.
 pub const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
-/// Decode `source`'s best audio stream to 16 kHz mono f32 samples, whole.
+/// Hard upper bound on any whole-track ceiling: 24 hours. Past it no
+/// caller policy is sane (24 h × 16 kHz × 4 B ≈ 5.5 GB resident), and the
+/// bound keeps `samples() + 1` arithmetic overflow-free on usize.
+const MAX_CEILING_SECONDS: u32 = 24 * 3600;
+
+/// A validated ceiling on whole-track PCM materialization, in seconds of
+/// 16 kHz audio.
+///
+/// [`AudioSamples::collect`] — the only whole-track entry point — demands
+/// one, so "decode the entire track into memory" is inexpressible without
+/// a bound: a hostile file claiming hundreds of hours of DTX/silence audio
+/// fails with a typed error instead of decoding into a multi-GB `Vec`.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioCeiling {
+    seconds: u32,
+}
+
+impl AudioCeiling {
+    /// Build a ceiling of `secs` seconds. Rejects 0 and anything past the
+    /// 24-hour hard cap with [`ErrorCode::InvalidConfig`]: both describe a
+    /// misconfigured caller, never a property of the input.
+    pub fn from_seconds(secs: u32) -> Result<AudioCeiling> {
+        if secs == 0 || secs > MAX_CEILING_SECONDS {
+            return Err(Error::new(
+                ErrorCode::InvalidConfig,
+                format!(
+                    "invalid audio ceiling: {secs}s (must be 1..={MAX_CEILING_SECONDS} seconds)"
+                ),
+            ));
+        }
+        Ok(AudioCeiling { seconds: secs })
+    }
+
+    /// The ceiling in 16 kHz samples.
+    pub fn samples(&self) -> usize {
+        self.seconds as usize * WHISPER_SAMPLE_RATE as usize
+    }
+}
+
+/// Decode `source`'s best audio stream to 16 kHz mono f32 samples, whole,
+/// bounded by `cap`.
 ///
 /// The convenience form of [`AudioSamples`] for callers that need the
 /// entire track in memory (VAD wants random access). `Ok(None)` when the
 /// container carries no audio stream at all: absence is a fact about the
 /// input, not a decode failure, and the caller decides what "nothing to
 /// transcribe" means. Errors are reserved for a container that cannot be
-/// opened or a decode that breaks mid-stream.
-pub fn decode_audio_16k_mono(source: &Source) -> Result<Option<Vec<f32>>> {
-    let Some(mut stream) = AudioSamples::open(source)? else {
+/// opened, a decode that breaks mid-stream, or a track that decodes past
+/// `cap` ([`AudioSamples::collect`]). `stop` bounds every blocking read on
+/// a stalled source; see [`super::open_input`].
+pub fn decode_audio_16k_mono(
+    source: &Source,
+    stop: &Stop,
+    cap: AudioCeiling,
+) -> Result<Option<Vec<f32>>> {
+    let Some(mut stream) = AudioSamples::open(source, stop)? else {
         return Ok(None);
     };
-    let mut samples = Vec::new();
-    stream.fill(&mut samples, usize::MAX)?;
-    Ok(Some(samples))
+    Ok(Some(stream.collect(cap)?))
 }
 
 /// A pull stream of 16 kHz mono f32 samples from one audio track.
@@ -42,7 +86,7 @@ pub fn decode_audio_16k_mono(source: &Source) -> Result<Option<Vec<f32>>> {
 /// on demand. Per-packet failures are absorbed by an `ErrorBudget`, so
 /// only a permanently broken stream surfaces as an error.
 pub struct AudioSamples {
-    ictx: ffmpeg::format::context::Input,
+    ictx: InterruptibleInput,
     stream_index: usize,
     decoder: ffmpeg::decoder::Audio,
     sink: MonoSink,
@@ -69,9 +113,10 @@ enum Stage {
 impl AudioSamples {
     /// Open `source`'s best audio stream as a sample stream. `Ok(None)`
     /// when the container has no audio stream at all — absence is the
-    /// input's shape, not a decode failure.
-    pub fn open(source: &Source) -> Result<Option<AudioSamples>> {
-        let ictx = open_input(source)?;
+    /// input's shape, not a decode failure. `stop` bounds every blocking
+    /// read on a stalled source; see [`super::open_input`].
+    pub fn open(source: &Source, stop: &Stop) -> Result<Option<AudioSamples>> {
+        let ictx = open_input(source, stop, &[])?;
         let Some(stream) = ictx.streams().best(ffmpeg::media::Type::Audio) else {
             return Ok(None);
         };
@@ -104,6 +149,31 @@ impl AudioSamples {
         }))
     }
 
+    /// Decode the remainder of the track into one `Vec`, failing once the
+    /// decoded audio passes `cap` with [`ErrorCode::InputTooLong`].
+    ///
+    /// The only whole-track entry point. Overflow is an error, never a
+    /// silent truncation: a partial transcript masquerading as complete
+    /// would misreport the input. Peak memory on overflow is `cap` plus
+    /// [`Self::fill`]'s one-packet overshoot — asking for one sample past
+    /// the ceiling is enough to prove the track exceeds it.
+    pub fn collect(&mut self, cap: AudioCeiling) -> Result<Vec<f32>> {
+        let mut samples = Vec::new();
+        self.fill(&mut samples, cap.samples() + 1)?;
+        if samples.len() > cap.samples() {
+            return Err(Error::new(
+                ErrorCode::InputTooLong,
+                format!(
+                    "audio track decodes past the {}-second whole-track ceiling \
+                     ({} samples at 16 kHz)",
+                    cap.seconds,
+                    cap.samples()
+                ),
+            ));
+        }
+        Ok(samples)
+    }
+
     /// Append decoded samples to `out` until `out.len() >= min_samples` or
     /// the track ends. Returns whether more samples may still arrive;
     /// `false` is final — further calls keep answering `false` without
@@ -123,7 +193,7 @@ impl AudioSamples {
     fn step(&mut self, out: &mut Vec<f32>) -> Result<bool> {
         match self.stage {
             Stage::Demux => {
-                match self.packet.read(&mut self.ictx) {
+                match self.ictx.read_packet(&mut self.packet) {
                     Ok(()) if self.packet.stream() != self.stream_index => {}
                     Ok(()) => match self.decoder.send_packet(&self.packet) {
                         Ok(()) => self.receive_frames(out)?,
@@ -161,13 +231,22 @@ impl AudioSamples {
 
     /// Move every frame the decoder currently holds through the sink.
     fn receive_frames(&mut self, out: &mut Vec<f32>) -> Result<()> {
-        while self.decoder.receive_frame(&mut self.frame).is_ok() {
-            match self.sink.push(&mut self.frame, out) {
-                Ok(()) => self.budget.ok(),
-                Err(e) => self.budget.fail(e)?,
+        loop {
+            match classify_receive(self.decoder.receive_frame(&mut self.frame)) {
+                Recv::Frame => match self.sink.push(&mut self.frame, out) {
+                    Ok(()) => self.budget.ok(),
+                    Err(e) => self.budget.fail(e)?,
+                },
+                Recv::Drained => return Ok(()),
+                // A hard receive error is charged, never mistaken for
+                // "drained": a decoder that fails every receive trips the
+                // budget instead of silently truncating the audio tail.
+                Recv::Broken(e) => {
+                    self.budget.fail(e)?;
+                    return Ok(());
+                }
             }
         }
-        Ok(())
     }
 }
 
@@ -264,4 +343,27 @@ fn append_samples(out: &frame::Audio, samples: &mut Vec<f32>) {
     }
     // Packed mono: one plane, one sample per frame slot.
     samples.extend_from_slice(&out.plane::<f32>(0)[..n]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_ceiling_rejects_zero_and_beyond_the_hard_cap() {
+        assert_eq!(
+            AudioCeiling::from_seconds(0)
+                .expect_err("zero seconds is not a ceiling")
+                .code,
+            ErrorCode::InvalidConfig
+        );
+        assert_eq!(
+            AudioCeiling::from_seconds(MAX_CEILING_SECONDS + 1)
+                .expect_err("past the 24h hard cap")
+                .code,
+            ErrorCode::InvalidConfig
+        );
+        let cap = AudioCeiling::from_seconds(MAX_CEILING_SECONDS).expect("the cap itself is legal");
+        assert_eq!(cap.samples(), 24 * 3600 * 16_000);
+    }
 }

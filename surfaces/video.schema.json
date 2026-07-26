@@ -46,7 +46,7 @@
         "type": "string"
       },
       "transcribe": {
-        "description": "Set true (alone with source) to generate a whisper transcript of the audio; it is cached and rides along with every grid afterwards. Needs local media: for a URL, download it first (bare call, then confirm), then repeat with transcribe.",
+        "description": "Set true (alone with source) to transcribe the audio with whisper: the reply carries the transcript as timestamped lines, and it is cached to ride along with every grid afterwards. Needs local media: for a URL, download it first (bare call, then confirm), then repeat with transcribe.",
         "type": "boolean"
       },
       "until": {

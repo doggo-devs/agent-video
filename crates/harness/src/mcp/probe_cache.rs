@@ -62,20 +62,52 @@ fn render_probe_doc(probe: &ProbeSummary) -> Option<String> {
     .ok()
 }
 
+/// Marker: the probed media file does not exist. What absence *means*
+/// depends on where the path came from — a user-supplied argument that is
+/// missing is the caller's error, a cache-derived rip that is missing was
+/// evicted underfoot and must be indistinguishable from a cache miss — so
+/// the meaning is assigned by the caller, never here.
+pub(super) struct MediaMissing;
+
+/// Probe failure with absence typed out of the prose.
+pub(super) enum ProbeError {
+    Missing(MediaMissing),
+    Fault(Fault),
+}
+
+/// [`probe_media`] with absence rendered as the user-path diagnosis
+/// (`bad_input: file not found`), for callers whose path is the caller's
+/// own argument.
+pub(super) fn cached_probe(
+    file: &Path,
+    deps: &ServerDeps,
+) -> Result<(ProbeSummary, ContentId), Fault> {
+    probe_media(file, deps).map_err(|e| match e {
+        ProbeError::Missing(MediaMissing) => {
+            Fault::bad_input(format!("file not found: {}", file.display()))
+        }
+        ProbeError::Fault(f) => f,
+    })
+}
+
 /// Probe via content-fingerprint cache; unstable files are probed fresh,
 /// never cached. The cached document is a function of content only:
 /// sidecar subtitle files — a property of the file's directory — are
 /// rescanned live and appended after the cache read, and a cached whisper
 /// transcript decorates the summary last (never the cache entry).
-pub(super) fn cached_probe(
+///
+/// An absent file is [`ProbeError::Missing`], not a rendered fault: only
+/// the caller knows the path's provenance.
+pub(super) fn probe_media(
     file: &Path,
     deps: &ServerDeps,
-) -> Result<(ProbeSummary, ContentId), Fault> {
+) -> Result<(ProbeSummary, ContentId), ProbeError> {
     let fp = fingerprint_file(file).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => {
-            Fault::bad_input(format!("file not found: {}", file.display()))
-        }
-        _ => Fault::bad_input(format!("cannot read {}: {e}", file.display())),
+        std::io::ErrorKind::NotFound => ProbeError::Missing(MediaMissing),
+        _ => ProbeError::Fault(Fault::bad_input(format!(
+            "cannot read {}: {e}",
+            file.display()
+        ))),
     })?;
     let cached: Option<ProbeSummary> = fp
         .stable
@@ -99,7 +131,7 @@ pub(super) fn cached_probe(
     let mut probe = match cached {
         Some(p) => p,
         None => {
-            let p = deps.prober.probe(file)?;
+            let p = deps.prober.probe(file).map_err(ProbeError::Fault)?;
             if fp.stable
                 && let Some(doc) = render_probe_doc(&p)
                 && let Err(e) = deps.cache.put_probe(&fp.id, &doc)
@@ -218,6 +250,20 @@ mod tests {
             effective_prompt_for(&fp, &env.deps),
             frozen,
             "the conditioning prompt — and with it the transcript id — is frozen at first sighting"
+        );
+    }
+
+    #[test]
+    fn an_absent_file_is_a_typed_miss_not_a_rendered_fault() {
+        // The caller alone knows whether absence is a user error or an
+        // evicted cache entry; the probe must not bake in a diagnosis.
+        let env = env(probe(90.0, vec![]), false);
+        assert!(
+            matches!(
+                probe_media(Path::new("/no/such/file.mp4"), &env.deps),
+                Err(ProbeError::Missing(MediaMissing))
+            ),
+            "a missing file surfaces as the typed miss"
         );
     }
 

@@ -69,8 +69,18 @@ const CANCELLED_NOTE: &str = "download cancelled: its tracker slot was abandoned
 
 /// Agent wired for one download job: explicit deadlines, the
 /// egress-screening resolver (every connection this client makes —
-/// redirect targets included — passes the host policy), and a
+/// redirect targets included — passes the host policy), no proxy, and a
 /// `StallGuard` wrapping every transport.
+///
+/// This is the single recipe for a screened agent: the [`GuardedResolver`]
+/// and the proxy override are installed together here so the resolver's
+/// contract cannot drift from the connection path. ureq's
+/// `Config::default()` adopts `HTTP_PROXY`/`HTTPS_PROXY` from the
+/// environment; a proxy would be dialed in place of every target, so the
+/// resolver would screen only the proxy's address and redirect targets
+/// would bypass the egress policy entirely — exactly in the corp
+/// environments where an internal-reaching proxy exists. `.proxy(None)`
+/// pins all dialing to the guarded path and must stay.
 ///
 /// Deadlines are deliberately only `connect` + `global`. ureq 3 has no
 /// idle timeout, and its phase timeouts cannot fill in: `recv_body` is
@@ -85,6 +95,9 @@ fn agent(cfg: &Config, cancel: &CancelSignal) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_global(Some(BODY_CEILING))
+        // See the contract above: overrides the env-proxy default so the
+        // GuardedResolver screens the real target of every connection.
+        .proxy(None)
         .build();
     let connector = DefaultConnector::default().chain(StallGuardConnector(cancel.clone()));
     ureq::Agent::with_parts(config, connector, GuardedResolver::new(cfg))
@@ -631,6 +644,22 @@ mod tests {
             info.options[1].effect
         );
         assert!(info.headline.contains("1280x720"), "{}", info.headline);
+    }
+
+    #[test]
+    fn pins_the_agent_proxy_to_none() {
+        // ureq's Config::default() adopts HTTP(S)_PROXY from the process
+        // environment, which would route every connection past the
+        // GuardedResolver's screen. The env vars are not set here —
+        // `std::env::set_var` is unsafe and racy under the parallel test
+        // harness — so this pins the override itself: the screened agent
+        // must never carry a proxy, whatever the environment says.
+        let cfg = crate::config::default_config(&crate::config::test_dirs(Path::new("/home/u")));
+        let agent = agent(&cfg, &CancelSignal::new());
+        assert!(
+            agent.config().proxy().is_none(),
+            "the screened agent must dial targets directly, never an env proxy"
+        );
     }
 
     #[test]

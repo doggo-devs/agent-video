@@ -3,7 +3,7 @@
 //! argument vector, run it (JSON captured, exit class recovered from the
 //! published exit-code contract), and the `transcribe: true` flow that
 //! resolves local media, reuses or runs whisper (single-flight per
-//! transcript key), and answers with a plan.
+//! transcript key), and answers with the transcript itself.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -12,10 +12,12 @@ use rmcp::model::CallToolResult;
 
 use super::deps::{Notifier, ServerDeps};
 use super::handler::resolve_media;
-use super::probe_cache::{cached_probe, effective_prompt_for, transcript_id_for};
-use super::wire::{CoreMetadata, failed, json_result, ready_result};
+use super::probe_cache::{
+    MediaMissing, ProbeError, effective_prompt_for, probe_media, transcript_id_for,
+};
+use super::wire::{CoreMetadata, evicted_rip, failed, is_url, json_result, ready_result};
 use crate::fault::{Fault, FaultKind};
-use crate::identity::fingerprint_file;
+use crate::identity::{ContentId, fingerprint_file};
 use crate::plan::{CoreInvocation, plan_response};
 use crate::schema::{VideoArgs, VideoBody};
 use crate::transcribe;
@@ -29,35 +31,37 @@ pub(super) fn run_invocation(
     notices: &[String],
     deps: &ServerDeps,
 ) -> CallToolResult {
-    // `--json` (pushed below) selects the stdout sink; no `-o` exists in
-    // that mode.
-    let mut args: Vec<String> = vec![
-        invocation.subcommand.as_str().to_string(),
-        media_path.to_string_lossy().into_owned(),
-    ];
-    if let Some(window) = invocation.window {
-        args.extend([
-            "--from".to_string(),
-            window.start().to_string(),
-            "--until".to_string(),
-            window.end().to_string(),
-        ]);
-    }
-    // Explicit pick, else a cached whisper transcript.
+    // Explicit pick, else the cached whisper transcript — looked up through
+    // the transcription gate, so a grid landing while whisper still runs
+    // waits for the transcript instead of silently rendering without it.
+    // The wait is this waiter's own bound; a render that outlasts it
+    // proceeds and says so in a notice rather than staying silent. The
+    // hold is dropped before core runs: the gate guards the rendezvous,
+    // not the render.
+    let mut notices = notices.to_vec();
+    let mut transcript_in_flight = false;
     let subtitle = invocation.subtitle.clone().or_else(|| {
         let fp = fingerprint_file(media_path).ok()?;
-        deps.cache
-            .find_transcript(&fp.id, &transcript_id_for(&fp.id, deps))
+        let transcript_id = transcript_id_for(&fp.id, deps);
+        let key = transcript_gate_key(&fp.id, &transcript_id);
+        match deps.transcriptions.admit_within(&key, deps.transcribe_wait) {
+            Some(_hold) => deps.cache.find_transcript(&fp.id, &transcript_id),
+            None => {
+                transcript_in_flight = true;
+                None
+            }
+        }
     });
-    if let Some(subtitle) = subtitle {
-        args.extend([
-            "--subtitle".to_string(),
-            subtitle.to_string_lossy().into_owned(),
-        ]);
+    if transcript_in_flight {
+        notices.push(
+            "a transcription of this content is still in flight; this render carries no \
+             subtitles — repeat the call once it lands to re-render with them"
+                .to_string(),
+        );
     }
-    args.extend(invocation.flags.iter().cloned());
-    args.push("--json".to_string());
-
+    // `--json` (inside `argv`) selects the stdout sink; no `-o` exists in
+    // that mode.
+    let args = invocation.argv(media_path, subtitle.as_deref());
     let run = match deps.core.run(&args) {
         Ok(run) => run,
         Err(e) => return failed(&Fault::internal(format!("core failed to start: {e}"))),
@@ -69,7 +73,7 @@ pub(super) fn run_invocation(
             core_exit_kind(run.exit),
             format!(
                 "core {} failed ({}):\n{}",
-                invocation.subcommand.as_str(),
+                invocation.args.subcommand().as_str(),
                 run.exit,
                 detail.join("\n")
             ),
@@ -87,11 +91,18 @@ pub(super) fn run_invocation(
     // Same wire types on both sides and truncation handled above, so a
     // parse failure is a bug (stray bytes), not contract drift.
     match serde_json::from_str::<CoreMetadata>(&run.stdout) {
-        Ok(meta) => ready_result(meta, notices),
+        Ok(meta) => ready_result(meta, &notices),
         Err(e) => failed(&Fault::internal(format!(
             "core output failed to parse ({e}) — this is an agent-video bug"
         ))),
     }
+}
+
+/// The single-flight key for one transcript: content × recipe. One
+/// definition for the transcribe flow (the holder) and the grid flow (the
+/// rendezvous), so the two sides cannot key apart.
+fn transcript_gate_key(fingerprint: &ContentId, transcript_id: &str) -> String {
+    format!("{fingerprint}.{transcript_id}")
 }
 
 /// Recover the failure class from a core child's exit status: the exit
@@ -114,7 +125,7 @@ fn core_exit_kind(exit: super::core_run::CoreExit) -> FaultKind {
 // ── transcription execution ──
 
 /// The `transcribe: true` flow: resolve local media, reuse a cached
-/// transcript, else run whisper; answer with the refreshed plan. The
+/// transcript, else run whisper; answer with the transcript text. The
 /// handler routes here on [`crate::schema::Intent::Transcribe`], so
 /// exclusivity with `raw`/`confirm`/grid intent is already proven.
 pub(super) fn transcribe_flow(
@@ -123,10 +134,7 @@ pub(super) fn transcribe_flow(
     notify: &Notifier,
 ) -> CallToolResult {
     let Some(media) = resolve_media(&args.source, deps) else {
-        return failed(&Fault::bad_input(
-            "transcription needs local media, and this URL has no cached rip. Call with just \
-             the URL first, confirm a download, then repeat with transcribe.",
-        ));
+        return failed(&no_cached_rip());
     };
     if !deps.whisper.available(&deps.config) {
         return failed(&Fault::environment(
@@ -137,6 +145,13 @@ pub(super) fn transcribe_flow(
     }
     let fingerprint = match fingerprint_file(&media) {
         Ok(fp) => fp.id,
+        // A cache-derived rip that vanished between resolve and open was
+        // evicted underfoot by a concurrent process: a transient race,
+        // never the caller's arguments — unlike the never-downloaded
+        // resolve miss above.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && is_url(&args.source) => {
+            return failed(&evicted_rip());
+        }
         Err(e) => {
             return failed(&Fault::bad_input(format!(
                 "cannot read {}: {e}",
@@ -164,7 +179,7 @@ pub(super) fn transcribe_flow(
         // a rival that outwaits its own bound answers "in flight" instead
         // of inheriting the winner's whole account.
         let Some(_admitted) = deps.transcriptions.admit_within(
-            &format!("{fingerprint}.{transcript_id}"),
+            &transcript_gate_key(&fingerprint, &transcript_id),
             deps.transcribe_wait,
         ) else {
             return failed(&Fault::transient(
@@ -193,10 +208,44 @@ pub(super) fn transcribe_flow(
             }
         }
     }
-    let (probe, _) = match cached_probe(&media, deps) {
+    let (probe, _) = match probe_media(&media, deps) {
         Ok(v) => v,
-        Err(e) => return failed(&e),
+        // Same eviction race as above, later in the flow: the transcript
+        // already landed in the shared cache, so re-download-then-
+        // transcribe adopts it without another whisper run.
+        Err(ProbeError::Missing(MediaMissing)) if is_url(&args.source) => {
+            return failed(&evicted_rip());
+        }
+        Err(ProbeError::Missing(MediaMissing)) => {
+            return failed(&Fault::bad_input(format!(
+                "file not found: {}",
+                media.display()
+            )));
+        }
+        Err(ProbeError::Fault(e)) => return failed(&e),
     };
+    // The transcript is this call's product, not a side effect: read it
+    // back and answer with the text itself. With age-sweep removals vetoed
+    // by a concurrent touch ([`crate::cache::Cache::evict`]), the only
+    // remaining way for it to be absent here is the narrow
+    // recheck-to-unlink window of a rival process's sweep — a benign race
+    // at the age boundary, not a bug: a retry regenerates it.
+    let Some(srt_path) = deps.cache.find_transcript(&fingerprint, &transcript_id) else {
+        return failed(&transcript_swept());
+    };
+    let srt = match std::fs::read_to_string(&srt_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return failed(&transcript_swept());
+        }
+        Err(e) => {
+            return failed(&Fault::internal(format!(
+                "cannot read the cached transcript {}: {e}",
+                srt_path.display()
+            )));
+        }
+    };
+    let (transcript, clipped) = render_transcript(&srt);
     // Honesty over silence: a transcript that stops mid-video says so.
     let truncation_note = decoded_seconds
         .filter(|&a| crate::probe::materially_truncated(a, probe.duration))
@@ -209,11 +258,17 @@ pub(super) fn transcribe_flow(
             )
         })
         .unwrap_or_default();
+    let clip_note = if clipped {
+        "The transcript exceeds the inline budget and is clipped here; grids carry the full \
+         text sliced per range. "
+    } else {
+        ""
+    };
     let next = plan_response(&args.source, &probe, &deps.config);
-    json_result(&VideoBody::Plan {
-        probe: next.probe,
+    json_result(&VideoBody::Transcript {
+        transcript,
         guidance: format!(
-            "{truncation_note}Transcript ready and cached — it rides along with every grid \
+            "{truncation_note}{clip_note}Transcript cached — it rides along with every grid \
              from now on. {}",
             next.guidance
         ),
@@ -221,9 +276,51 @@ pub(super) fn transcribe_flow(
     })
 }
 
+/// The transcription miss for a URL that was never downloaded: `resolve`
+/// found no rip, so the model skipped the consent dance — fixing the call
+/// sequence is the model's own move, hence `bad_input`. A rip that
+/// resolved and *then* vanished is a different state — the transient
+/// [`evicted_rip`], constructed in one place for every flow.
+fn no_cached_rip() -> Fault {
+    Fault::bad_input(
+        "transcription needs local media, and this URL has no cached rip. Call with just \
+         the URL first, confirm a download, then repeat with transcribe.",
+    )
+}
+
+/// A transcript removed by a concurrent cache sweep between its creation
+/// (or adoption) and its readback: transient, not an agent-video bug.
+fn transcript_swept() -> Fault {
+    Fault::transient(
+        "the transcript was evicted by a concurrent cache sweep just as it was being read \
+         back — call again with transcribe to regenerate it",
+    )
+}
+
+/// Inline budget for the transcript payload of a `transcribe` reply.
+/// Roughly half an hour of dense speech fits; past it the text clips at a
+/// cue boundary and the guidance says so — the full transcript still rides
+/// along with grids, pre-sliced per grid.
+const TRANSCRIPT_INLINE_MAX_BYTES: usize = 32 * 1024;
+
+/// Render cached SRT as `MM:SS text` cue lines, clipped to
+/// [`TRANSCRIPT_INLINE_MAX_BYTES`] at a cue boundary. The bool reports
+/// whether clipping occurred.
+fn render_transcript(srt: &str) -> (String, bool) {
+    let mut out = String::new();
+    for cue in agent_video_core::subtitle::parse_srt(srt) {
+        let line = format!("{} {}\n", format_ts(cue.start), cue.text);
+        if out.len() + line.len() > TRANSCRIPT_INLINE_MAX_BYTES {
+            return (out.trim_end().to_string(), true);
+        }
+        out.push_str(&line);
+    }
+    (out.trim_end().to_string(), false)
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::mcp::testutil::{body_of, call, env, media_file, offered_tokens, probe};
+    use crate::mcp::testutil::{body_of, call, env, media_file, offered_tokens, probe, text_of};
 
     /// Run the URL flow up to a cached analysis rip, then transcribe it.
     fn download_then_transcribe(env: &crate::mcp::testutil::TestEnv, url: &str) {
@@ -239,7 +336,7 @@ mod tests {
             env,
             serde_json::json!({"source": url, "transcribe": true}),
         ));
-        assert_eq!(after["status"], "plan", "{after}");
+        assert_eq!(after["status"], "transcript", "{after}");
     }
 
     fn titled_env() -> crate::mcp::testutil::TestEnv {
@@ -262,6 +359,85 @@ mod tests {
                 last_cancel: Mutex::new(None),
             },
         )
+    }
+
+    #[test]
+    fn transcribe_after_full_eviction_is_indistinguishable_from_a_miss() {
+        // The rip was evicted *before* this call resolved it: the flow
+        // observes exactly what a never-downloaded URL looks like, so it
+        // must answer the resolve miss — never diagnose a broken file
+        // argument. (An eviction observed *mid-flow* is distinguishable
+        // and transient; see the underfoot test below.)
+        let env = titled_env();
+        let url = "https://example.com/v.mp4";
+        download_then_transcribe(&env, url);
+        let downloads = env.deps.config.paths.cache.join("downloads");
+        for entry in std::fs::read_dir(&downloads).expect("downloads dir") {
+            std::fs::remove_file(entry.expect("entry").path()).expect("evict the rip");
+        }
+
+        let body = crate::mcp::testutil::body_of(&call(
+            &env,
+            serde_json::json!({"source": url, "transcribe": true}),
+        ));
+        assert_eq!(body["kind"], "bad_input", "{body}");
+        let error = body["error"].as_str().expect("error text");
+        assert!(
+            error.contains("no cached rip"),
+            "the miss names its healing action: {error}"
+        );
+        assert!(
+            !error.contains("cannot read") && !error.contains("file not found"),
+            "a cache-internal path must never be diagnosed to the model: {error}"
+        );
+    }
+
+    #[test]
+    fn transcribe_rip_evicted_underfoot_answers_transient_with_the_healing_action() {
+        // The rip resolved, then vanished while whisper held the flow open
+        // (a concurrent process's eviction): a transient race, never the
+        // caller's arguments — a kind-branching agent must keep retrying,
+        // and never see a cache-internal path diagnosed.
+        use std::sync::mpsc;
+        let env = titled_env();
+        let url = "https://example.com/v.mp4";
+        let offer = body_of(&call(&env, serde_json::json!({"source": url})));
+        assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let token = offered_tokens(&offer).remove(0);
+        let done = body_of(&call(
+            &env,
+            serde_json::json!({"source": url, "confirm": token}),
+        ));
+        assert_eq!(done["status"], "plan", "{done}");
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *env.whisper.gate.lock().expect("whisper gate") = Some((entered_tx, release_rx));
+
+        let body = std::thread::scope(|s| {
+            let transcriber =
+                s.spawn(|| call(&env, serde_json::json!({"source": url, "transcribe": true})));
+            entered_rx
+                .recv()
+                .expect("the transcription reached whisper");
+            let downloads = env.deps.config.paths.cache.join("downloads");
+            for entry in std::fs::read_dir(&downloads).expect("downloads dir") {
+                std::fs::remove_file(entry.expect("entry").path()).expect("evict the rip");
+            }
+            release_tx.send(()).expect("release whisper");
+            body_of(&transcriber.join().expect("transcribe completes"))
+        });
+
+        assert_eq!(body["kind"], "transient", "{body}");
+        let error = body["error"].as_str().expect("error text");
+        assert!(
+            error.contains("URL"),
+            "the race names its healing action: {error}"
+        );
+        assert!(
+            !error.contains("cannot read") && !error.contains("file not found"),
+            "a cache-internal path must never be diagnosed to the model: {error}"
+        );
     }
 
     #[test]
@@ -299,7 +475,7 @@ mod tests {
             &env,
             serde_json::json!({"source": file.to_string_lossy(), "transcribe": true}),
         ));
-        assert_eq!(after["status"], "plan", "{after}");
+        assert_eq!(after["status"], "transcript", "{after}");
         assert_eq!(
             *env.whisper.prompts.lock().expect("prompts"),
             [""],
@@ -344,13 +520,10 @@ mod tests {
         );
         for (name, result) in [("winner", &winner), ("rival", &rival)] {
             let body = body_of(result);
-            assert_eq!(body["status"], "plan", "{name}: {body}");
-            assert!(
-                body["guidance"]
-                    .as_str()
-                    .expect("guidance")
-                    .contains("Transcript ready"),
-                "{name}: {body}"
+            assert_eq!(body["status"], "transcript", "{name}: {body}");
+            assert_eq!(
+                body["transcript"], "00:00 hi",
+                "{name}: both callers answer with the cached transcript text"
             );
         }
     }
@@ -390,12 +563,98 @@ mod tests {
             );
             release_tx.send(()).expect("release the winner");
             let winner = body_of(&winner.join().expect("winner completes"));
-            assert_eq!(winner["status"], "plan", "the winner is unaffected");
+            assert_eq!(winner["status"], "transcript", "the winner is unaffected");
         });
         assert_eq!(
             *env.whisper.calls.lock().expect("calls"),
             1,
             "the refused rival never started a second whisper run"
+        );
+    }
+
+    #[test]
+    fn grid_render_waits_for_an_in_flight_transcription() {
+        use std::sync::mpsc;
+        let env = env(probe(90.0, vec![]), true);
+        let file = media_file(&env, "v.mp4");
+        let source = file.to_string_lossy().into_owned();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *env.whisper.gate.lock().expect("whisper gate") = Some((entered_tx, release_rx));
+
+        std::thread::scope(|s| {
+            let transcriber = s.spawn(|| {
+                call(
+                    &env,
+                    serde_json::json!({"source": source.clone(), "transcribe": true}),
+                )
+            });
+            entered_rx
+                .recv()
+                .expect("the transcription reached whisper");
+            // The grid call lands mid-transcription: it must rendezvous on
+            // the transcript gate and attach the fresh transcript, never
+            // render silently without it.
+            let grid = s.spawn(|| call(&env, serde_json::json!({"source": source.clone()})));
+            release_tx.send(()).expect("release whisper");
+            let grid = grid.join().expect("grid completes");
+            assert_ne!(grid.is_error, Some(true), "{}", text_of(&grid));
+            transcriber.join().expect("transcribe completes");
+        });
+
+        let calls = env.core.calls.lock().expect("calls");
+        let last = calls.last().expect("core ran");
+        assert!(
+            last.iter().any(|a| a == "--subtitle"),
+            "the mid-flight transcript must ride along: {last:?}"
+        );
+    }
+
+    #[test]
+    fn grid_render_notes_a_transcription_it_outwaited() {
+        use std::sync::mpsc;
+        let mut env = env(probe(90.0, vec![]), true);
+        std::sync::Arc::get_mut(&mut env.deps)
+            .expect("sole owner before threads spawn")
+            .transcribe_wait = std::time::Duration::from_millis(50);
+        let file = media_file(&env, "v.mp4");
+        let source = file.to_string_lossy().into_owned();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *env.whisper.gate.lock().expect("whisper gate") = Some((entered_tx, release_rx));
+
+        std::thread::scope(|s| {
+            let transcriber = s.spawn(|| {
+                call(
+                    &env,
+                    serde_json::json!({"source": source.clone(), "transcribe": true}),
+                )
+            });
+            entered_rx
+                .recv()
+                .expect("the transcription reached whisper");
+            // The waiter outlasts its own bound: the render proceeds, but
+            // the silent-degradation state is gone — the response says the
+            // transcript is still in flight.
+            let grid = call(&env, serde_json::json!({"source": source.clone()}));
+            assert_ne!(grid.is_error, Some(true), "{}", text_of(&grid));
+            assert!(
+                text_of(&grid).contains("still in flight"),
+                "the render must disclose the missing transcript: {}",
+                text_of(&grid)
+            );
+            release_tx.send(()).expect("release whisper");
+            transcriber.join().expect("transcribe completes");
+        });
+
+        let calls = env.core.calls.lock().expect("calls");
+        let grid_run = calls
+            .iter()
+            .find(|args| args.iter().any(|a| a == "process"))
+            .expect("core ran the grid");
+        assert!(
+            !grid_run.iter().any(|a| a == "--subtitle"),
+            "an outwaited transcript cannot half-attach: {grid_run:?}"
         );
     }
 

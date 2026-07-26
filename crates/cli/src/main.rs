@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! agent-video CLI entry point.
 //!
-//! Five subcommands: `process` (smart frame selection + grid composition),
+//! Six subcommands: `process` (smart frame selection + grid composition),
 //! `extract` (high-density sampling of a time range), `mcp` (the stdio MCP
 //! server exposing the `video` tool), `install-whisper` (provision
-//! transcription weights), and `cookie` (manage the jar for login-gated
-//! sites). `process`/`extract` accept a local file path or any URL the
-//! linked FFmpeg can open.
+//! transcription weights), `cookie` (manage the jar for login-gated
+//! sites), and `config` (manage config.toml). `process`/`extract` accept a
+//! local file path or any URL the linked FFmpeg can open.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand, ValueHint};
 use agent_video_core::config::{Config, Overrides, Profile, StrategyOpts};
 use agent_video_core::error::Error;
 use agent_video_core::event::{Event, EventSink};
+use agent_video_core::media;
 use agent_video_core::pipeline::{self, parse_range};
 use agent_video_core::source::Source;
 use agent_video_core::types::{TimeRange, format_ts};
@@ -168,6 +169,11 @@ enum Command {
         #[command(subcommand)]
         action: CookieAction,
     },
+    /// Manage config.toml.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Hidden child side of the crash-isolated GPU probe: enumerate the
     /// named backend's devices and answer via the exit status (0 = a
     /// usable device exists). Runs in a disposable process because ggml's
@@ -193,6 +199,46 @@ enum CookieAction {
         #[arg(long)]
         domain: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Write a fully-commented template to the config path: every key at
+    /// its default for this machine, sshd_config-style — the file changes
+    /// nothing until a line is uncommented. Refuses to overwrite.
+    Init {
+        /// Overwrite an existing config.toml.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// Run one `config` action. Failures are [`harness::config::ConfigError`]
+/// so they exit with the invalid-config code, not the uncoded-bug code.
+fn run_config(action: &ConfigAction) -> anyhow::Result<()> {
+    use harness::config::{BaseDirs, ConfigError, config_file_path, default_config};
+    let dirs = BaseDirs::detect();
+    match action {
+        ConfigAction::Init { force } => {
+            let path = config_file_path(&dirs);
+            if path.exists() && !force {
+                return Err(ConfigError(format!(
+                    "{} already exists; pass --force to overwrite it",
+                    path.display()
+                ))
+                .into());
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| ConfigError(format!("cannot create {}: {e}", parent.display())))?;
+            }
+            let template = harness::config::render_template(&default_config(&dirs));
+            std::fs::write(&path, template)
+                .map_err(|e| ConfigError(format!("cannot write {}: {e}", path.display())))?;
+            println!("wrote {}", path.display());
+            Ok(())
+        }
+    }
 }
 
 /// Run one `cookie` action against the loaded config.
@@ -413,6 +459,9 @@ fn run() -> anyhow::Result<()> {
                     max_in_flight: in_flight.unwrap_or(pipeline::DEFAULT_IN_FLIGHT),
                     subs: run.subs,
                     window,
+                    // Manual token: the CLI has no cancellation path yet;
+                    // ctrl-C wiring would trip this one.
+                    stop: media::Stop::new(),
                     events: &StderrEvents,
                 },
             )
@@ -427,6 +476,7 @@ fn run() -> anyhow::Result<()> {
                 &run.cfg,
                 range,
                 run.subs,
+                &media::Stop::new(),
                 &StderrEvents,
             )
         }
@@ -438,10 +488,57 @@ fn run() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Cookie { action } => run_cookie(&action),
+        Command::Config { action } => run_config(&action),
         Command::ProbeGpu { backend } => {
             // The parent reads only the exit status; bypass the error
             // plumbing and its exit-code conventions entirely.
             std::process::exit(harness::gpu::probe_child(&backend));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Pins the cross-crate assumption behind the harness's `raw` vetting
+    /// (`agent_video_harness::raw`, `forbidden_flag`): its `-o` prefix ban
+    /// covers every clap spelling only while no boolean short flag exists
+    /// on the raw-reachable subcommands — a boolean `-x` would let
+    /// `-xo/tmp` cluster the value-taking `-o` behind it, and the token no
+    /// longer starts with `-o`. Every short flag taking a value makes such
+    /// clusters unrepresentable.
+    #[test]
+    fn every_short_flag_takes_a_value_so_none_clusters_ahead_of_dash_o() {
+        let cli = Cli::command();
+        for name in ["process", "extract"] {
+            let sub = cli
+                .get_subcommands()
+                .find(|s| s.get_name() == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "subcommand {name} exists — it is raw-reachable through the \
+                         harness ({name} renamed or removed? update harness raw vetting)"
+                    )
+                });
+            for arg in sub.get_arguments() {
+                let shorts: Vec<char> = arg
+                    .get_short()
+                    .into_iter()
+                    .chain(arg.get_all_short_aliases().into_iter().flatten())
+                    .collect();
+                if shorts.is_empty() {
+                    continue;
+                }
+                assert!(
+                    arg.get_action().takes_values(),
+                    "short flag(s) {shorts:?} of --{} on `{name}` take no value: a boolean \
+                     short flag lets clap clusters smuggle -o past the harness's \
+                     forbidden_flag prefix check (crates/harness/src/raw.rs)",
+                    arg.get_id(),
+                );
+            }
         }
     }
 }

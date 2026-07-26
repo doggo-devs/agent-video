@@ -12,7 +12,7 @@ use crate::error::{Error, ErrorCode, ErrorContext};
 use crate::event::{Event, EventSink};
 use crate::source::Source;
 use crate::subtitle::Subtitles;
-use crate::types::{GridImage, GridMeta};
+use crate::types::{GridImage, GridMeta, GridSubtitles, TimeRange};
 use crate::wire;
 
 use super::OutputSink;
@@ -244,36 +244,63 @@ fn is_own_artifact(name: &str) -> bool {
         || numbered_jpg("static_")
 }
 
-/// Slice per-grid subtitles, assemble [`Metadata`], and commit the session.
+/// One run's time facts, assembled by the caller and consumed whole at the
+/// output boundary.
+pub struct Timeline {
+    /// What `metadata.json` reports: the probed total duration, floored by
+    /// the frame-derived estimate.
+    pub duration: f32,
+    /// The range the run attended to (the `--from/--until` window, else the
+    /// whole video) — the subtitle-ownership boundary for
+    /// [`Subtitles::assign`].
+    pub processed: TimeRange,
+}
+
+/// Assign per-grid subtitles, assemble [`Metadata`], and commit the session.
 ///
 /// `subs` is already resolved by the caller — resolution can fail (ambiguous
 /// sources, unreadable files) and must happen before any grid hits the disk,
-/// not here at the tail of the run. `events` receives the commit's
-/// [`Event::GridsWritten`] in file mode.
+/// not here at the tail of the run. Every cue inside `timeline.processed`
+/// lands on exactly one grid ([`Subtitles::assign`]), so the unsampled
+/// head/tail and inter-grid gaps cannot swallow text. `events` receives the
+/// commit's [`Event::GridsWritten`] in file mode.
 pub fn write_outputs(
     session: OutputSession<'_>,
     input: &Source,
     cfg: &Config,
-    duration: f32,
+    timeline: Timeline,
     mut grid_metas: Vec<GridMeta>,
     subs: Option<&Subtitles>,
     events: &dyn EventSink,
 ) -> Result<()> {
-    for grid in &mut grid_metas {
-        grid.subtitles = match subs {
-            Some(subs) => subs.slice(grid.time_range),
-            None => crate::types::GridSubtitles::NoSource,
-        };
+    match subs {
+        Some(subs) => {
+            let spans: Vec<TimeRange> = grid_metas.iter().map(|g| g.time_range).collect();
+            for (grid, assigned) in grid_metas
+                .iter_mut()
+                .zip(subs.assign(timeline.processed, &spans))
+            {
+                grid.subtitles = assigned;
+            }
+        }
+        None => {
+            for grid in &mut grid_metas {
+                grid.subtitles = GridSubtitles::NoSource;
+            }
+        }
     }
 
     let meta = wire::Metadata::process(
         input.to_string(),
-        duration,
+        timeline.duration,
         cfg.settings(),
         grid_metas.into_iter().map(Into::into).collect(),
     );
 
-    session.commit(&meta, subs.map(Subtitles::raw), events)
+    // The SRT payload materializes only for the commit: verbatim sources
+    // borrow, embedded cues serialize here and drop with `srt`.
+    let srt = subs.map(Subtitles::srt_text);
+    session.commit(&meta, srt.as_deref(), events)
 }
 
 /// Write a staged file, mapping failures into the output error decade.

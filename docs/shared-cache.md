@@ -3,14 +3,14 @@
 Several agent-video server processes can run against the same cache directory
 and the same cookie jar at once (one per MCP client, plus ad-hoc CLI runs).
 The cache has no manifest and no lock server: disk is the index, and safety
-comes from choosing, per artifact, one of exactly three legal sharing
-patterns. Anything outside these three is a bug.
+comes from choosing, per artifact, one of the legal sharing patterns below.
+Anything outside them is a bug.
 
 **The rule:** every shared on-disk artifact must name its pattern in its module
 doc. A reviewer can then check the write path against the named pattern without
 reconstructing the concurrency argument from scratch.
 
-The three patterns, from cheapest to most involved:
+The patterns, from cheapest to most involved:
 
 ## Pattern 1 — Content-addressed + idempotent write
 
@@ -88,6 +88,35 @@ ownership test; in-flight staging is exempt from the LRU budget.
   the staging file carries the writer id; write, then rename, removing the
   `.part` on failure.
 
+## Pattern 2a — Per-writer staging + atomic hard-link + first-writer-wins
+
+**When it applies:** the artifact is *stable-per-content, not a pure function
+of the bytes* — any single writer's value would serve, but the value must
+freeze at first publication because downstream identities derive from it.
+Pattern 1's equal-bytes argument does not hold (two writers for the same key
+may carry different values), and Pattern 2's last-writer-wins would break the
+freeze (a re-publication changes the derived identity).
+
+**Why it is safe:** staging is exactly Pattern 2's — a writer-unique `.part`
+from `cache::naming`, so no two writers share a buffer and a crashed writer's
+debris is age-swept like everyone else's. Only the publish step differs:
+`fs::hard_link(part, dest)` instead of `rename`. The link atomically installs
+the complete staged bytes or fails with `AlreadyExists` when a winner is in
+place, so a reader can never observe a torn or empty artifact and no later
+writer can dethrone the winner — losers remove their staging and report
+success.
+
+**Members:**
+
+- **Title sidecars** — `crate::cache::Cache::put_title`. The first-sighted
+  media title for a content fingerprint, an input to the transcript identity
+  (`crate::transcribe::transcript_id`); freezing it closes the
+  retitle → new transcript id → re-transcription fragmentation window. A
+  blank title is never published, and a blank on-disk sidecar (a legacy torn
+  write from the pre-atomic path) is no winner: `get_title` answers `None`
+  without refreshing its clock so it ages out, and `put_title` unlinks it and
+  contests the link again, so the next sighting heals it.
+
 ## Pattern 3 — Three-way merge protocol
 
 **When it applies:** genuinely shared *mutable* state that several processes
@@ -123,6 +152,7 @@ pattern.
 | Whisper transcripts (`cache.rs` keying + `transcribe::write_srt`) | 2 | keyed by fingerprint × `transcript_id`; writer-unique `.part` (via `cache::naming`), `rename`, `.part` removed on failure | Yes — the key rules out cross-recipe answers, but decoding is not byte-deterministic, so safety rests on the staged rename: exactly what pattern 2 provides. |
 | Direct downloads (`fetch/direct.rs`) | 2 | writer-unique `.part` (via `cache::naming`), `sync_all`, atomic `rename` | Yes. |
 | yt-dlp downloads (`fetch/ytdlp.rs`) | 2 | per-writer `.staging-…` dir (via `cache::naming`), fsync + per-file `rename` in `adopt_into` | Yes. |
+| Title sidecars (`cache.rs::put_title`) | 2a | writer-unique `.part` (via `cache::naming`), atomic `hard_link` publish, `.part` removed win or lose | Yes — the link installs the whole title or loses to an existing winner, so first-writer-wins is atomic; blank legacy sidecars are dethroned on put and self-retire on read. |
 | Cookie jar (`cookies.rs`) | 3 | exclusive `.lock`, checkout/commit delta merge, temp + rename publish | Yes. |
 
 Every write path meets or exceeds its declared pattern. The one over-strength

@@ -6,7 +6,9 @@ use anyhow::Result;
 use crate::error::{Error, ErrorCode};
 use crate::types::TimeRange;
 
-/// Parse a `MM:SS-MM:SS` (or `SS-SS`) range into a [`TimeRange`].
+/// Parse a `MM:SS-MM:SS` (or `SS-SS`) range into a [`TimeRange`]. Each bound
+/// is the crate's shared clock grammar (`crate::types::parse_clock`), so `.`
+/// and `,` fractions are both accepted in any component.
 pub fn parse_range(s: &str) -> Result<TimeRange> {
     let (a, b) = s.split_once('-').ok_or_else(|| {
         Error::new(
@@ -82,40 +84,17 @@ impl Window {
     }
 }
 
+/// The shared clock grammar with `--range`'s error currency: a rejection
+/// must carry [`ErrorCode::InvalidRange`] (exit 31), not the uncoded exit 1
+/// a bare anyhow error would degrade to.
 fn parse_clock(s: &str) -> Result<f32> {
-    let parts: Vec<&str> = s.split(':').collect();
-    // Malformed `--range` must carry InvalidRange (exit 31), not the uncoded
-    // exit 1 a bare anyhow error would degrade to.
-    let parse = |p: &str| {
-        p.parse::<f32>().map_err(|_| {
-            anyhow::Error::from(Error::new(
-                ErrorCode::InvalidRange,
-                format!("invalid time '{s}'"),
-            ))
-        })
-    };
-    let secs = match parts.as_slice() {
-        [sec] => parse(sec)?,
-        [m, sec] => parse(m)? * 60.0 + parse(sec)?,
-        [h, m, sec] => parse(h)? * 3600.0 + parse(m)? * 60.0 + parse(sec)?,
-        _ => {
-            return Err(Error::new(
-                ErrorCode::InvalidRange,
-                format!("expected MM:SS or seconds, got '{s}'"),
-            )
-            .into());
-        }
-    };
-    // f32::parse accepts NaN/inf; none are valid clock times, and NaN would
-    // slip past the ordering check below.
-    if !secs.is_finite() || secs < 0.0 {
-        return Err(Error::new(
+    crate::types::parse_clock(s).ok_or_else(|| {
+        Error::new(
             ErrorCode::InvalidRange,
-            format!("time '{s}' must be a finite, non-negative clock value"),
+            format!("invalid time '{s}': expected [HH:]MM:SS or seconds, finite and non-negative"),
         )
-        .into());
-    }
-    Ok(secs)
+        .into()
+    })
 }
 
 #[cfg(test)]
@@ -152,6 +131,14 @@ mod tests {
     #[test]
     fn rejects_negative_clock_components() {
         assert!(parse_range("0:-30-1:00").is_err());
+    }
+
+    #[test]
+    fn parses_comma_fraction_range() {
+        // The shared clock grammar accepts `,` fractions (SRT heritage);
+        // range bounds inherit the leniency by construction.
+        let r = parse_range("1:23,5-1:24").expect("comma fraction is valid");
+        assert_eq!((r.start(), r.end()), (83.5, 84.0));
     }
 
     #[test]

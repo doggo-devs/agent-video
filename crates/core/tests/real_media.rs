@@ -8,7 +8,10 @@ mod support;
 
 use agent_video_core::config::Overrides;
 use agent_video_core::event::Discard;
-use agent_video_core::media::audio::{AudioSamples, WHISPER_SAMPLE_RATE, decode_audio_16k_mono};
+use agent_video_core::media::Stop;
+use agent_video_core::media::audio::{
+    AudioCeiling, AudioSamples, WHISPER_SAMPLE_RATE, decode_audio_16k_mono,
+};
 use agent_video_core::pipeline::{self, OutputSink, SubtitleSource, Window};
 use agent_video_core::probe;
 use agent_video_core::source::Source;
@@ -25,6 +28,12 @@ const ROUNDING: f32 = 0.5;
 /// content it covers; combined with rounding on both endpoints, two grids
 /// (or a grid and the file edge) may legitimately sit this far apart.
 const COVERAGE_SLACK: f32 = 2.0;
+
+/// A ceiling far above any fixture's duration: overflow tests pick their
+/// own tight cap; everything else must never trip this one.
+fn generous_cap() -> AudioCeiling {
+    AudioCeiling::from_seconds(60).expect("60s is a valid ceiling")
+}
 
 macro_rules! require_fixture {
     ($e:expr) => {
@@ -61,6 +70,7 @@ fn run_process(
             max_in_flight: pipeline::DEFAULT_IN_FLIGHT,
             subs,
             window,
+            stop: Stop::new(),
             events: &Discard,
         },
     )
@@ -92,6 +102,7 @@ fn covers_full_duration_without_overlap() {
             max_in_flight: pipeline::DEFAULT_IN_FLIGHT,
             subs: SubtitleSource::Auto,
             window: None,
+            stop: Stop::new(),
             events: &Discard,
         },
     )
@@ -245,6 +256,7 @@ fn extracts_single_valid_jpeg_grid() {
         &cfg,
         range,
         SubtitleSource::Auto,
+        &Stop::new(),
         &Discard,
     )
     .expect("extract succeeds on the synthesized fixture");
@@ -274,8 +286,8 @@ fn extracts_single_valid_jpeg_grid() {
 #[test]
 fn probes_duration_within_half_second() {
     let fx = require_fixture!(support::fixtures::h264_talk(6.0));
-    let duration =
-        probe::probe_duration(&source_of(&fx.media)).expect("probe succeeds on the fixture");
+    let duration = probe::probe_duration(&source_of(&fx.media), &Stop::new())
+        .expect("probe succeeds on the fixture");
     assert!(
         (duration - fx.duration).abs() <= 0.5,
         "probed {duration}s is within 0.5s of the synthesized {}s",
@@ -318,9 +330,22 @@ fn reports_a_missing_audio_track_as_absence_not_failure() {
     // legitimate silent video (surveillance, screen capture) must decode
     // to "no audio here", never to a corrupt-input error.
     let fx = require_fixture!(support::fixtures::keyframe_poor(2.0));
-    let decoded = decode_audio_16k_mono(&source_of(&fx.media))
+    let decoded = decode_audio_16k_mono(&source_of(&fx.media), &Stop::new(), generous_cap())
         .expect("a video without an audio track is not a decode failure");
     assert!(decoded.is_none(), "absence is Ok(None), not an error");
+}
+
+#[test]
+fn rejects_audio_decoding_past_the_ceiling() {
+    // The finding's shape: a track longer than the caller's ceiling must
+    // fail with a typed error before materializing, never decode whole and
+    // never truncate silently. 6s of audio against a 1s cap pins the
+    // mechanism without synthesizing a hostile multi-hour file.
+    let fx = require_fixture!(support::fixtures::audio_param_change(6.0));
+    let cap = AudioCeiling::from_seconds(1).expect("1s is a valid ceiling");
+    let err = decode_audio_16k_mono(&source_of(&fx.media), &Stop::new(), cap)
+        .expect_err("6s of audio must overflow a 1s ceiling");
+    assert_eq!(err.code, agent_video_core::error::ErrorCode::InputTooLong);
 }
 
 #[test]
@@ -330,7 +355,7 @@ fn follows_mid_stream_sample_rate_change_in_audio_decode() {
     // 44100 -> 22050 Hz mid-stream change with AVERROR_INPUT_CHANGED and
     // discarded everything already decoded. Following the change means the
     // decode succeeds AND its output spans both segments, not just the first.
-    let samples = decode_audio_16k_mono(&source_of(&fx.media))
+    let samples = decode_audio_16k_mono(&source_of(&fx.media), &Stop::new(), generous_cap())
         .expect("audio decode follows the mid-stream sample-rate change")
         .expect("the fixture has an audio track");
     let expected = fx.duration * WHISPER_SAMPLE_RATE as f32;
@@ -347,16 +372,17 @@ fn follows_mid_stream_sample_rate_change_in_audio_decode() {
 }
 
 #[test]
-fn bounded_fills_reproduce_the_whole_decode() {
+fn collects_whole_track_under_a_generous_ceiling() {
     // The streaming contract: pulling the track through small bounded
-    // fills must yield bit-identical samples to the whole-track decode —
-    // same pipeline, same carry-over handling, chunk seams invisible.
+    // fills must yield bit-identical samples to the capped whole-track
+    // decode — same pipeline, same carry-over handling, chunk seams
+    // invisible, and a generous ceiling changes nothing on legit input.
     let fx = require_fixture!(support::fixtures::audio_param_change(6.0));
-    let whole = decode_audio_16k_mono(&source_of(&fx.media))
-        .expect("whole decode succeeds")
+    let whole = decode_audio_16k_mono(&source_of(&fx.media), &Stop::new(), generous_cap())
+        .expect("whole decode succeeds under a generous ceiling")
         .expect("the fixture has an audio track");
 
-    let mut stream = AudioSamples::open(&source_of(&fx.media))
+    let mut stream = AudioSamples::open(&source_of(&fx.media), &Stop::new())
         .expect("stream opens")
         .expect("the fixture has an audio track");
     let mut streamed = Vec::new();

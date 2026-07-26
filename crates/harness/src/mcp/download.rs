@@ -266,12 +266,21 @@ fn perform_download(
     // included. First writer wins (`put_title` is write-once): a
     // re-download under a retitled upload must not shift the derived
     // prompt. Best-effort: a rip without a recorded title only loses
-    // the derived prompt, never the download.
+    // the derived prompt, never the download — but the loss must be
+    // observable, because it is not local: an untitled rip derives a
+    // different transcript id than titled rips of the same content on
+    // other machines, splitting the shared transcript cache and
+    // re-running whisper for identical bytes.
     if let Some(title) = &plan.title
         && let Ok(fp) = crate::identity::fingerprint_file(&path)
         && fp.stable
+        && let Err(e) = deps.cache.put_title(&fp.id, title)
     {
-        let _ = deps.cache.put_title(&fp.id, title);
+        tracing::warn!(
+            error = %e,
+            "title sidecar publication failed; transcripts of this content derive an \
+             untitled prompt on this machine, splitting the shared transcript cache"
+        );
     }
     match plan.dest {
         Dest::Cache => analysis_response(source, &path, warning.as_deref(), deps).into(),

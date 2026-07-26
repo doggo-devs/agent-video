@@ -167,6 +167,11 @@ impl<'a> ProcessState<'a> {
         // chunks, so waiting for room at the spawn boundary is what bounds
         // buffered chunks.
         let env = self.env;
+        // The catch serves unwind builds (tests, downstream consumers on
+        // the default profile), where a chunk-worker panic must surface as
+        // this run's error, not silently lose a grid. This workspace's
+        // release binaries build with `panic = "abort"` and terminate
+        // before reaching it.
         let results = self.jobs.spawn(self.pool, move |ci| {
             panic::catch_unwind(AssertUnwindSafe(|| {
                 process_chunk(ci, chunk, prev_tail, env)

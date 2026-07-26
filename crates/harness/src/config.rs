@@ -3,7 +3,9 @@
 //!
 //! Defaults come from the `dirs` crate; a file at
 //! `<config_dir>/agent-video/config.toml` (or `$AGENT_VIDEO_CONFIG`) overrides
-//! any key. Invalid values fail loudly at load time — a misconfigured server
+//! any key; `agent-video config init` writes a fully-commented template of
+//! every key at its default ([`render_template`]). Invalid values fail loudly
+//! at load time — a misconfigured server
 //! must not start. Positive integers are encoded as `NonZero` types so a zero
 //! budget or byte ceiling is unrepresentable past this boundary.
 
@@ -36,7 +38,7 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// Resolved harness configuration; all byte values are absolute counts.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub paths: Paths,
     pub cache: CacheCfg,
@@ -50,7 +52,7 @@ pub struct Config {
 
 /// Subtitle sidecar policy; consumed by the yt-dlp source when electing
 /// the one promoted sidecar from a multi-language download.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SubtitlesCfg {
     /// Language preference for the election: prefix-matched (`"en"` claims
     /// `"en-US"`), first hit wins, no hit falls back to the first
@@ -59,7 +61,7 @@ pub struct SubtitlesCfg {
 }
 
 /// The three path roles, kept distinct.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Paths {
     /// Evictable analysis artifacts: download rips, probe docs, transcripts.
     pub cache: PathBuf,
@@ -69,13 +71,13 @@ pub struct Paths {
     pub keep: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CacheCfg {
     /// LRU eviction threshold over `downloads/`.
     pub max_bytes: NonZeroU64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WhisperCfg {
     pub model: WhisperModel,
     /// Explicit backend pin; `None` auto-detects from compiled features.
@@ -108,7 +110,7 @@ impl WhisperCfg {
     pub const DEFAULT_API_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DownloadCfg {
     /// Hard refusal ceiling for any single download.
     pub max_bytes: NonZeroU64,
@@ -122,7 +124,7 @@ pub struct DownloadCfg {
 }
 
 /// Egress policy knobs; enforcement lives in [`crate::netguard`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NetworkCfg {
     /// Permit URL sources whose hosts resolve to private, loopback, or
     /// otherwise non-global addresses. Off by default: a model-supplied
@@ -134,7 +136,7 @@ pub struct NetworkCfg {
 /// ([`crate::fetch::ytdlp`]). Acquisition is always explicit — a config key
 /// or `agent-video cookie import` — never an implicit browser read during a
 /// tool call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CookiesCfg {
     /// `--cookies-from-browser` value (e.g. `"firefox"`,
     /// `"chrome:Profile 1"`): read cookies live from this browser's store
@@ -185,7 +187,7 @@ fn parse_language(value: &str) -> Result<String, ConfigError> {
     Ok(value.to_string())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BudgetCfg {
     /// Predicted grid count at or below which a call runs immediately.
     pub auto_run: NonZeroU32,
@@ -631,6 +633,313 @@ fn expand_tilde(path: &str, home: &Path) -> PathBuf {
     }
 }
 
+// ── template ──
+
+/// Render the sshd_config-style `config.toml` template for `cfg`: every key
+/// present at its resolved value and commented out, so the file as written
+/// changes nothing.
+///
+/// Two comment shapes, machine-distinguishable: `#key = value` (no space
+/// after `#`) is a disabled key whose value is `cfg`'s — uncommenting it
+/// verbatim is a no-op, guaranteed by the round-trip test; `# text` (space
+/// after `#`) is prose, including examples for keys whose default is the
+/// absence of the key.
+///
+/// The exhaustive destructuring below is the drift guard: a new config field
+/// fails compilation here until the template learns to render it.
+pub fn render_template(cfg: &Config) -> String {
+    use std::fmt::Write;
+
+    fn t(s: &str) -> String {
+        toml::Value::String(s.to_string()).to_string()
+    }
+    fn tp(p: &Path) -> String {
+        t(&p.to_string_lossy())
+    }
+
+    let Config {
+        paths,
+        cache,
+        whisper,
+        download,
+        budget,
+        network,
+        cookies,
+        subtitles,
+    } = cfg;
+    let Paths {
+        cache: cache_path,
+        models,
+        keep,
+    } = paths;
+    let CacheCfg {
+        max_bytes: cache_max_bytes,
+    } = cache;
+    let WhisperCfg {
+        model,
+        backend,
+        api_key,
+        api_url,
+        prompt,
+        language,
+    } = whisper;
+    let DownloadCfg {
+        max_bytes: download_max_bytes,
+        analysis_max_height,
+        sync_wait_seconds,
+    } = download;
+    let BudgetCfg {
+        auto_run,
+        max,
+        max_stretch_seconds,
+    } = budget;
+    let NetworkCfg {
+        allow_private_hosts,
+    } = network;
+    let CookiesCfg { from_browser, jar } = cookies;
+    let SubtitlesCfg { preferred_langs } = subtitles;
+
+    let model_value = match model {
+        WhisperModel::Medium => t("medium"),
+        WhisperModel::LargeV3 => t("large-v3"),
+        WhisperModel::LargeV3Turbo => t("large-v3-turbo"),
+        WhisperModel::File(p) => tp(p),
+    };
+    let langs_value = toml::Value::Array(
+        preferred_langs
+            .iter()
+            .map(|l| toml::Value::String(l.clone()))
+            .collect(),
+    )
+    .to_string();
+
+    // An optional key: `Some` renders as a disabled `#key = value` line,
+    // `None` as a prose example — uncommenting must never invent a value
+    // whose default is absence.
+    let opt = |out: &mut String, key: &str, value: Option<String>, example: &str| {
+        match value {
+            Some(v) => writeln!(out, "#{key} = {v}"),
+            None => writeln!(out, "# {key} = {example}"),
+        }
+        .expect("writing to a String cannot fail");
+    };
+
+    fn line(out: &mut String, s: &str) {
+        out.push_str(s);
+        out.push('\n');
+    }
+
+    let mut out = String::new();
+
+    line(
+        &mut out,
+        "# agent-video config.toml — generated by `agent-video config init`.",
+    );
+    line(&mut out, "#");
+    line(
+        &mut out,
+        "# Every key is shown at its resolved default for this machine and",
+    );
+    line(
+        &mut out,
+        "# commented out: as written, this file changes nothing. Uncomment a",
+    );
+    line(
+        &mut out,
+        "# `#key = value` line and edit it to override. Keys whose default is",
+    );
+    line(
+        &mut out,
+        "# the key's absence carry a `# key = ...` example instead. Unknown",
+    );
+    line(
+        &mut out,
+        "# keys and invalid values refuse the load. Full reference:",
+    );
+    line(&mut out, "# docs/config.md in the source tree.");
+    line(&mut out, "");
+    line(&mut out, "[paths]");
+    line(
+        &mut out,
+        "# Evictable analysis artifacts: download rips, probe docs, transcripts.",
+    );
+    line(&mut out, &format!("#cache = {}", tp(cache_path)));
+    line(
+        &mut out,
+        "# Whisper weights (model + Silero VAD): persistent, never evicted.",
+    );
+    line(&mut out, &format!("#models = {}", tp(models)));
+    line(
+        &mut out,
+        "# Landing directory for keep downloads; files here belong to you.",
+    );
+    line(&mut out, &format!("#keep = {}", tp(keep)));
+    line(&mut out, "");
+    line(&mut out, "[cache]");
+    line(
+        &mut out,
+        "# LRU eviction threshold over downloads/, in bytes (default 10 GiB).",
+    );
+    line(&mut out, &format!("#max_bytes = {cache_max_bytes}"));
+    line(&mut out, "");
+    line(&mut out, "[whisper]");
+    line(
+        &mut out,
+        "# Transcription model: medium, large-v3, large-v3-turbo (provisioned",
+    );
+    line(
+        &mut out,
+        "# by `agent-video install-whisper`), or a path to a self-supplied",
+    );
+    line(&mut out, "# ggml file.");
+    line(&mut out, &format!("#model = {model_value}"));
+    line(
+        &mut out,
+        "# GPU backend pin: metal, coreml, cuda, vulkan; must be compiled into",
+    );
+    line(
+        &mut out,
+        "# this build. Unset: auto-detect from compiled features.",
+    );
+    opt(
+        &mut out,
+        "backend",
+        backend.map(|b| t(b.name())),
+        "\"vulkan\"",
+    );
+    line(
+        &mut out,
+        "# API key for remote transcription (Groq / OpenAI-compatible);",
+    );
+    line(
+        &mut out,
+        "# the WHISPER_API_KEY environment variable overrides it at load time.",
+    );
+    opt(
+        &mut out,
+        "api_key",
+        api_key.as_deref().map(t),
+        "\"gsk_...\"",
+    );
+    line(&mut out, "# Remote transcription endpoint.");
+    line(&mut out, &format!("#api_url = {}", t(api_url)));
+    line(
+        &mut out,
+        "# Whisper conditioning text: continuation-style vocabulary bias, not",
+    );
+    line(
+        &mut out,
+        "# instructions. Unset: derived from the media title.",
+    );
+    opt(
+        &mut out,
+        "prompt",
+        prompt.as_deref().map(t),
+        "\"Preceding-transcript-style text with domain vocabulary.\"",
+    );
+    line(
+        &mut out,
+        "# ISO 639-1 language hint, e.g. \"zh\". Unset: auto-detect.",
+    );
+    opt(&mut out, "language", language.as_deref().map(t), "\"zh\"");
+    line(&mut out, "");
+    line(&mut out, "[download]");
+    line(
+        &mut out,
+        "# Hard refusal ceiling for any single download, in bytes (default 2 GiB).",
+    );
+    line(&mut out, &format!("#max_bytes = {download_max_bytes}"));
+    line(
+        &mut out,
+        "# Frame-height ceiling for analysis rips (grid quality ceiling).",
+    );
+    line(
+        &mut out,
+        &format!("#analysis_max_height = {analysis_max_height}"),
+    );
+    line(
+        &mut out,
+        "# Seconds a confirmed download may block the call before detaching.",
+    );
+    line(
+        &mut out,
+        &format!("#sync_wait_seconds = {sync_wait_seconds}"),
+    );
+    line(&mut out, "");
+    line(&mut out, "[budget]");
+    line(
+        &mut out,
+        "# Predicted grid count at or below which a bare call runs immediately.",
+    );
+    line(&mut out, &format!("#auto_run = {auto_run}"));
+    line(
+        &mut out,
+        "# Predicted grid count above which the plan degrades / needs consent.",
+    );
+    line(&mut out, &format!("#max = {max}"));
+    line(
+        &mut out,
+        "# Max seconds one stretched grid may cover before requiring consent.",
+    );
+    line(
+        &mut out,
+        &format!("#max_stretch_seconds = {max_stretch_seconds}"),
+    );
+    line(&mut out, "");
+    line(&mut out, "[network]");
+    line(
+        &mut out,
+        "# Permit URL sources resolving to private/loopback addresses. Off by",
+    );
+    line(
+        &mut out,
+        "# default so a model-supplied URL cannot reach internal services (SSRF).",
+    );
+    line(
+        &mut out,
+        &format!("#allow_private_hosts = {allow_private_hosts}"),
+    );
+    line(&mut out, "");
+    line(&mut out, "[cookies]");
+    line(
+        &mut out,
+        "# yt-dlp --cookies-from-browser value, e.g. \"firefox\" or",
+    );
+    line(
+        &mut out,
+        "# \"chrome:Profile 1\": read cookies live from the browser store at",
+    );
+    line(
+        &mut out,
+        "# every spawn. Unset: anonymous, or the jar below when it exists.",
+    );
+    opt(
+        &mut out,
+        "from_browser",
+        from_browser.as_deref().map(t),
+        "\"firefox\"",
+    );
+    line(
+        &mut out,
+        "# The canonical jar is managed by `agent-video cookie import`, not",
+    );
+    line(&mut out, "# by this file; it lives at:");
+    line(&mut out, &format!("#   {}", jar.display()));
+    line(&mut out, "");
+    line(&mut out, "[subtitles]");
+    line(
+        &mut out,
+        "# Language preference for electing the promoted subtitle sidecar;",
+    );
+    line(
+        &mut out,
+        "# prefix-matched (\"en\" claims \"en-US\"), first hit wins.",
+    );
+    line(&mut out, &format!("#preferred_langs = {langs_value}"));
+
+    out
+}
+
 #[cfg(test)]
 pub(crate) fn test_dirs(root: &Path) -> BaseDirs {
     BaseDirs {
@@ -883,5 +1192,71 @@ mod tests {
     fn rejects_unknown_backend() {
         let err = parse_config("[whisper]\nbackend = \"tpu\"\n", &dirs()).expect_err("unknown");
         assert!(err.0.contains("tpu"), "names the value: {err}");
+    }
+
+    /// Strip the leading `#` from every disabled-key line (`#key = value`,
+    /// no space after `#`), leaving prose comments (`# text`) alone — the
+    /// mechanical inverse of the template's comment convention.
+    fn uncomment(template: &str) -> String {
+        template
+            .lines()
+            .map(|l| match l.strip_prefix('#') {
+                Some(rest) if rest.starts_with(|c: char| c.is_ascii_lowercase()) => rest,
+                _ => l,
+            })
+            .fold(String::new(), |mut acc, l| {
+                acc.push_str(l);
+                acc.push('\n');
+                acc
+            })
+    }
+
+    #[test]
+    fn template_is_inert_as_written() {
+        let d = dirs();
+        let cfg = parse_config(&render_template(&default_config(&d)), &d)
+            .expect("the template must parse as-is");
+        assert_eq!(
+            cfg,
+            default_config(&d),
+            "a fully-commented template is a no-op"
+        );
+    }
+
+    #[test]
+    fn uncommented_template_round_trips_to_defaults() {
+        let d = dirs();
+        let text = uncomment(&render_template(&default_config(&d)));
+        assert!(
+            text.contains("\nmax_stretch_seconds = "),
+            "uncommenting must actually enable keys:\n{text}"
+        );
+        let cfg = parse_config(&text, &d).expect("every uncommented default must be valid");
+        assert_eq!(
+            cfg,
+            default_config(&d),
+            "uncommenting a default line must be a no-op"
+        );
+    }
+
+    #[test]
+    fn template_renders_set_optionals_as_disabled_keys() {
+        let d = dirs();
+        let mut cfg = default_config(&d);
+        cfg.whisper.backend = Some(Backend::Cuda);
+        cfg.whisper.api_key = Some("gsk_live".to_string());
+        cfg.whisper.prompt = Some("Rust 所有权与生命周期。".to_string());
+        cfg.whisper.language = Some("zh".to_string());
+        cfg.cookies.from_browser = Some("chrome:Profile 1".to_string());
+        let text = render_template(&cfg);
+        for needle in [
+            "#backend = \"cuda\"",
+            "#api_key = \"gsk_live\"",
+            "#prompt = \"Rust 所有权与生命周期。\"",
+            "#language = \"zh\"",
+            "#from_browser = \"chrome:Profile 1\"",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
     }
 }

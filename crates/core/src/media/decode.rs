@@ -11,8 +11,6 @@
 //! that produced the pixels.
 
 use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
@@ -28,8 +26,8 @@ use crate::types::{TimeRange, Ts};
 
 use super::scale::Rescaler;
 use super::{
-    ErrorBudget, MAX_READ_ERRORS, VideoStream, best_video_stream, decode_error,
-    open_input_interruptible,
+    ErrorBudget, Recv, Stop, VideoStream, best_video_stream, classify_receive, decode_error,
+    open_input,
 };
 
 /// One sampled RGB frame, already downscaled for composition.
@@ -81,12 +79,13 @@ const CHANNEL_FRAMES: usize = 8;
 pub struct FrameSource {
     rx: Option<Receiver<std::result::Result<RgbFrame, Error>>>,
     thread: Option<JoinHandle<()>>,
-    /// Set on drop so the worker exits at its next packet-loop iteration
-    /// instead of decoding on until the next sampled frame's failed send.
-    /// Also wired into libav's interrupt callback at open, so a packet read
-    /// blocked inside a libav C call (stalled network source, hung pipe)
-    /// aborts with `AVERROR_EXIT` instead of blocking the join forever.
-    stop: Arc<AtomicBool>,
+    /// Tripped on drop so the worker exits at its next packet-loop
+    /// iteration instead of decoding on until the next sampled frame's
+    /// failed send. Also wired into libav's interrupt callback at open, so
+    /// a packet read blocked inside a libav C call (stalled network source,
+    /// hung pipe) aborts with `AVERROR_EXIT` instead of blocking the join
+    /// forever.
+    stop: Stop,
     aspect: Option<f32>,
     done: bool,
 }
@@ -100,6 +99,13 @@ impl FrameSource {
     /// precise error codes; mid-stream failures surface from `next_frame`.
     /// `events` receives a [`Event::SeekFallback`] when a seek to a window
     /// start fails and decoding degrades to a sequential read.
+    ///
+    /// The [`Stop`] guarding this open is self-minted, not taken from the
+    /// caller: [`Drop`] needs the exclusive right to trip it (a shared
+    /// token tripped elsewhere would kill an unrelated decode mid-stream).
+    /// A pipeline-level stop token (e.g. `ProcessOpts.stop`) therefore
+    /// covers the probe/subtitle paths but not this decode thread; future
+    /// ctrl-C wiring must bridge the two tokens explicitly.
     pub fn open(
         input: &Source,
         spec: SampleSpec,
@@ -109,8 +115,8 @@ impl FrameSource {
     ) -> Result<Self> {
         // Built before the container so it can ride into libav's interrupt
         // callback, arming every blocking I/O call in this context.
-        let stop = Arc::new(AtomicBool::new(false));
-        let mut ictx = open_input_interruptible(input, Arc::clone(&stop), &[])?;
+        let stop = Stop::new();
+        let mut ictx = open_input(input, &stop, &[])?;
         let video = best_video_stream(&ictx, input)?;
 
         // Seek before building the decoder so no flush is needed. The seek
@@ -151,7 +157,7 @@ impl FrameSource {
             .map_err(|e| decode_error("opening video decoder", e).with_input(input.as_path()))?;
 
         let (tx, rx) = sync_channel(CHANNEL_FRAMES);
-        let stop_flag = Arc::clone(&stop);
+        let stop_flag = stop.clone();
         let thread = std::thread::Builder::new()
             .name("agent-video-decode".into())
             .spawn(move || {
@@ -170,7 +176,6 @@ impl FrameSource {
                     tx,
                     stop: stop_flag,
                     frames_sent: 0,
-                    decode_errors: 0,
                 };
                 worker.run();
             })
@@ -197,8 +202,12 @@ impl FrameSource {
 
     /// Read the next sampled frame, or `None` after a clean end of stream.
     /// A decode-thread panic surfaces here as an [`Error`] with
-    /// [`ErrorCode::DecodeFailed`], never as a silently truncated stream.
-    /// Mid-stream decode failures carry the worker's typed code unchanged.
+    /// [`ErrorCode::DecodeFailed`], never as a silently truncated stream —
+    /// in unwind builds (tests, downstream consumers on the default
+    /// profile). This workspace's release binaries build with
+    /// `panic = "abort"`, so a panic terminates the process before ever
+    /// reaching this path. Mid-stream decode failures carry the worker's
+    /// typed code unchanged.
     pub fn next_frame(&mut self) -> Result<Option<RgbFrame>> {
         if self.done {
             return Ok(None);
@@ -250,11 +259,11 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 
 impl Drop for FrameSource {
     fn drop(&mut self) {
-        // The flag stops the worker at its next loop iteration and aborts a
+        // The token stops the worker at its next loop iteration and aborts a
         // packet read blocked inside libav (interrupt callback); dropping the
         // receiver unblocks a send in progress. Together they bound the join
         // even on a source that will never deliver another byte.
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.trip();
         self.rx = None;
         // A panic here was already reported by the panic hook; propagating
         // out of Drop would escalate it to an abort.
@@ -410,9 +419,8 @@ struct Worker {
     rescaler: Rescaler,
     tx: SyncSender<std::result::Result<RgbFrame, Error>>,
     /// Checked once per packet: the consumer's drop requests an early exit.
-    stop: Arc<AtomicBool>,
+    stop: Stop,
     frames_sent: u64,
-    decode_errors: u32,
 }
 
 /// Whether to keep pumping after handling one decoded frame.
@@ -432,8 +440,12 @@ impl Worker {
     fn pump(&mut self) -> Result<()> {
         let mut packet = Packet::empty();
         let mut read_budget = ErrorBudget::new("reading packets");
+        // Corrupt-packet tolerance is consecutive, not cumulative: every
+        // accepted packet resets it, so scattered corruption over a long
+        // video never accumulates into a mid-run abort.
+        let mut decode_budget = ErrorBudget::new("decoding video packet");
         loop {
-            if self.stop.load(Ordering::Relaxed) {
+            if self.stop.is_tripped() {
                 return Ok(());
             }
             match self.ictx.read_packet(&mut packet) {
@@ -453,13 +465,13 @@ impl Worker {
                 continue;
             }
 
-            if let Err(e) = self.decoder.send_packet(&packet) {
+            match self.decoder.send_packet(&packet) {
+                Ok(()) => decode_budget.ok(),
                 // A corrupt packet does not abandon the rest of the stream.
-                self.decode_errors += 1;
-                if self.decode_errors > MAX_READ_ERRORS {
-                    return Err(decode_error("decoding video packet", e));
+                Err(e) => {
+                    decode_budget.fail(e)?;
+                    continue;
                 }
-                continue;
             }
             if matches!(self.drain()?, Flow::Stop) {
                 return Ok(());
@@ -477,12 +489,12 @@ impl Worker {
         }
         self.drain()?;
 
-        if self.frames_sent == 0 && self.decode_errors > 0 {
+        if self.frames_sent == 0 && decode_budget.failures() > 0 {
             return Err(Error::new(
                 ErrorCode::DecodeFailed,
                 format!(
                     "no frames decoded ({} packet errors); is the input corrupt?",
-                    self.decode_errors
+                    decode_budget.failures()
                 ),
             ));
         }
@@ -495,13 +507,10 @@ impl Worker {
     fn drain(&mut self) -> Result<Flow> {
         let mut frame = ffmpeg::frame::Video::empty();
         loop {
-            match self.decoder.receive_frame(&mut frame) {
-                Ok(()) => {}
-                Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => {
-                    return Ok(Flow::Continue);
-                }
-                Err(ffmpeg::Error::Eof) => return Ok(Flow::Continue),
-                Err(e) => return Err(decode_error("receiving decoded frame", e)),
+            match classify_receive(self.decoder.receive_frame(&mut frame)) {
+                Recv::Frame => {}
+                Recv::Drained => return Ok(Flow::Continue),
+                Recv::Broken(e) => return Err(decode_error("receiving decoded frame", e)),
             }
 
             // best-effort timestamp, pts fallback. No pts at all, or a pts

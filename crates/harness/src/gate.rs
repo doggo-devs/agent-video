@@ -69,11 +69,8 @@ impl Drop for KeyHold<'_> {
             .lock()
             .expect("keyed gate poisoned")
             .remove(&self.key);
-        // One condvar for all keys, so a release wakes every waiter and
-        // the wrong-key ones re-sleep. Per-key parking would need a
-        // per-key waiter registry with its own lifecycle; at this gate's
-        // load (transcription single-flight, single-digit waiters) that
-        // is machinery for a stampede that cannot form.
+        // One condvar for all keys, so a release must wake every waiter;
+        // the wrong-key ones re-sleep.
         self.gate.freed.notify_all();
     }
 }

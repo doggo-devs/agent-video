@@ -27,6 +27,7 @@ use anyhow::{Context, Result};
 use crate::config::Config;
 use crate::error::{Error, ErrorCode, ErrorContext};
 use crate::event::{Event, EventSink};
+use crate::media;
 use crate::probe::{KeyframeInfo, SampleStrategy};
 use crate::source::Source;
 use crate::subtitle::Subtitles;
@@ -132,6 +133,12 @@ pub struct ProcessOpts<'a> {
     pub subs: SubtitleSource<'a>,
     /// Attention window (`--from`/`--until`); `None` covers the whole video.
     pub window: Option<Window>,
+    /// Stall guard for the run's probe and subtitle-extraction reads: a
+    /// stalled source aborts with an error instead of hanging when the
+    /// token trips. The decode thread self-mints its own token (its Drop
+    /// owns the trip right — see [`crate::media::decode::FrameSource::open`]);
+    /// a caller wiring ctrl-C must bridge the two.
+    pub stop: media::Stop,
     /// Receives every diagnostic the run emits (mode announcements,
     /// sparse-region fill lines, decode-open and subtitle warnings) as
     /// typed [`Event`]s; pass [`crate::event::Discard`] for silence.
@@ -150,6 +157,7 @@ pub fn process(
         max_in_flight,
         subs,
         window,
+        stop,
         events,
     } = opts;
     validate_input(input)?;
@@ -158,10 +166,10 @@ pub fn process(
     // defaulted keyframe/adaptive request onto fixed-fps: a window (pairing
     // can't survive a seek) and a keyframe-poor source. An explicit
     // --strategy is honored and validated instead.
-    let plan = resolve_plan(input, cfg, window, events)?;
+    let plan = resolve_plan(input, cfg, window, &stop, events)?;
     // Before any side effect: a subtitle failure must not leave grids on
     // disk without metadata.
-    let subs = Subtitles::resolve(input, subs, events)?;
+    let subs = Subtitles::resolve(input, subs, &stop, events)?;
 
     let mut builder = rayon::ThreadPoolBuilder::new();
     if threads > 0 {
@@ -221,7 +229,7 @@ pub fn process(
         }
         ResolvedPlan::Adaptive(info) => adaptive_stream(&ctx, &info)?,
     };
-    process_stream(&ctx, session, stream)
+    process_stream(&ctx, session, stream, window)
 }
 
 /// Build the adaptive sampling stream: keyframes everywhere, fixed-fps fill
@@ -300,6 +308,7 @@ fn resolve_plan(
     input: &Source,
     cfg: &Config,
     window: Option<Window>,
+    stop: &media::Stop,
     events: &dyn EventSink,
 ) -> Result<ResolvedPlan> {
     let strategy = resolve_windowed_strategy(cfg, window)?;
@@ -310,14 +319,14 @@ fn resolve_plan(
         // `.context` keeps the probe's own error code downcastable, so the
         // exit code names the real cause rather than a generic wrapper.
         SampleStrategy::FixedFps => {
-            let duration = probe::probe_duration(input)
+            let duration = probe::probe_duration(input, stop)
                 .context("cannot verify duration safety for fixed-fps sampling (use --force to skip this check)")?;
             let probed_duration = Some(duration);
             validate_fixed_fps(cfg, probed_duration, window)?;
             Ok(ResolvedPlan::FixedFps { probed_duration })
         }
         SampleStrategy::Keyframes | SampleStrategy::Adaptive => {
-            let info = probe::probe_keyframes(input)?;
+            let info = probe::probe_keyframes(input, stop)?;
             // A defaulted keyframe/adaptive request degrades to fixed-fps for a
             // keyframe-poor source; its probed duration still carries forward.
             if degrade_if_keyframe_poor(cfg, strategy, &info, events) == SampleStrategy::FixedFps {
@@ -471,6 +480,7 @@ fn process_stream(
     ctx: &RunCtx<'_>,
     session: OutputSession<'_>,
     stream: sample::FrameStream,
+    window: Option<Window>,
 ) -> Result<()> {
     let cfg = ctx.cfg;
     let mut stream = CandidateStream::new(
@@ -498,11 +508,26 @@ fn process_stream(
         session,
         ctx.input,
         ctx.cfg,
-        duration,
+        output::Timeline {
+            duration,
+            processed: processed_range(window, duration),
+        },
         grid_metas,
         ctx.subs.as_ref(),
         ctx.events,
     )
+}
+
+/// The range this run attended to — the subtitle-ownership boundary for
+/// [`output::write_outputs`]: the window when one was given (an open end
+/// reads to the video's end), else the whole video. The end floors at the
+/// start so a window reaching past a short video still forms a range.
+fn processed_range(window: Option<Window>, duration: f32) -> TimeRange {
+    let (start, end) = match window {
+        Some(w) => (w.start(), w.end().unwrap_or(duration).max(w.start())),
+        None => (0.0, duration.max(0.0)),
+    };
+    TimeRange::new(start, end).expect("window bounds are finite and ordered by construction")
 }
 
 /// Reject a run that produced no grids before any metadata is written.

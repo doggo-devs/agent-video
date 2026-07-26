@@ -150,6 +150,20 @@ pub(super) fn foreign_scheme(source: &str) -> Option<&str> {
 
 // ── result rendering ──
 
+/// The evicted-underfoot fault: a rip that resolved from the cache and
+/// then vanished before it could be used — a concurrent process's
+/// eviction, never the caller's arguments. Transient by the repo's own
+/// taxonomy (retrying the same call, after a re-download, succeeds), and
+/// the healing action rides in the prose. One constructor, so no call
+/// site can misfile the race under another kind.
+pub(super) fn evicted_rip() -> Fault {
+    Fault::transient(
+        "the cached rip for this URL is gone (evicted underfoot by a concurrent process). \
+         Call again with just the URL to re-download; a finished transcript stays in the \
+         shared cache and is adopted without re-running whisper.",
+    )
+}
+
 pub(super) fn failed(fault: &Fault) -> CallToolResult {
     let body = VideoBody::Failed {
         error: fault.message.clone(),

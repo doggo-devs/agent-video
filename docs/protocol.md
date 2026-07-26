@@ -21,7 +21,7 @@ optional and, when omitted, lets the server pick a lenient default.
 | `strategy` | `adaptive` \| `keyframes` \| `uniform` | Which moments become frames; omit = lenient adaptive. Orthogonal to `look`. |
 | `raw` | string | Expert escape hatch: verbatim core CLI arguments (`process ...` / `extract ...`). Mutually exclusive with `from`/`until`/`look`/`strategy`. |
 | `confirm` | string | Echo of a consent token from a previous response. Must be passed alone (only with `source`). |
-| `transcribe` | boolean | `true` = generate (or reuse) a whisper transcript for the source. Must be passed alone. |
+| `transcribe` | boolean | `true` = generate (or reuse) a whisper transcript for the source; the reply carries the transcript text. Must be passed alone. |
 
 The published JSON Schema advertises `additionalProperties: false`, but clients
 do not reliably enforce it, so the server re-checks the argument whitelist
@@ -36,7 +36,8 @@ block describing the grids followed by the JPEG image blocks, not a tagged body.
 
 | `status` | Shape | Meaning | What the caller does |
 |----------|-------|---------|----------------------|
-| `plan` | `probe`, `guidance`, `recommended_calls` | Probe-only summary plus ready-to-paste follow-up calls. Returned for a bare source on anything non-trivial (decode later), and after an analysis download or a transcription completes. | Pick a recommended call and copy its args verbatim, or answer from the metadata alone. |
+| `plan` | `probe`, `guidance`, `recommended_calls` | Probe-only summary plus ready-to-paste follow-up calls. Returned for a bare source on anything non-trivial (decode later), and after an analysis download completes. | Pick a recommended call and copy its args verbatim, or answer from the metadata alone. |
+| `transcript` | `transcript`, `guidance`, `recommended_calls` | The product of `transcribe: true`: `MM:SS text` cue lines, possibly clipped to the inline budget (`guidance` says so). The full transcript is cached and rides along with every grid afterwards, sliced per grid. | Read the text; render grids to pair it with frames. |
 | `confirm_required` | `consequence`, `tokens` | The request needs explicit consent: an over-budget render, a large download. Each token carries an `effect` line spelling out what redeeming it does. | Retry with `confirm` set to one token, and nothing else but `source`. |
 | `pending` | `message` | A download continues in the background after the sync grace window elapsed. | Call again with just the same source to poll; the result is served once it finishes. |
 | `failed` | `error`, `kind` | The call failed. `error` is model-presentable prose; `kind` is the machine-readable class (see fault taxonomy). This is the one body rendered as an MCP *error* result. | Branch on `kind`: fix arguments, tell the user, retry, or report a bug. |
@@ -46,7 +47,7 @@ frames, subtitles, and any notices — followed by one image block per grid.
 
 ### The probe summary
 
-`plan` and the transcription/download follow-ups embed a `ProbeSummary`. Its
+`plan` and the download follow-ups embed a `ProbeSummary`. Its
 field names are the wire contract and stay camelCase where the TS harness set
 the precedent (`sizeBytes`). An unknown size is *absent* on the wire, never a
 fake `0`. `subtitles` lists human-readable descriptions (e.g.

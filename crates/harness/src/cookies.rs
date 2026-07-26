@@ -36,6 +36,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::CookiesCfg;
 
@@ -118,6 +119,18 @@ pub struct JarLease {
     canonical: PathBuf,
 }
 
+/// Writer-unique `pid-seq` token for lease staging dirs, mirroring the
+/// grammar of `cache::naming::writer_id` (kept private there): a pid
+/// alone — or pid plus a timestamp, which Windows quantizes coarsely —
+/// would let two concurrent leases of one process share a directory,
+/// and the first lease's Drop would then delete it under the other's
+/// live child.
+fn writer_id() -> String {
+    static WRITER_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = WRITER_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{seq}", std::process::id())
+}
+
 impl JarLease {
     /// Copy the canonical jar into a fresh staging dir under the lock.
     /// Fails when the jar is missing — resolve the mode first.
@@ -125,14 +138,7 @@ impl JarLease {
         let parent = canonical
             .parent()
             .ok_or_else(|| io::Error::other("cookie jar path has no parent directory"))?;
-        let staging = parent.join(format!(
-            ".cookie-lease-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let staging = parent.join(format!(".cookie-lease-{}", writer_id()));
         fs::create_dir_all(&staging)?;
         let lease = JarLease {
             staging,
@@ -608,6 +614,29 @@ mod tests {
 
         let jar = fs::read_to_string(&cfg.jar).expect("read");
         assert!(jar.contains("new"), "delta lands in the recreated jar");
+    }
+
+    #[test]
+    fn concurrent_leases_never_share_a_staging_dir() {
+        // Checkouts within one clock quantum used to collide on a
+        // pid+timestamp name (both `create_dir_all` calls succeed, both
+        // children rewrite one jar.txt, and the first Drop deletes the
+        // dir under the other's live child); pid+seq is collision-free
+        // by construction.
+        let (cfg, _dir) = temp_cfg("unique");
+        fs::write(&cfg.jar, line(".a.com", "n", "v")).expect("write");
+
+        let leases: Vec<JarLease> = (0..8)
+            .map(|_| JarLease::checkout(&cfg.jar).expect("checkout"))
+            .collect();
+
+        let distinct: std::collections::BTreeSet<&Path> =
+            leases.iter().map(|l| l.staging.as_path()).collect();
+        assert_eq!(
+            distinct.len(),
+            leases.len(),
+            "every lease owns a private staging dir"
+        );
     }
 
     #[test]

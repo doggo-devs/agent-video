@@ -39,7 +39,84 @@ pub fn init() {
     });
 }
 
-/// Open a media container for reading.
+/// The stall guard every container open requires: a cloneable stop token
+/// wired into libav's interrupt callback.
+///
+/// Tripping the token makes any blocking I/O inside the opened context —
+/// the open itself, seeks, and every subsequent packet read — return
+/// `AVERROR_EXIT` instead of blocking until the operation completes. This
+/// is what bounds a consumer's shutdown on a stalled source (dead network
+/// peer, hung pipe), where a plain read would never return and a joining
+/// thread would hang with it. `ErrorBudget` only bounds reads that
+/// *return* errors; this token bounds the ones that never return.
+///
+/// The guard's *existence* is the type-level guarantee ([`open_input`]
+/// takes one unconditionally); *when* it trips is the caller's policy — a
+/// manual token ([`Stop::new`]) for local files, a deadline
+/// ([`Stop::after`]) for network probes, a Drop-tripped token for a
+/// consumer-owned decode thread.
+#[derive(Clone)]
+pub struct Stop {
+    flag: Arc<AtomicBool>,
+    /// Held only by deadline-armed tokens: dropping the last clone
+    /// disconnects the channel, waking the deadline thread immediately —
+    /// a finished open never leaks a sleeping thread past a scheduler
+    /// tick, and disarming cannot be forgotten on any return path.
+    _disarm: Option<Arc<std::sync::mpsc::Sender<()>>>,
+}
+
+impl Stop {
+    /// A manual token: trips only via [`Stop::trip`], never on its own.
+    pub fn new() -> Stop {
+        Stop {
+            flag: Arc::new(AtomicBool::new(false)),
+            _disarm: None,
+        }
+    }
+
+    /// A deadline token: trips itself after `timeout` unless every clone
+    /// is dropped first.
+    pub fn after(timeout: std::time::Duration) -> Stop {
+        let flag = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let armed = Arc::clone(&flag);
+        std::thread::spawn(move || {
+            if rx.recv_timeout(timeout) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                armed.store(true, Ordering::Relaxed);
+            }
+        });
+        Stop {
+            flag,
+            _disarm: Some(Arc::new(tx)),
+        }
+    }
+
+    /// Trip the token: every blocking libav call it guards aborts with
+    /// `AVERROR_EXIT` at its next interrupt poll. Idempotent; visible to
+    /// all clones.
+    pub fn trip(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the token has tripped (manually or by deadline).
+    pub fn is_tripped(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    /// The flag the interrupt callback polls through a raw pointer.
+    fn flag(&self) -> &Arc<AtomicBool> {
+        &self.flag
+    }
+}
+
+impl Default for Stop {
+    fn default() -> Stop {
+        Stop::new()
+    }
+}
+
+/// Open a media container for reading, with `stop` wired into libav's
+/// interrupt callback and `options` forwarded as protocol/demuxer knobs.
 ///
 /// A local file's existence/readability is validated by the pipeline before
 /// any media work, so an open failure here means the content is not a
@@ -47,20 +124,10 @@ pub fn init() {
 /// a protocol the linked FFmpeg lacks maps to
 /// [`ErrorCode::ProtocolUnsupported`]; every other failure (unreachable host,
 /// HTTP error, non-media payload) stays an input-decade error.
-pub fn open_input(source: &Source) -> Result<ffmpeg::format::context::Input> {
-    init();
-    ffmpeg::format::input(&source.ffmpeg_path()).map_err(|e| open_error(source, e))
-}
-
-/// Like [`open_input`], but wires `stop` into libav's interrupt callback and
-/// forwards `options` as protocol/demuxer knobs to the open.
 ///
-/// Raising `stop` makes any blocking I/O inside the returned context — the
-/// open itself, seeks, and every subsequent packet read — return
-/// `AVERROR_EXIT` instead of blocking until the operation completes. This is
-/// what bounds a consumer's shutdown on a stalled source (dead network peer,
-/// hung pipe), where a plain read would never return and a joining thread
-/// would hang with it.
+/// `stop` is mandatory by design: "opened without a stall guard" is not a
+/// representable state (see [`Stop`]). A caller that never intends to trip
+/// passes `&Stop::new()`.
 ///
 /// `options` become an `AVDictionary` handed to `avformat_open_input`, so
 /// each pair is a libav protocol/demuxer option — e.g.
@@ -69,15 +136,15 @@ pub fn open_input(source: &Source) -> Result<ffmpeg::format::context::Input> {
 /// verbatim and never interprets their meaning; pass `&[]` for a plain open.
 ///
 /// The returned [`InterruptibleInput`] derefs to the plain input context
-/// and owns the callback's flag reference — nothing leaks per open.
-pub fn open_input_interruptible(
+/// and owns its clone of the token — nothing leaks per open.
+pub fn open_input(
     source: &Source,
-    stop: Arc<AtomicBool>,
+    stop: &Stop,
     options: &[(&str, &str)],
 ) -> Result<InterruptibleInput> {
     init();
     let path = path_cstring(source)?;
-    open_with_interrupt_and_options(&path, stop, options).map_err(|e| open_error(source, e))
+    open_with_interrupt_and_options(&path, stop.clone(), options).map_err(|e| open_error(source, e))
 }
 
 /// The source path as the C string libav's open call takes.
@@ -101,13 +168,13 @@ fn path_cstring(source: &Source) -> Result<std::ffi::CString> {
         })
 }
 
-/// An opened container whose blocking I/O observes a stop flag.
+/// An opened container whose blocking I/O observes a [`Stop`] token.
 ///
-/// The interrupt callback installed by [`open_input_interruptible`] polls
-/// the `AtomicBool` inside `stop` through a raw pointer, so the flag must
+/// The interrupt callback installed by [`open_input`] polls the
+/// `AtomicBool` inside the token through a raw pointer, so the flag must
 /// outlive every callback invocation. This wrapper is that proof: field
 /// order drops `input` first — `avformat_close_input` runs, after which
-/// libav never calls back — and only then releases the flag reference.
+/// libav never calls back — and only then releases the token clone.
 /// Unlike `ffmpeg::util::interrupt`'s boxed-closure API (which leaks the
 /// closure per open, unreclaimable because the context has no teardown
 /// hook for it), nothing here outlives the open — which matters in a
@@ -124,12 +191,12 @@ pub struct InterruptibleInput {
     /// Declared (and therefore dropped) first: the context must close
     /// before the flag it polls is released.
     input: ffmpeg::format::context::Input,
-    /// Keeps the callback's pointee alive for the context's lifetime.
-    _stop: Arc<AtomicBool>,
+    /// Keeps the callback's pointee alive (and any deadline armed) for the
+    /// context's lifetime.
+    _stop: Stop,
 }
 
 impl InterruptibleInput {
-    /// Seek the demuxer; see [`ffmpeg::format::context::Input::seek`].
     pub fn seek<R: ffmpeg::util::range::Range<i64>>(
         &mut self,
         ts: i64,
@@ -138,7 +205,6 @@ impl InterruptibleInput {
         self.input.seek(ts, range)
     }
 
-    /// Read the next packet from the container; see [`ffmpeg::Packet::read`].
     pub fn read_packet(
         &mut self,
         packet: &mut ffmpeg::Packet,
@@ -178,7 +244,7 @@ unsafe extern "C" fn interrupt_poll(opaque: *mut std::ffi::c_void) -> std::ffi::
 /// libav's raw error keeps the coded mapping in one place ([`open_error`]).
 fn open_with_interrupt_and_options(
     path: &std::ffi::CStr,
-    stop: Arc<AtomicBool>,
+    stop: Stop,
     options: &[(&str, &str)],
 ) -> std::result::Result<InterruptibleInput, ffmpeg::Error> {
     use ffmpeg::format::context::Input;
@@ -192,10 +258,11 @@ fn open_with_interrupt_and_options(
     // `avformat_open_input`, which on success adopts it (freed later by the
     // wrapping `Input`'s Drop) and on error frees it via
     // `avformat_close_input`. The interrupt callback's opaque pointer
-    // aliases the `AtomicBool` inside `stop`, whose owning `Arc` travels in
-    // the returned `InterruptibleInput` and is released only after the
-    // context closes — see that type's drop-order contract; on every error
-    // path the context is already gone before `stop` drops here. `opts` is
+    // aliases the `AtomicBool` inside `stop`, whose owning `Stop` clone
+    // travels in the returned `InterruptibleInput` and is released only
+    // after the context closes — see that type's drop-order contract; on
+    // every error path the context is already gone before `stop` drops
+    // here. `opts` is
     // disowned into the call and re-owned after so the reclaimed dictionary
     // frees any options libav did not consume.
     unsafe {
@@ -209,7 +276,7 @@ fn open_with_interrupt_and_options(
         }
         (*ps).interrupt_callback = ffmpeg::ffi::AVIOInterruptCB {
             callback: Some(interrupt_poll),
-            opaque: Arc::as_ptr(&stop).cast_mut().cast(),
+            opaque: Arc::as_ptr(stop.flag()).cast_mut().cast(),
         };
         let mut opts = dict.disown();
         let res = ffmpeg::ffi::avformat_open_input(
@@ -410,9 +477,10 @@ pub struct StreamCoverage {
     pub video_seconds: Option<f64>,
 }
 
-/// Read [`StreamCoverage`] from a container header.
-pub fn stream_coverage(source: &Source) -> Result<StreamCoverage> {
-    let ictx = open_input(source)?;
+/// Read [`StreamCoverage`] from a container header. `stop` bounds the
+/// header reads on a stalled source; see [`open_input`].
+pub fn stream_coverage(source: &Source, stop: &Stop) -> Result<StreamCoverage> {
+    let ictx = open_input(source, stop, &[])?;
     let container_seconds = f64::from(duration_seconds(&ictx, source)?);
     let track = |ty: ffmpeg::media::Type| -> Option<f64> {
         let stream = ictx.streams().best(ty)?;
@@ -536,6 +604,10 @@ pub(crate) const MAX_READ_ERRORS: u32 = 64;
 /// hand-rolled counter can be forgotten.
 pub(crate) struct ErrorBudget {
     left: u32,
+    /// Cumulative failures, kept across [`ErrorBudget::ok`] resets —
+    /// diagnostics only (the "0 frames decoded, N bad packets" verdict
+    /// and its message), never the trip condition.
+    total: u64,
     /// Names the loop in the error message, e.g. "reading packets".
     context: &'static str,
 }
@@ -544,6 +616,7 @@ impl ErrorBudget {
     pub fn new(context: &'static str) -> Self {
         Self {
             left: MAX_READ_ERRORS,
+            total: 0,
             context,
         }
     }
@@ -556,6 +629,7 @@ impl ErrorBudget {
     /// A failed iteration: spend one unit, or convert `e` into the loop's
     /// coded error once the budget is exhausted.
     pub fn fail(&mut self, e: ffmpeg::Error) -> Result<()> {
+        self.total += 1;
         match self.left.checked_sub(1) {
             Some(left) => {
                 self.left = left;
@@ -563,6 +637,37 @@ impl ErrorBudget {
             }
             None => Err(decode_error(self.context, e)),
         }
+    }
+
+    /// Cumulative failures over the budget's lifetime, across resets.
+    pub fn failures(&self) -> u64 {
+        self.total
+    }
+}
+
+/// One `receive_frame` outcome, classified. Three states demand three
+/// downstream policies — a frame to handle, a drained decoder to leave
+/// for the next feed, a hard error to charge or surface — so the
+/// distinction is a type, and `while receive_frame().is_ok()` (which
+/// silently conflates [`Recv::Broken`] with [`Recv::Drained`] and
+/// truncates the tail) has no shape left to be written in.
+pub(crate) enum Recv {
+    /// A frame arrived; the receive buffer holds it.
+    Frame,
+    /// The decoder owes nothing right now: `EAGAIN` (feed more input) or
+    /// `EOF` (fully flushed). Both end this drain pass.
+    Drained,
+    /// A hard decoder error — never silently absorbed.
+    Broken(ffmpeg::Error),
+}
+
+/// Classify one `receive_frame` result; shared by every drain loop.
+pub(crate) fn classify_receive(result: std::result::Result<(), ffmpeg::Error>) -> Recv {
+    match result {
+        Ok(()) => Recv::Frame,
+        Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => Recv::Drained,
+        Err(ffmpeg::Error::Eof) => Recv::Drained,
+        Err(e) => Recv::Broken(e),
     }
 }
 
@@ -646,5 +751,63 @@ mod tests {
         budget
             .fail(io_error())
             .expect("a success resets consecutive-failure tracking");
+    }
+
+    #[test]
+    fn keeps_total_failures_across_resets() {
+        let mut budget = ErrorBudget::new("test loop");
+        budget.fail(io_error()).expect("within budget");
+        budget.ok();
+        budget.fail(io_error()).expect("reset restores the budget");
+        assert_eq!(
+            budget.failures(),
+            2,
+            "cumulative count survives the consecutive reset"
+        );
+    }
+
+    #[test]
+    fn classifies_drained_receive_results() {
+        assert!(matches!(classify_receive(Ok(())), Recv::Frame));
+        assert!(matches!(
+            classify_receive(Err(ffmpeg::Error::Other {
+                errno: ffmpeg::error::EAGAIN,
+            })),
+            Recv::Drained
+        ));
+        assert!(matches!(
+            classify_receive(Err(ffmpeg::Error::Eof)),
+            Recv::Drained
+        ));
+    }
+
+    #[test]
+    fn classifies_hard_receive_error_as_broken() {
+        assert!(matches!(
+            classify_receive(Err(ffmpeg::Error::InvalidData)),
+            Recv::Broken(ffmpeg::Error::InvalidData)
+        ));
+    }
+
+    #[test]
+    fn trips_manual_token_across_clones() {
+        let stop = Stop::new();
+        let clone = stop.clone();
+        assert!(!clone.is_tripped(), "a fresh token is untripped");
+        stop.trip();
+        assert!(clone.is_tripped(), "a trip is visible to every clone");
+    }
+
+    #[test]
+    fn trips_deadline_token_after_timeout() {
+        let stop = Stop::after(std::time::Duration::from_millis(5));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !stop.is_tripped() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the deadline thread must trip the token"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }

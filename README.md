@@ -114,7 +114,8 @@ If you installed via npm, use the npm shim as the command instead:
 
 Call `video` with just a `source` first: short videos run immediately, longer
 ones answer with a plan and copyable follow-up calls. Set `transcribe: true`
-(alone) to generate a whisper transcript that then rides along with every grid.
+(alone) to get a whisper transcript back as timestamped lines; it is cached
+and rides along with every grid afterwards.
 Transcription needs weights (`agent-video install-whisper`, GPU build) or a
 `WHISPER_API_KEY` for the API route.
 

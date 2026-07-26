@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The `http_proxy` option forwarded through
-//! [`media::open_input_interruptible`] must route libav's own connections
-//! through the given proxy rather than dialing the target directly. This is
-//! the contract the harness relies on to keep the egress policy enforced on
-//! every demuxer connection, so it is asserted against the linked libav for
-//! both http and https targets.
+//! The `http_proxy` option forwarded through [`media::open_input`] must
+//! route libav's own connections through the given proxy rather than
+//! dialing the target directly. This is the contract the harness relies on
+//! to keep the egress policy enforced on every demuxer connection, so it
+//! is asserted against the linked libav for both http and https targets.
 
 use std::io::Read;
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use agent_video_core::media;
@@ -45,13 +43,8 @@ fn proxied_request_line(scheme: &str) -> Option<String> {
     // A literal global IP: routing through the proxy means the proxy sees
     // the request; dialing directly would never touch the recorder.
     let source = Source::classify(&format!("{scheme}://93.184.216.34/video.mp4"));
-    let stop = Arc::new(AtomicBool::new(false));
-    let disarm = Arc::clone(&stop);
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(4));
-        disarm.store(true, Ordering::Relaxed);
-    });
-    let _ = media::open_input_interruptible(&source, stop, &[("http_proxy", &proxy)]);
+    let stop = media::Stop::after(Duration::from_secs(4));
+    let _ = media::open_input(&source, &stop, &[("http_proxy", &proxy)]);
     let seen = rx.recv_timeout(Duration::from_secs(6)).ok();
     recorder.join().ok();
     seen.filter(|s| !s.is_empty())

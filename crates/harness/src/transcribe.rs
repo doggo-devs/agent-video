@@ -38,6 +38,9 @@ use std::time::Instant;
 use super::config::Backend;
 use super::config::{Config, WhisperModel};
 use crate::fault::Fault;
+use agent_video_core::media::Stop;
+#[cfg(feature = "whisper-local")]
+use agent_video_core::media::audio::AudioCeiling;
 use agent_video_core::media::audio::{AudioSamples, WHISPER_SAMPLE_RATE};
 use agent_video_core::source::Source;
 use agent_video_core::subtitle as core_subtitle;
@@ -214,6 +217,15 @@ pub fn transcript_id(cfg: &Config, prompt: &str) -> String {
     )
 }
 
+/// Whole-track decode ceiling for the local route: 4 hours of 16 kHz f32
+/// PCM is 4 × 3600 × 16_000 × 4 B ≈ 921 MB resident — the most this
+/// harness will materialize for VAD's random access. The policy number
+/// lives here; the 24-hour hard cap lives in core's [`AudioCeiling`]
+/// constructor. A track past this ceiling fails as too-long input rather
+/// than transcribing a silent prefix as if it were the whole file.
+#[cfg(feature = "whisper-local")]
+const MAX_LOCAL_AUDIO_SECONDS: u32 = 4 * 3600;
+
 // ── cue type ──
 
 /// One recognized cue with absolute media timestamps in centiseconds.
@@ -256,7 +268,9 @@ pub fn transcribe(
     // Both flavors of silence are the input's shape, not a decode failure:
     // a container with no audio track (screen capture, surveillance) and a
     // track that decodes to zero samples each get named for what they are.
-    let Some(mut stream) = AudioSamples::open(&source)? else {
+    // Local-file contract (see above): no dead peer to stall on, so a
+    // manual token that never trips satisfies the stall-guard requirement.
+    let Some(mut stream) = AudioSamples::open(&source, &Stop::new())? else {
         return Err(Fault::bad_input(format!(
             "{} has no audio track — nothing to transcribe",
             file.display()
@@ -266,10 +280,12 @@ pub fn transcribe(
     let (cues, sample_count) = match route {
         #[cfg(feature = "whisper-local")]
         Route::Local { backend, model, .. } => {
-            // The local route decodes whole: VAD wants random access.
+            // The local route decodes whole (VAD wants random access),
+            // bounded by the harness's materialization ceiling.
+            let cap = AudioCeiling::from_seconds(MAX_LOCAL_AUDIO_SECONDS)
+                .expect("4h is under core's 24h hard cap");
             let t = Instant::now();
-            let mut samples = Vec::new();
-            stream.fill(&mut samples, usize::MAX)?;
+            let samples = stream.collect(cap)?;
             tracing::info!(
                 elapsed_ms = t.elapsed().as_millis() as u64,
                 samples = samples.len(),

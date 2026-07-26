@@ -14,6 +14,11 @@ comes from the `dirs` crate (`$XDG_CONFIG_HOME` or `~/.config` on Linux,
 `~/Library/Application Support` on macOS, `%APPDATA%` on Windows). Set
 `$AGENT_VIDEO_CONFIG` to point at an explicit path instead.
 
+`agent-video config init` writes a fully-commented template there,
+sshd_config-style: every key at its resolved default for the machine,
+disabled with `#` — the file changes nothing until a line is uncommented.
+It refuses to overwrite an existing file unless given `--force`.
+
 Defaults that name a directory hang off the platform's base dirs (cache, data,
 download, config), so the concrete default paths below are the Linux/XDG
 spelling; on other platforms the same roles resolve to that platform's

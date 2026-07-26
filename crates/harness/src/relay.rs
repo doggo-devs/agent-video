@@ -29,9 +29,9 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::gate::Semaphore;
 use crate::netguard::{self, ScreenRefusal};
@@ -42,20 +42,34 @@ use crate::netguard::{self, ScreenRefusal};
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 
 /// Read timeout while waiting for the request head. Bounds a client that
-/// connects and then stalls before stating its intent; widened to
-/// [`TUNNEL_IDLE_TIMEOUT`] once a tunnel is established, since long
-/// downloads inside it are legitimate.
+/// connects and then stalls before stating its intent; replaced by
+/// [`TUNNEL_TICK`]-paced waits under the shared idle clock once a tunnel
+/// is established, since long downloads inside it are legitimate.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Idle bound per direction on an established tunnel. A client that
-/// vanished without FIN/RST (a hard-killed subprocess, a dropped link)
-/// would otherwise pin its handler thread and both sockets until process
-/// exit; a direction that moves no bytes for this long errors out of its
-/// `io::copy` and the tunnel closes. Far above every consumer's
-/// own liveness bound (yt-dlp's watchdog aborts at 480s of no progress,
-/// CDNs idle out well under this), so it only reaps connections nothing is
-/// waiting on.
+/// Idle bound on an established tunnel as a whole: it is reaped only when
+/// NEITHER direction has moved a byte for this long. Per-direction silence
+/// proves nothing — the request side of a CONNECT tunnel carrying one long
+/// response is legitimately silent for hours — but whole-tunnel silence
+/// means the client vanished without FIN/RST (a hard-killed subprocess, a
+/// dropped link) and would otherwise pin its handler threads and both
+/// sockets until process exit. Far above every consumer's own liveness
+/// bound (yt-dlp's watchdog aborts at 480s of no progress, CDNs idle out
+/// well under this), so it only reaps tunnels nothing is waiting on.
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Granularity of the tunnel pumps' socket waits. A blocked read or write
+/// wakes at most this often to consult the shared [`TunnelClock`]; a
+/// timed-out wait is a check ("did the other direction move recently?"),
+/// never a verdict by itself.
+const TUNNEL_TICK: Duration = Duration::from_secs(5);
+
+/// Hard ceiling on a tunnel's total lifetime, active or not: a termination
+/// guarantee against a peer that dribbles forever, not stall detection —
+/// the idle clock handles silence. Mirrors the direct client's whole-call
+/// ceiling and is sized the same way, for `download.max_bytes` on slow
+/// links.
+const TUNNEL_LIFETIME_CEILING: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Connection-establishment bound when dialing a screened upstream.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -90,12 +104,24 @@ impl PolicyRelay {
     /// downloads (yt-dlp opens many) never serialize behind one another,
     /// capped at `MAX_TUNNELS` live connections.
     pub fn start(allow_private: bool) -> std::io::Result<Self> {
+        Self::start_with_idle_limit(allow_private, TUNNEL_IDLE_TIMEOUT)
+    }
+
+    /// Same relay with an injectable idle bound — the test seam that lets
+    /// the whole-tunnel idle invariant be proven without waiting out the
+    /// production fifteen minutes. The pub path fixes the bound at
+    /// [`TUNNEL_IDLE_TIMEOUT`].
+    fn start_with_idle_limit(allow_private: bool, idle_limit: Duration) -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let local = listener.local_addr()?;
         let shutdown = Arc::new(AtomicBool::new(false));
+        let tunneling = Tunneling {
+            allow_private,
+            idle_limit,
+        };
         let accept = {
             let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || accept_loop(listener, shutdown, allow_private))
+            std::thread::spawn(move || accept_loop(listener, shutdown, tunneling))
         };
         Ok(PolicyRelay {
             local,
@@ -128,13 +154,22 @@ impl Drop for PolicyRelay {
     }
 }
 
+/// The per-connection knobs the accept loop hands every handler: the
+/// policy screen's bypass flag and the tunnel idle bound (a constant in
+/// production, injectable in tests).
+#[derive(Clone, Copy)]
+struct Tunneling {
+    allow_private: bool,
+    idle_limit: Duration,
+}
+
 /// Accept until the shutdown flag is raised, handling each connection on
 /// its own thread while a permit of the tunnel gate is held for it. The
 /// gate is a [`Semaphore`] used through `try_acquire`: the listener is
 /// unauthenticated, so over-cap connections are refused with `503` rather
 /// than parked — a blocked thread per excess caller would be exactly the
 /// unbounded growth the cap exists to prevent.
-fn accept_loop(listener: TcpListener, shutdown: Arc<AtomicBool>, allow_private: bool) {
+fn accept_loop(listener: TcpListener, shutdown: Arc<AtomicBool>, tunneling: Tunneling) {
     let gate = Arc::new(Semaphore::new(MAX_TUNNELS));
     for stream in listener.incoming() {
         if shutdown.load(Ordering::Relaxed) {
@@ -168,7 +203,7 @@ fn accept_loop(listener: TcpListener, shutdown: Arc<AtomicBool>, allow_private: 
         // with it the stream and the permit: that connection alone closes.
         let _ = std::thread::Builder::new().spawn(move || {
             let _permit = permit;
-            let _ = handle(stream, allow_private);
+            let _ = handle(stream, tunneling);
         });
     }
 }
@@ -176,7 +211,7 @@ fn accept_loop(listener: TcpListener, shutdown: Arc<AtomicBool>, allow_private: 
 /// One proxied connection: read the request head, then either tunnel a
 /// CONNECT or forward an absolute-form http request. Every error path
 /// closes the client stream.
-fn handle(client: TcpStream, allow_private: bool) -> std::io::Result<()> {
+fn handle(client: TcpStream, tunneling: Tunneling) -> std::io::Result<()> {
     // Bound both directions until intent is known: the read timeout caps a
     // client that stalls before stating its request, the write timeout caps
     // one that requests and then never drains our error response. Both are
@@ -199,9 +234,9 @@ fn handle(client: TcpStream, allow_private: bool) -> std::io::Result<()> {
     let version = parts.next().unwrap_or("HTTP/1.1");
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        handle_connect(client, target, allow_private)
+        handle_connect(client, target, tunneling)
     } else if target.starts_with("http://") {
-        handle_absolute(client, method, target, version, lines, allow_private)
+        handle_absolute(client, method, target, version, lines, tunneling)
     } else {
         respond(
             &client,
@@ -213,18 +248,18 @@ fn handle(client: TcpStream, allow_private: bool) -> std::io::Result<()> {
 
 /// Tunnel a `CONNECT host:port`: screen the authority, dial the screened
 /// address, acknowledge, then splice raw bytes without inspecting them.
-fn handle_connect(client: TcpStream, authority: &str, allow_private: bool) -> std::io::Result<()> {
+fn handle_connect(client: TcpStream, authority: &str, tunneling: Tunneling) -> std::io::Result<()> {
     let (host, port) = match split_authority(authority) {
         Some(hp) => hp,
         None => return respond(&client, "400 Bad Request", "malformed CONNECT authority"),
     };
-    let upstream = match dial_screened(&host, port, allow_private) {
+    let upstream = match dial_screened(&host, port, tunneling.allow_private) {
         Ok(stream) => stream,
         Err(refusal) => return refuse(&client, &refusal),
     };
-    set_tunnel_timeouts(&client, &upstream)?;
+    set_tunnel_timeouts(&client, &upstream, tunneling.idle_limit)?;
     (&client).write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
-    splice(client, upstream);
+    splice(client, upstream, tunneling.idle_limit);
     Ok(())
 }
 
@@ -237,7 +272,7 @@ fn handle_absolute(
     target: &str,
     version: &str,
     header_lines: std::str::Split<'_, &str>,
-    allow_private: bool,
+    tunneling: Tunneling,
 ) -> std::io::Result<()> {
     let uri: ureq::http::Uri = match target.parse() {
         Ok(uri) => uri,
@@ -254,7 +289,7 @@ fn handle_absolute(
         .filter(|p| !p.is_empty())
         .unwrap_or("/");
 
-    let mut upstream = match dial_screened(&host, port, allow_private) {
+    let mut upstream = match dial_screened(&host, port, tunneling.allow_private) {
         Ok(stream) => stream,
         Err(refusal) => return refuse(&client, &refusal),
     };
@@ -277,8 +312,8 @@ fn handle_absolute(
     rewritten.push_str("Connection: close\r\n\r\n");
     upstream.write_all(rewritten.as_bytes())?;
 
-    set_tunnel_timeouts(&client, &upstream)?;
-    splice(client, upstream);
+    set_tunnel_timeouts(&client, &upstream, tunneling.idle_limit)?;
+    splice(client, upstream, tunneling.idle_limit);
     Ok(())
 }
 
@@ -347,21 +382,75 @@ fn dial(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
     Err(last)
 }
 
-/// Widen both sockets from the head-phase bounds to the tunnel idle bound:
-/// long transfers are legitimate, immortal half-open tunnels are not.
-fn set_tunnel_timeouts(client: &TcpStream, upstream: &TcpStream) -> std::io::Result<()> {
+/// Move both sockets from the head-phase bounds to [`TUNNEL_TICK`]-paced
+/// waits (capped by the idle limit so tiny test bounds still tick): long
+/// transfers are legitimate, so a per-wait timeout is a wake-up to consult
+/// the shared [`TunnelClock`], not a bound on the transfer itself.
+fn set_tunnel_timeouts(
+    client: &TcpStream,
+    upstream: &TcpStream,
+    idle_limit: Duration,
+) -> std::io::Result<()> {
+    let tick = TUNNEL_TICK.min(idle_limit);
     for stream in [client, upstream] {
-        stream.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
-        stream.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+        stream.set_read_timeout(Some(tick))?;
+        stream.set_write_timeout(Some(tick))?;
     }
     Ok(())
 }
 
-/// Copy bytes both ways between `a` and `b` until each direction hits EOF
-/// or sits idle past [`TUNNEL_IDLE_TIMEOUT`], half-closing the write side
-/// as each source drains. The relay never inspects what flows; this is a
-/// raw byte pump.
-fn splice(a: TcpStream, b: TcpStream) {
+/// Shared activity clock for one tunnel: both pumps bump it whenever bytes
+/// move in their direction, and every timed-out socket wait asks it whether
+/// the tunnel as a whole is dead. Activity in either direction keeps the
+/// whole tunnel alive; only whole-tunnel silence past the idle limit — or a
+/// lifetime past [`TUNNEL_LIFETIME_CEILING`] — expires it.
+struct TunnelClock {
+    started: Instant,
+    idle_limit: Duration,
+    /// Milliseconds after `started` at which a byte last moved, in either
+    /// direction. Relaxed suffices — freshness within a tick is all the
+    /// expiry check needs — and `fetch_max` keeps racing bumps monotonic.
+    last_activity_ms: AtomicU64,
+}
+
+impl TunnelClock {
+    fn new(idle_limit: Duration) -> Self {
+        TunnelClock {
+            started: Instant::now(),
+            idle_limit,
+            last_activity_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Record byte movement now.
+    fn bump(&self) {
+        let elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_activity_ms
+            .fetch_max(elapsed_ms, Ordering::Relaxed);
+    }
+
+    /// Whether the tunnel is over: silent in both directions past the idle
+    /// limit, or alive past the lifetime ceiling.
+    fn expired(&self) -> bool {
+        let elapsed = self.started.elapsed();
+        if elapsed >= TUNNEL_LIFETIME_CEILING {
+            return true;
+        }
+        let last = Duration::from_millis(self.last_activity_ms.load(Ordering::Relaxed));
+        elapsed.saturating_sub(last) >= self.idle_limit
+    }
+}
+
+/// Copy bytes both ways between `a` and `b` until each direction hits EOF,
+/// the whole tunnel sits idle past `idle_limit`, or it outlives
+/// [`TUNNEL_LIFETIME_CEILING`], half-closing the write side as each source
+/// drains. Idleness is judged on the tunnel, not the direction: both pumps
+/// share one [`TunnelClock`], so a direction that is legitimately silent
+/// for hours (the request side of a CONNECT tunnel carrying one long
+/// response) survives as long as the other side moves. The relay never
+/// inspects what flows; this is a raw byte pump.
+fn splice(a: TcpStream, b: TcpStream, idle_limit: Duration) {
+    let clock = Arc::new(TunnelClock::new(idle_limit));
     // `try_clone` is dup(2) and fails under fd exhaustion — likeliest
     // exactly when many tunnels are open. That is this tunnel's failure
     // alone: returning drops both streams and closes it, every other
@@ -370,16 +459,84 @@ fn splice(a: TcpStream, b: TcpStream) {
     let (Ok(a_read), Ok(b_write)) = (a.try_clone(), b.try_clone()) else {
         return;
     };
-    let pump = std::thread::Builder::new().spawn(move || {
-        let _ = std::io::copy(&mut &a_read, &mut &b_write);
-        let _ = b_write.shutdown(Shutdown::Write);
-    });
-    let Ok(pump) = pump else {
+    let other = {
+        let clock = Arc::clone(&clock);
+        std::thread::Builder::new().spawn(move || pump(a_read, b_write, &clock))
+    };
+    let Ok(other) = other else {
         return;
     };
-    let _ = std::io::copy(&mut &b, &mut &a);
-    let _ = a.shutdown(Shutdown::Write);
-    let _ = pump.join();
+    pump(b, a, &clock);
+    let _ = other.join();
+}
+
+/// Pump one direction until EOF, a hard error, or tunnel expiry. A
+/// timed-out socket wait is a check against the shared clock, not a
+/// verdict: the read is simply retried while the tunnel lives. `io::copy`
+/// would treat that timeout as fatal, which is why this loop owns its
+/// reads. EOF and errors half-close only the write side of `dst`,
+/// preserving the opposite direction. Expiry reaches this loop on two
+/// arms with different teardown: observed on a timed-out read, it tears
+/// both sockets down fully, so the sibling pump unblocks at once;
+/// surfacing through [`patient_write`]'s Err, it takes the plain error
+/// `break` and only half-closes `dst` — the sibling then notices expiry
+/// at its own next tick, at most [`TUNNEL_TICK`] later. No socket leaks
+/// either way.
+fn pump(src: TcpStream, dst: TcpStream, clock: &TunnelClock) {
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match (&src).read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                clock.bump();
+                if patient_write(&dst, &buf[..n], clock).is_err() {
+                    break;
+                }
+            }
+            Err(e) if is_timeout(&e) => {
+                if clock.expired() {
+                    let _ = src.shutdown(Shutdown::Both);
+                    let _ = dst.shutdown(Shutdown::Both);
+                    return;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = dst.shutdown(Shutdown::Write);
+}
+
+/// `write_all` that treats a timed-out wait as a clock check rather than a
+/// failure: a slowly draining receiver fails the tunnel only once nothing
+/// has moved anywhere for the idle limit. Partial progress counts as
+/// activity and bumps the clock.
+fn patient_write(dst: &TcpStream, buf: &[u8], clock: &TunnelClock) -> std::io::Result<()> {
+    let mut sent = 0;
+    while sent < buf.len() {
+        match (&*dst).write(&buf[sent..]) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+            Ok(n) => {
+                sent += n;
+                clock.bump();
+            }
+            Err(e) if is_timeout(&e) => {
+                if clock.expired() {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Whether `e` is a blocking-socket timeout: unix reports `WouldBlock`
+/// (EAGAIN under `SO_RCVTIMEO`/`SO_SNDTIMEO`), windows `TimedOut`.
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 /// Failure reading the request head: an oversized head is a client verdict
@@ -596,6 +753,82 @@ mod tests {
                 "slots never freed: {text}"
             );
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn keeps_tunnel_alive_while_one_direction_flows() {
+        // Idle bound far below the transfer's duration: only whole-tunnel
+        // idleness may reap, so a flow that is one-directional for several
+        // idle limits must survive intact.
+        let relay = PolicyRelay::start_with_idle_limit(true, Duration::from_millis(500))
+            .expect("relay starts");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+        let upstream = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // A long response with the client never sending a byte
+                // back: the client→upstream direction stays silent the
+                // whole time.
+                for _ in 0..15 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if stream.write_all(b"x").is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        let mut client = TcpStream::connect(relay.local).expect("connect relay");
+        client
+            .write_all(format!("CONNECT {upstream} HTTP/1.1\r\n\r\n").as_bytes())
+            .expect("write connect");
+        let mut established = [0u8; 39];
+        client
+            .read_exact(&mut established)
+            .expect("read established");
+        let mut body = Vec::new();
+        client.read_to_end(&mut body).expect("read tunneled bytes");
+        assert_eq!(
+            body.len(),
+            15,
+            "every byte of the 1.5s one-directional flow arrives despite the 500ms idle bound"
+        );
+    }
+
+    #[test]
+    fn reaps_tunnel_when_both_directions_idle() {
+        let relay = PolicyRelay::start_with_idle_limit(true, Duration::from_millis(200))
+            .expect("relay starts");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+        let upstream = listener.local_addr().expect("addr");
+        // Hold the accepted socket open and silent: from the relay's view,
+        // a tunnel nothing is waiting on.
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let _ = hold_tx.send(stream);
+            }
+        });
+        let mut client = TcpStream::connect(relay.local).expect("connect relay");
+        client
+            .write_all(format!("CONNECT {upstream} HTTP/1.1\r\n\r\n").as_bytes())
+            .expect("write connect");
+        let mut established = [0u8; 39];
+        client
+            .read_exact(&mut established)
+            .expect("read established");
+        let _held = hold_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("upstream accepted");
+        // The relay must close the tunnel on its own; the safety timeout
+        // makes a regression fail instead of hanging the test.
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set safety timeout");
+        let mut rest = Vec::new();
+        match client.read_to_end(&mut rest) {
+            Ok(_) => {} // EOF: the relay tore the idle tunnel down.
+            Err(e) => panic!("expected EOF from the reaped tunnel, got {e}"),
         }
     }
 

@@ -273,12 +273,37 @@ pub enum Detail {
     Fine,
 }
 
-/// JPEG caps image dimensions at 65535 px; a larger canvas would run the whole
-/// pipeline only to fail at encode time (after a multi-GB allocation).
-const MAX_CANVAS_EDGE: u32 = 65_535;
+/// JPEG caps image dimensions at 65535 px; a larger edge would run the whole
+/// pipeline only to fail at encode time (after a multi-GB allocation). The
+/// one ceiling every pixel-edge config knob validates against.
+pub(crate) const MAX_IMAGE_EDGE: u32 = 65_535;
+
+/// Validate a pixel-edge config value into `1..=`[`MAX_IMAGE_EDGE`].
+///
+/// The single upper-bound gate for every edge-shaped knob (canvas
+/// `max_edge`, sampling `score_edge`): an edge past the ceiling feeds
+/// decode-side pre-scaling and could only fail later as a capacity
+/// overflow, after arbitrarily large allocations. Rejects with
+/// [`crate::error::ErrorCode::InvalidConfig`], naming `field`.
+pub(crate) fn checked_edge(field: &str, edge: u32) -> crate::error::Result<u32> {
+    use crate::error::{Error, ErrorCode};
+    if edge == 0 {
+        return Err(Error::new(
+            ErrorCode::InvalidConfig,
+            format!("invalid {field}: 0 (must be >= 1)"),
+        ));
+    }
+    if edge > MAX_IMAGE_EDGE {
+        return Err(Error::new(
+            ErrorCode::InvalidConfig,
+            format!("invalid {field}: {edge} (exceeds JPEG's {MAX_IMAGE_EDGE}px dimension limit)"),
+        ));
+    }
+    Ok(edge)
+}
 
 /// Resolved canvas geometry for layout: `1 <= min_cell_edge <= edge <=`
-/// `MAX_CANVAS_EDGE` by construction.
+/// `MAX_IMAGE_EDGE` by construction.
 #[derive(Debug, Clone, Copy)]
 pub struct CanvasSpec {
     /// Longer canvas edge in pixels.
@@ -305,14 +330,7 @@ impl CanvasSpec {
         }
         // Cap before the pipeline allocates from this value; JPEG encoding
         // would reject the dimensions only at the very end.
-        if edge > MAX_CANVAS_EDGE {
-            return Err(Error::new(
-                ErrorCode::InvalidConfig,
-                format!(
-                    "invalid max_edge: {edge} (exceeds JPEG's {MAX_CANVAS_EDGE}px dimension limit)"
-                ),
-            ));
-        }
+        let edge = checked_edge("max_edge", edge)?;
         Ok(Self {
             edge,
             min_cell_edge: min_cell_edge.max(1),
@@ -452,6 +470,32 @@ pub fn format_ts(ts: f32) -> String {
     }
 }
 
+/// Parse a text clock into seconds — the crate's single text clock grammar
+/// and [`format_ts`]'s parsing counterpart: `SS`, `MM:SS`, or `HH:MM:SS`,
+/// with `.` or `,` fractions allowed in any component.
+///
+/// Returns `None` unless every component parses finite and non-negative and
+/// the weighted total stays finite (finite components can still overflow
+/// f32 when scaled to seconds). Both textual clock consumers — `--range`
+/// bounds and SRT/WebVTT cue timestamps — delegate here, so their accepted
+/// syntax cannot drift and the finiteness discipline cannot be forgotten at
+/// one entry point but not the other.
+pub(crate) fn parse_clock(s: &str) -> Option<f32> {
+    let normalized = s.replace(',', ".");
+    let component = |p: &str| {
+        let v: f32 = p.parse().ok()?;
+        (v.is_finite() && v >= 0.0).then_some(v)
+    };
+    let parts: Vec<&str> = normalized.split(':').collect();
+    let total = match parts.as_slice() {
+        [sec] => component(sec)?,
+        [m, sec] => component(m)? * 60.0 + component(sec)?,
+        [h, m, sec] => component(h)? * 3600.0 + component(m)? * 60.0 + component(sec)?,
+        _ => return None,
+    };
+    total.is_finite().then_some(total)
+}
+
 /// Metadata for a single key (hero) frame inside a grid. Rides the wire
 /// unchanged inside [`crate::wire::Grid`], so both value fields are frozen
 /// presentation, not pipeline data.
@@ -492,6 +536,55 @@ mod tests {
         assert_eq!(format_ts(5025.0), "1:23:45");
         assert_eq!(format_ts(3599.6), "1:00:00", "rounds up into the hour");
         assert_eq!(format_ts(3599.4), "59:59", "stays MM:SS below the hour");
+    }
+
+    #[test]
+    fn parses_clock_with_comma_fraction() {
+        let secs = parse_clock("1:23,500").expect("comma fraction is valid");
+        assert!((secs - 83.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn parses_bare_seconds_clock() {
+        assert_eq!(parse_clock("83"), Some(83.0));
+        assert_eq!(parse_clock("83.5"), Some(83.5));
+    }
+
+    #[test]
+    fn rejects_nonfinite_clock_component() {
+        for bad in ["inf:00", "nan:30", "0:infinity", "NaN"] {
+            assert_eq!(parse_clock(bad), None, "clock '{bad}' must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_negative_clock_component() {
+        assert_eq!(parse_clock("0:-30"), None);
+        assert_eq!(parse_clock("-5"), None);
+    }
+
+    #[test]
+    fn rejects_negative_component_with_positive_total() {
+        // 2*60 - 30 = 90s: the old range parser checked only the total, so
+        // this slipped through. Each component must be non-negative.
+        assert_eq!(parse_clock("2:-30"), None);
+    }
+
+    #[test]
+    fn rejects_overflowing_clock_total() {
+        // Finite components can still overflow f32 when scaled to seconds.
+        assert_eq!(parse_clock("1e38:0:0"), None);
+    }
+
+    #[test]
+    fn rejects_extra_clock_groups() {
+        assert_eq!(parse_clock("1:2:3:4"), None);
+    }
+
+    #[test]
+    fn rejects_empty_clock_token() {
+        assert_eq!(parse_clock(""), None);
+        assert_eq!(parse_clock("1::5"), None);
     }
 
     #[test]

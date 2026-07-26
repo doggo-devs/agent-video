@@ -67,15 +67,19 @@ interface Pending {
 /** The one result an aborted call resolves to. The contract: the server
  * keeps working (downloads stay pollable; a late response finds no waiter
  * and is dropped) — cancellation only detaches this call's waiter, never
- * the shared child or other pending calls. */
-const CANCELLED: McpCallResult = {
-	content: [
-		{
-			type: "text",
-			text: "call cancelled — the server keeps working; repeat the same source to pick up the result",
-		},
-	],
-};
+ * the shared child or other pending calls. Constructed per call: no
+ * mutable object is ever shared across calls, so passing `result.content`
+ * through to the host stays safe. */
+function cancelled(): McpCallResult {
+	return {
+		content: [
+			{
+				type: "text",
+				text: "call cancelled — the server keeps working; repeat the same source to pick up the result",
+			},
+		],
+	};
+}
 
 /** One MCP server child per pi session, restarted on death at the next call. */
 class VideoServer {
@@ -95,9 +99,9 @@ class VideoServer {
 		// once on entry, once after the shared handshake (which an abort must
 		// ride out, not kill — other calls share the spawn). Either way the
 		// request is never sent and no pending entry is left behind.
-		if (signal?.aborted) return CANCELLED;
+		if (signal?.aborted) return cancelled();
 		await this.start();
-		if (signal?.aborted) return CANCELLED;
+		if (signal?.aborted) return cancelled();
 		const id = this.nextId++;
 		const result = new Promise<McpCallResult>((resolve, reject) => {
 			this.pending.set(id, { resolve, reject, onProgress });
@@ -118,7 +122,7 @@ class VideoServer {
 				const waiter = this.pending.get(id);
 				if (waiter === undefined) return; // already settled
 				this.pending.delete(id);
-				waiter.resolve(CANCELLED);
+				waiter.resolve(cancelled());
 			},
 			{ once: true },
 		);

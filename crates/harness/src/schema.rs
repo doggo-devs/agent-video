@@ -270,7 +270,7 @@ pub fn video_input_schema() -> Value {
             },
             "transcribe": {
                 "type": "boolean",
-                "description": "Set true (alone with source) to generate a whisper transcript of the audio; it is cached and rides along with every grid afterwards. Needs local media: for a URL, download it first (bare call, then confirm), then repeat with transcribe."
+                "description": "Set true (alone with source) to transcribe the audio with whisper: the reply carries the transcript as timestamped lines, and it is cached to ride along with every grid afterwards. Needs local media: for a URL, download it first (bare call, then confirm), then repeat with transcribe."
             }
         },
         "required": ["source"],
@@ -329,6 +329,15 @@ pub enum VideoBody {
     ConfirmRequired {
         consequence: String,
         tokens: Vec<OfferedToken>,
+    },
+    /// The product of `transcribe: true`: the transcript itself, as
+    /// `MM:SS text` cue lines — possibly clipped to the inline budget, in
+    /// which case `guidance` says so. The full transcript is cached and
+    /// rides along with every grid afterwards, sliced per grid.
+    Transcript {
+        transcript: String,
+        guidance: String,
+        recommended_calls: Vec<RecommendedCall>,
     },
     /// A download continues in the background; poll with the same source.
     Pending { message: String },

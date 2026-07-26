@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Consent token registry, in-memory for one MCP stdio session.
 //!
-//! The registry is the only token mint: policy emits [`OfferDraft`]s and
-//! [`Tokens::commit`] assigns each one a session-unique token from a
-//! monotonic counter, so two distinct plans can never alias — uniqueness
-//! is a registry fact, not a property of any text policy could construct.
+//! The registry is the only token mint: policy emits [`OfferDraft`]s —
+//! which carry no token text — and [`Tokens::commit`] assigns each one a
+//! session-unique token from a monotonic counter, so two distinct plans
+//! can never alias — uniqueness is a registry fact, not a property of any
+//! text policy could construct. [`Token::new`] wraps the text the model
+//! echoes back, and wrapping is not minting: a constructed token is a
+//! lookup claim that redeems nothing unless a commit minted its text.
 //!
 //! A token only authorizes the plan and source it was issued for. Redemption
 //! is idempotent: an offer stays redeemable until a newer plan for the same
@@ -15,8 +18,9 @@
 //! action whose repetition duplicates a user-owned file — is recorded via
 //! [`Tokens::fulfill`] so later echoes replay the receipt instead.
 //!
-//! Offer sets are keyed by canonical source identity (`source_key`), not
-//! by the model's spelling, and the registry is bounded: past
+//! Offer sets are keyed by canonical source identity
+//! ([`crate::cache::source::SourceId`] — the same identity the disk cache
+//! keys on), not by the model's spelling, and the registry is bounded: past
 //! `MAX_OFFER_SETS` live sources the stalest set is evicted, its tokens
 //! answering as stale — a state the model is already told how to leave.
 
@@ -24,6 +28,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use super::cache::source::SourceId;
 use super::fetch::Recipe;
 use super::plan::CoreInvocation;
 
@@ -34,6 +39,10 @@ use super::plan::CoreInvocation;
 pub struct Token(String);
 
 impl Token {
+    /// Wrap echoed text as a lookup claim. This constructs the *key*, not
+    /// the authority: a `Token` grants nothing until [`Tokens::take`]
+    /// matches it against a minted entry, and policy code cannot smuggle
+    /// one into an offer — [`OfferDraft`] carries no token text.
     pub fn new(text: impl Into<String>) -> Self {
         Token(text.into())
     }
@@ -133,28 +142,16 @@ struct OfferSet {
     slots: HashMap<Token, Slot>,
 }
 
-/// Canonical registry key for a source. The contract — one live offer set
-/// per source — is about the source, not the model's spelling of it:
-/// `/v.mp4`, `/./v.mp4`, and a trailing-space echo must be one
-/// conversation, or a superseded plan would stay redeemable under an
-/// alias. URLs key on their trimmed text (matching the cache side, which
-/// hashes URLs verbatim); local paths are made absolute and lexically
-/// normalized. The registry derives the key itself, so no caller can
-/// mis-key it.
-fn source_key(source: &str) -> String {
-    let source = source.trim();
-    let lower = source.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        return source.to_string();
-    }
-    std::path::absolute(source)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| source.to_string())
-}
-
-/// Pending offers keyed by canonical source identity, behind the one lock
-/// that guards them; guards never escape this type. One live offer set
-/// per source, at most `MAX_OFFER_SETS` sources.
+/// Pending offers keyed by canonical source identity ([`SourceId`]),
+/// behind the one lock that guards them; guards never escape this type.
+/// One live offer set per source, at most `MAX_OFFER_SETS` sources.
+///
+/// The contract — one live offer set per *source* — is about the source,
+/// not the model's spelling of it: `/v.mp4`, `/./v.mp4`, a trailing-space
+/// echo, or a re-cased URL host must be one conversation, or a superseded
+/// plan would stay redeemable under an alias. The registry derives the
+/// [`SourceId`] itself — the same type whose hash keys the disk cache —
+/// so no caller can mis-key it and the two sides cannot diverge.
 ///
 /// A cheaply-cloneable shared handle: clones share one registry (and one
 /// mint counter). Owning a `Tokens` pins nothing but the registry itself —
@@ -171,7 +168,7 @@ pub struct Tokens(Arc<Mutex<Registry>>);
 /// threads are genuinely parallel) cannot mint equal or inverted stamps.
 #[derive(Debug, Default)]
 struct Registry {
-    pending: HashMap<String, OfferSet>,
+    pending: HashMap<SourceId, OfferSet>,
     /// Session-local mint counter; every commit draws fresh values, so no
     /// two offers of this registry's lifetime ever share a token.
     minted: u64,
@@ -191,7 +188,7 @@ impl Tokens {
     /// Returns the completed offers for rendering — the model sees exactly
     /// what became redeemable.
     pub fn commit(&self, source: &str, drafts: Vec<OfferDraft>) -> Vec<Offer> {
-        let key = source_key(source);
+        let key = SourceId::from_spelling(source);
         let mut reg = self.lock();
         let mut slots = HashMap::with_capacity(drafts.len());
         let offers: Vec<Offer> = drafts
@@ -230,7 +227,7 @@ impl Tokens {
             match self
                 .lock()
                 .pending
-                .get(&source_key(source))?
+                .get(&SourceId::from_spelling(source))?
                 .slots
                 .get(token)?
             {
@@ -249,7 +246,7 @@ impl Tokens {
         if let Some(slot) = self
             .lock()
             .pending
-            .get_mut(&source_key(source))
+            .get_mut(&SourceId::from_spelling(source))
             .and_then(|s| s.slots.get_mut(token))
         {
             *slot = Slot::Fulfilled(path);
@@ -264,14 +261,20 @@ impl Tokens {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raw::RawSubcommand;
+    use crate::look::preset_for;
+    use crate::plan::CoreArgs;
 
     fn core_action(tag: u32) -> PendingAction {
+        // Distinct pending actions told apart by their stretched cadence —
+        // a semantically valid process run, not a placeholder flag.
         PendingAction::Core(CoreInvocation {
-            subcommand: RawSubcommand::Process,
-            flags: vec![format!("--tag{tag}")],
+            args: CoreArgs::Process {
+                look: preset_for(None),
+                strategy: None,
+                chunk_seconds: Some(tag),
+                window: None,
+            },
             subtitle: None,
-            window: None,
             predicted_grids: tag,
         })
     }
@@ -333,6 +336,33 @@ mod tests {
                 "{spelling:?} names the same file as /v.mp4"
             );
         }
+    }
+
+    #[test]
+    fn keys_url_offers_by_identity_across_case_spellings() {
+        let reg = Tokens::default();
+        let offers = reg.commit("https://example.com/v.mp4", vec![draft(1)]);
+        for spelling in [
+            "HTTPS://example.com/v.mp4",
+            "https://EXAMPLE.com/v.mp4",
+            "https://example.com/v.mp4 ",
+        ] {
+            assert!(
+                reg.take(spelling, &offers[0].token).is_some(),
+                "{spelling:?} names the same source"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_url_differing_past_the_authority() {
+        let reg = Tokens::default();
+        let offers = reg.commit("https://example.com/v.mp4", vec![draft(1)]);
+        assert!(
+            reg.take("https://example.com/V.mp4", &offers[0].token)
+                .is_none(),
+            "path case names a different resource"
+        );
     }
 
     #[test]

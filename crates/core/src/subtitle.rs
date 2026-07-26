@@ -13,6 +13,7 @@
 //! transcript writer — goes through [`serialize_srt`], so writer and reader
 //! cannot drift apart.
 
+use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
 
@@ -20,7 +21,7 @@ use crate::error::{Error, ErrorCode, ErrorContext, Result};
 use crate::event::{Discard, Event, EventSink};
 use crate::media;
 use crate::source::Source;
-use crate::types::{GridSubtitles, TimeRange};
+use crate::types::{GridSubtitles, TimeRange, format_ts};
 
 /// A single parsed subtitle cue.
 #[derive(Debug, Clone)]
@@ -33,6 +34,12 @@ pub struct Cue {
 impl Cue {
     /// Build a cue clipped to the visible timeline `[0, ∞)`.
     ///
+    /// The sole cue gate on every parse path — SRT text ([`parse_srt`]) and
+    /// embedded tracks — so a parsed [`Cue`] has finite bounds with
+    /// `0 <= start < end` and non-empty text by construction. Non-finite
+    /// bounds yield `None`: NaN or infinity here is corrupt input, not a
+    /// clampable time.
+    ///
     /// Embedded streams legitimately carry cues placed before the video's
     /// first frame: edit-list pre-roll (MP4 `elst` negative offsets),
     /// `-itsoffset`-shifted tracks, and broadcast priming cues. The domain
@@ -41,12 +48,16 @@ impl Cue {
     /// which honors the container's intent that its text be on screen when
     /// the first frame presents. Empty text also yields `None`.
     pub fn visible(start: f64, end: f64, text: String) -> Option<Cue> {
+        // Narrow first, so an f64 that overflows f32 becomes inf here and
+        // fails the finiteness check with the other non-finite inputs; the
+        // check precedes the clamp because NaN.max(0.0) would silently
+        // launder NaN into 0.
+        let (start, end) = (start as f32, end as f32);
+        if !start.is_finite() || !end.is_finite() {
+            return None;
+        }
         let start = start.max(0.0);
-        (end > start && !text.is_empty()).then_some(Cue {
-            start: start as f32,
-            end: end as f32,
-            text,
-        })
+        (end > start && !text.is_empty()).then_some(Cue { start, end, text })
     }
 }
 
@@ -65,7 +76,8 @@ pub enum SubtitleSource<'a> {
     Auto,
 }
 
-/// Resolved subtitles for one run: the raw SRT text plus its parsed cues.
+/// Resolved subtitles for one run: parsed cues plus the provenance of
+/// their SRT text ([`Subtitles::srt_text`]).
 ///
 /// Constructed only by [`Subtitles::resolve`], so holding a value means every
 /// discovery, read, extraction, and parse failure has already been mapped to a
@@ -76,8 +88,22 @@ pub enum SubtitleSource<'a> {
 /// carried as silently empty metadata.
 #[derive(Debug)]
 pub struct Subtitles {
-    raw: String,
+    payload: SrtPayload,
     cues: Vec<Cue>,
+}
+
+/// Provenance of the `subtitles.txt` payload.
+///
+/// A file or sidecar source keeps its original text byte-faithfully; an
+/// embedded track keeps only its cues and serializes SRT on demand — the
+/// cues reside in memory exactly once for the life of a pipeline run,
+/// instead of doubling into an equal-size string at construction.
+#[derive(Debug)]
+enum SrtPayload {
+    /// The byte-faithful original SRT text of a file/sidecar source.
+    Verbatim(String),
+    /// Cues decoded from an embedded track; text derives on demand.
+    Derived,
 }
 
 impl Subtitles {
@@ -93,16 +119,19 @@ impl Subtitles {
     /// `events` receives the auto path's environmental warnings (an empty
     /// embedded track, an unlistable sidecar directory) as typed events; the
     /// explicit-source paths emit none. Pass [`crate::event::Discard`] for
-    /// silence.
+    /// silence. `stop` bounds the embedded-track reads on a stalled source;
+    /// see [`media::open_input`].
     pub fn resolve(
         input: &Source,
         source: SubtitleSource<'_>,
+        stop: &media::Stop,
         events: &dyn EventSink,
     ) -> Result<Option<Self>> {
         match source {
             SubtitleSource::File(p) => Ok(Some(Self::from_srt_text(input, extract_from_file(p)?)?)),
             SubtitleSource::Track(t) => {
-                let cues = media::embedded_subtitle::extract_track(input, t, "subtitle track")?;
+                let cues =
+                    media::embedded_subtitle::extract_track(input, t, "subtitle track", stop)?;
                 if cues.is_empty() {
                     return Err(Error::new(
                         ErrorCode::InputCorrupt,
@@ -112,7 +141,7 @@ impl Subtitles {
                 }
                 Ok(Some(Self::from_cues(cues)))
             }
-            SubtitleSource::Auto => match auto_detect(input, events)? {
+            SubtitleSource::Auto => match auto_detect(input, stop, events)? {
                 Some(AutoSource::Sidecar(text)) => Ok(Some(Self::from_srt_text(input, text)?)),
                 Some(AutoSource::Embedded(cues)) => Ok(Some(Self::from_cues(cues))),
                 None => Ok(None),
@@ -131,32 +160,72 @@ impl Subtitles {
             )
             .with_context(ErrorContext::default().with_input(input.as_path())));
         }
-        Ok(Subtitles { raw, cues })
+        Ok(Subtitles {
+            payload: SrtPayload::Verbatim(raw),
+            cues,
+        })
     }
 
-    /// Build from decoded embedded cues; the `subtitles.txt` payload is
-    /// rendered back to SRT. Callers guarantee at least one cue — both
-    /// resolution paths reject or degrade on an empty extraction first.
+    /// Build from decoded embedded cues; the `subtitles.txt` payload
+    /// derives from them on demand ([`Self::srt_text`]). Callers guarantee
+    /// at least one cue — both resolution paths reject or degrade on an
+    /// empty extraction first.
     fn from_cues(cues: Vec<Cue>) -> Self {
         Subtitles {
-            raw: serialize_srt(cues.iter().map(SrtCue::from)),
+            payload: SrtPayload::Derived,
             cues,
         }
     }
 
-    /// Text of every cue overlapping `range`, for a grid's metadata entry.
-    /// A miss is [`GridSubtitles::NoCueInRange`], distinct by type from "the
-    /// run had no source" — the caller cannot collapse the two.
-    pub fn slice(&self, range: TimeRange) -> GridSubtitles {
-        match slice_for_range(&self.cues, range.start(), range.end()) {
-            Some(text) => GridSubtitles::Text(text),
-            None => GridSubtitles::NoCueInRange,
+    /// Every cue overlapping `processed`, assigned to exactly one grid: the
+    /// one whose frame span lies nearest the cue's midpoint (ties go to the
+    /// earlier grid). Returns one entry per span, in order; a grid that won
+    /// no cue is [`GridSubtitles::NoCueInRange`], distinct by type from "the
+    /// run had no source".
+    ///
+    /// Totality is the contract: grid spans cover picked frames, not the
+    /// timeline, so per-grid overlap slicing silently dropped every cue in
+    /// the unsampled head/tail and in the gaps between grids — worst on
+    /// short videos, whose sparse frames leave proportionally wide gaps.
+    /// Nearest-span assignment has no gaps to drop into, and handles
+    /// overlapping spans (static stretches straddle their neighbors) with
+    /// the same rule instead of duplicating boundary cues into both grids.
+    ///
+    /// Each entry renders as `MM:SS text` lines (cue start times), so the
+    /// text stays addressable for follow-up `--from/--until` calls.
+    pub fn assign(&self, processed: TimeRange, spans: &[TimeRange]) -> Vec<GridSubtitles> {
+        let mut per_grid: Vec<Vec<&Cue>> = spans.iter().map(|_| Vec::new()).collect();
+        for cue in &self.cues {
+            if cue.end <= processed.start() || cue.start >= processed.end() {
+                continue;
+            }
+            let mid = 0.5 * (cue.start + cue.end);
+            if let Some(nearest) = nearest_span(mid, spans) {
+                per_grid[nearest].push(cue);
+            }
         }
+        per_grid
+            .into_iter()
+            .map(|mut cues| {
+                if cues.is_empty() {
+                    return GridSubtitles::NoCueInRange;
+                }
+                cues.sort_by(|a, b| a.start.total_cmp(&b.start));
+                GridSubtitles::Text(render_cue_lines(&cues))
+            })
+            .collect()
     }
 
-    /// The full resolved SRT text — the `subtitles.txt` payload.
-    pub fn raw(&self) -> &str {
-        &self.raw
+    /// The full resolved SRT text — the `subtitles.txt` payload: the
+    /// byte-faithful original for file and sidecar sources, or SRT
+    /// serialized on demand from embedded cues. A derived payload lives
+    /// only as long as the returned value, so embedded cues are never
+    /// stored twice.
+    pub fn srt_text(&self) -> Cow<'_, str> {
+        match &self.payload {
+            SrtPayload::Verbatim(raw) => Cow::Borrowed(raw.as_str()),
+            SrtPayload::Derived => Cow::Owned(serialize_srt(self.cues.iter().map(SrtCue::from))),
+        }
     }
 }
 
@@ -187,12 +256,16 @@ fn extract_from_file(path: &Path) -> Result<String> {
 /// Returns `None` when no subtitles are found. Sidecar discovery is
 /// local-only: a remote source has no directory to scan, so only its embedded
 /// tracks are considered.
-fn auto_detect(input: &Source, events: &dyn EventSink) -> Result<Option<AutoSource>> {
+fn auto_detect(
+    input: &Source,
+    stop: &media::Stop,
+    events: &dyn EventSink,
+) -> Result<Option<AutoSource>> {
     let sidecars = match input {
         Source::Local(path) => find_sidecars_inner(path, events),
         Source::Remote(_) => Vec::new(),
     };
-    let embedded = media::embedded_subtitle::list_tracks(input)?;
+    let embedded = media::embedded_subtitle::list_tracks(input, stop)?;
 
     let total = sidecars.len() + embedded.len();
     if total > 1 {
@@ -224,7 +297,8 @@ fn auto_detect(input: &Source, events: &dyn EventSink) -> Result<Option<AutoSour
     }
 
     if embedded.len() == 1 {
-        let cues = media::embedded_subtitle::extract_track(input, 0, "embedded subtitle stream")?;
+        let cues =
+            media::embedded_subtitle::extract_track(input, 0, "embedded subtitle stream", stop)?;
         if cues.is_empty() {
             // A present-but-empty text track is a legal container state, not
             // corruption; unrequested, the auto path degrades to no subtitles.
@@ -376,9 +450,10 @@ pub struct SrtCue<'a> {
 }
 
 impl<'a> From<&'a Cue> for SrtCue<'a> {
-    /// Round f32 seconds to the nearest millisecond. Negative times (a
-    /// hand-built cue bypassing [`Cue::visible`]) saturate to 0 via the
-    /// float-to-int cast rather than wrapping.
+    /// Round f32 seconds to the nearest millisecond. Parsed cues are finite
+    /// and non-negative by [`Cue::visible`]'s construction; a hand-built cue
+    /// bypassing that gate saturates via the float-to-int cast (negatives to
+    /// 0, infinity to `u64::MAX` ms) rather than wrapping.
     fn from(cue: &'a Cue) -> Self {
         SrtCue {
             start_ms: (f64::from(cue.start) * 1000.0).round() as u64,
@@ -423,8 +498,11 @@ fn srt_timestamp(ms: u64) -> String {
 ///
 /// The reader half of the SRT contract whose writer is [`serialize_srt`].
 /// Lenient by design: the numeric cue index is optional, `.` and `,`
-/// millisecond separators are both accepted, timing-line settings after the
-/// end time are ignored, and multi-line cue text joins with a space.
+/// millisecond separators are both accepted, bare-seconds timing (`5 --> 10`)
+/// parses, timing-line settings after the end time are ignored, and
+/// multi-line cue text joins with a space. Every cue passes through
+/// [`Cue::visible`], so non-finite, inverted, or zero-length timing drops
+/// the cue rather than representing it.
 pub fn parse_srt(srt: &str) -> Vec<Cue> {
     // Windows editors write a UTF-8 BOM; left in, it fails the first index
     // line's digit check and silently drops the first cue.
@@ -463,12 +541,10 @@ pub fn parse_srt(srt: &str) -> Vec<Cue> {
             text_lines.push(line);
         }
 
-        if !text_lines.is_empty() {
-            cues.push(Cue {
-                start,
-                end,
-                text: text_lines.join(" "),
-            });
+        // Cue::visible is the single gate: empty text, inverted, and
+        // zero-length cues all drop here instead of being representable.
+        if let Some(cue) = Cue::visible(f64::from(start), f64::from(end), text_lines.join(" ")) {
+            cues.push(cue);
         }
     }
 
@@ -476,41 +552,38 @@ pub fn parse_srt(srt: &str) -> Vec<Cue> {
 }
 
 /// Parse a cue timing line `start --> end [settings…]` into (start_secs,
-/// end_secs). Settings after the end time — SubRip `X1:…` coordinates
-/// (danmaku converters), WebVTT `position:…`/`align:…` (CC downloaders) —
-/// are ignored, not treated as part of the timestamp.
+/// end_secs). Each side's leading whitespace-delimited token is a timestamp
+/// in the crate's shared clock grammar (`crate::types::parse_clock`); the
+/// rest is settings to discard — SubRip `X1:…` coordinates (danmaku
+/// converters), WebVTT `position:…`/`align:…` (CC downloaders) — not part
+/// of the timestamp.
 fn parse_timestamp_line(line: &str) -> Option<(f32, f32)> {
     let (lhs, rhs) = line.split_once("-->")?;
-    Some((parse_srt_time(lhs)?, parse_srt_time(rhs)?))
+    let time = |s: &str| crate::types::parse_clock(s.split_whitespace().next()?);
+    Some((time(lhs)?, time(rhs)?))
 }
 
-/// Parse the leading `[HH:]MM:SS[,.]mmm` token of `s` into seconds; anything
-/// after the first whitespace is the caller's settings to discard. The hours
-/// group is optional (WebVTT permits `MM:SS.mmm`).
-fn parse_srt_time(s: &str) -> Option<f32> {
-    let token = s.split_whitespace().next()?.replace(',', ".");
-    let mut parts = token.split(':').rev();
-    let secs: f32 = parts.next()?.parse().ok()?;
-    let mins: f32 = parts.next()?.parse().ok()?;
-    let hours: f32 = match parts.next() {
-        Some(h) => h.parse().ok()?,
-        None => 0.0,
-    };
-    if parts.next().is_some() {
-        return None;
+/// Index of the span nearest to instant `t` (distance 0 inside a span).
+/// The first minimum wins, so assignment stays deterministic when spans
+/// overlap; `None` only for an empty span list.
+fn nearest_span(t: f32, spans: &[TimeRange]) -> Option<usize> {
+    let distance = |s: &TimeRange| (s.start() - t).max(t - s.end()).max(0.0);
+    let mut best: Option<(usize, f32)> = None;
+    for (i, span) in spans.iter().enumerate() {
+        let d = distance(span);
+        if best.is_none_or(|(_, held)| d < held) {
+            best = Some((i, d));
+        }
     }
-    Some(hours * 3600.0 + mins * 60.0 + secs)
+    best.map(|(i, _)| i)
 }
 
-/// Extract subtitles that overlap with a time range [start, end].
-fn slice_for_range(cues: &[Cue], start: f32, end: f32) -> Option<String> {
-    let text: String = cues
-        .iter()
-        .filter(|c| c.end > start && c.start < end)
-        .map(|c| c.text.as_str())
+/// `MM:SS text` per cue, newline-joined — the grid subtitle payload.
+fn render_cue_lines(cues: &[&Cue]) -> String {
+    cues.iter()
+        .map(|c| format!("{} {}", format_ts(c.start), c.text))
         .collect::<Vec<_>>()
-        .join(" ");
-    if text.is_empty() { None } else { Some(text) }
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -570,15 +643,42 @@ with continuation
     #[test]
     fn parses_time_without_hours_group() {
         // WebVTT permits MM:SS.mmm.
-        let secs = parse_srt_time("01:23.500").expect("two-group time is valid");
-        assert!((secs - 83.5).abs() < 0.01);
+        let (start, _) =
+            parse_timestamp_line("01:23.500 --> 01:25.000").expect("two-group time is valid");
+        assert!((start - 83.5).abs() < 0.01);
     }
 
     #[test]
     fn rejects_malformed_time_token() {
-        assert_eq!(parse_srt_time("00:00:01junk"), None);
-        assert_eq!(parse_srt_time("1:2:3:4,000"), None, "too many groups");
-        assert_eq!(parse_srt_time(""), None);
+        assert_eq!(parse_timestamp_line("00:00:01junk --> 00:00:02,000"), None);
+        assert_eq!(
+            parse_timestamp_line("1:2:3:4,000 --> 00:00:05,000"),
+            None,
+            "too many groups"
+        );
+        assert_eq!(parse_timestamp_line(" --> 00:00:02,000"), None);
+    }
+
+    #[test]
+    fn rejects_nonfinite_srt_time() {
+        // f32::parse happily reads "inf" and "nan"; the shared clock grammar
+        // must not let them become cue bounds.
+        let cues = parse_srt("1\ninf:00 --> nan:30\nghost\n");
+        assert!(cues.is_empty(), "non-finite timing must drop the cue");
+    }
+
+    #[test]
+    fn rejects_negative_srt_time_component() {
+        let cues = parse_srt("1\n0:-30,000 --> 0:40,000\nearly\n");
+        assert!(cues.is_empty(), "negative component must drop the cue");
+    }
+
+    #[test]
+    fn drops_inverted_srt_cue() {
+        // Routing parse_srt through Cue::visible makes inverted (and
+        // zero-length) cues unrepresentable, not merely unlikely.
+        let cues = parse_srt("1\n00:00:05,000 --> 00:00:01,000\nbackwards\n");
+        assert!(cues.is_empty(), "inverted timing must drop the cue");
     }
 
     #[test]
@@ -614,28 +714,132 @@ with continuation
     }
 
     #[test]
-    fn slices_by_range() {
-        let cues = vec![
-            Cue {
-                start: 1.0,
-                end: 3.0,
-                text: "one".into(),
-            },
-            Cue {
-                start: 5.0,
-                end: 8.0,
-                text: "two".into(),
-            },
-            Cue {
-                start: 10.0,
-                end: 12.0,
-                text: "three".into(),
-            },
-        ];
-        assert_eq!(slice_for_range(&cues, 0.0, 4.0), Some("one".into()));
-        assert_eq!(slice_for_range(&cues, 4.0, 9.0), Some("two".into()));
-        assert_eq!(slice_for_range(&cues, 2.0, 6.0), Some("one two".into()));
-        assert_eq!(slice_for_range(&cues, 20.0, 30.0), None);
+    fn rejects_nonfinite_cue_bounds() {
+        assert!(Cue::visible(f64::NAN, 1.0, "x".into()).is_none());
+        assert!(Cue::visible(0.0, f64::NAN, "x".into()).is_none());
+        assert!(Cue::visible(0.0, f64::INFINITY, "x".into()).is_none());
+        assert!(Cue::visible(f64::NEG_INFINITY, 1.0, "x".into()).is_none());
+        // An f64 finite value past f32::MAX becomes inf on narrowing and
+        // must be caught by the same check.
+        assert!(Cue::visible(0.0, f64::MAX, "x".into()).is_none());
+    }
+
+    fn cue(start: f32, end: f32, text: &str) -> Cue {
+        Cue {
+            start,
+            end,
+            text: text.into(),
+        }
+    }
+
+    fn subs(cues: Vec<Cue>) -> Subtitles {
+        Subtitles {
+            payload: SrtPayload::Derived,
+            cues,
+        }
+    }
+
+    #[test]
+    fn derives_srt_text_from_cues_on_demand() {
+        let s = subs(vec![cue(1.0, 2.5, "hi")]);
+        let text = s.srt_text();
+        assert!(
+            matches!(text, Cow::Owned(_)),
+            "embedded cues serialize on demand"
+        );
+        assert_eq!(text, serialize_srt(s.cues.iter().map(SrtCue::from)));
+    }
+
+    #[test]
+    fn borrows_verbatim_srt_text_for_file_sources() {
+        let raw = "1\n00:00:01,000 --> 00:00:02,000\nHello\n\n";
+        let s = Subtitles::from_srt_text(&Source::classify("video.mp4"), raw.to_string())
+            .expect("a valid SRT parses");
+        let text = s.srt_text();
+        assert!(
+            matches!(text, Cow::Borrowed(_)),
+            "a file source's payload borrows the original"
+        );
+        assert_eq!(text, raw, "byte-faithful to the source text");
+    }
+
+    fn range(start: f32, end: f32) -> TimeRange {
+        TimeRange::new(start, end).expect("valid test range")
+    }
+
+    #[test]
+    fn assigns_every_cue_despite_sampling_gaps() {
+        // Grid spans cover frames at 6-58s and 180-186s of a 188s video:
+        // cues in the head (0-6), the inter-grid gap (58-180 midpointed),
+        // and the tail (186-188) all still land somewhere.
+        let s = subs(vec![
+            cue(0.0, 4.0, "head"),
+            cue(30.0, 33.0, "inside first"),
+            cue(100.0, 104.0, "gap, nearer first"),
+            cue(170.0, 175.0, "gap, nearer last"),
+            cue(186.5, 188.0, "tail"),
+        ]);
+        let assigned = s.assign(range(0.0, 188.0), &[range(6.0, 58.0), range(180.0, 186.0)]);
+        assert_eq!(
+            assigned,
+            vec![
+                GridSubtitles::Text(
+                    "00:00 head\n00:30 inside first\n01:40 gap, nearer first".into()
+                ),
+                GridSubtitles::Text("02:50 gap, nearer last\n03:07 tail".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn assigns_boundary_cue_to_exactly_one_grid() {
+        // A cue straddling two adjacent spans must not appear in both.
+        let s = subs(vec![cue(9.0, 11.0, "straddler")]);
+        let assigned = s.assign(range(0.0, 20.0), &[range(0.0, 10.0), range(10.0, 20.0)]);
+        assert_eq!(
+            assigned,
+            vec![
+                GridSubtitles::Text("00:09 straddler".into()),
+                GridSubtitles::NoCueInRange,
+            ]
+        );
+    }
+
+    #[test]
+    fn excludes_cues_outside_the_processed_range() {
+        // A --from/--until run must not adopt cues it never attended to.
+        let s = subs(vec![
+            cue(1.0, 2.0, "before"),
+            cue(65.0, 68.0, "inside"),
+            cue(200.0, 204.0, "after"),
+        ]);
+        let assigned = s.assign(range(60.0, 120.0), &[range(62.0, 118.0)]);
+        assert_eq!(assigned, vec![GridSubtitles::Text("01:05 inside".into())]);
+    }
+
+    #[test]
+    fn ties_between_overlapping_spans_go_to_the_earlier_grid() {
+        // A static stretch's span overlaps its neighbor; a cue inside both
+        // has distance 0 to each and must resolve deterministically.
+        let s = subs(vec![cue(5.0, 6.0, "shared")]);
+        let assigned = s.assign(range(0.0, 20.0), &[range(0.0, 10.0), range(4.0, 20.0)]);
+        assert_eq!(
+            assigned,
+            vec![
+                GridSubtitles::Text("00:05 shared".into()),
+                GridSubtitles::NoCueInRange,
+            ]
+        );
+    }
+
+    #[test]
+    fn renders_cues_as_timestamped_lines_in_time_order() {
+        let s = subs(vec![cue(83.0, 85.0, "later"), cue(1.0, 2.0, "earlier")]);
+        let assigned = s.assign(range(0.0, 90.0), &[range(0.0, 90.0)]);
+        assert_eq!(
+            assigned,
+            vec![GridSubtitles::Text("00:01 earlier\n01:23 later".into())]
+        );
     }
 
     #[test]
@@ -742,9 +946,32 @@ with continuation
         let err = Subtitles::resolve(
             &Source::classify("video.mp4"),
             SubtitleSource::File(&sub),
+            &media::Stop::new(),
             &Discard,
         )
         .expect_err("unparseable subtitle must fail");
+        assert_eq!(err.code, ErrorCode::InputCorrupt);
+
+        fs::remove_dir_all(&dir).expect("cleanup test dir");
+    }
+
+    #[test]
+    fn rejects_sidecar_with_only_nonfinite_cues() {
+        // The finding's trigger surface end-to-end: a hostile subtitle file
+        // whose only cue carries non-finite timing must fail as corrupt, not
+        // ride NaN bounds into assign().
+        let dir = std::env::temp_dir().join(format!("agent-video-nonfin-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test dir");
+        let sub = dir.join("hostile.srt");
+        fs::write(&sub, "1\ninf:00 --> nan:30\nghost\n").expect("write test subtitle");
+
+        let err = Subtitles::resolve(
+            &Source::classify("video.mp4"),
+            SubtitleSource::File(&sub),
+            &media::Stop::new(),
+            &Discard,
+        )
+        .expect_err("non-finite-only subtitle must fail");
         assert_eq!(err.code, ErrorCode::InputCorrupt);
 
         fs::remove_dir_all(&dir).expect("cleanup test dir");

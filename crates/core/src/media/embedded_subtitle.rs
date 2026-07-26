@@ -16,7 +16,7 @@ use crate::error::{Error, ErrorCode, ErrorContext, Result};
 use crate::source::Source;
 use crate::subtitle::Cue;
 
-use super::{ErrorBudget, Timeline, decode_error, open_input};
+use super::{ErrorBudget, Stop, Timeline, decode_error, open_input};
 
 /// Embedded subtitle track info, in subtitle-relative index order.
 #[derive(Debug)]
@@ -25,9 +25,10 @@ pub struct EmbeddedTrack {
     pub language: Option<String>,
 }
 
-/// List the container's subtitle streams with their language tags.
-pub fn list_tracks(input: &Source) -> Result<Vec<EmbeddedTrack>> {
-    let ictx = open_input(input)?;
+/// List the container's subtitle streams with their language tags. `stop`
+/// bounds the header reads on a stalled source; see [`super::open_input`].
+pub fn list_tracks(input: &Source, stop: &Stop) -> Result<Vec<EmbeddedTrack>> {
+    let ictx = open_input(input, stop, &[])?;
     Ok(ictx
         .streams()
         .filter(|s| {
@@ -58,8 +59,11 @@ pub fn list_tracks(input: &Source) -> Result<Vec<EmbeddedTrack>> {
 /// container state, and whether emptiness is fatal is the caller's policy
 /// (an explicitly requested track fails the run; auto-detection degrades to
 /// running without subtitles).
-pub fn extract_track(input: &Source, track: usize, what: &str) -> Result<Vec<Cue>> {
-    let mut ictx = open_input(input)?;
+///
+/// `stop` bounds every blocking read on a stalled source; see
+/// [`super::open_input`].
+pub fn extract_track(input: &Source, track: usize, what: &str, stop: &Stop) -> Result<Vec<Cue>> {
+    let mut ictx = open_input(input, stop, &[])?;
 
     // Cue times must land on the same 0-based clock the video frames use,
     // or grid time-range slicing would systematically misattribute text on
@@ -98,11 +102,11 @@ pub fn extract_track(input: &Source, track: usize, what: &str) -> Result<Vec<Cue
         decode_error(&format!("opening {what} decoder"), e).with_input(input.as_path())
     })?;
 
-    let mut cues = Vec::new();
+    let mut cues = CueBudget::new();
     let mut packet = Packet::empty();
     let mut read_budget = ErrorBudget::new("reading subtitle packets");
     loop {
-        match packet.read(&mut ictx) {
+        match ictx.read_packet(&mut packet) {
             Ok(()) => read_budget.ok(),
             Err(ffmpeg::Error::Eof) => break,
             Err(e) => {
@@ -154,11 +158,64 @@ pub fn extract_track(input: &Source, track: usize, what: &str) -> Result<Vec<Cue
         // Cues before the video's first frame (edit-list pre-roll, priming
         // cues) are clipped or dropped by the cue's own visibility rule.
         if let Some(cue) = Cue::visible(start, end, text) {
-            cues.push(cue);
+            cues.push(cue).map_err(|e| e.with_input(input.as_path()))?;
         }
     }
 
-    Ok(cues)
+    Ok(cues.into_cues())
+}
+
+/// Cue-count budget for one extracted track. Feature-length movies run
+/// ~2,500 cues; the budget sits an order of magnitude above, so only an
+/// absurd (hostile) track can trip it.
+const MAX_TRACK_CUES: usize = 20_000;
+
+/// Text-byte budget for one extracted track. Real tracks carry ~200 KB of
+/// text; same order-of-magnitude headroom as [`MAX_TRACK_CUES`].
+const MAX_TRACK_TEXT_BYTES: usize = 4 << 20;
+
+/// The extract loop's only accumulation channel: every decoded cue enters
+/// through [`Self::push`], so cue count and resident text bytes are
+/// bounded by construction — a container stuffed with subtitle packets
+/// cannot grow memory in proportion to its size.
+struct CueBudget {
+    cues: Vec<Cue>,
+    text_bytes: usize,
+}
+
+impl CueBudget {
+    fn new() -> CueBudget {
+        CueBudget {
+            cues: Vec::new(),
+            text_bytes: 0,
+        }
+    }
+
+    /// Accept one cue, or fail the track once either budget would be
+    /// exceeded. Overflow is a hard [`ErrorCode::InputCorrupt`] on both
+    /// the auto and explicit paths: the budgets only trip on absurd
+    /// tracks, and silently keeping a prefix would mask an attack as a
+    /// clean run.
+    fn push(&mut self, cue: Cue) -> Result<()> {
+        if self.cues.len() == MAX_TRACK_CUES
+            || self.text_bytes + cue.text.len() > MAX_TRACK_TEXT_BYTES
+        {
+            return Err(Error::new(
+                ErrorCode::InputCorrupt,
+                format!(
+                    "subtitle track exceeds the extraction budget ({MAX_TRACK_CUES} cues / \
+                     {MAX_TRACK_TEXT_BYTES} bytes of text); refusing to decode further"
+                ),
+            ));
+        }
+        self.text_bytes += cue.text.len();
+        self.cues.push(cue);
+        Ok(())
+    }
+
+    fn into_cues(self) -> Vec<Cue> {
+        self.cues
+    }
 }
 
 /// Display duration used when neither the codec nor the container declares
@@ -350,6 +407,37 @@ fn strip_ass_markup(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cue(text: &str) -> Cue {
+        Cue::visible(0.0, 1.0, text.to_string()).expect("a valid test cue")
+    }
+
+    #[test]
+    fn rejects_a_track_exceeding_the_cue_count_budget() {
+        let mut budget = CueBudget::new();
+        for _ in 0..MAX_TRACK_CUES {
+            budget.push(cue("x")).expect("under the cue-count budget");
+        }
+        let err = budget
+            .push(cue("x"))
+            .expect_err("one cue past the count budget must fail");
+        assert_eq!(err.code, ErrorCode::InputCorrupt);
+    }
+
+    #[test]
+    fn rejects_a_track_exceeding_the_text_byte_budget() {
+        let mut budget = CueBudget::new();
+        let megabyte = "y".repeat(1 << 20);
+        for _ in 0..4 {
+            budget
+                .push(cue(&megabyte))
+                .expect("exactly 4 MiB fits the byte budget");
+        }
+        let err = budget
+            .push(cue("z"))
+            .expect_err("one byte past the text budget must fail");
+        assert_eq!(err.code, ErrorCode::InputCorrupt);
+    }
 
     #[test]
     fn uses_codec_display_window_when_declared() {

@@ -20,6 +20,13 @@ const FORBIDDEN_LONG: [&str; 2] = ["--output", "--json"];
 /// `flag=`-prefix for the long flags (`--output=/x`), and `-o` attachment
 /// (`-o/x`, `-o=/x` — clap short-flag attachment). A flag that merely
 /// shares a prefix (a hypothetical `--jsonx`) is not matched.
+///
+/// The `-o` prefix rule covers every clap spelling only while no boolean
+/// short flag exists on the raw-reachable subcommands — a boolean `-x`
+/// would let `-xo/tmp` cluster `-o` behind it, out of prefix reach. The
+/// CLI crate pins that assumption
+/// (`every_short_flag_takes_a_value_so_none_clusters_ahead_of_dash_o` in
+/// `crates/cli/src/main.rs`).
 fn forbidden_flag(token: &str) -> Option<&'static str> {
     if token.starts_with("-o") && !token.starts_with("--") {
         return Some("-o");
@@ -30,6 +37,38 @@ fn forbidden_flag(token: &str) -> Option<&'static str> {
                 .strip_prefix(flag)
                 .is_some_and(|rest| rest.starts_with('='))
     })
+}
+
+/// Argument tokens proven free of server-owned plumbing.
+///
+/// The only constructor is [`SanitizedFlags::vet`], which rejects `-o`,
+/// `--output` and `--json` in every clap spelling — holding a value is the
+/// proof, so a smuggled plumbing flag is a type error at the construction
+/// site, not a review item. No mutable access exists outside this module,
+/// and in-module mutation only ever removes tokens (subtitle lifting),
+/// which cannot introduce a flag the vetting rejected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SanitizedFlags(Vec<String>);
+
+impl SanitizedFlags {
+    /// Vet raw tokens; a server-owned flag is rejected with a
+    /// model-presentable message.
+    pub fn vet(tokens: Vec<String>) -> Result<Self, ArgError> {
+        for t in &tokens {
+            if let Some(flag) = forbidden_flag(t) {
+                return Err(ArgError(format!(
+                    "raw must not contain {t} ({flag} is server-owned): input/output plumbing \
+                     is injected by the server. Pass only strategy flags."
+                )));
+            }
+        }
+        Ok(Self(tokens))
+    }
+
+    /// The vetted tokens, in the order they will reach core's argv.
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
 }
 
 /// One occurrence of an observed user flag, in either clap spelling:
@@ -84,6 +123,24 @@ fn find_flag(flags: &[String], name: &str) -> Option<FlagOccurrence> {
     }
 }
 
+/// The sole occurrence of `name`, or an error when it repeats.
+///
+/// Core's clap rejects a duplicated flag at spawn, so a repeat must never
+/// feed the budget prediction a value the run would not use — the
+/// cross-crate contract is declared here instead of discovered when core
+/// exits. Only used for flags that stay in the stream and reach core.
+fn sole_flag(flags: &[String], name: &str) -> Result<Option<FlagOccurrence>, ArgError> {
+    let Some(first) = find_flag(flags, name) else {
+        return Ok(None);
+    };
+    if find_flag(&flags[first.span.end..], name).is_some() {
+        return Err(ArgError(format!(
+            "{name} appears more than once — core rejects a repeated flag; pass it once"
+        )));
+    }
+    Ok(Some(first))
+}
+
 /// The core subcommand a raw string may start with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawSubcommand {
@@ -104,9 +161,9 @@ impl RawSubcommand {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawInvocation {
     pub subcommand: RawSubcommand,
-    /// Everything after the subcommand, tokenized — minus the flags the
-    /// harness reasons about, which are typed fields below.
-    pub flags: Vec<String>,
+    /// Everything after the subcommand, tokenized and vetted — minus the
+    /// flags the harness reasons about, which are typed fields below.
+    pub flags: SanitizedFlags,
     /// Explicit `--subtitle` choice; its presence suppresses the server's
     /// cached-transcript attachment.
     pub subtitle: Option<PathBuf>,
@@ -154,24 +211,17 @@ pub fn parse_raw(raw: &str) -> Result<RawInvocation, ArgError> {
             )));
         }
     };
-    let mut flags: Vec<String> = tokens[1..].to_vec();
-
-    for t in &flags {
-        if let Some(flag) = forbidden_flag(t) {
-            return Err(ArgError(format!(
-                "raw must not contain {t} ({flag} is server-owned): input/output plumbing \
-                 is injected by the server. Pass only strategy flags."
-            )));
-        }
-    }
+    let mut flags = SanitizedFlags::vet(tokens[1..].to_vec())?;
 
     // The harness must know whether a subtitle was chosen (a cached whisper
     // transcript rides along otherwise), so `--subtitle` is lifted out of
-    // the opaque flags into a typed field; last occurrence wins.
+    // the opaque flags into a typed field; last occurrence wins. Duplicates
+    // are tolerated (unlike below) because the flag never reaches core —
+    // exactly one rendered occurrence survives the lift.
     let mut subtitle: Option<PathBuf> = None;
-    while let Some(occurrence) = find_flag(&flags, "--subtitle") {
+    while let Some(occurrence) = find_flag(&flags.0, "--subtitle") {
         let Some(path) = occurrence
-            .remove_from(&mut flags)
+            .remove_from(&mut flags.0)
             .filter(|p| !p.is_empty() && !p.starts_with('-'))
         else {
             return Err(ArgError(
@@ -186,11 +236,11 @@ pub fn parse_raw(raw: &str) -> Result<RawInvocation, ArgError> {
     // unknown name dies here, with core's own message, instead of running
     // core just to watch it reject the flag.
     let mut chunk_seconds = f64::from(DEFAULT_CHUNK_SECONDS);
-    if let Some(name) = find_flag(&flags, "--profile").and_then(|o| o.value) {
+    if let Some(name) = sole_flag(&flags.0, "--profile")?.and_then(|o| o.value) {
         let profile = name.parse::<Profile>().map_err(|e| ArgError(e.reason))?;
         chunk_seconds = f64::from(default_chunk_seconds(Some(profile)));
     }
-    if let Some(v) = find_flag(&flags, "--chunk-seconds")
+    if let Some(v) = sole_flag(&flags.0, "--chunk-seconds")?
         .and_then(|o| o.value)
         .and_then(|s| s.parse::<f64>().ok())
         && v.is_finite()
@@ -223,7 +273,7 @@ mod tests {
     fn parses_process_with_flags() {
         let inv = parse_raw("process --strategy keyframes").expect("valid");
         assert_eq!(inv.subcommand, RawSubcommand::Process);
-        assert_eq!(inv.flags, ["--strategy", "keyframes"]);
+        assert_eq!(inv.flags.as_slice(), ["--strategy", "keyframes"]);
         assert_eq!(inv.chunk_seconds, f64::from(DEFAULT_CHUNK_SECONDS));
     }
 
@@ -262,7 +312,7 @@ mod tests {
         // `--jsonx` is not `--json`: the ban is exact-or-`=`-attached, not
         // a prefix match.
         let inv = parse_raw("process --jsonx foo").expect("prefix-sharing flag passes");
-        assert_eq!(inv.flags, ["--jsonx", "foo"]);
+        assert_eq!(inv.flags.as_slice(), ["--jsonx", "foo"]);
     }
 
     #[test]
@@ -304,7 +354,11 @@ mod tests {
         let inv =
             parse_raw(r#"process --subtitle "my file.srt" --strategy keyframes"#).expect("valid");
         assert_eq!(inv.subtitle, Some(PathBuf::from("my file.srt")));
-        assert_eq!(inv.flags, ["--strategy", "keyframes"], "no residue");
+        assert_eq!(
+            inv.flags.as_slice(),
+            ["--strategy", "keyframes"],
+            "no residue"
+        );
     }
 
     #[test]
@@ -316,6 +370,21 @@ mod tests {
             let err = parse_raw(raw).expect_err("dangling --subtitle");
             assert!(err.0.contains("file path"), "{}", err.0);
         }
+    }
+
+    #[test]
+    fn rejects_repeated_profile_as_core_would() {
+        // Core's clap errors on a duplicated flag; predicting the budget
+        // from the first occurrence would gate on a run that cannot happen.
+        let err = parse_raw("process --profile fast --profile=quality").expect_err("duplicate");
+        assert!(err.0.contains("once"), "{}", err.0);
+    }
+
+    #[test]
+    fn rejects_repeated_chunk_seconds_as_core_would() {
+        let err =
+            parse_raw("process --chunk-seconds 30 --chunk-seconds=60").expect_err("duplicate");
+        assert!(err.0.contains("once"), "{}", err.0);
     }
 
     #[test]
@@ -338,14 +407,22 @@ mod tests {
     fn lifts_equals_form_subtitle_out_of_flags() {
         let inv = parse_raw("process --subtitle=captions.srt --strategy keyframes").expect("valid");
         assert_eq!(inv.subtitle, Some(PathBuf::from("captions.srt")));
-        assert_eq!(inv.flags, ["--strategy", "keyframes"], "no residue");
+        assert_eq!(
+            inv.flags.as_slice(),
+            ["--strategy", "keyframes"],
+            "no residue"
+        );
     }
 
     #[test]
     fn lifts_last_subtitle_across_mixed_spellings() {
         let inv = parse_raw("process --subtitle a.srt --subtitle=b.srt").expect("valid");
         assert_eq!(inv.subtitle, Some(PathBuf::from("b.srt")));
-        assert!(inv.flags.is_empty(), "no residue: {:?}", inv.flags);
+        assert!(
+            inv.flags.as_slice().is_empty(),
+            "no residue: {:?}",
+            inv.flags
+        );
     }
 
     #[test]

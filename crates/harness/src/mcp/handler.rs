@@ -17,9 +17,11 @@ use super::download::{
     DOWNLOAD_ABANDON_LIMIT, execute_download, keep_response, progress_message, slot_key,
 };
 use super::invoke::{run_invocation, transcribe_flow};
-use super::probe_cache::cached_probe;
+use super::probe_cache::{MediaMissing, ProbeError, probe_media};
 use super::tracker::Poll;
-use super::wire::{coerce_args, failed, foreign_scheme, is_url, json_result, pending_result};
+use super::wire::{
+    coerce_args, evicted_rip, failed, foreign_scheme, is_url, json_result, pending_result,
+};
 use crate::fault::Fault;
 use crate::fetch::rip_key;
 use crate::offer::decide_url;
@@ -100,48 +102,71 @@ pub fn handle_video_call(
                 }
             }
         }
-        return match deps
-            .cache
-            .find_download(&rip_key(&args.source, &deps.config))
-        {
-            None => url_first_contact(&args, deps, notify),
-            Some(cached) => local_flow(
+        // A cache hit that evaporates before use is indistinguishable
+        // from a miss: another process's eviction can unlink the rip
+        // between this resolve and the probe's open. Re-resolve once — a
+        // rival's re-download or a surviving rival container may answer —
+        // then fall through to first contact (a fresh download offer),
+        // exactly as if the entry had never been found. Never a
+        // `bad_input`: the model's arguments were right.
+        let key = rip_key(&args.source, &deps.config);
+        for _ in 0..2 {
+            let Some(cached) = deps.cache.find_download(&key) else {
+                break;
+            };
+            match local_flow(
                 &args,
                 &cached,
                 vec!["serving from the cached analysis rip".to_string()],
                 deps,
                 notify,
-            ),
-        };
+            ) {
+                Ok(result) => return result,
+                Err(MediaMissing) => continue,
+            }
+        }
+        return url_first_contact(&args, deps, notify);
     }
     let path = PathBuf::from(&args.source);
-    local_flow(&args, &path, Vec::new(), deps, notify)
+    // A user-supplied path that is missing is the caller's error — the
+    // miss semantics above are reserved for cache-derived paths.
+    local_flow(&args, &path, Vec::new(), deps, notify).unwrap_or_else(|MediaMissing| {
+        failed(&Fault::bad_input(format!(
+            "file not found: {}",
+            path.display()
+        )))
+    })
 }
 
-/// Probe a local media file and run the local decision engine.
+/// Probe a resolved media path and run the local decision engine. An
+/// absent file is returned as [`MediaMissing`], never rendered here: only
+/// the caller knows what absence means for this path's provenance — a
+/// user-supplied argument is the caller's error, a cache-derived rip was
+/// evicted underfoot and must answer like a cache miss.
 fn local_flow(
     args: &VideoArgs,
     media_path: &Path,
     extra_notices: Vec<String>,
     deps: &Arc<ServerDeps>,
     notify: &Notifier,
-) -> CallToolResult {
-    let (probe, _) = match cached_probe(media_path, deps) {
+) -> Result<CallToolResult, MediaMissing> {
+    let (probe, _) = match probe_media(media_path, deps) {
         Ok(v) => v,
-        Err(e) => return failed(&e),
+        Err(ProbeError::Missing(m)) => return Err(m),
+        Err(ProbeError::Fault(e)) => return Ok(failed(&e)),
     };
     let mut decision = decide(args, &probe, &deps.config);
     if let Decision::Plan(plan) = &mut decision {
         offer_transcription(&args.source, plan, deps);
     }
-    execute_decision(
+    Ok(execute_decision(
         args,
         decision,
         Some(media_path.to_path_buf()),
         extra_notices,
         deps,
         notify,
-    )
+    ))
 }
 
 /// Subtitle-less plans grow a transcribe recommendation (or an install hint).
@@ -262,10 +287,7 @@ fn run_core(
     deps: &Arc<ServerDeps>,
 ) -> CallToolResult {
     let Some(resolved) = media_path.or_else(|| resolve_media(source, deps)) else {
-        return failed(&Fault::transient(
-            "the cached rip for this URL is gone (evicted). Call again with just the \
-             URL to re-download.",
-        ));
+        return failed(&evicted_rip());
     };
     run_invocation(&resolved, invocation, &notices, deps)
 }
@@ -341,6 +363,51 @@ mod tests {
         // The failure class rides the wire: the model can tell "fix the
         // argument" from "this build lacks a capability" without parsing prose.
         assert_eq!(body["kind"], "bad_input", "{body}");
+    }
+
+    #[test]
+    fn absent_media_is_a_typed_miss_for_the_caller_to_classify() {
+        // `local_flow` must not bake in a diagnosis: the URL branch maps
+        // this miss to a re-resolve/fresh offer, the local branch to
+        // `bad_input` — the provenance decides, not the probe.
+        let env = env(probe(90.0, vec![]), false);
+        let args = VideoArgs::bare("/no/such/file.mp4");
+        let r = local_flow(
+            &args,
+            Path::new("/no/such/file.mp4"),
+            Vec::new(),
+            &env.deps,
+            &crate::mcp::deps::null_notifier(),
+        );
+        assert!(r.is_err(), "an absent path surfaces as MediaMissing");
+    }
+
+    #[test]
+    fn evicted_rip_answers_as_a_miss_not_a_caller_error() {
+        // The rip landed, then vanished (eviction in another process).
+        // The next call must re-offer the download — never tell the model
+        // its arguments are wrong.
+        let env = env(probe(90.0, vec![]), false);
+        let url = "https://example.com/v.mp4";
+        let offer = body_of(&call(&env, serde_json::json!({"source": url})));
+        assert_eq!(offer["status"], "confirm_required", "{offer}");
+        let token = offered_tokens(&offer).remove(0);
+        let done = body_of(&call(
+            &env,
+            serde_json::json!({"source": url, "confirm": token}),
+        ));
+        assert_eq!(done["status"], "plan", "{done}");
+
+        let downloads = env.deps.config.paths.cache.join("downloads");
+        for entry in std::fs::read_dir(&downloads).expect("downloads dir") {
+            std::fs::remove_file(entry.expect("entry").path()).expect("evict the rip");
+        }
+
+        let again = body_of(&call(&env, serde_json::json!({"source": url})));
+        assert_eq!(
+            again["status"], "confirm_required",
+            "an evaporated rip re-offers the download: {again}"
+        );
     }
 
     #[test]
@@ -420,20 +487,16 @@ mod tests {
             &env,
             serde_json::json!({"source": source, "transcribe": true}),
         ));
-        assert_eq!(after["status"], "plan", "{after}");
+        assert_eq!(after["status"], "transcript", "{after}");
+        assert_eq!(
+            after["transcript"], "00:00 hi",
+            "the reply carries the transcript text itself: {after}"
+        );
         assert!(
             after["guidance"]
                 .as_str()
                 .expect("guidance")
-                .contains("Transcript ready"),
-            "{after}"
-        );
-        assert!(
-            after["probe"]["subtitles"]
-                .as_array()
-                .expect("subtitles")
-                .iter()
-                .any(|s| s == "transcript (whisper)"),
+                .contains("Transcript cached"),
             "{after}"
         );
 
@@ -461,12 +524,16 @@ mod tests {
             &env,
             serde_json::json!({"source": source, "transcribe": true}),
         ));
-        assert_eq!(first["status"], "plan", "{first}");
+        assert_eq!(first["status"], "transcript", "{first}");
         let again = body_of(&call(
             &env,
             serde_json::json!({"source": source, "transcribe": true}),
         ));
-        assert_eq!(again["status"], "plan", "{again}");
+        assert_eq!(again["status"], "transcript", "{again}");
+        assert_eq!(
+            again["transcript"], first["transcript"],
+            "the cache hit answers with the same text"
+        );
         assert_eq!(
             *env.whisper.calls.lock().expect("calls"),
             1,
@@ -483,13 +550,13 @@ mod tests {
             &env,
             serde_json::json!({"source": file, "transcribe": true}),
         ));
-        assert_eq!(body["status"], "plan", "{body}");
+        assert_eq!(body["status"], "transcript", "{body}");
         let guidance = body["guidance"].as_str().expect("guidance");
         assert!(
             guidance.starts_with("Warning: only 00:49"),
             "truncation leads the guidance: {guidance}"
         );
-        assert!(guidance.contains("Transcript ready"), "{guidance}");
+        assert!(guidance.contains("Transcript cached"), "{guidance}");
     }
 
     #[test]

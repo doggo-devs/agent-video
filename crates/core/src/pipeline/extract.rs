@@ -35,18 +35,22 @@ use super::{OutputSink, SubtitleSource};
 ///
 /// `events` receives every diagnostic the run emits (decode-open and subtitle
 /// warnings) as typed events; pass [`crate::event::Discard`] for silence.
+/// `stop` bounds the subtitle-extraction reads on a stalled source; the
+/// sampling pass decodes behind its own self-minted token (see
+/// [`crate::media::decode::FrameSource::open`]).
 pub fn extract_range(
     input: &Source,
     sink: OutputSink<'_>,
     cfg: &Config,
     range: TimeRange,
     subs: SubtitleSource<'_>,
+    stop: &crate::media::Stop,
     events: &dyn EventSink,
 ) -> Result<()> {
     super::validate_input(input)?;
     // Before the expensive sampling pass: subtitle errors must fail fast,
     // not after all the CPU and IO have been spent.
-    let subs = Subtitles::resolve(input, subs, events)?;
+    let subs = Subtitles::resolve(input, subs, stop, events)?;
     let session = OutputSession::open(sink)?;
 
     let fps = cfg.extract_fps();
@@ -156,7 +160,13 @@ pub fn extract_range(
     let mut grid_meta = build_grid_draft(&picked, &[], lay.template).into_meta(image);
 
     grid_meta.subtitles = match subs {
-        Some(ref subs) => subs.slice(range),
+        // One span, one assignment: every cue overlapping the requested
+        // range lands on the single grid, even when the picked frames
+        // cover a narrower stretch than the range itself.
+        Some(ref subs) => subs
+            .assign(range, &[grid_meta.time_range])
+            .pop()
+            .expect("one span yields exactly one assignment"),
         None => crate::types::GridSubtitles::NoSource,
     };
 

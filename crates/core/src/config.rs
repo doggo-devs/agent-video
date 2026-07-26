@@ -256,9 +256,10 @@ impl Sampling {
         if !min_gap.is_finite() || min_gap < 0.0 {
             return invalid("min_gap", format!("{min_gap} (must be finite and >= 0)"));
         }
-        if score_edge == 0 {
-            return invalid("score_edge", "0 (must be >= 1)");
-        }
+        // Shares the canvas edge's ceiling (`types::checked_edge`): an
+        // unbounded score_edge drives decode pre-scaling just like an
+        // unbounded canvas would.
+        let score_edge = crate::types::checked_edge("score_edge", score_edge)?;
         Ok(Self {
             base_fps,
             extract_fps,
@@ -935,6 +936,20 @@ mod tests {
         };
         assert_eq!(
             config_with(ov).expect_err("score_edge 0 rejected").code,
+            ErrorCode::InvalidConfig
+        );
+    }
+
+    #[test]
+    fn rejects_score_edge_above_the_image_edge_limit() {
+        let ov = Overrides {
+            score_edge: Some(65_536),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_with(ov)
+                .expect_err("score_edge above the JPEG edge limit rejected")
+                .code,
             ErrorCode::InvalidConfig
         );
     }

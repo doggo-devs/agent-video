@@ -8,8 +8,6 @@
 //! callback so a hung server cannot stall the call forever.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use super::schema::ProbeSummary;
@@ -59,26 +57,6 @@ fn round_centis(seconds: f32) -> f64 {
     (f64::from(seconds) * 100.0).round() / 100.0
 }
 
-/// Arms `stop` after `timeout` unless dropped first. Dropping the guard
-/// disconnects the channel, waking the deadline thread immediately — so a
-/// finished probe never leaks a sleeping thread past a scheduler tick, and
-/// disarming cannot be forgotten on any return path.
-struct Deadline {
-    _disarm: mpsc::Sender<()>,
-}
-
-impl Deadline {
-    fn arm(stop: Arc<AtomicBool>, timeout: Duration) -> Self {
-        let (tx, rx) = mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            if rx.recv_timeout(timeout) == Err(mpsc::RecvTimeoutError::Timeout) {
-                stop.store(true, Ordering::Relaxed);
-            }
-        });
-        Deadline { _disarm: tx }
-    }
-}
-
 /// Human-readable embedded-track descriptions, mirroring the TS wire text
 /// (`embedded #0 (eng, subrip)`). Sidecar lines (`sidecar x.srt`) are a
 /// property of the file's directory, not its content, and are appended
@@ -114,7 +92,9 @@ pub fn probe_local_file(file: &Path) -> Result<ProbeSummary, Fault> {
     let source = Source::classify(&file.to_string_lossy());
     // A failed stat is an unknown size, not a zero-byte claim.
     let size = std::fs::metadata(file).ok().map(|m| m.len());
-    let ictx = media::open_input(&source)?;
+    // A local file cannot stall like a dead peer; a manual token that
+    // never trips satisfies the open's stall-guard contract.
+    let ictx = media::open_input(&source, &media::Stop::new(), &[])?;
     let summary = media::summarize_input(&ictx, &source)?;
     Ok(ProbeSummary {
         duration: round_centis(summary.duration),
@@ -139,7 +119,7 @@ pub(crate) fn materially_truncated(track_s: f64, container_s: f64) -> bool {
 /// file cannot be probed — integrity has its own verdicts elsewhere.
 pub fn coverage_shortfall(file: &Path) -> Option<String> {
     let source = Source::classify(&file.to_string_lossy());
-    let coverage = media::stream_coverage(&source).ok()?;
+    let coverage = media::stream_coverage(&source, &media::Stop::new()).ok()?;
     let check = |name: &str, seconds: Option<f64>| -> Option<String> {
         let s = seconds?;
         materially_truncated(s, coverage.container_seconds).then(|| {
@@ -165,13 +145,12 @@ pub fn coverage_shortfall(file: &Path) -> Option<String> {
 /// trusted from the up-front [`crate::netguard::vet`].
 pub fn probe_media_url(url: &str, relay: &PolicyRelay) -> Result<ProbeSummary, Fault> {
     let source = Source::classify(url);
-    // Deadline: arms libav's interrupt callback, turning a stalled
-    // open/read into AVERROR_EXIT. The atomic is the FFI boundary — the C
-    // callback polls it.
-    let stop = Arc::new(AtomicBool::new(false));
-    let _deadline = Deadline::arm(Arc::clone(&stop), URL_PROBE_TIMEOUT);
+    // A deadline token arms libav's interrupt callback, turning a stalled
+    // open/read into AVERROR_EXIT after the timeout. The context's own
+    // clone keeps the deadline live for every later header read.
+    let stop = media::Stop::after(URL_PROBE_TIMEOUT);
     let proxy = relay.url();
-    let ictx = media::open_input_interruptible(&source, stop, &[("http_proxy", &proxy)])?;
+    let ictx = media::open_input(&source, &stop, &[("http_proxy", &proxy)])?;
     let summary = media::summarize_input(&ictx, &source)?;
     Ok(ProbeSummary {
         duration: round_centis(summary.duration),

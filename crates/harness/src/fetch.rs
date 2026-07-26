@@ -13,10 +13,11 @@
 pub mod direct;
 pub mod ytdlp;
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
-use super::cache::url_key;
-use super::config::Config;
+use super::cache::source::SourceId;
+use super::config::{Config, CookiesCfg, DownloadCfg, NetworkCfg};
 use super::fault::{Fault, FaultKind};
 use super::netguard::VettedUrl;
 use super::plan::format_bytes;
@@ -26,28 +27,123 @@ use super::tokens::{Dest, DownloadPlan};
 /// Version of the download recipe logic. Bump when the bytes a download
 /// produces change for reasons outside the config — e.g. the yt-dlp format
 /// selector template in [`ytdlp`] — so old cache entries miss instead of
-/// impersonating the new recipe's output.
+/// impersonating the new recipe's output. Key-*input* changes need no
+/// bump: when [`SourceId`] normalization converges spellings, a canonical
+/// key still means exactly the bytes it always meant, and keys that
+/// existed only under non-canonical spellings orphan into natural misses
+/// the LRU ages out.
 const RECIPE_VERSION: u32 = 1;
 
-/// Cache identity of one analysis rip: the URL plus every knob that shapes
-/// the downloaded bytes (`download.analysis_max_height`, the recipe logic
-/// version, whether cookies are in play — a member-only stream and the
-/// anonymous fallback are different bytes). Same URL, different recipe ⇒
-/// different cache entry, so a config change can never serve stale bytes
-/// as a hit.
+/// Cache identity of one analysis rip: the canonical source plus every
+/// config knob that shapes the downloaded bytes. "Every" is enforced by
+/// construction, not by review: [`RipId::derive`] is the only constructor,
+/// and it destructures the whole [`Config`] without `..`.
+#[derive(Debug, PartialEq, Eq)]
+struct RipId {
+    source: SourceId,
+    /// `download.analysis_max_height`: the frame-height cap both fetchers
+    /// select formats under.
+    max_height: NonZeroU32,
+    /// Whether any cookie source is configured — a member-only stream and
+    /// the anonymous fallback are different bytes, so an authenticated rip
+    /// must never answer for an anonymous one (or vice versa).
+    authenticated: bool,
+    /// `network.allow_private_hosts`: under split-horizon DNS the same URL
+    /// serves different bytes from the private vantage than from the
+    /// public one, so a rip fetched under the permissive policy must never
+    /// answer for the strict one (or vice versa) — isomorphic to
+    /// `authenticated` (intranet view vs public view ⇔ member view vs
+    /// anonymous view).
+    private_hosts_allowed: bool,
+}
+
+impl RipId {
+    /// Classify the whole config into byte-shaping identity inputs and
+    /// explicit discards. No `..` in any pattern: a field added to the
+    /// config — in any section — fails to compile here until it is either
+    /// folded into the identity or bound to a discard with the reason it
+    /// cannot shape the downloaded bytes.
+    fn derive(source: SourceId, cfg: &Config) -> RipId {
+        let Config {
+            // Where artifacts land, never which bytes land there.
+            paths: _,
+            // When cache entries die, not what they contain.
+            cache: _,
+            // Shapes transcripts, which carry their own recipe identity
+            // ([`crate::transcribe::transcript_id`]), not downloads.
+            whisper: _,
+            download:
+                DownloadCfg {
+                    // Refusal ceiling: decides whether a download runs,
+                    // never the bytes of one that does.
+                    max_bytes: _,
+                    analysis_max_height,
+                    // Response latency, invisible to the fetched bytes.
+                    sync_wait_seconds: _,
+                },
+            // Consent thresholds for grid rendering, downstream of the rip.
+            budget: _,
+            // Not just "whether a host may be reached": under
+            // split-horizon DNS the vantage shapes the bytes served
+            // ([`RipId::private_hosts_allowed`]).
+            network: NetworkCfg {
+                allow_private_hosts,
+            },
+            cookies:
+                cookies @ CookiesCfg {
+                    from_browser: _,
+                    jar: _,
+                },
+            // Sidecar election among already-downloaded subtitles; the
+            // media bytes — the rip's identity — are untouched, and
+            // sidecars are best-effort decoration that may be absent
+            // entirely ([`Downloaded::warning`]).
+            subtitles: _,
+        } = cfg;
+        // Both cookie fields feed `mode`: any credential source flips the
+        // marker, which is why the whole struct — not one field — is the
+        // classified input.
+        let authenticated = !matches!(
+            crate::cookies::mode(cookies),
+            crate::cookies::CookieMode::Anonymous
+        );
+        RipId {
+            source,
+            max_height: *analysis_max_height,
+            authenticated,
+            private_hosts_allowed: *allow_private_hosts,
+        }
+    }
+
+    /// Render the on-disk key. Destructures `self` exhaustively, so an
+    /// identity field cannot exist without entering the key; the spelling
+    /// keeps the pre-`RipId` format, so existing cache entries stay valid.
+    fn key(&self) -> String {
+        let RipId {
+            source,
+            max_height,
+            authenticated,
+            private_hosts_allowed,
+        } = self;
+        let auth = if *authenticated { "-auth" } else { "" };
+        let net = if *private_hosts_allowed { "-priv" } else { "" };
+        format!(
+            "{}-h{max_height}r{RECIPE_VERSION}{auth}{net}",
+            source.cache_key()
+        )
+    }
+}
+
+/// Cache key of the analysis rip for `url` under `cfg`: the rendered
+/// `RipId`. Same source, different recipe ⇒ different cache entry, so a
+/// config change can never serve stale bytes as a hit; different spelling,
+/// same source ⇒ the same entry, by [`SourceId`] construction.
 ///
-/// Not the in-flight job key: the tracker dedupes by [`url_key`] alone —
-/// "a download for this URL is running" is URL identity, not byte identity.
+/// Not the in-flight job key: the tracker dedupes by
+/// [`crate::cache::url_key`] alone — "a download for this URL is running"
+/// is source identity, not byte identity.
 pub fn rip_key(url: &str, cfg: &Config) -> String {
-    let auth = match crate::cookies::mode(&cfg.cookies) {
-        crate::cookies::CookieMode::Anonymous => "",
-        _ => "-auth",
-    };
-    format!(
-        "{}-h{}r{RECIPE_VERSION}{auth}",
-        url_key(url),
-        cfg.download.analysis_max_height
-    )
+    RipId::derive(SourceId::from_spelling(url), cfg).key()
 }
 
 /// A source-typed download recipe; the variant names the source that issued
@@ -99,7 +195,6 @@ pub type ProgressFn<'a> = &'a mut (dyn FnMut(u64, Option<u64>) + Send);
 pub struct CancelSignal(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
 impl CancelSignal {
-    /// A fresh, untripped signal.
     pub fn new() -> Self {
         Self::default()
     }
@@ -224,6 +319,50 @@ mod tests {
             before,
             rip_key(url, &cfg),
             "a different recipe must be a different cache entry"
+        );
+    }
+
+    #[test]
+    fn rip_key_converges_spellings_of_one_source() {
+        let dirs = test_dirs(Path::new("/home/u"));
+        let cfg = default_config(&dirs);
+        let canonical = rip_key("https://example.com/v.mp4", &cfg);
+        assert_eq!(
+            canonical,
+            rip_key("HTTPS://Example.COM/v.mp4", &cfg),
+            "scheme and host case never split the cache"
+        );
+        assert_ne!(
+            canonical,
+            rip_key("https://example.com/V.mp4", &cfg),
+            "path case names a different resource"
+        );
+    }
+
+    #[test]
+    fn rip_key_changes_when_private_hosts_are_allowed() {
+        let dirs = test_dirs(Path::new("/home/u"));
+        let mut cfg = default_config(&dirs);
+        let url = "https://example.com/v";
+        let strict = rip_key(url, &cfg);
+
+        cfg.network.allow_private_hosts = true;
+        assert_ne!(
+            strict,
+            rip_key(url, &cfg),
+            "a permissive-network rip must never answer for a strict one"
+        );
+    }
+
+    #[test]
+    fn default_policy_rip_keys_keep_their_spelling() {
+        let dirs = test_dirs(Path::new("/home/u"));
+        let cfg = default_config(&dirs);
+        let key = rip_key("https://example.com/v", &cfg);
+        assert!(
+            !key.contains("-priv") && !key.contains("-auth"),
+            "default-policy keys keep the pre-field spelling, so existing \
+             cache entries stay valid: {key}"
         );
     }
 

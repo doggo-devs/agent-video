@@ -137,19 +137,22 @@ impl KeyframeInfo {
 }
 
 /// Probe video duration only (container header; no packet scanning).
-pub fn probe_duration(input: &Source) -> Result<f32> {
-    let ictx = media::open_input(input)?;
+/// `stop` bounds the header reads on a stalled source; see
+/// [`media::open_input`].
+pub fn probe_duration(input: &Source, stop: &media::Stop) -> Result<f32> {
+    let ictx = media::open_input(input, stop, &[])?;
     media::duration_seconds(&ictx, input)
 }
 
 /// Probe a video for I-frame timestamps and duration.
 ///
 /// A single demux pass: every packet of the best video stream is inspected
-/// for the keyframe flag; nothing is decoded.
-pub fn probe_keyframes(input: &Source) -> Result<KeyframeInfo> {
+/// for the keyframe flag; nothing is decoded. `stop` bounds every blocking
+/// read on a stalled source; see [`media::open_input`].
+pub fn probe_keyframes(input: &Source, stop: &media::Stop) -> Result<KeyframeInfo> {
     use ffmpeg_next as ffmpeg;
 
-    let mut ictx = media::open_input(input)?;
+    let mut ictx = media::open_input(input, stop, &[])?;
     let duration = media::duration_seconds(&ictx, input)?;
     let video = media::best_video_stream(&ictx, input)?;
 
@@ -157,7 +160,7 @@ pub fn probe_keyframes(input: &Source) -> Result<KeyframeInfo> {
     let mut packet = ffmpeg::Packet::empty();
     let mut read_budget = media::ErrorBudget::new("scanning packets for keyframes");
     loop {
-        match packet.read(&mut ictx) {
+        match ictx.read_packet(&mut packet) {
             Ok(()) => read_budget.ok(),
             Err(ffmpeg::Error::Eof) => break,
             Err(e) => {

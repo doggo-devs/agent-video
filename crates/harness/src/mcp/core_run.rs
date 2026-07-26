@@ -27,14 +27,8 @@ const CORE_DEADLINE: Duration = Duration::from_secs(10 * 60);
 /// How many core children may run at once. Each child is sized to the
 /// whole machine — its ffmpeg decode threads and rayon compose pool both
 /// scale to every core — so parallel children multiply oversubscription,
-/// not throughput. Two lets one child's compute run under another's I/O
-/// stalls without letting N parallel grid calls schedule N × cores of
-/// work. Excess callers block on the gate (one blocked call is cheaper
-/// than a poll chain — the `sync_wait_seconds` stance in docs/config.md),
-/// and every holder is bounded by [`CORE_DEADLINE`], so slots keep
-/// turning over; admission order is the condvar's, not FIFO, so no
-/// per-waiter bound is promised — with two slots and callers that are
-/// themselves serialized agents, overtaking stays theoretical.
+/// not throughput; two lets one child's compute run under another's I/O
+/// stalls.
 const MAX_CORE_CHILDREN: usize = 2;
 
 /// Admission for [`SelfSpawn`] children. Lives at the spawn seam so every

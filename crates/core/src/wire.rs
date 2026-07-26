@@ -152,8 +152,9 @@ pub struct Grid {
     #[serde(default)]
     pub key_frames: Vec<KeyFrameMeta>,
     pub layout: LayoutKind,
-    /// Concatenated cue text overlapping the grid's range; absent when the
-    /// run resolved no subtitle source or no cue overlaps.
+    /// `MM:SS text` cue lines assigned to this grid (every cue in the
+    /// processed range lands on exactly one grid); absent when the run
+    /// resolved no subtitle source or this grid won no cue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitles: Option<String>,
 }

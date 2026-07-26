@@ -7,8 +7,8 @@
 //! becomes a `Reject` with a model-presentable message.
 
 use super::config::Config;
-use super::look::preset_for;
-use super::raw::{RawSubcommand, parse_raw};
+use super::look::{LookKnobs, preset_for};
+use super::raw::{RawSubcommand, SanitizedFlags, parse_raw};
 use super::schema::{
     CONFIRM_ALONE, GridSpec, Intent, Look, ProbeSummary, RecommendedCall, Strategy, VideoArgs,
 };
@@ -19,18 +19,148 @@ use agent_video_core::types::format_ts;
 /// A fully-decided core run; the server injects source and I/O flags.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CoreInvocation {
-    pub subcommand: RawSubcommand,
-    /// Strategy flags only; never contains the input path, `-o`, `--json`,
-    /// or `--subtitle` (a typed field below).
-    pub flags: Vec<String>,
+    /// The subcommand and its typed strategy surface.
+    pub args: CoreArgs,
     /// Explicit subtitle choice; `None` lets the server attach a cached
     /// whisper transcript.
     pub subtitle: Option<std::path::PathBuf>,
-    /// Attention window for `process` (core clamp); `extract` encodes
-    /// `--range` in flags. A [`Window`] is a valid sub-range of the video
-    /// by construction, so an inverted or NaN window cannot ride here.
-    pub window: Option<Window>,
     pub predicted_grids: u32,
+}
+
+impl CoreInvocation {
+    /// The complete child argv: subcommand, input, window clamp, subtitle,
+    /// the typed strategy tail, `--json`. The single render site — server
+    /// plumbing joins the vector here and nowhere else, and no
+    /// [`CoreArgs`] field can carry it, so an invocation smuggling the
+    /// input path, `-o` or `--json` is unrepresentable rather than
+    /// reviewed.
+    pub fn argv(&self, media: &std::path::Path, subtitle: Option<&std::path::Path>) -> Vec<String> {
+        let mut argv = vec![
+            self.args.subcommand().as_str().to_string(),
+            media.to_string_lossy().into_owned(),
+        ];
+        if let Some(window) = self.args.window() {
+            argv.extend([
+                "--from".to_string(),
+                window.start().to_string(),
+                "--until".to_string(),
+                window.end().to_string(),
+            ]);
+        }
+        if let Some(subtitle) = subtitle {
+            argv.extend([
+                "--subtitle".to_string(),
+                subtitle.to_string_lossy().into_owned(),
+            ]);
+        }
+        self.args.render_tail(&mut argv);
+        argv.push("--json".to_string());
+        argv
+    }
+}
+
+/// The strategy surface of one core run: every argument the harness sends
+/// beyond source and I/O plumbing, held typed until spawn. Each variant
+/// carries only the knobs its subcommand's clap accepts — an `extract`
+/// with a strategy flag, which core would reject, cannot be built.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CoreArgs {
+    /// `process`: chunked pass over the (optionally windowed) video.
+    Process {
+        look: LookKnobs,
+        /// Rendered via [`Strategy::core_flag`]; `Adaptive` (like `None`)
+        /// renders no flag, keeping core's lenient default.
+        strategy: Option<Strategy>,
+        /// Stretched chunk length in whole seconds (>= 1) once the natural
+        /// grid count exceeds budget; `None` keeps the look's cadence.
+        chunk_seconds: Option<u32>,
+        /// Attention window (core clamp); `None` = whole video. A
+        /// [`Window`] is a valid sub-range of the video by construction,
+        /// so an inverted or NaN window cannot ride here.
+        window: Option<Window>,
+    },
+    /// `extract`: one dense grid over an integral second range.
+    Extract {
+        look: LookKnobs,
+        range: ExtractRange,
+    },
+    /// The `raw` escape hatch: user-authored tokens, proven plumbing-free
+    /// at the parse boundary ([`SanitizedFlags`]).
+    Raw {
+        subcommand: RawSubcommand,
+        flags: SanitizedFlags,
+    },
+}
+
+impl CoreArgs {
+    /// The core subcommand this run spawns.
+    pub fn subcommand(&self) -> RawSubcommand {
+        match self {
+            CoreArgs::Process { .. } => RawSubcommand::Process,
+            CoreArgs::Extract { .. } => RawSubcommand::Extract,
+            CoreArgs::Raw { subcommand, .. } => *subcommand,
+        }
+    }
+
+    /// The window clamp, if this run has one. Raw runs spell any window
+    /// inside their own flags; extract encodes its range instead.
+    fn window(&self) -> Option<Window> {
+        match self {
+            CoreArgs::Process { window, .. } => *window,
+            CoreArgs::Extract { .. } | CoreArgs::Raw { .. } => None,
+        }
+    }
+
+    /// Render the strategy tail — everything after the server-owned
+    /// plumbing, before `--json`.
+    fn render_tail(&self, argv: &mut Vec<String>) {
+        match self {
+            CoreArgs::Process {
+                look,
+                strategy,
+                chunk_seconds,
+                ..
+            } => {
+                look.render_into(argv);
+                if let Some(flag) = strategy.and_then(Strategy::core_flag) {
+                    argv.extend(["--strategy".to_string(), flag.to_string()]);
+                }
+                if let Some(secs) = chunk_seconds {
+                    argv.extend(["--chunk-seconds".to_string(), secs.to_string()]);
+                }
+            }
+            CoreArgs::Extract { look, range } => {
+                look.render_into(argv);
+                argv.extend(["--range".to_string(), range.to_string()]);
+            }
+            CoreArgs::Raw { flags, .. } => argv.extend(flags.as_slice().iter().cloned()),
+        }
+    }
+}
+
+/// Integral-second extract range; `start < end` by construction — the only
+/// door is a [`Window`], whose span is positive, and flooring the start
+/// while ceiling the end can only widen it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtractRange {
+    start: u64,
+    end: u64,
+}
+
+impl From<Window> for ExtractRange {
+    fn from(window: Window) -> Self {
+        Self {
+            start: window.start().floor() as u64,
+            end: window.end().ceil() as u64,
+        }
+    }
+}
+
+impl std::fmt::Display for ExtractRange {
+    /// Core's `--range` spelling, accepted by its `parse_range`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.start, self.end)
+    }
 }
 
 /// Probe-only decision; also reused verbatim after analysis downloads.
@@ -138,32 +268,25 @@ fn decide_inner(
     };
 
     let (window, mut notices) = resolve_window(grid.from, grid.until, probe.duration)?;
-    let preset = preset_for(grid.look);
+    let look = preset_for(grid.look);
     let span = window.span();
-    let natural = ((span / preset.chunk_seconds).ceil() as u32).max(1);
+    let natural = ((span / look.chunk_seconds()).ceil() as u32).max(1);
 
     // Bare source on anything non-trivial: plan first, decode later.
     if grid.is_bare() && natural > cfg.budget.auto_run.get() {
         return Ok(Decision::Plan(plan_response(&args.source, probe, cfg)));
     }
 
-    let mut preset_flags: Vec<String> = preset.flags.iter().map(|s| s.to_string()).collect();
-    if let Some(flag) = grid.strategy.and_then(Strategy::core_flag) {
-        preset_flags.extend(["--strategy".to_string(), flag.to_string()]);
-    }
-
     // An explicit strategy is a temporal-selection request extract's dense
     // range sampling would ignore, so it stays on the process path.
     if natural == 1 && grid.strategy.is_none() {
-        let range = format!("{}-{}", window.start().floor(), window.end().ceil());
-        let mut flags = preset_flags;
-        flags.extend(["--range".to_string(), range]);
         return Ok(Decision::Run {
             invocation: CoreInvocation {
-                subcommand: RawSubcommand::Extract,
-                flags,
+                args: CoreArgs::Extract {
+                    look,
+                    range: window.into(),
+                },
                 subtitle: None,
-                window: None,
                 predicted_grids: 1,
             },
             notices,
@@ -173,19 +296,18 @@ fn decide_inner(
     let max = cfg.budget.max.get();
     if natural <= max {
         return Ok(Decision::Run {
-            invocation: process_invocation(preset_flags, window, natural),
+            invocation: process_invocation(look, grid.strategy, None, window, natural),
             notices,
         });
     }
 
     // Over budget: stretch chunks so the window fits in budget.max grids.
-    let stretched = (span / f64::from(max)).ceil();
-    let mut flags = preset_flags;
-    flags.extend(["--chunk-seconds".to_string(), format!("{stretched}")]);
-    let invocation = process_invocation(flags, window, max);
+    // `span > 0` makes the ceiling at least 1, as core requires.
+    let stretched = (span / f64::from(max)).ceil() as u32;
+    let invocation = process_invocation(look, grid.strategy, Some(stretched), window, max);
     // The degradation floor (budget.max_stretch_seconds): past it, grids
     // are too thin to run without consent.
-    if stretched <= f64::from(cfg.budget.max_stretch_seconds.get()) {
+    if stretched <= cfg.budget.max_stretch_seconds.get() {
         notices.push(format!(
             "budget: {natural} grids at requested density exceeds the {max}-grid budget; each \
              grid now covers ~{stretched}s (degraded temporal resolution). Zoom into ranges \
@@ -204,7 +326,7 @@ fn decide_inner(
              to be useful. Better: survey sub-windows with from/until (look=overview), or rely \
              on subtitles for long talks.",
             format_ts(span as f32),
-            (stretched / 60.0).round()
+            (f64::from(stretched) / 60.0).round()
         ),
         offers: vec![OfferDraft {
             effect: format!("run anyway: {max} grids, ~{stretched}s of video per grid"),
@@ -218,10 +340,11 @@ fn decide_raw(raw: &str, probe: &ProbeSummary, cfg: &Config) -> Result<Decision,
     if raw.subcommand == RawSubcommand::Extract {
         return Ok(Decision::Run {
             invocation: CoreInvocation {
-                subcommand: RawSubcommand::Extract,
-                flags: raw.flags,
+                args: CoreArgs::Raw {
+                    subcommand: RawSubcommand::Extract,
+                    flags: raw.flags,
+                },
                 subtitle: raw.subtitle,
-                window: None,
                 predicted_grids: 1,
             },
             notices: Vec::new(),
@@ -229,10 +352,11 @@ fn decide_raw(raw: &str, probe: &ProbeSummary, cfg: &Config) -> Result<Decision,
     }
     let predicted = ((probe.duration / raw.chunk_seconds).ceil() as u32).max(1);
     let invocation = CoreInvocation {
-        subcommand: RawSubcommand::Process,
-        flags: raw.flags,
+        args: CoreArgs::Raw {
+            subcommand: RawSubcommand::Process,
+            flags: raw.flags,
+        },
         subtitle: raw.subtitle,
-        window: None,
         predicted_grids: predicted,
     };
     let max = cfg.budget.max.get();
@@ -255,12 +379,21 @@ fn decide_raw(raw: &str, probe: &ProbeSummary, cfg: &Config) -> Result<Decision,
     })
 }
 
-fn process_invocation(flags: Vec<String>, window: Window, predicted_grids: u32) -> CoreInvocation {
+fn process_invocation(
+    look: LookKnobs,
+    strategy: Option<Strategy>,
+    chunk_seconds: Option<u32>,
+    window: Window,
+    predicted_grids: u32,
+) -> CoreInvocation {
     CoreInvocation {
-        subcommand: RawSubcommand::Process,
-        flags,
+        args: CoreArgs::Process {
+            look,
+            strategy,
+            chunk_seconds,
+            window: (!window.is_full()).then_some(window),
+        },
         subtitle: None,
-        window: (!window.is_full()).then_some(window),
         predicted_grids,
     }
 }
@@ -268,7 +401,7 @@ fn process_invocation(flags: Vec<String>, window: Window, predicted_grids: u32) 
 /// Plan response for a bare source: probe summary plus verbatim next calls.
 pub fn plan_response(source: &str, probe: &ProbeSummary, cfg: &Config) -> PlanDecision {
     let max = cfg.budget.max.get();
-    let overview_grids = (probe.duration / preset_for(Some(Look::Overview)).chunk_seconds).ceil();
+    let overview_grids = (probe.duration / preset_for(Some(Look::Overview)).chunk_seconds()).ceil();
     let capped = (overview_grids as u32).min(max);
     let mid = probe.duration / 2.0;
     let zoom_from = format_ts((mid - 30.0).max(0.0) as f32);
@@ -383,9 +516,11 @@ mod tests {
         let Decision::Run { invocation, .. } = d else {
             panic!("expected Run, got {d:?}");
         };
-        assert_eq!(invocation.subcommand, RawSubcommand::Process);
         assert_eq!(invocation.predicted_grids, 2);
-        assert_eq!(invocation.window, None, "full window is implicit");
+        let CoreArgs::Process { window, .. } = invocation.args else {
+            panic!("expected a process run, got {:?}", invocation.args);
+        };
+        assert_eq!(window, None, "full window is implicit");
     }
 
     #[test]
@@ -409,9 +544,10 @@ mod tests {
         let Decision::Run { invocation, .. } = d else {
             panic!("expected Run, got {d:?}");
         };
-        assert_eq!(invocation.subcommand, RawSubcommand::Extract);
-        assert!(invocation.flags.contains(&"--range".to_string()));
-        assert!(invocation.flags.contains(&"60-90".to_string()));
+        let CoreArgs::Extract { range, .. } = invocation.args else {
+            panic!("expected an extract run, got {:?}", invocation.args);
+        };
+        assert_eq!(range.to_string(), "60-90", "integral-second core range");
     }
 
     #[test]
@@ -426,9 +562,10 @@ mod tests {
             panic!("expected Run, got {d:?}");
         };
         assert_eq!(invocation.predicted_grids, 5);
-        let window = invocation
-            .window
-            .expect("explicit sub-range rides as a window");
+        let CoreArgs::Process { window, .. } = invocation.args else {
+            panic!("expected a process run, got {:?}", invocation.args);
+        };
+        let window = window.expect("explicit sub-range rides as a window");
         assert_eq!((window.start(), window.end()), (0.0, 300.0));
     }
 
@@ -448,8 +585,10 @@ mod tests {
             panic!("expected Run, got {d:?}");
         };
         assert_eq!(invocation.predicted_grids, 8);
-        assert!(invocation.flags.contains(&"--chunk-seconds".to_string()));
-        assert!(invocation.flags.contains(&"150".to_string()));
+        let CoreArgs::Process { chunk_seconds, .. } = invocation.args else {
+            panic!("expected a process run, got {:?}", invocation.args);
+        };
+        assert_eq!(chunk_seconds, Some(150), "stretched cadence rides typed");
         assert!(notices.iter().any(|n| n.contains("budget")), "{notices:?}");
     }
 
@@ -562,9 +701,13 @@ mod tests {
         let Decision::Run { invocation, .. } = d else {
             panic!("expected Run, got {d:?}");
         };
-        assert_eq!(invocation.subcommand, RawSubcommand::Process);
-        assert!(invocation.flags.contains(&"--strategy".to_string()));
-        assert!(invocation.flags.contains(&"fixed-fps".to_string()));
+        assert_eq!(invocation.args.subcommand(), RawSubcommand::Process);
+        let argv = invocation.argv(Path::new("/v.mp4"), None);
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["--strategy".to_string(), "fixed-fps".to_string()]),
+            "uniform renders as core's fixed-fps: {argv:?}"
+        );
     }
 
     #[test]
@@ -580,7 +723,11 @@ mod tests {
         let Decision::Run { invocation, .. } = d else {
             panic!("expected Run, got {d:?}");
         };
-        assert!(!invocation.flags.contains(&"--strategy".to_string()));
+        let argv = invocation.argv(Path::new("/v.mp4"), None);
+        assert!(
+            !argv.contains(&"--strategy".to_string()),
+            "adaptive must render no flag: {argv:?}"
+        );
     }
 
     #[test]
@@ -595,16 +742,99 @@ mod tests {
         let Decision::Run { invocation, .. } = d else {
             panic!("expected Run, got {d:?}");
         };
-        assert_eq!(
-            invocation.subcommand,
-            RawSubcommand::Process,
-            "extract would silently ignore the strategy"
-        );
-        assert!(invocation.flags.contains(&"keyframes".to_string()));
-        let window = invocation
-            .window
-            .expect("explicit sub-range rides as a window");
+        let CoreArgs::Process {
+            strategy, window, ..
+        } = invocation.args
+        else {
+            panic!(
+                "extract would silently ignore the strategy, got {:?}",
+                invocation.args
+            );
+        };
+        assert_eq!(strategy, Some(Strategy::Keyframes));
+        let window = window.expect("explicit sub-range rides as a window");
         assert_eq!((window.start(), window.end()), (60.0, 90.0));
+    }
+
+    #[test]
+    fn renders_process_argv_in_wire_order() {
+        // The rendered argv is the wire contract with the self-spawned
+        // core binary: pin it token for token.
+        let args = VideoArgs {
+            from: Some(TimeValue::Number(0.0)),
+            until: Some(TimeValue::Number(300.0)),
+            ..VideoArgs::bare("/v.mp4")
+        };
+        let Decision::Run { invocation, .. } = decide_bare(3600.0, args) else {
+            panic!("expected Run");
+        };
+        assert_eq!(
+            invocation.argv(Path::new("/v.mp4"), Some(Path::new("/t.srt"))),
+            [
+                "process",
+                "/v.mp4",
+                "--from",
+                "0",
+                "--until",
+                "300",
+                "--subtitle",
+                "/t.srt",
+                "--detail",
+                "standard",
+                "--quality",
+                "low",
+                "--json",
+            ]
+        );
+    }
+
+    #[test]
+    fn renders_extract_argv_in_wire_order() {
+        let args = VideoArgs {
+            from: Some(TimeValue::Text("1:00".into())),
+            until: Some(TimeValue::Text("1:30".into())),
+            ..VideoArgs::bare("/v.mp4")
+        };
+        let Decision::Run { invocation, .. } = decide_bare(3600.0, args) else {
+            panic!("expected Run");
+        };
+        assert_eq!(
+            invocation.argv(Path::new("/v.mp4"), None),
+            [
+                "extract",
+                "/v.mp4",
+                "--detail",
+                "standard",
+                "--quality",
+                "low",
+                "--range",
+                "60-90",
+                "--json",
+            ]
+        );
+    }
+
+    #[test]
+    fn renders_raw_argv_with_vetted_tail_verbatim() {
+        let args = VideoArgs {
+            raw: Some("process --strategy keyframes --min-gap 0.2".into()),
+            ..VideoArgs::bare("/v.mp4")
+        };
+        let Decision::Run { invocation, .. } = decide_bare(60.0, args) else {
+            panic!("expected Run");
+        };
+        assert_eq!(
+            invocation.argv(Path::new("/v.mp4"), None),
+            [
+                "process",
+                "/v.mp4",
+                "--strategy",
+                "keyframes",
+                "--min-gap",
+                "0.2",
+                "--json",
+            ]
+        );
     }
 
     #[test]

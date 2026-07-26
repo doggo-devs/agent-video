@@ -32,4 +32,9 @@ undocumented_unsafe_blocks = "warn"
 strip = true
 lto = true
 codegen-units = 1
+# Release binaries abort on panic. The library's panic-recovery paths
+# (`FrameSource::next_frame`'s join handling, the chunk-worker
+# `catch_unwind` in pipeline/state.rs) serve unwind builds — tests and
+# downstream consumers on the default profile; here the process terminates
+# before reaching them.
 panic = "abort"
