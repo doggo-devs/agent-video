@@ -8,7 +8,11 @@
 //!
 //! Timestamps come from the decoded frames themselves (`best-effort pts ×
 //! time_base`, rebased to the stream start), produced by the same decoder
-//! that produced the pixels.
+//! that produced the pixels. Before sampling, every decoded frame passes a
+//! one-frame monotonicity gate ([`TimelineGate`]): a frame is released only
+//! once its successor confirms it, so a single corrupt pts is dropped in
+//! retrospect instead of committing the sampler or the chunker to a bogus
+//! timeline.
 
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -170,6 +174,7 @@ impl FrameSource {
                     video,
                     decoder,
                     gate: PacketGate::new(&spec),
+                    timeline_gate: TimelineGate::new(),
                     sampler: Sampler::new(spec),
                     end,
                     rescaler: Rescaler::new(min_edge),
@@ -201,6 +206,16 @@ impl FrameSource {
     }
 
     /// Read the next sampled frame, or `None` after a clean end of stream.
+    ///
+    /// Frames arrive in non-decreasing timestamp order: the decode thread
+    /// releases a frame only once its successor confirms its timestamp
+    /// ([`TimelineGate`]), so an isolated corrupt pts — forward or backward —
+    /// is dropped rather than emitted, and a timeline that never recovers
+    /// (more than [`MAX_TS_OUTLIERS`] consecutive unplaceable frames)
+    /// surfaces here as [`ErrorCode::InputCorrupt`]. The one frame the
+    /// stream cannot vouch for is the last one before EOF; it is released
+    /// as-is.
+    ///
     /// A decode-thread panic surfaces here as an [`Error`] with
     /// [`ErrorCode::DecodeFailed`], never as a silently truncated stream —
     /// in unwind builds (tests, downstream consumers on the default
@@ -285,6 +300,11 @@ impl Drop for FrameSource {
 /// once `step` fell below the accumulator's ULP — and hours of ticks have
 /// no error to accumulate, each instant being one multiplication away from
 /// `start`.
+///
+/// The grid state is a ratchet: once advanced it never rewinds, so the
+/// caller must feed non-decreasing timestamps. [`TimelineGate`] enforces
+/// that upstream; the saturation in [`Tick::wants`] is a float-rounding
+/// guard, not a corruption policy.
 struct Tick {
     start: f64,
     step: f64,
@@ -314,9 +334,8 @@ impl Tick {
             return false;
         }
         // The last tick index at or before `reach`, computed directly. The
-        // `as` cast saturates, bounding a corrupt far-future pts at
-        // `u64::MAX`; `max` keeps the index monotonic against float
-        // rounding at the tick boundary.
+        // `as` cast saturates on out-of-range values; `max` keeps the index
+        // monotonic against float rounding at the tick boundary.
         let reached = ((reach - self.start) / self.step) as u64;
         self.idx = reached.max(self.idx).saturating_add(1);
         true
@@ -429,6 +448,112 @@ impl PacketGate {
     }
 }
 
+/// Decoded frames dropped off the monotone timeline before the input is
+/// declared broken. Consecutive, not cumulative — every released frame
+/// refunds it (the [`ErrorBudget`] discipline): scattered single-frame
+/// outliers over a long video heal for free, while a timeline that never
+/// recovers fails the run instead of silently dropping everything after
+/// the poison frame. The same verdict the chunker reaches for its own
+/// regressions ([`ErrorCode::InputCorrupt`]).
+const MAX_TS_OUTLIERS: u32 = 64;
+
+/// Admits decoded frames onto a monotone timeline, one frame late: a frame
+/// is released only once its successor confirms it (`successor ts >= its
+/// ts`), so nothing downstream — the sampler's tick grid, the chunker's
+/// placement anchor — ever commits to a timestamp the stream itself does
+/// not vouch for.
+///
+/// An outlier is identifiable only in retrospect, by what follows it.
+/// Blame therefore needs three points — the committed timeline `c` (last
+/// released ts), the held frame `h`, and the newcomer `n`:
+///
+/// - `n >= h`: the stream vouches for `h`; release it. A legitimate
+///   forward jump (splice, timelapse gap, seek landing) is exactly this
+///   case — its successors follow it, so no magnitude threshold exists to
+///   misjudge.
+/// - `c <= n < h`: `n` continues the committed timeline, so `h` was the
+///   outlier; drop `h`. This is the corrupt far-future pts dying alone.
+/// - `n < c`: `n` fell behind frames already released; drop `n`. This is
+///   the backward outlier, same anomaly seen from the other side.
+///
+/// Each dropped frame spends the consecutive [`MAX_TS_OUTLIERS`] budget; a
+/// released frame refunds it. Exhaustion means the timeline never recovered
+/// and the run fails with [`ErrorCode::InputCorrupt`] instead of silently
+/// truncating the stream.
+struct TimelineGate {
+    /// The frame awaiting its successor's confirmation.
+    held: Option<(Ts, ffmpeg::frame::Video)>,
+    /// Timestamp of the last released frame: the committed timeline.
+    committed: Option<Ts>,
+    /// Consecutive dropped frames; reset by every release.
+    outliers: u32,
+}
+
+impl TimelineGate {
+    fn new() -> Self {
+        Self {
+            held: None,
+            committed: None,
+            outliers: 0,
+        }
+    }
+
+    /// Feed the next decoded frame; get back its confirmed predecessor when
+    /// that predecessor earned release, or the budget-exhaustion error.
+    fn admit(
+        &mut self,
+        ts: Ts,
+        frame: ffmpeg::frame::Video,
+    ) -> Result<Option<(Ts, ffmpeg::frame::Video)>> {
+        let Some((held_ts, held_frame)) = self.held.take() else {
+            self.held = Some((ts, frame));
+            return Ok(None);
+        };
+        if ts >= held_ts {
+            self.held = Some((ts, frame));
+            self.committed = Some(held_ts);
+            self.outliers = 0;
+            Ok(Some((held_ts, held_frame)))
+        } else if self.committed.is_some_and(|c| ts < c) {
+            // The newcomer fell behind released frames: it is the outlier.
+            self.held = Some((held_ts, held_frame));
+            self.charge(ts)?;
+            Ok(None)
+        } else {
+            // The newcomer continues the committed timeline (or no timeline
+            // is committed yet): the held frame it contradicts was the
+            // outlier.
+            self.held = Some((ts, frame));
+            self.charge(held_ts)?;
+            Ok(None)
+        }
+    }
+
+    /// End of stream: the final frame has no successor to vouch for it;
+    /// release it as-is.
+    fn finish(&mut self) -> Option<(Ts, ffmpeg::frame::Video)> {
+        self.held.take()
+    }
+
+    fn charge(&mut self, offending: Ts) -> Result<()> {
+        self.outliers += 1;
+        if self.outliers > MAX_TS_OUTLIERS {
+            return Err(Error::new(
+                ErrorCode::InputCorrupt,
+                format!(
+                    "{} consecutive frames off the monotone timeline \
+                     (last released {:?}, offending {}); the input's \
+                     timeline is broken",
+                    self.outliers,
+                    self.committed.map(Ts::get),
+                    offending.get()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The decode thread's state; consumed by [`Worker::run`].
 struct Worker {
     ictx: super::InterruptibleInput,
@@ -437,6 +562,9 @@ struct Worker {
     sampler: Sampler,
     /// Demux-level packet gate: what it rejects never reaches the decoder.
     gate: PacketGate,
+    /// Frame-level monotonicity gate: what it drops never reaches the
+    /// sampler, and what it releases is non-decreasing by construction.
+    timeline_gate: TimelineGate,
     /// Stop decoding once a frame's ts reaches this bound (range sampling).
     end: Option<f32>,
     rescaler: Rescaler,
@@ -511,6 +639,11 @@ impl Worker {
             Err(e) => return Err(decode_error("flushing decoder at end of stream", e)),
         }
         self.drain()?;
+        // The last decoded frame has no successor to vouch for it; release
+        // it unconfirmed rather than truncate every clean stream by one.
+        if let Some((ts, frame)) = self.timeline_gate.finish() {
+            self.deliver(ts, &frame)?;
+        }
 
         if self.frames_sent == 0 && decode_budget.failures() > 0 {
             return Err(Error::new(
@@ -528,8 +661,10 @@ impl Worker {
     /// scale, and send. `Flow::Stop` when past the range end or the consumer
     /// hung up.
     fn drain(&mut self) -> Result<Flow> {
-        let mut frame = ffmpeg::frame::Video::empty();
         loop {
+            // A fresh buffer per frame: the gate takes ownership of each
+            // decoded frame, holding it until its successor confirms it.
+            let mut frame = ffmpeg::frame::Video::empty();
             match classify_receive(self.decoder.receive_frame(&mut frame)) {
                 Recv::Frame => {}
                 Recv::Drained => return Ok(Flow::Continue),
@@ -546,21 +681,31 @@ impl Worker {
             let Some(ts) = Ts::new(self.video.ts_seconds(pts)) else {
                 continue;
             };
-            if let Some(end) = self.end
-                && ts.get() >= end
-            {
-                return Ok(Flow::Stop);
-            }
-            if !self.sampler.wants(ts.get(), frame.is_key()) {
+            let Some((ts, frame)) = self.timeline_gate.admit(ts, frame)? else {
                 continue;
-            }
-
-            let rgb = self.rescaler.rgb(&frame)?;
-            if self.tx.send(Ok(RgbFrame { ts, rgb })).is_err() {
+            };
+            if matches!(self.deliver(ts, &frame)?, Flow::Stop) {
                 return Ok(Flow::Stop);
             }
-            self.frames_sent += 1;
         }
+    }
+
+    /// Range-check, sample, scale, and send one gate-released frame.
+    fn deliver(&mut self, ts: Ts, frame: &ffmpeg::frame::Video) -> Result<Flow> {
+        if let Some(end) = self.end
+            && ts.get() >= end
+        {
+            return Ok(Flow::Stop);
+        }
+        if !self.sampler.wants(ts.get(), frame.is_key()) {
+            return Ok(Flow::Continue);
+        }
+        let rgb = self.rescaler.rgb(frame)?;
+        if self.tx.send(Ok(RgbFrame { ts, rgb })).is_err() {
+            return Ok(Flow::Stop);
+        }
+        self.frames_sent += 1;
+        Ok(Flow::Continue)
     }
 }
 
@@ -594,20 +739,6 @@ mod tests {
     }
 
     #[test]
-    fn stops_when_a_corrupt_pts_outruns_the_step() {
-        // A finite but absurd pts (what `Ts` still admits): on the old
-        // accumulating advance, `next += step` became a floating no-op once
-        // `step < ULP(next) / 2` and the decode thread spun forever. The
-        // indexed advance must answer immediately.
-        let mut tick = Tick::new(0.0, 1.0 / 30.0);
-        assert!(tick.wants(1e30), "corrupt frame still owns the pending tick");
-        assert!(
-            !tick.wants(0.0),
-            "the tick grid stays monotonic after the jump"
-        );
-    }
-
-    #[test]
     fn keeps_tick_instants_on_grid_after_hours_of_ticks() {
         // Ten hours of single-step advances at a step that is inexact in
         // binary: the old f32 accumulator drifted by whole seconds here;
@@ -622,6 +753,114 @@ mod tests {
             "tick grid drifted: {} vs {expected}",
             tick.next_instant()
         );
+    }
+
+    /// Feed one timestamp through the gate; map a released frame to its ts.
+    fn admit(gate: &mut TimelineGate, v: f32) -> Result<Option<f32>> {
+        let ts = Ts::new(v).expect("finite test ts");
+        gate.admit(ts, ffmpeg::frame::Video::empty())
+            .map(|released| released.map(|(t, _)| t.get()))
+    }
+
+    fn release(gate: &mut TimelineGate, v: f32) -> Option<f32> {
+        admit(gate, v).expect("within the outlier budget")
+    }
+
+    #[test]
+    fn releases_frames_once_their_successor_confirms_them() {
+        let mut gate = TimelineGate::new();
+        assert_eq!(release(&mut gate, 0.0), None, "first frame is held");
+        assert_eq!(release(&mut gate, 0.5), Some(0.0));
+        assert_eq!(release(&mut gate, 1.0), Some(0.5));
+        assert_eq!(
+            gate.finish().map(|(t, _)| t.get()),
+            Some(1.0),
+            "EOF releases the final unconfirmed frame"
+        );
+        assert_eq!(gate.finish().map(|(t, _)| t.get()), None);
+    }
+
+    #[test]
+    fn drops_a_far_future_outlier_and_keeps_the_frames_after_it() {
+        // The adversarial shape: one corrupt pts must die alone instead of
+        // making every later legal frame unsampleable (silent truncation).
+        let mut gate = TimelineGate::new();
+        assert_eq!(release(&mut gate, 0.0), None);
+        assert_eq!(release(&mut gate, 1e30), Some(0.0), "not yet contradicted");
+        assert_eq!(
+            release(&mut gate, 0.5),
+            None,
+            "0.5 continues the committed timeline, so 1e30 is dropped"
+        );
+        assert_eq!(release(&mut gate, 1.0), Some(0.5), "legal frames flow on");
+        assert_eq!(gate.finish().map(|(t, _)| t.get()), Some(1.0));
+    }
+
+    #[test]
+    fn admits_a_forward_jump_its_successors_follow() {
+        // A splice / timelapse gap: the jump target is vouched for by the
+        // frame after it. No magnitude threshold exists to misjudge.
+        let mut gate = TimelineGate::new();
+        assert_eq!(release(&mut gate, 0.0), None);
+        assert_eq!(release(&mut gate, 1.0), Some(0.0));
+        assert_eq!(release(&mut gate, 3600.0), Some(1.0));
+        assert_eq!(release(&mut gate, 3600.5), Some(3600.0), "the jump holds");
+    }
+
+    #[test]
+    fn drops_a_backward_outlier_below_the_committed_timeline() {
+        let mut gate = TimelineGate::new();
+        assert_eq!(release(&mut gate, 5.0), None);
+        assert_eq!(release(&mut gate, 6.0), Some(5.0));
+        assert_eq!(release(&mut gate, 2.0), None, "behind the timeline: drop");
+        assert_eq!(release(&mut gate, 7.0), Some(6.0), "the held frame stays");
+    }
+
+    #[test]
+    fn trusts_the_successor_when_no_timeline_is_committed() {
+        // Before anything is released there is no anchor to vouch for the
+        // first frame; its successor wins and the stream starts there.
+        let mut gate = TimelineGate::new();
+        assert_eq!(release(&mut gate, 10.0), None);
+        assert_eq!(release(&mut gate, 5.0), None, "10.0 is dropped");
+        assert_eq!(release(&mut gate, 5.5), Some(5.0));
+    }
+
+    #[test]
+    fn fails_with_input_corrupt_past_the_outlier_budget() {
+        // Two corrupt frames vouching for each other poison the committed
+        // timeline; every legal frame after them is unplaceable. That must
+        // end in an explicit InputCorrupt, never a silently truncated run.
+        let mut gate = TimelineGate::new();
+        release(&mut gate, 0.0);
+        release(&mut gate, 1e29);
+        release(&mut gate, 1e30);
+        for i in 0..MAX_TS_OUTLIERS {
+            assert_eq!(
+                release(&mut gate, 1.0 + i as f32),
+                None,
+                "drops within the budget are tolerated"
+            );
+        }
+        let err = admit(&mut gate, 100.0).expect_err("budget exhausted");
+        assert_eq!(err.code, ErrorCode::InputCorrupt);
+    }
+
+    #[test]
+    fn refunds_the_outlier_budget_on_every_released_frame() {
+        // Scattered healable outliers over a long stream never accumulate
+        // into an abort: the budget is consecutive, not cumulative.
+        let mut gate = TimelineGate::new();
+        release(&mut gate, 0.0);
+        release(&mut gate, 1.0);
+        for i in 1..=(2 * MAX_TS_OUTLIERS) {
+            assert_eq!(release(&mut gate, -1000.0), None, "outlier dropped");
+            assert_eq!(
+                release(&mut gate, 1.0 + i as f32),
+                Some(i as f32),
+                "each release refunds the budget"
+            );
+        }
     }
 
     #[test]

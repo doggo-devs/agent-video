@@ -32,8 +32,10 @@ use serde::{Deserialize, Serialize};
 /// pipeline as a frame timestamp, and everything downstream orders and
 /// buckets timestamps without runtime finiteness checks. Negative values are
 /// valid: edit lists and decoder pre-roll place frames before the stream
-/// start. Non-decreasing order is a stream property, not a value property,
-/// and stays the chunker's to enforce.
+/// start. Non-decreasing order is a stream property, not a value property:
+/// the decode boundary enforces it at the mint point (a frame is released
+/// only once its successor confirms its timestamp), and the chunker
+/// re-enforces it as a precondition of its own pure API.
 #[derive(Debug, Clone, Copy)]
 pub struct Ts(f32);
 
