@@ -74,3 +74,7 @@ jobs:
       - run: bun run gen:surfaces
       # -N stages new files as intent-to-add so the diff also catches them
       - run: git add -N surfaces .agents && git diff --exit-code surfaces .agents
+      # The pi extension's MCP client is host-side TypeScript with real
+      # boundary logic (param narrowing, consent flow, fault-kind fidelity);
+      # its behavior tests run against an in-memory fake server.
+      - run: bun test surfaces/pi
