@@ -246,7 +246,10 @@ pub fn process(
 /// executes the plan; no per-region sub-streams to interleave).
 ///
 /// [`SampleSpec::Mixed`]: crate::media::decode::SampleSpec::Mixed
-fn adaptive_stream(ctx: &RunCtx<'_>, info: &KeyframeInfo) -> Result<sample::FrameStream> {
+fn adaptive_stream<'a>(
+    ctx: &RunCtx<'a>,
+    info: &KeyframeInfo,
+) -> Result<sample::FrameStream<'a>> {
     let cfg = ctx.cfg;
     let fill = merge_regions(
         info.sparse_regions(cfg.gap_threshold()),
@@ -474,7 +477,7 @@ pub(crate) fn validate_input(input: &Source) -> Result<()> {
 fn process_stream(
     ctx: &RunCtx<'_>,
     session: OutputSession<'_>,
-    stream: sample::FrameStream,
+    stream: sample::FrameStream<'_>,
     window: Option<Window>,
 ) -> Result<()> {
     let cfg = ctx.cfg;

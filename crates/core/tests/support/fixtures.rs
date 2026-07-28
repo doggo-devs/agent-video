@@ -174,6 +174,75 @@ pub fn audio_param_change(duration: f32) -> Option<Fixture> {
     })
 }
 
+/// A clean testsrc2 MPEG-TS remuxed with a `setts` bitstream filter
+/// rewriting selected video packet timestamps: the raw material for the
+/// decode pass's timeline-gate integration tests.
+///
+/// `expr` is an ffmpeg `setts` pts expression over `N` (packet index) and
+/// `PTS` (90 kHz ticks); commas inside function calls must be escaped as
+/// `\,` for the bsf option parser. B-frames are disabled so decode order
+/// equals presentation order and packet index maps 1:1 onto the frames the
+/// gate sees; MPEG-TS is used because its 33-bit pts field round-trips
+/// far-future values that MP4's composition offsets cannot represent.
+pub fn corrupt_pts(tag: &str, duration: f32, expr: &str) -> Option<Fixture> {
+    require_ffmpeg()?;
+    let clean: Vec<String> = [
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("testsrc2=duration={duration}:size=320x180:rate=30,rotate=t"),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-bf",
+        "0",
+        "-g",
+        "30",
+        "-muxdelay",
+        "0",
+        "-muxpreload",
+        "0",
+        "-f",
+        "mpegts",
+        "clean.ts",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let remux: Vec<String> = [
+        "-i",
+        "clean.ts",
+        "-c",
+        "copy",
+        "-bsf:v",
+        &format!("setts=pts={expr}"),
+        "-copyts",
+        "-muxdelay",
+        "0",
+        "-muxpreload",
+        "0",
+        "-f",
+        "mpegts",
+        "corrupt.ts",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let key: Vec<String> = clean.iter().chain(remux.iter()).cloned().collect();
+    let dir = cached(tag, &key, &["corrupt.ts"], |scratch| {
+        run_ffmpeg(scratch, &clean);
+        run_ffmpeg(scratch, &remux);
+    });
+    Some(Fixture {
+        media: dir.join("corrupt.ts"),
+        sidecar: None,
+        duration,
+    })
+}
+
 /// `Some(())` when the ffmpeg CLI is on PATH (detected once per process).
 /// Absent + `AV_REQUIRE_MEDIA_TESTS` set panics; absent otherwise returns
 /// `None` so the caller can skip.

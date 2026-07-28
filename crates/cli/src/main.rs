@@ -82,6 +82,9 @@ impl EventSink for StderrEvents {
             Event::UnplaceableTimestamp { ts, last } => eprintln!(
                 "  warning: skipping frame with unplaceable timestamp {ts} (last {last:?})"
             ),
+            Event::TimestampsDropped { count } => eprintln!(
+                "  warning: {count} frame(s) dropped: timestamps off the stream's timeline"
+            ),
             Event::GridsWritten { count, dir } => {
                 eprintln!("wrote {count} grid(s) to {}", dir.display());
             }

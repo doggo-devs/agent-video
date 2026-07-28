@@ -4,6 +4,9 @@
 //! coverage, ordering, container magic — never pixel content, so the suite
 //! survives encoder and ffmpeg-version drift.
 
+// The support module is shared with timeline_corruption.rs; each test
+// binary uses its own subset, so unused items are expected here.
+#[allow(dead_code)]
 mod support;
 
 use agent_video_core::config::Overrides;

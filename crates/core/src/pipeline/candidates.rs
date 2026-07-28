@@ -27,7 +27,7 @@ pub trait RgbSource {
     fn aspect(&self) -> Option<Aspect>;
 }
 
-impl RgbSource for sample::FrameStream {
+impl RgbSource for sample::FrameStream<'_> {
     fn next_frame(&mut self) -> Result<Option<RgbFrame>> {
         sample::FrameStream::next_frame(self)
     }

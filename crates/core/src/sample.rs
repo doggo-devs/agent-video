@@ -21,8 +21,9 @@ use crate::types::{CandidateFrame, TimeRange};
 pub use crate::media::decode::RgbFrame;
 
 /// Streaming source of sampled frames — the pipeline-facing name for
-/// [`FrameSource`].
-pub type FrameStream = FrameSource;
+/// [`FrameSource`]. Carries the run's event-sink borrow: decode-time
+/// timeline-gate drops are reported through it.
+pub type FrameStream<'e> = FrameSource<'e>;
 
 /// Shared knobs of every streaming-extractor entry point: what varies per
 /// call is only the sampling shape (fps, window, fill ranges), so those
@@ -40,8 +41,8 @@ pub struct StreamParams<'a> {
     pub events: &'a dyn EventSink,
 }
 
-impl StreamParams<'_> {
-    fn open(&self, input: &Source, spec: SampleSpec) -> crate::error::Result<FrameStream> {
+impl<'a> StreamParams<'a> {
+    fn open(&self, input: &Source, spec: SampleSpec) -> crate::error::Result<FrameStream<'a>> {
         FrameSource::open(
             input,
             spec,
@@ -53,11 +54,11 @@ impl StreamParams<'_> {
 }
 
 /// Open a streaming extractor for the whole video at a fixed fps.
-pub fn stream_frames(
+pub fn stream_frames<'a>(
     input: &Source,
     fps: f32,
-    params: StreamParams<'_>,
-) -> crate::error::Result<FrameStream> {
+    params: StreamParams<'a>,
+) -> crate::error::Result<FrameStream<'a>> {
     params.open(
         input,
         SampleSpec::Fps {
@@ -72,12 +73,12 @@ pub fn stream_frames(
 ///
 /// Timestamps produced by the stream are absolute (0-based at the stream
 /// start), not range-relative.
-pub fn stream_range(
+pub fn stream_range<'a>(
     input: &Source,
     fps: f32,
     range: TimeRange,
-    params: StreamParams<'_>,
-) -> crate::error::Result<FrameStream> {
+    params: StreamParams<'a>,
+) -> crate::error::Result<FrameStream<'a>> {
     params.open(
         input,
         SampleSpec::Fps {
@@ -91,13 +92,13 @@ pub fn stream_range(
 /// Open a streaming extractor from `start` to `end`, or to EOF when `end` is
 /// `None` — the `process --from/--until` window. Timestamps stay absolute.
 /// Decode-open diagnostics include a seek fallback, if any.
-pub fn stream_window(
+pub fn stream_window<'a>(
     input: &Source,
     fps: f32,
     start: f32,
     end: Option<f32>,
-    params: StreamParams<'_>,
-) -> crate::error::Result<FrameStream> {
+    params: StreamParams<'a>,
+) -> crate::error::Result<FrameStream<'a>> {
     params.open(input, SampleSpec::Fps { fps, start, end })
 }
 
@@ -108,12 +109,12 @@ pub fn stream_window(
 /// [`crate::probe::KeyframeInfo::sparse_regions`] provides and region merging
 /// preserves. One decoder emits the merged stream in presentation order, so
 /// downstream monotonicity needs no interleaving choreography.
-pub fn stream_mixed(
+pub fn stream_mixed<'a>(
     input: &Source,
     fps: f32,
     fill: Vec<TimeRange>,
-    params: StreamParams<'_>,
-) -> crate::error::Result<FrameStream> {
+    params: StreamParams<'a>,
+) -> crate::error::Result<FrameStream<'a>> {
     params.open(input, SampleSpec::Mixed { fps, fill })
 }
 
@@ -121,10 +122,10 @@ pub fn stream_mixed(
 ///
 /// Only key packets reach the decoder, so this decodes I-frames exclusively.
 /// Each frame carries its own pts.
-pub fn stream_keyframes(
+pub fn stream_keyframes<'a>(
     input: &Source,
-    params: StreamParams<'_>,
-) -> crate::error::Result<FrameStream> {
+    params: StreamParams<'a>,
+) -> crate::error::Result<FrameStream<'a>> {
     params.open(input, SampleSpec::Keyframes)
 }
 

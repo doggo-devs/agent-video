@@ -54,9 +54,14 @@ pub enum Event<'a> {
     KeyframePoorDegrade { count: usize, minimum: usize },
     /// A static stretch `[start, end]` seconds was collapsed into `file`.
     StaticCollapsed { start: f32, end: f32, file: &'a str },
-    /// A frame's timestamp fell behind the last placed frame and the frame
-    /// was skipped; `last` is the last placed timestamp.
+    /// A decoded frame's timestamp could not be placed on the stream's
+    /// timeline and the frame was dropped (first occurrence in a decode
+    /// pass; the pass total arrives as [`Event::TimestampsDropped`]).
+    /// `last` is the last released timestamp, when any.
     UnplaceableTimestamp { ts: f32, last: Option<f32> },
+    /// End-of-decode accounting: `count` decoded frames were dropped off
+    /// the timeline over the whole pass. Emitted only when `count > 0`.
+    TimestampsDropped { count: u64 },
     /// A run finished writing `count` grids to `dir`.
     GridsWritten { count: usize, dir: &'a Path },
     /// An embedded subtitle stream held no text cues; the auto path continues

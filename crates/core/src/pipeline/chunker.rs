@@ -2,11 +2,11 @@
 //! Pure chunking state machine: judged frames in, chunk/static events out.
 //!
 //! Owns everything about placing frames on the timeline — time-chunk keying,
-//! sparse-chunk merge-forward (the carry), scene-diff boundary context,
-//! static-stretch detection, and broken-timeline accounting — and nothing
-//! about how chunks are processed: no thread pool, no output session, no
-//! I/O. The shell ([`super::state::ProcessState`]) interprets the emitted
-//! [`Event`]s; this core is unit-testable with plain frames.
+//! sparse-chunk merge-forward (the carry), scene-diff boundary context, and
+//! static-stretch detection — and nothing about how chunks are processed:
+//! no thread pool, no output session, no I/O. The shell
+//! ([`super::state::ProcessState`]) interprets the emitted [`Event`]s; this
+//! core is unit-testable with plain frames.
 //!
 //! Time chunks are a throttle, not a floor: a chunk whose surviving frames
 //! cannot fill a grid is merged forward into the next chunk(s), so sparse
@@ -19,19 +19,9 @@ use std::sync::Arc;
 
 use image::GrayImage;
 
-use crate::error::{Error, ErrorCode, Result};
-use crate::event::EventSink;
 use crate::types::{CandidateFrame, Ts};
 
 use super::stretch::{Stretch, StretchDetector};
-
-/// Backwards-timestamp frames tolerated per run before the input's timeline
-/// is declared broken. Timestamps are finite by construction ([`Ts`]), so
-/// going backwards is the one way a frame can still be unplaceable — a
-/// stream property no single-value constructor can seal. The same shape as
-/// the demux-error cap in [`crate::media`]: bounded badness degrades output,
-/// unbounded badness fails the run.
-const MAX_TS_REGRESSIONS: u32 = 64;
 
 /// One effect the shell must perform, in emission order.
 #[derive(Debug)]
@@ -68,12 +58,9 @@ pub(super) struct Chunker {
     /// retaining the tail is a pointer clone, like the RGB representative.
     prev_chunk_tail: Option<Arc<GrayImage>>,
     high_water_mark: Option<usize>,
-    /// Timestamp of the last placed frame; frames whose ts falls behind it
-    /// cannot be placed and are skipped (see [`Chunker::push`]).
+    /// Timestamp of the last placed frame; the monotone-input contract is
+    /// asserted against it (see [`Chunker::push`]).
     last_ts: Option<Ts>,
-    /// Skipped backwards-timestamp frames so far, capped by
-    /// [`MAX_TS_REGRESSIONS`].
-    ts_regressions: u32,
     /// Static-stretch detector, fed every dedup verdict in timestamp order.
     stretches: StretchDetector,
     duration: f32,
@@ -89,7 +76,6 @@ impl Chunker {
             prev_chunk_tail: None,
             high_water_mark: None,
             last_ts: None,
-            ts_regressions: 0,
             stretches: StretchDetector::new(chunk_seconds),
             duration: 0.0,
         }
@@ -106,49 +92,22 @@ impl Chunker {
     /// `capacity` is the current grid capacity — the fill level at which
     /// carried frames become a [`Event::Chunk`].
     ///
-    /// Chunk keying, high-water-mark sealing, and static detection all assume
-    /// non-decreasing timestamps. The decode pass emits frames in
-    /// presentation order and the pts→seconds mapping preserves that order,
-    /// so a violation means the input's own timestamps are broken — the frame
-    /// cannot be placed in any chunk and is skipped. More than
-    /// [`MAX_TS_REGRESSIONS`] such frames mean the whole timeline is garbage,
-    /// and the run fails with [`ErrorCode::InputCorrupt`] instead of silently
-    /// mangling chunk boundaries.
-    ///
-    /// `events` receives one [`crate::event::Event::UnplaceableTimestamp`] on
-    /// the first skipped frame; the sink is a parameter, not stored, so this
-    /// core stays free of per-run references.
-    pub fn push(
-        &mut self,
-        frame: CandidateFrame,
-        kept: bool,
-        capacity: usize,
-        events: &dyn EventSink,
-    ) -> Result<Vec<Event>> {
-        if self.last_ts.is_some_and(|last| frame.ts < last) {
-            self.ts_regressions += 1;
-            if self.ts_regressions > MAX_TS_REGRESSIONS {
-                // A timeline this broken is a property of the input, not a
-                // bug: the harness must see INPUT_CORRUPT, not an uncoded exit.
-                return Err(Error::new(
-                    ErrorCode::InputCorrupt,
-                    format!(
-                        "{} frames with backwards timestamps (last placed {:?}, offending {}); \
-                         the input's timeline is broken",
-                        self.ts_regressions,
-                        self.last_ts.map(Ts::get),
-                        frame.ts.get()
-                    ),
-                ));
-            }
-            if self.ts_regressions == 1 {
-                events.event(crate::event::Event::UnplaceableTimestamp {
-                    ts: frame.ts.get(),
-                    last: self.last_ts.map(Ts::get),
-                });
-            }
-            return Ok(Vec::new());
-        }
+    /// Chunk keying, high-water-mark sealing, and static detection all
+    /// assume non-decreasing timestamps. The decode pass guarantees exactly
+    /// that ([`crate::media::decode`]'s timeline gate releases a
+    /// non-decreasing, in-extent stream and fails the run otherwise), and
+    /// every stage between it and this core preserves order — so a
+    /// regression here is a bug in this crate, not an input property, and
+    /// panics per this workspace's error contract (bugs are panics, never
+    /// coded errors).
+    pub fn push(&mut self, frame: CandidateFrame, kept: bool, capacity: usize) -> Vec<Event> {
+        assert!(
+            self.last_ts.is_none_or(|last| frame.ts >= last),
+            "frames must arrive in non-decreasing timestamp order \
+             (last placed {:?}, got {}); the decode gate guarantees this",
+            self.last_ts.map(Ts::get),
+            frame.ts.get()
+        );
         self.last_ts = Some(frame.ts);
         self.duration = self.duration.max(frame.ts.get() + 1.0 / self.base_fps);
         if kept {
@@ -157,10 +116,10 @@ impl Chunker {
                 events.push(Event::Static(stretch));
             }
             self.push_chunked_frame(frame, capacity, &mut events);
-            Ok(events)
+            events
         } else {
             self.stretches.note_dropped(frame.ts.get());
-            Ok(Vec::new())
+            Vec::new()
         }
     }
 
@@ -231,7 +190,6 @@ impl Chunker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Discard;
     use image::{GrayImage, RgbImage};
     use std::sync::Arc;
 
@@ -262,14 +220,14 @@ mod tests {
 
         let mut events = Vec::new();
         for ts in [0.0, 10.0, 20.0, 30.0] {
-            events.extend(chunker.push(frame(ts), true, 4, &Discard).expect("push"));
+            events.extend(chunker.push(frame(ts), true, 4));
         }
         assert!(
             chunk_ts(&events).is_empty(),
             "the open chunk stays buffered until a later chunk starts"
         );
 
-        events.extend(chunker.push(frame(65.0), true, 4, &Discard).expect("push"));
+        events.extend(chunker.push(frame(65.0), true, 4));
         assert_eq!(
             chunk_ts(&events),
             vec![vec![0.0, 10.0, 20.0, 30.0]],
@@ -283,9 +241,9 @@ mod tests {
 
         let mut events = Vec::new();
         for ts in [-0.5, 0.0, 10.0, 20.0] {
-            events.extend(chunker.push(frame(ts), true, 4, &Discard).expect("push"));
+            events.extend(chunker.push(frame(ts), true, 4));
         }
-        events.extend(chunker.push(frame(65.0), true, 4, &Discard).expect("push"));
+        events.extend(chunker.push(frame(65.0), true, 4));
 
         assert_eq!(
             chunk_ts(&events),
@@ -301,7 +259,7 @@ mod tests {
         // One frame per chunk at capacity 4: the throttle merges them forward.
         let mut events = Vec::new();
         for ts in [0.0, 65.0, 130.0, 195.0, 260.0] {
-            events.extend(chunker.push(frame(ts), true, 4, &Discard).expect("push"));
+            events.extend(chunker.push(frame(ts), true, 4));
         }
 
         assert_eq!(
@@ -316,7 +274,7 @@ mod tests {
         let mut chunker = Chunker::new(60.0, 1.0);
 
         for ts in [0.0, 10.0] {
-            chunker.push(frame(ts), true, 4, &Discard).expect("push");
+            chunker.push(frame(ts), true, 4);
         }
         let events = chunker.finish(4);
 
@@ -329,7 +287,7 @@ mod tests {
 
         let mut events = Vec::new();
         for ts in [0.0, 10.0, 65.0, 70.0] {
-            events.extend(chunker.push(frame(ts), true, 2, &Discard).expect("push"));
+            events.extend(chunker.push(frame(ts), true, 2));
         }
         events.extend(chunker.finish(2));
 
@@ -348,73 +306,22 @@ mod tests {
     }
 
     #[test]
-    fn skips_backwards_timestamp_frames() {
+    #[should_panic(expected = "non-decreasing timestamp order")]
+    fn panics_on_a_timestamp_regression_from_upstream() {
+        // The decode gate guarantees non-decreasing input; a regression
+        // reaching this core is a bug in this crate, never an input
+        // property — bugs are panics, not coded errors.
         let mut chunker = Chunker::new(60.0, 1.0);
 
-        chunker
-            .push(frame(10.0), true, 4, &Discard)
-            .expect("place 10.0");
-        let events = chunker
-            .push(frame(5.0), true, 4, &Discard)
-            .expect("bounded bad timestamps must not fail the run");
-        assert!(events.is_empty(), "the backwards frame emits nothing");
-        chunker
-            .push(frame(11.0), true, 4, &Discard)
-            .expect("place 11.0");
-
-        let events = chunker.finish(4);
-        assert_eq!(
-            chunk_ts(&events),
-            vec![vec![10.0, 11.0]],
-            "the backwards frame is skipped, not chunked"
-        );
-    }
-
-    #[test]
-    fn fails_after_unbounded_backwards_timestamps() {
-        let mut chunker = Chunker::new(60.0, 1.0);
-
-        chunker
-            .push(frame(1000.0), true, 4, &Discard)
-            .expect("place anchor");
-        for i in 0..MAX_TS_REGRESSIONS {
-            chunker
-                .push(frame(i as f32), true, 4, &Discard)
-                .expect("regressions within the cap are skipped");
-        }
-        chunker
-            .push(frame(0.5), true, 4, &Discard)
-            .expect_err("exceeding the regression cap must fail");
-    }
-
-    #[test]
-    fn maps_timeline_corruption_to_input_corrupt() {
-        let mut chunker = Chunker::new(60.0, 1.0);
-
-        chunker
-            .push(frame(1000.0), true, 4, &Discard)
-            .expect("place anchor");
-        for i in 0..MAX_TS_REGRESSIONS {
-            chunker
-                .push(frame(i as f32), true, 4, &Discard)
-                .expect("regressions within the cap are skipped");
-        }
-
-        let err = chunker
-            .push(frame(0.5), true, 4, &Discard)
-            .expect_err("exceeding the regression cap must fail");
-        assert_eq!(
-            err.code,
-            ErrorCode::InputCorrupt,
-            "a broken input timeline is input corruption, not a bug"
-        );
+        chunker.push(frame(10.0), true, 4);
+        chunker.push(frame(5.0), true, 4);
     }
 
     #[test]
     fn extends_duration_by_sampling_coverage() {
         let mut chunker = Chunker::new(60.0, 2.0);
 
-        chunker.push(frame(9.0), true, 4, &Discard).expect("push");
+        chunker.push(frame(9.0), true, 4);
 
         assert_eq!(chunker.duration(), 9.5, "ts plus 1/fps of coverage");
     }
@@ -424,15 +331,11 @@ mod tests {
         let mut chunker = Chunker::new(60.0, 1.0);
 
         let mut events = Vec::new();
-        events.extend(chunker.push(frame(0.0), true, 8, &Discard).expect("push"));
+        events.extend(chunker.push(frame(0.0), true, 8));
         for ts in 1..=70 {
-            events.extend(
-                chunker
-                    .push(frame(ts as f32), false, 8, &Discard)
-                    .expect("push"),
-            );
+            events.extend(chunker.push(frame(ts as f32), false, 8));
         }
-        events.extend(chunker.push(frame(75.0), true, 8, &Discard).expect("push"));
+        events.extend(chunker.push(frame(75.0), true, 8));
 
         let statics: Vec<(f32, f32)> = events
             .iter()
