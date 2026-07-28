@@ -155,7 +155,9 @@ pub struct Grid {
     pub time_range: String,
     /// Number of frames composed onto the grid.
     pub total_frames: usize,
-    /// Hero frames, omitted from uniform grids' JSON when empty.
+    /// Hero frames; uniform grids carry none. Always serialized — an empty
+    /// list is `[]` on the wire — while `default` lets the consumer read
+    /// documents that omit the key.
     #[serde(default)]
     pub key_frames: Vec<KeyFrameMeta>,
     /// Layout template label.
@@ -276,6 +278,27 @@ mod tests {
             json["grids"][0].get("subtitles").is_none(),
             "non-text subtitle states serialize as absent"
         );
+    }
+
+    /// Empty `key_frames` still serializes as `[]`: the frozen wire shape
+    /// carries the key unconditionally.
+    #[test]
+    fn serializes_empty_key_frames_as_empty_array() {
+        let mut meta = grid_meta(GridImage::File("grid_001.jpg".to_string()));
+        meta.key_frames = Vec::new();
+        let json = serde_json::to_string(&Grid::new(meta, GridSubtitles::NoSource))
+            .expect("serialize");
+        assert!(
+            json.contains(r#""key_frames":[]"#),
+            "empty key_frames must stay on the wire as []: {json}"
+        );
+    }
+
+    #[test]
+    fn defaults_absent_key_frames_to_empty_on_read() {
+        let json = r#"{"file":"g.jpg","time_range":"00:00-01:30","total_frames":1,"layout":"UNIFORM"}"#;
+        let grid: Grid = serde_json::from_str(json).expect("deserialize without key_frames");
+        assert!(grid.key_frames.is_empty());
     }
 
     #[test]

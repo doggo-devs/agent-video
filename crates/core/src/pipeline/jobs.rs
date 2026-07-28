@@ -191,6 +191,22 @@ mod tests {
         NonZeroUsize::new(n).expect("test limit is nonzero")
     }
 
+    /// A single-thread pool whose panic handler swallows unwinds, so a dead
+    /// job leaves the pool alive.
+    fn panic_swallowing_pool() -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .panic_handler(|_| {})
+            .build()
+            .expect("test pool builds")
+    }
+
+    /// A job that unwinds before producing a result. `resume_unwind` skips
+    /// the panic hook: no backtrace noise in test output.
+    fn die(_seq: usize) -> usize {
+        std::panic::resume_unwind(Box::new("job dies before sending"))
+    }
+
     #[test]
     fn delivers_results_in_spawn_order() {
         let pool = pool(2);
@@ -251,26 +267,66 @@ mod tests {
 
     #[test]
     fn surfaces_a_vanished_job_instead_of_blocking_spawn() {
-        // A pool whose panic handler swallows the unwind: the job dies and
-        // the pool lives on. On the old shape the next spawn blocked forever
-        // on the wedged sequence number; the completion guard now reports
-        // the death and spawn errors out.
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .panic_handler(|_| {})
-            .build()
-            .expect("test pool builds");
+        // The job dies and the pool lives on. On the old shape the next
+        // spawn blocked forever on the wedged sequence number; the
+        // completion guard now reports the death and spawn errors out.
+        let pool = panic_swallowing_pool();
         let mut jobs: OrderedJobs<usize> = OrderedJobs::new(limit(1));
 
-        jobs.spawn(&pool, |_| -> usize {
-            // resume_unwind skips the panic hook: no backtrace noise.
-            std::panic::resume_unwind(Box::new("job dies before sending"))
-        })
-        .expect("first spawn has room");
+        jobs.spawn(&pool, die).expect("first spawn has room");
 
         let err = jobs
             .spawn(&pool, |seq| seq)
             .expect_err("dead job must surface as an error, not a wedge");
         assert!(err.to_string().contains("panicked"), "got: {err:#}");
+    }
+
+    #[test]
+    fn surfaces_a_vanished_job_through_finish() {
+        // Same death as above, but with no further spawn the drain in
+        // finish must be the path that reports it.
+        let pool = panic_swallowing_pool();
+        let mut jobs: OrderedJobs<usize> = OrderedJobs::new(limit(1));
+
+        jobs.spawn(&pool, die).expect("first spawn has room");
+
+        let err = jobs
+            .finish()
+            .expect_err("finish must surface the dead job, not return results");
+        assert_eq!(err.seq, 0);
+    }
+
+    #[test]
+    fn drops_completion_silently_after_dispatcher_is_gone() {
+        // Sends on drop, so the test observes the moment strictly after the
+        // completion guard has finished reporting into a closed channel.
+        struct DoneOnDrop(mpsc::Sender<()>);
+        impl Drop for DoneOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        // No panic handler: if the guard's drop panicked, the spawned task
+        // would abort the process and fail the test loudly.
+        let pool = pool(1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        let mut jobs = OrderedJobs::new(limit(1));
+        jobs.spawn(&pool, move |_| {
+            release_rx.recv().expect("dispatcher drop releases the job");
+            DoneOnDrop(done_tx)
+        })
+        .expect("first spawn has room");
+
+        // The dispatcher gives up while the job is still running: its
+        // receiver closes, so the guard's send has nowhere to land.
+        drop(jobs);
+        release_tx.send(()).expect("job is waiting for release");
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("guard completes without wedging or panicking");
     }
 }
