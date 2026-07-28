@@ -12,7 +12,7 @@
 //! PCR discontinuities, 33-bit pts wrap-arounds, and spliced clock domains
 //! are all legal — and no local evidence can distinguish a legal jump from
 //! a corrupt one, so this module never tries. Instead, every decoded frame
-//! passes the [`Segmenter`], which cuts the container clock into monotone
+//! passes the `Segmenter`, which cuts the container clock into monotone
 //! *segments* and projects them onto one continuous logical clock;
 //! everything downstream (sampler ticks, range end, chunk placement, wire
 //! time ranges) consumes only the logical clock. A single-segment stream —
@@ -33,6 +33,13 @@
 //! segment's container offset is unknowable before its frames are decoded,
 //! so a windowed decode of a multi-segment stream finds its window where
 //! the container clock says it is, while labels follow the logical clock.
+//! A seek the demuxer reports as successful can still land beyond every
+//! decodable frame (a poisoned head packet drags the container's index
+//! arbitrarily); that landing is detected at demuxer EOF with zero decoded
+//! frames, announced as [`Event::SeekFallback`], and retried once
+//! sequentially from the stream head — on a remote source the retry rereads
+//! the stream, the bounded price of never letting an index alone turn
+//! content into an empty run.
 
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -139,6 +146,9 @@ enum Msg {
     Frame(RgbFrame),
     Dropped { ts: f32, last: Option<f32> },
     Discontinuity { container: f64, logical: f64 },
+    /// A window seek reported success but landed beyond every decodable
+    /// frame; the worker rewound to the stream head and reads sequentially.
+    SeekRecovered { start: f32 },
 }
 
 /// A stream of sampled frames decoded on a background thread.
@@ -172,9 +182,10 @@ impl<'e> FrameSource<'e> {
     /// stream, decoder, and seek failures surface here, synchronously, with
     /// precise error codes; mid-stream failures surface from `next_frame`.
     /// `events` receives a [`Event::SeekFallback`] when a seek to a window
-    /// start fails and decoding degrades to a sequential read, then rides
-    /// along for the stream's lifetime to report timeline signals (see
-    /// [`FrameSource::next_frame`]).
+    /// start fails — or reports success but lands beyond every decodable
+    /// frame (see the module docs) — and decoding degrades to a sequential
+    /// read, then rides along for the stream's lifetime to report timeline
+    /// signals (see [`FrameSource::next_frame`]).
     ///
     /// The [`Stop`] guarding this open is self-minted, not taken from the
     /// caller: [`Drop`] needs the exclusive right to trip it (a shared
@@ -204,16 +215,19 @@ impl<'e> FrameSource<'e> {
         // `start` is projected through the timeline; this is exact only
         // within the stream's first timeline segment (see the module docs).
         // An unseekable stream degrades to a decode-and-discard up to the
-        // sampler's first tick.
+        // sampler's first tick. A seek that succeeds is still unverified
+        // until a frame decodes — the worker rewinds on an empty landing.
+        let mut pending_seek = None;
         if let SampleSpec::Fps { start, .. } = &spec
             && *start > 0.0
         {
             let target = video.timeline.seek_target(*start as f64).as_av_time();
-            if let Err(e) = ictx.seek(target, ..target) {
-                events.event(Event::SeekFallback {
+            match ictx.seek(target, ..target) {
+                Ok(()) => pending_seek = Some(*start),
+                Err(e) => events.event(Event::SeekFallback {
                     start: *start,
                     error: e.to_string(),
-                });
+                }),
             }
         }
 
@@ -253,6 +267,7 @@ impl<'e> FrameSource<'e> {
                     tx,
                     stop: stop_flag,
                     frames_sent: 0,
+                    pending_seek,
                 };
                 worker.run();
             })
@@ -282,7 +297,7 @@ impl<'e> FrameSource<'e> {
     /// Read the next sampled frame, or `None` after a clean end of stream.
     ///
     /// Frames arrive in non-decreasing *logical* timestamp order (see
-    /// [`Segmenter`]). Timeline trouble is signal, never verdict: the first
+    /// `Segmenter`). Timeline trouble is signal, never verdict: the first
     /// dropped frame emits [`Event::UnplaceableTimestamp`], a clean end of
     /// stream with any drops emits [`Event::TimestampsDropped`], and every
     /// committed clock seam emits [`Event::TimelineDiscontinuity`] — no
@@ -317,6 +332,14 @@ impl<'e> FrameSource<'e> {
                     self.events.event(Event::TimelineDiscontinuity {
                         container_ts: container,
                         logical_ts: logical,
+                    });
+                }
+                Ok(Ok(Msg::SeekRecovered { start })) => {
+                    self.events.event(Event::SeekFallback {
+                        start,
+                        error: "seek landed beyond every decodable frame; \
+                                rewound to the stream head"
+                            .into(),
                     });
                 }
                 Ok(Err(e)) => {
@@ -546,12 +569,6 @@ impl PacketGate {
 /// discontinuity within three frames of its seam.
 const SEGMENT_CONFIRM_FRAMES: usize = 3;
 
-/// Floor of the in-segment forward fence, seconds — the previous
-/// paradigm's EOF jump floor, value and rationale unchanged: admits every
-/// sane inter-frame gap while keeping an unvouched forward jump below
-/// chunk scale.
-const FORWARD_FENCE_FLOOR: f64 = 10.0;
-
 /// Extent-fence slack over the declared duration: `fence = duration ×
 /// FACTOR + SLACK` — the previous paradigm's plausible-extent slack,
 /// repurposed from a corruption verdict into a label prior. The slack
@@ -683,31 +700,35 @@ fn drop_run(buf: Buffered, step: &mut SegStep) {
 /// on the input. Frames are content; timestamps are labels; a wrong
 /// threshold mislabels a seam instead of losing content.
 ///
-/// Three local heuristics decide where segments end, all bounded, none
-/// fatal:
+/// Admission has exactly one door. A frame continues the committed run
+/// only when its gap from the last released frame sits inside the learned
+/// pacing tolerance: backward within the jitter bound (twice the nominal
+/// frame gap — the depth B-frame reordering can jitter presentation
+/// order; a backward step inside it is decoder noise and drops that frame
+/// with a signal), forward within twice the largest released gap. Every
+/// other frame, forward or backward, buffers as a challenger and must
+/// gather [`SEGMENT_CONFIRM_FRAMES`] frames — no unvouched frame ever
+/// advances the committed cursor or teaches the gap statistics. Runs
+/// without released precedent — the stream head and every challenger —
+/// fence against the declared extent
+/// ([`EXTENT_FENCE_FACTOR`]`/`[`EXTENT_FENCE_SLACK`]), so a keyframe-only
+/// decode teaches itself minute-scale cadence at the head while a
+/// far-future poisoned timestamp still cannot join any run.
 ///
-/// - A backward jump beyond the jitter bound (twice the nominal frame gap
-///   — the depth B-frame reordering can jitter presentation order) opens a
-///   challenger; a backward step within it is decoder noise and drops that
-///   frame with a signal, as the previous paradigm did.
-/// - A forward jump beyond the fence (`max(`[`FORWARD_FENCE_FLOOR`]`, 2 ×`
-///   the largest released gap`)` — the previous EOF rule generalized to
-///   every frame) opens a challenger; smaller forward gaps are legal
-///   pacing (timelapse splices, keyframe cadence) and pass through.
-/// - Runs without released precedent — the stream head and every
-///   challenger — fence instead against the declared extent
-///   ([`EXTENT_FENCE_FACTOR`]`/`[`EXTENT_FENCE_SLACK`]), so a keyframe-only
-///   decode teaches itself minute-scale cadence at the head while a
-///   far-future poisoned timestamp still cannot join any run.
-///
-/// A challenger must gather [`SEGMENT_CONFIRM_FRAMES`] frames to commit.
-/// Committing seals the current segment at its last released instant and
-/// continues the logical clock one nominal gap later (a
-/// [`Discontinuity`]); a challenger contradicted first is dropped whole,
-/// with signals, at most `SEGMENT_CONFIRM_FRAMES - 1` frames each. That
-/// bound is what keeps alternating poisoned timestamps from shredding the
-/// stream: the poisoned half dies challenger by challenger while the legal
-/// half streams on uninterrupted.
+/// Confirmation decides the label, and the declared extent is the label
+/// prior. A confirmed challenger that continues forward within the extent
+/// fence is sparse pacing (timelapse splices, keyframe cadence): it
+/// extends the same segment identically — no seam, no relabel — and its
+/// released gaps become precedent, so the next equal gap passes the door
+/// directly. One that jumps backward or beyond the extent commits a seam:
+/// the current segment seals at its last released instant and the logical
+/// clock continues one nominal gap later (a [`Discontinuity`]). A
+/// challenger contradicted first is dropped whole, with signals — a
+/// rejected challenger costs at most its own frames, fewer than
+/// [`SEGMENT_CONFIRM_FRAMES`]. That bound is what keeps alternating
+/// poisoned timestamps from shredding the stream: the poisoned half dies
+/// challenger by challenger while the legal half streams on
+/// uninterrupted.
 ///
 /// The first confirmed segment projects identically (`shift == 0`) when it
 /// opens within [`PREROLL_ALLOWANCE`]; below that — a poisoned head packet
@@ -732,9 +753,10 @@ struct Segmenter {
     /// jitter bound scales with it — a small backward resync there costs a
     /// frame or two (signaled) instead of a seam.
     nominal_gap: f64,
-    /// Largest released in-segment gap: the forward fence's precedent.
-    /// Learning is capped at the extent fence so a confirmed challenger
-    /// carrying a corrupt gap cannot widen the fence without bound.
+    /// Largest released in-segment gap: the forward tolerance's precedent.
+    /// Only released — vouched — frames teach it, and learning is capped
+    /// at the extent fence, so neither an unvouched blip nor a confirmed
+    /// run carrying a corrupt gap can widen the tolerance without bound.
     max_released_gap: f64,
     /// Highest logical instant released — the monotonicity invariant,
     /// stated where it is produced.
@@ -782,20 +804,38 @@ impl Segmenter {
         step
     }
 
-    /// End of stream. An unconfirmed challenger is dropped — the same rule
-    /// as mid-stream: an unvouched tail cannot commit a seam. An
-    /// unconfirmed head is the whole stream (nothing ever contradicted
-    /// it), so it confirms: a two-frame video is content, not a fragment.
+    /// End of stream. A pending challenger has nothing left to contradict
+    /// it — the confirmation quorum exists to protect future frames from
+    /// an unvouched cursor advance, and there are none. A forward tail
+    /// within the extent fence is content at a plausible position and is
+    /// released in place; any other tail still has no committable label
+    /// and is dropped with signals. An unconfirmed head is the whole
+    /// stream (nothing ever contradicted it), so it confirms: a two-frame
+    /// video is content, not a fragment.
     fn finish(&mut self) -> SegStep {
         let mut step = SegStep::default();
         if let State::Open { current, challenger } =
             std::mem::replace(&mut self.state, State::Unopened)
         {
-            if let Some(ch) = challenger {
-                drop_run(ch, &mut step);
-            }
-            if let Current::Head(buf) = current {
-                self.confirm_first(buf, &mut step);
+            match current {
+                Current::Head(buf) => {
+                    // A challenger against an unconfirmed head contradicted
+                    // it backward or beyond the extent, so it cannot extend
+                    // the segment the head is about to become either.
+                    if let Some(ch) = challenger {
+                        drop_run(ch, &mut step);
+                    }
+                    self.confirm_first(buf, &mut step);
+                }
+                Current::Confirmed(mut seg) => {
+                    if let Some(ch) = challenger {
+                        if self.continues_forward(&seg, &ch) {
+                            self.extend(&mut seg, ch, &mut step);
+                        } else {
+                            drop_run(ch, &mut step);
+                        }
+                    }
+                }
             }
         }
         step
@@ -848,13 +888,16 @@ impl Segmenter {
         }
     }
 
-    /// Whether `ts` continues the committed run.
+    /// Whether `ts` continues the committed run through the single
+    /// admission door: inside the learned pacing tolerance. Everything
+    /// else — forward or backward, big or small — must gather quorum as a
+    /// challenger before it can advance the committed cursor.
     fn fits_current(&self, current: &Current, ts: ContainerTs) -> bool {
         match current {
             Current::Head(buf) => self.fits_run(buf, ts),
             Current::Confirmed(seg) => {
                 let gap = ts.0 - seg.last.0;
-                (-self.jitter()..=self.fence()).contains(&gap)
+                (-self.jitter()..=self.forward_tolerance()).contains(&gap)
             }
         }
     }
@@ -872,10 +915,21 @@ impl Segmenter {
         2.0 * self.nominal_gap
     }
 
-    /// Forward fence inside a confirmed segment: twice the largest jump
-    /// the stream itself released, floored at [`FORWARD_FENCE_FLOOR`].
-    fn fence(&self) -> f64 {
-        FORWARD_FENCE_FLOOR.max(2.0 * self.max_released_gap)
+    /// Forward tolerance inside a confirmed segment: twice the largest gap
+    /// the segment's released — vouched — frames established. No flat
+    /// floor exists: an unvouched forward jump of any size buffers as a
+    /// challenger, so no single frame can advance the committed cursor or
+    /// rewrite the statistics that admit the next one.
+    fn forward_tolerance(&self) -> f64 {
+        2.0 * self.max_released_gap
+    }
+
+    /// Whether a challenger's first frame continues `seg` forward within
+    /// the extent fence — the label prior deciding identity extension
+    /// against a seam.
+    fn continues_forward(&self, seg: &Segment, ch: &Buffered) -> bool {
+        let gap = ch.first().0 - seg.last.0;
+        gap > 0.0 && gap <= self.extent_fence
     }
 
     /// Advance the committed run with a frame that fits it.
@@ -923,8 +977,11 @@ impl Segmenter {
         self.open_segment(Segment::anchored(anchor, first), buf, step)
     }
 
-    /// Commit a confirmed challenger: seal the current run and continue
-    /// the logical clock one nominal gap past its last released instant.
+    /// Commit a confirmed challenger. Against the stream's unconfirmed
+    /// head it becomes the first segment; against a committed segment the
+    /// extent prior decides: sparse forward pacing extends the segment
+    /// identically, anything else seals it and continues the logical
+    /// clock one nominal gap past its last released instant.
     fn commit(&mut self, current: Current, ch: Buffered, step: &mut SegStep) -> Segment {
         match current {
             // The head never confirmed: its short run is dropped whole
@@ -935,15 +992,31 @@ impl Segmenter {
                 drop_run(buf, step);
                 self.confirm_first(ch, step)
             }
-            Current::Confirmed(seg) => {
-                let seam = seg.project(seg.last).0 + self.nominal_gap;
-                let first = ch.first();
-                step.cut = Some(Discontinuity {
-                    container: first,
-                    logical: LogicalTs(seam),
-                });
-                self.open_segment(Segment::anchored(seam, first), ch, step)
+            Current::Confirmed(mut seg) => {
+                if self.continues_forward(&seg, &ch) {
+                    // The same clock, sparser: successors vouched for the
+                    // jump and the extent prior vouches for the position.
+                    self.extend(&mut seg, ch, step);
+                    seg
+                } else {
+                    let seam = seg.project(seg.last).0 + self.nominal_gap;
+                    let first = ch.first();
+                    step.cut = Some(Discontinuity {
+                        container: first,
+                        logical: LogicalTs(seam),
+                    });
+                    self.open_segment(Segment::anchored(seam, first), ch, step)
+                }
             }
+        }
+    }
+
+    /// Release a forward run into the segment it continues: identity
+    /// labels, no seam — sparse pacing at a position the extent prior
+    /// vouches for.
+    fn extend(&mut self, seg: &mut Segment, ch: Buffered, step: &mut SegStep) {
+        for (ts, frame) in ch.frames {
+            self.release(seg, ts, frame, step);
         }
     }
 
@@ -971,7 +1044,7 @@ impl Segmenter {
         debug_assert!(gap >= 0.0, "in-segment releases are monotone");
         // Precedent learning is capped at the extent fence: a confirmed
         // challenger may legally carry a large gap, but nothing beyond the
-        // declared extent may widen future fences.
+        // declared extent may widen future tolerances.
         if gap > 0.0 && gap <= self.extent_fence {
             self.nominal_gap = gap;
             self.max_released_gap = self.max_released_gap.max(gap);
@@ -1119,6 +1192,14 @@ struct Worker {
     /// Checked once per packet: the consumer's drop requests an early exit.
     stop: Stop,
     frames_sent: u64,
+    /// `Some(start)` while a demuxer-successful window seek has produced
+    /// no decoded frame yet. A demuxer EOF in that state means the seek
+    /// landed beyond every decodable frame (a poisoned head drags the
+    /// container's index arbitrarily): the worker rewinds to the stream
+    /// head for one announced sequential retry — the sampler discards
+    /// everything before its first tick, so only cost changes, not
+    /// correctness. Cleared by the first decoded frame.
+    pending_seek: Option<f32>,
 }
 
 /// Whether to keep pumping after handling one decoded frame.
@@ -1148,7 +1229,23 @@ impl Worker {
             }
             match self.ictx.read_packet(&mut packet) {
                 Ok(()) => read_budget.ok(),
-                Err(ffmpeg::Error::Eof) => break,
+                Err(ffmpeg::Error::Eof) => {
+                    // A window seek that never yielded a frame landed past
+                    // all content. Rewind to the stream head (the absolute
+                    // minimum, not logical 0 — the declared origin may be
+                    // the poison) and read sequentially, announced. Taken
+                    // at most once: the flag never re-arms.
+                    if let Some(start) = self.pending_seek.take()
+                        && self.ictx.seek(i64::MIN, ..).is_ok()
+                    {
+                        self.decoder.flush();
+                        if self.tx.send(Ok(Msg::SeekRecovered { start })).is_err() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    break;
+                }
                 // Interrupt callback tripped: a requested stop, not a failure.
                 Err(ffmpeg::Error::Exit) => return Ok(()),
                 Err(e) => {
@@ -1186,9 +1283,11 @@ impl Worker {
             Err(e) => return Err(decode_error("flushing decoder at end of stream", e)),
         }
         self.drain()?;
-        // Flush the segmenter: an unconfirmed tail challenger is dropped
-        // (with signals); an unconfirmed head — a stream shorter than one
-        // confirmation — is released whole.
+        // Flush the segmenter: a forward tail challenger within the extent
+        // fence is released in place (nothing left to contradict it); any
+        // other unconfirmed challenger is dropped with signals; an
+        // unconfirmed head — a stream shorter than one confirmation — is
+        // released whole.
         let step = self.path.finish();
         if matches!(self.apply(step)?, Flow::Stop) {
             return Ok(());
@@ -1216,7 +1315,7 @@ impl Worker {
             // confirmation.
             let mut frame = ffmpeg::frame::Video::empty();
             match classify_receive(self.decoder.receive_frame(&mut frame)) {
-                Recv::Frame => {}
+                Recv::Frame => self.pending_seek = None,
                 Recv::Drained => return Ok(Flow::Continue),
                 Recv::Broken(e) => return Err(decode_error("receiving decoded frame", e)),
             }
@@ -1456,33 +1555,99 @@ mod tests {
     }
 
     #[test]
-    fn releases_an_in_fence_forward_gap_in_segment() {
-        // Legal pacing (a timelapse splice) below the fence floor passes
-        // through on the identity projection — it must not be shredded
-        // into segments.
+    fn extends_the_segment_over_a_confirmed_sparse_splice() {
+        // Legal sparse pacing (a timelapse splice): the jump buffers as a
+        // challenger and, once its successors vouch for it, continues the
+        // same segment identically — no seam, no relabel, no drop.
         let mut seg = segmenter(Some(60.0));
         for v in [0.0, 0.1, 0.2] {
             admit(&mut seg, v);
         }
-        assert_eq!(released(&admit(&mut seg, 5.0)), vec![5.0]);
-        assert_eq!(released(&admit(&mut seg, 5.1)), vec![5.1]);
+        assert!(released(&admit(&mut seg, 5.0)).is_empty(), "buffered");
+        assert!(released(&admit(&mut seg, 5.1)).is_empty(), "buffered");
+        let step = admit(&mut seg, 5.2);
+        assert!(step.cut.is_none(), "sparse pacing is not a seam");
+        assert!(step.dropped.is_empty(), "sparse pacing is not corruption");
+        assert_eq!(released(&step), vec![5.0, 5.1, 5.2]);
+        assert_eq!(
+            released(&admit(&mut seg, 9.8)),
+            vec![9.8],
+            "the released splice gap is precedent for the next one"
+        );
     }
 
     #[test]
-    fn learns_the_forward_fence_from_released_gaps() {
+    fn quarantines_an_unvouched_forward_blip() {
+        // One frame jumps +9.5s — below the old 10s fence floor that let
+        // it walk into the segment unconfirmed, drag the cursor forward,
+        // and rewrite the jitter scale until ~49 legal successors fell
+        // into the backward-drop path. The single door buffers it as a
+        // challenger; the next legal frame kills it; nothing is learned
+        // from it.
+        let mut seg = segmenter(Some(2.0));
+        let mut kept = Vec::new();
+        let mut lost = Vec::new();
+        for i in 0..60 {
+            let t = f64::from(i) * 0.033;
+            let v = if i == 10 { t + 9.5 } else { t };
+            let step = admit(&mut seg, v);
+            assert!(step.cut.is_none(), "a blip commits no seam");
+            kept.extend(released(&step));
+            lost.extend(dropped(&step));
+        }
+        let tail = seg.finish();
+        kept.extend(released(&tail));
+        lost.extend(dropped(&tail));
+        assert_eq!(kept.len(), 59, "every legal frame survives: {kept:?}");
+        assert!(kept.iter().all(|&t| t < 2.0), "labels stay at content scale");
+        assert_close(&lost, &[10.0 * 0.033 + 9.5]);
+    }
+
+    #[test]
+    fn releases_a_plausible_sparse_tail_at_eof() {
+        // A keyframe-only decode of a legal long-GOP recording: keyframes
+        // 0,2,..,10 then 25 and 39.9 inside a declared 40s extent. The
+        // tail is content at a plausible position with nothing left to
+        // contradict it — released in place, not dropped as an
+        // unconfirmed challenger.
+        let mut seg = Segmenter::new(Some(40.0), FALLBACK_NOMINAL_GAP);
+        let values = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 25.0, 39.9];
+        let out = drain_releases(&mut seg, &values);
+        assert_eq!(out, values.to_vec(), "the whole legal file is content");
+    }
+
+    #[test]
+    fn commits_a_seam_on_a_confirmed_beyond_extent_jump() {
+        // A confirmed forward run beyond the extent prior cannot keep its
+        // labels: the position does not exist in the declared file, so
+        // the clock seams and content continues at the seal.
+        let mut seg = segmenter(Some(2.0));
+        for v in [0.0, 0.1, 0.2] {
+            admit(&mut seg, v);
+        }
+        assert!(released(&admit(&mut seg, 86_400.0)).is_empty(), "buffered");
+        assert!(released(&admit(&mut seg, 86_400.1)).is_empty(), "buffered");
+        let step = admit(&mut seg, 86_400.2);
+        let cut = step.cut.expect("beyond the extent prior: a seam");
+        assert!((cut.logical.0 - 0.3).abs() < 1e-9);
+        assert_close(&released(&step), &[0.3, 0.4, 0.5]);
+    }
+
+    #[test]
+    fn learns_the_forward_tolerance_from_released_gaps() {
         let mut seg = segmenter(Some(100.0));
-        // Head learns an 8s cadence: fence becomes max(10, 2×8) = 16.
+        // Head learns an 8s cadence: tolerance becomes 2 × 8 = 16.
         for v in [0.0, 8.0, 16.0] {
             admit(&mut seg, v);
         }
         assert_eq!(
             released(&admit(&mut seg, 31.0)),
             vec![31.0],
-            "a 15s gap fits the learned fence"
+            "a 15s gap fits the learned tolerance"
         );
         assert!(
             released(&admit(&mut seg, 100.0)).is_empty(),
-            "a 69s gap beyond the fence opens a challenger"
+            "a 69s gap beyond the tolerance opens a challenger"
         );
     }
 
@@ -1621,13 +1786,13 @@ mod tests {
         assert_eq!(path_admit(&mut path, 0.0).0, Vec::<f32>::new());
         assert_eq!(path_admit(&mut path, 0.5).0, Vec::<f32>::new());
         assert_eq!(path_admit(&mut path, 1.0).0, vec![0.0, 0.5, 1.0]);
-        let (sent, _, stop) = path_admit(&mut path, 2.5);
+        let (sent, _, stop) = path_admit(&mut path, 2.0);
         assert!(sent.is_empty(), "past the end sends nothing");
         assert!(stop, "monotone releases make the first crossing final");
     }
 
     #[test]
-    fn does_not_stop_the_range_on_an_out_of_fence_outlier() {
+    fn does_not_stop_the_range_on_an_out_of_tolerance_outlier() {
         // A lone corrupt pts past the range end must not truncate the
         // range: it opens a challenger, the next legal frame kills it, and
         // sampling continues.

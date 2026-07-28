@@ -492,6 +492,122 @@ fn extracts_a_range_across_a_poisoned_head() {
     );
 }
 
+/// S1: a single forward blip below the old 10-second fence floor (+9.5s
+/// on a 30 fps stream). The two-door design admitted it unconfirmed — it
+/// advanced the committed cursor, inflated the learned gap statistics,
+/// and pushed the next ~49 legal frames into the backward-jitter drop
+/// path: one poisoned frame cost 49 legal ones, with no seam signal.
+/// Single-door: it buffers as a challenger, the next legal frame kills
+/// it, and the stream survives whole.
+#[test]
+fn quarantines_a_sub_ten_second_forward_blip() {
+    let fx = require_fixture!(support::fixtures::corrupt_pts(
+        "ts-s1-fence-blip",
+        2.0,
+        "if(eq(N\\,10)\\,PTS+855000\\,PTS)",
+    ));
+    let events = Recorder::default();
+
+    let ts = drain(&fx.media, full_speed(), &events).expect("timestamps never fail a run");
+
+    assert!(ts.len() >= 55, "the legal frames survive whole: {} frames", ts.len());
+    assert!(
+        ts.iter().all(|&t| (-0.1..3.0).contains(&t)),
+        "the blip never enters the released history: {:?}..{:?}",
+        ts.first(),
+        ts.last()
+    );
+    assert_monotone(&ts);
+}
+
+/// S2: a legal long-GOP recording (screen capture, `-g 600` encodes)
+/// whose keyframes run 0,2,..,10 then jump to 25 and 39.9. The tail
+/// keyframes are content at a plausible position inside the declared
+/// 40s extent with nothing left to contradict them; dropping them at EOF
+/// as an unconfirmed challenger loses the last 30 seconds of a healthy
+/// file — the exact content loss this paradigm's contract forbids.
+#[test]
+fn keyframe_decode_surfaces_a_legal_sparse_tail() {
+    let fx = require_fixture!(support::fixtures::sparse_tail_keyframes(40.0));
+    let events = Recorder::default();
+
+    let ts = drain(&fx.media, SampleSpec::Keyframes, &events).expect("a legal file never fails");
+
+    assert!(
+        ts.iter().any(|&t| (24.0..26.0).contains(&t)),
+        "the 25s keyframe is visible: {ts:?}"
+    );
+    assert!(
+        ts.last().is_some_and(|&t| t > 35.0),
+        "the tail keyframe is visible: {ts:?}"
+    );
+    assert_monotone(&ts);
+    assert!(
+        !events.saw("UnplaceableTimestamp")
+            && !events.saw("TimestampsDropped")
+            && !events.saw("TimelineDiscontinuity"),
+        "a legal file emits zero timeline events"
+    );
+}
+
+/// S3: a window seek on the poisoned-head stream speaks the dragged
+/// container clock (logical 1.0 → ~86401s absolute), reports success,
+/// and decodes nothing — under the old assembly the run died as
+/// NoFramesExtracted with zero events, timestamps alone failing a run.
+/// The decode pass now detects the empty landing at demuxer EOF, rewinds
+/// to the stream head, announces the fallback, and serves the window
+/// sequentially from content.
+#[test]
+fn recovers_a_window_seek_dragged_by_a_poisoned_head() {
+    let fx = require_fixture!(poisoned_head());
+    let events = Recorder::default();
+
+    let ts = drain(
+        &fx.media,
+        SampleSpec::Fps {
+            fps: 120.0,
+            start: 1.0,
+            end: Some(2.0),
+        },
+        &events,
+    )
+    .expect("a poisoned index must not fail the window");
+
+    assert!(!ts.is_empty(), "the window is served from content");
+    assert!(
+        ts.iter().all(|&t| (0.9..2.0).contains(&t)),
+        "window labels stay inside the request: {ts:?}"
+    );
+    assert_monotone(&ts);
+    assert!(events.saw("SeekFallback"), "the degraded seek is announced");
+}
+
+/// The extract door over the same S3 shape: `extract_range(1.0, 2.0)` on
+/// the poisoned-head stream must produce a grid, not NoFramesExtracted.
+#[test]
+fn extracts_a_mid_range_across_a_poisoned_head() {
+    let fx = require_fixture!(poisoned_head());
+    let events = Recorder::default();
+    let dir = support::fresh_output_dir("segments-extract-mid");
+
+    pipeline::extract_range(
+        &Source::classify(fx.media.to_str().expect("fixture path is utf-8")),
+        OutputSink::Files(&dir),
+        &fixed_fps_config(),
+        TimeRange::new(1.0, 2.0).expect("valid range"),
+        SubtitleSource::Auto,
+        &Stop::new(),
+        &events,
+    )
+    .expect("a timestamp alone never fails a run");
+
+    assert!(
+        dir.join("grid_extract.jpg").exists(),
+        "the mid-range grid is written from recovered content"
+    );
+    assert!(events.saw("SeekFallback"), "the degraded seek is announced");
+}
+
 /// The regression pinned since the first design: an edit-list cut mp4 has
 /// legitimate negative packet pts (pre-roll) against a zero header origin.
 /// It is a normal file: one identity segment, zero timeline events, and

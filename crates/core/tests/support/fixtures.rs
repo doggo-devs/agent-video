@@ -88,6 +88,49 @@ pub fn keyframe_poor(duration: f32) -> Option<Fixture> {
     })
 }
 
+/// A legal long-GOP recording with a sparse keyframe tail: keyframes
+/// forced at 0,2,..,10 then 25 and `duration - 0.1`, everything else
+/// suppressed (`-g 9999 -sc_threshold 0`) — the screen-capture/`-g 600`
+/// cadence where minute-scale keyframe gaps are the file's legal pacing.
+/// A keyframe-only decode must surface the tail keyframes: dropping them
+/// loses the last `duration - 10` seconds of a healthy file.
+pub fn sparse_tail_keyframes(duration: f32) -> Option<Fixture> {
+    require_ffmpeg()?;
+    let last = duration - 0.1;
+    let args: Vec<String> = [
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("testsrc2=duration={duration}:size=320x180:rate=30,rotate=t"),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-force_key_frames",
+        &format!("0,2,4,6,8,10,25,{last}"),
+        "-g",
+        "9999",
+        "-keyint_min",
+        "9999",
+        "-sc_threshold",
+        "0",
+        "sparse.mp4",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let dir = cached("sparse-tail-keyframes", &args, &["sparse.mp4"], |scratch| {
+        run_ffmpeg(scratch, &args);
+    });
+    Some(Fixture {
+        media: dir.join("sparse.mp4"),
+        sidecar: None,
+        duration,
+    })
+}
+
 /// [`h264_talk`] plus a generated `.srt` sidecar with one cue per two
 /// seconds. The sidecar's stem deliberately differs from the media's, so a
 /// run with `SubtitleSource::Auto` on the shared media never discovers it.
