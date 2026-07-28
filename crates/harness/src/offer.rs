@@ -2,8 +2,11 @@
 //! Download offers: first contact with a not-yet-downloaded URL.
 //!
 //! Turns source facts into download tiers behind consent tokens, or refusals.
-//! Nothing is downloaded without an echoed token; tiers over
-//! `download.max_bytes` are dropped.
+//! Nothing is downloaded without an echoed token; tiers whose estimated size
+//! exceeds `download.max_bytes` are dropped. Tiers without an estimate are
+//! offered as such — refusing them would kill legitimate sources that simply
+//! report no size — with the consequence disclosed in the consent text: the
+//! download layer cuts any stream off at the ceiling mid-transfer.
 
 use super::config::Config;
 use super::fetch::SourceInfo;
@@ -37,11 +40,13 @@ pub fn decide_url(args: &VideoArgs, info: &SourceInfo, cfg: &Config) -> Decision
     let max_bytes = cfg.download.max_bytes.get();
     let mut offers: Vec<OfferDraft> = Vec::new();
     let mut dropped: Vec<&str> = Vec::new();
+    let mut offered_unknown_size = false;
     for opt in &info.options {
         if opt.estimated_bytes.is_some_and(|est| est > max_bytes) {
             dropped.push(&opt.label);
             continue;
         }
+        offered_unknown_size |= opt.estimated_bytes.is_none();
         offers.push(OfferDraft {
             effect: opt.effect.clone(),
             action: PendingAction::Download(DownloadPlan {
@@ -87,6 +92,15 @@ pub fn decide_url(args: &VideoArgs, info: &SourceInfo, cfg: &Config) -> Decision
              the call after it completes."
                 .to_string(),
         );
+    }
+    if offered_unknown_size {
+        // Consent must carry the consequence of the unknown: the ceiling is
+        // still enforced at download time, mid-transfer.
+        notes.push(format!(
+            "Tiers of unknown size are offered as-is; if the stream turns out to exceed the \
+             {} ceiling (download.max_bytes), the download is aborted mid-transfer.",
+            format_bytes(max_bytes)
+        ));
     }
     notes.push(CHOICE_GUIDANCE.to_string());
 
@@ -190,6 +204,34 @@ mod tests {
             panic!("expected Reject, got {d:?}");
         };
         assert!(message.contains("download.max_bytes"), "{message}");
+    }
+
+    #[test]
+    fn notes_mid_transfer_abort_for_unknown_size_tiers() {
+        let args = VideoArgs::bare("https://ex.com/v");
+        let d = decide_url(
+            &args,
+            &info(vec![option("keep-720", Dest::Keep, None)]),
+            &cfg(),
+        );
+        let Decision::Confirm { consequence, .. } = d else {
+            panic!("expected Confirm, got {d:?}");
+        };
+        assert!(consequence.contains("aborted mid-transfer"), "{consequence}");
+    }
+
+    #[test]
+    fn omits_unknown_size_note_when_every_tier_has_an_estimate() {
+        let args = VideoArgs::bare("https://ex.com/v");
+        let d = decide_url(
+            &args,
+            &info(vec![option("analysis", Dest::Cache, Some(1024))]),
+            &cfg(),
+        );
+        let Decision::Confirm { consequence, .. } = d else {
+            panic!("expected Confirm, got {d:?}");
+        };
+        assert!(!consequence.contains("aborted mid-transfer"), "{consequence}");
     }
 
     #[test]

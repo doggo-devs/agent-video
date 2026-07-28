@@ -108,19 +108,10 @@ impl ServerHandler for VideoServer {
 /// Boot the stdio MCP server with production deps; blocks until the client
 /// disconnects. Owns the process's only tokio runtime.
 pub fn serve_stdio() -> anyhow::Result<()> {
-    // The in-process libav demuxer consults `no_proxy` at connect time even
-    // when the `http_proxy` option routes it through the policy relay
-    // (ffmpeg's http protocol checks the env var first), so an inherited
-    // value would silently bypass the per-connection egress screen. Scrub
-    // it for the whole server process. Direct CLI runs (`process`,
-    // `extract`) are untouched: there the user's proxy environment is
-    // their own business.
-    // SAFETY: runs at server boot before the tokio runtime or any other
-    // thread exists, so no concurrent getenv can race the mutation.
-    unsafe {
-        std::env::remove_var("no_proxy");
-        std::env::remove_var("NO_PROXY");
-    }
+    // First statement on purpose: the env scrub below requires a
+    // single-threaded process, so it must precede the tracing subscriber,
+    // config loading, and everything else that may spawn threads.
+    scrub_no_proxy_env();
 
     // stderr is safe: MCP transport is on stdin/stdout.
     tracing_subscriber::fmt()
@@ -148,4 +139,62 @@ pub fn serve_stdio() -> anyhow::Result<()> {
         service.waiting().await?;
         Ok(())
     })
+}
+
+/// Scrub `no_proxy` from the server process's environment.
+///
+/// The in-process libav demuxer consults `no_proxy` at connect time even
+/// when the `http_proxy` option routes it through the policy relay
+/// (ffmpeg's http protocol checks the env var first), so an inherited
+/// value would silently bypass the per-connection egress screen. Direct
+/// CLI runs (`process`, `extract`) are untouched: there the user's proxy
+/// environment is their own business.
+///
+/// Must run while the process is still single-threaded. That is a call-site
+/// obligation the type system cannot state, so debug builds enforce it with
+/// a live thread count instead of trusting the caller.
+fn scrub_no_proxy_env() {
+    debug_assert!(
+        live_thread_count().is_none_or(|threads| threads == 1),
+        "scrub_no_proxy_env called after another thread exists: mutating the \
+         environment now races concurrent getenv — move the call earlier in boot"
+    );
+    // SAFETY: the process is single-threaded here, so no concurrent getenv
+    // can race the mutation — asserted above in debug builds, upheld by
+    // being the first statement of `serve_stdio`, before the tracing
+    // subscriber, the tokio runtime, or any library that spawns threads.
+    unsafe {
+        std::env::remove_var("no_proxy");
+        std::env::remove_var("NO_PROXY");
+    }
+}
+
+/// Live threads in this process, where the platform exposes them cheaply
+/// (`/proc/self/task` on Linux); `None` elsewhere, which callers must treat
+/// as "unknown", never as "one".
+fn live_thread_count() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(std::fs::read_dir("/proc/self/task").ok()?.count())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn thread_count_sees_a_live_spawned_thread() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _ = held.recv();
+        });
+        let count = super::live_thread_count().expect("linux exposes /proc/self/task");
+        assert!(count >= 2, "at least this thread and the held one: {count}");
+        release.send(()).expect("held thread is receiving");
+        handle.join().expect("held thread exits");
+    }
 }

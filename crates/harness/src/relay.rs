@@ -264,8 +264,10 @@ fn handle_connect(client: TcpStream, authority: &str, tunneling: Tunneling) -> s
 }
 
 /// Forward an absolute-form http request: screen the target, dial it,
-/// rewrite the request line to origin-form, drop hop-by-hop proxy headers,
-/// force `Connection: close`, then splice both directions until EOF.
+/// rewrite the request line to origin-form, drop the hop-by-hop headers
+/// (`Connection`/`Proxy-Connection` and every header they name, per
+/// RFC 7230 §6.1), force `Connection: close`, then splice both directions
+/// until EOF.
 fn handle_absolute(
     client: TcpStream,
     method: &str,
@@ -295,14 +297,23 @@ fn handle_absolute(
     };
 
     // Origin-form request line plus every original header except the
-    // hop-by-hop proxy ones, with a forced `Connection: close`.
+    // hop-by-hop ones, with a forced `Connection: close`. Per RFC 7230
+    // §6.1 that strips `Connection`/`Proxy-Connection` themselves and
+    // every header they name: `Connection: keep-alive, TE` marks
+    // `Keep-Alive` and `TE` as addressed to this hop, so forwarding them
+    // would misstate the relay's behavior to the origin.
+    let headers: Vec<&str> = header_lines.take_while(|line| !line.is_empty()).collect();
+    let named_hop_by_hop: Vec<String> = headers
+        .iter()
+        .filter(|line| is_connection_header(header_name(line)))
+        .flat_map(|line| line.split_once(':').map_or("", |(_, value)| value).split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .collect();
     let mut rewritten = format!("{method} {path_and_query} {version}\r\n");
-    for line in header_lines {
-        if line.is_empty() {
-            break;
-        }
-        let name = line.split(':').next().unwrap_or("").trim();
-        if name.eq_ignore_ascii_case("proxy-connection") || name.eq_ignore_ascii_case("connection")
+    for line in headers {
+        let name = header_name(line);
+        if is_connection_header(name)
+            || named_hop_by_hop.iter().any(|h| name.eq_ignore_ascii_case(h))
         {
             continue;
         }
@@ -571,6 +582,18 @@ fn read_request_head(stream: &TcpStream) -> Result<Vec<u8>, HeadError> {
     }
 }
 
+/// The field name of a raw header line: everything before the first
+/// colon, trimmed.
+fn header_name(line: &str) -> &str {
+    line.split(':').next().unwrap_or("").trim()
+}
+
+/// Whether `name` is the `Connection` header or its nonstandard proxy
+/// twin — the headers that both are hop-by-hop and name further ones.
+fn is_connection_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("connection") || name.eq_ignore_ascii_case("proxy-connection")
+}
+
 /// Split a `host:port` authority, handling a bracketed IPv6 literal
 /// (`[::1]:443`). The port must be present and numeric.
 fn split_authority(authority: &str) -> Option<(String, u16)> {
@@ -602,7 +625,7 @@ mod tests {
     use std::io::BufRead;
 
     /// A local listener that serves one canned response and records the
-    /// request line it received.
+    /// request head (request line plus headers) it received.
     fn canned_upstream(response: &'static [u8]) -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
         let addr = listener.local_addr().expect("addr");
@@ -610,19 +633,18 @@ mod tests {
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
-                let mut request_line = String::new();
-                let _ = reader.read_line(&mut request_line);
-                // Drain the rest of the head so the client's write completes.
+                let mut head = String::new();
                 let mut line = String::new();
                 loop {
                     line.clear();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                         break;
                     }
+                    head.push_str(&line);
                 }
                 let _ = stream.write_all(response);
                 let _ = stream.shutdown(Shutdown::Write);
-                let _ = tx.send(request_line);
+                let _ = tx.send(head);
             }
         });
         (addr, rx)
@@ -702,12 +724,47 @@ mod tests {
         let response = round_trip(&relay, request.as_bytes());
         let text = String::from_utf8_lossy(&response);
         assert!(text.contains("body"), "upstream body relayed back: {text}");
-        let request_line = rx
+        let head = rx
             .recv_timeout(Duration::from_secs(2))
             .expect("upstream saw request");
         assert!(
-            request_line.starts_with("GET /path?q=1 HTTP/1.1"),
-            "request line rewritten to origin-form: {request_line:?}"
+            head.starts_with("GET /path?q=1 HTTP/1.1"),
+            "request line rewritten to origin-form: {head:?}"
+        );
+    }
+
+    #[test]
+    fn strips_headers_named_in_connection() {
+        let relay = PolicyRelay::start(true).expect("relay starts");
+        let (upstream, rx) = canned_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let request = format!(
+            "GET http://{upstream}/ HTTP/1.1\r\nHost: {upstream}\r\n\
+             Connection: Keep-Alive, TE\r\nTE: trailers\r\nKeep-Alive: timeout=5\r\n\
+             X-Api-Key: k\r\n\r\n"
+        );
+        let _ = round_trip(&relay, request.as_bytes());
+        let head = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("upstream saw request");
+        let forwarded: Vec<&str> = head.lines().skip(1).collect();
+        for name in ["te:", "keep-alive:"] {
+            assert!(
+                !forwarded.iter().any(|l| l.to_ascii_lowercase().starts_with(name)),
+                "header named in Connection must not reach the origin: {head:?}"
+            );
+        }
+        assert!(
+            forwarded.contains(&"X-Api-Key: k"),
+            "end-to-end headers pass through: {head:?}"
+        );
+        assert_eq!(
+            forwarded
+                .iter()
+                .filter(|l| l.to_ascii_lowercase().starts_with("connection:"))
+                .copied()
+                .collect::<Vec<_>>(),
+            ["Connection: close"],
+            "only the forced close survives: {head:?}"
         );
     }
 
