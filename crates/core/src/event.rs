@@ -54,24 +54,23 @@ pub enum Event<'a> {
     KeyframePoorDegrade { count: usize, minimum: usize },
     /// A static stretch `[start, end]` seconds was collapsed into `file`.
     StaticCollapsed { start: f32, end: f32, file: &'a str },
-    /// A decoded frame's timestamp could not be placed on the stream's
-    /// timeline and the frame was dropped (first occurrence in a decode
-    /// pass; the pass total arrives as [`Event::TimestampsDropped`]).
-    /// `last` is the last released timestamp, when any.
+    /// A decoded frame fell off the logical timeline and was dropped:
+    /// backward jitter inside a segment, or a segment candidate that never
+    /// gathered its confirmation (first occurrence in a decode pass; the
+    /// pass total arrives as [`Event::TimestampsDropped`]). `ts` is the
+    /// frame's container timestamp, `last` the last released logical
+    /// timestamp, when any.
     UnplaceableTimestamp { ts: f32, last: Option<f32> },
     /// End-of-decode accounting: `count` decoded frames were dropped off
-    /// the timeline over the whole pass. Emitted only when `count > 0`.
+    /// the logical timeline over the whole pass (jitter and unconfirmed
+    /// segment candidates). Emitted only when `count > 0`.
     TimestampsDropped { count: u64 },
-    /// A decode pass failed on its timeline, but the dropped frames' own
-    /// pts formed a longer self-consistent timeline than everything the
-    /// declared origin released — the clock anchor, not the input, was
-    /// judged broken — and the run is retried once with the elected
-    /// origin. Both values are seconds on the container's absolute clock:
-    /// `declared` is the header origin the failed pass trusted, `elected`
-    /// the dropped chain's head. Diagnostic only; the retry itself is
-    /// decided by the pipeline (see `crate::media::decode`'s origin-rebase
-    /// contract).
-    OriginRebased { declared: f64, elected: f64 },
+    /// The decode pass committed a timeline discontinuity: the container
+    /// clock jumped (MPEG-TS PCR discontinuity, pts wrap-around, spliced
+    /// clock domains) and frames continue on the logical clock at
+    /// `logical_ts` while their container clock reads `container_ts`.
+    /// Content is preserved; only labels after the seam are projected.
+    TimelineDiscontinuity { container_ts: f64, logical_ts: f64 },
     /// A run finished writing `count` grids to `dir`.
     GridsWritten { count: usize, dir: &'a Path },
     /// An embedded subtitle stream held no text cues; the auto path continues

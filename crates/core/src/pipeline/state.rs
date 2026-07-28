@@ -107,7 +107,7 @@ impl<'a> ProcessState<'a> {
 
     /// Record one judged frame, interpreting whatever events it seals off.
     /// Timeline placement lives in [`Chunker::push`]; its monotone-input
-    /// precondition is guaranteed by the decode pass's timeline gate.
+    /// precondition is guaranteed by the decode pass's segmenter.
     pub fn push_judged(&mut self, frame: CandidateFrame, kept: bool) -> Result<()> {
         let events = self.chunker.push(frame, kept, self.capacity());
         self.handle_events(events)

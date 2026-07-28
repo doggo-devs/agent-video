@@ -94,8 +94,8 @@ impl Chunker {
     ///
     /// Chunk keying, high-water-mark sealing, and static detection all
     /// assume non-decreasing timestamps. The decode pass guarantees exactly
-    /// that ([`crate::media::decode`]'s timeline gate releases a
-    /// non-decreasing, in-extent stream and fails the run otherwise), and
+    /// that ([`crate::media::decode`]'s segmenter releases a stream
+    /// monotone on one logical clock), and
     /// every stage between it and this core preserves order — so a
     /// regression here is a bug in this crate, not an input property, and
     /// panics per this workspace's error contract (bugs are panics, never

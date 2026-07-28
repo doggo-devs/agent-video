@@ -56,21 +56,10 @@ pub fn extract_range(
     // Before the expensive sampling pass: subtitle errors must fail fast,
     // not after all the CPU and IO have been spent.
     let subs = Subtitles::resolve(input, subs, stop, events)?;
-
-    // The origin-rebase retry (see `super::rebase_or_fail`): at most two
-    // attempts, the second only for a failure whose evidence indicts the
-    // container's clock anchor. Each attempt opens a fresh session; a
-    // failed pass's partial artifacts never left staging.
-    let mut anchor = sample::Anchor::Declared;
-    loop {
-        match run(input, sink, cfg, range, subs.as_ref(), events, anchor) {
-            Ok(()) => return Ok(()),
-            Err(e) => anchor = super::rebase_or_fail(anchor, e, events)?,
-        }
-    }
+    run(input, sink, cfg, range, subs.as_ref(), events)
 }
 
-/// One decode-and-compose attempt of [`extract_range`], under `anchor`.
+/// The decode-and-compose pass of [`extract_range`].
 fn run(
     input: &Source,
     sink: OutputSink<'_>,
@@ -78,7 +67,6 @@ fn run(
     range: TimeRange,
     subs: Option<&Subtitles>,
     events: &dyn EventSink,
-    anchor: sample::Anchor,
 ) -> Result<()> {
     let session = OutputSession::open(sink)?;
 
@@ -93,7 +81,6 @@ fn run(
             score_edge: cfg.score_edge(),
             threads: None,
             events,
-            anchor,
         },
     )?;
 

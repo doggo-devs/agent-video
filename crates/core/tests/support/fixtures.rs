@@ -113,8 +113,8 @@ pub fn with_srt_sidecar(duration: f32) -> Option<Fixture> {
 /// edit list makes presentation start at 0 (header `start_time = 0`) while
 /// the copied packets from the preceding keyframe keep legitimate negative
 /// pts (down to `cut`'s distance from that keyframe) — the legal shape the
-/// origin rebase must never fire on: releases hold the majority, so the
-/// declared anchor always wins the election.
+/// segmenter must treat as one identity segment: pre-roll stays within the
+/// allowance, so no seam, no drop, no re-anchor.
 pub fn edit_list_cut(duration: f32, cut: f32) -> Option<Fixture> {
     let base = h264_talk(duration)?;
     let args: Vec<String> = [
@@ -206,13 +206,13 @@ pub fn audio_param_change(duration: f32) -> Option<Fixture> {
 
 /// A clean testsrc2 MPEG-TS remuxed with a `setts` bitstream filter
 /// rewriting selected video packet timestamps: the raw material for the
-/// decode pass's timeline-gate integration tests.
+/// decode pass's timeline-segmenter integration tests.
 ///
 /// `expr` is an ffmpeg `setts` pts expression over `N` (packet index) and
 /// `PTS` (90 kHz ticks); commas inside function calls must be escaped as
 /// `\,` for the bsf option parser. B-frames are disabled so decode order
 /// equals presentation order and packet index maps 1:1 onto the frames the
-/// gate sees; MPEG-TS is used because its 33-bit pts field round-trips
+/// segmenter sees; MPEG-TS is used because its 33-bit pts field round-trips
 /// far-future values that MP4's composition offsets cannot represent.
 pub fn corrupt_pts(tag: &str, duration: f32, expr: &str) -> Option<Fixture> {
     require_ffmpeg()?;

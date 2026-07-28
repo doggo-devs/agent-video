@@ -8,27 +8,31 @@
 //!
 //! Timestamps come from the decoded frames themselves (`best-effort pts ×
 //! time_base`, rebased to the stream start), produced by the same decoder
-//! that produced the pixels. Before sampling, every decoded frame passes
-//! [`TimelineGate`], which enforces the invariant everything downstream
-//! (sampler ticks, range end, chunk placement) relies on: released
-//! timestamps are non-decreasing *and* lie within the stream's own declared
-//! extent ([`PlausibleWindow`]). Order is confirmed locally by each frame's
-//! successor; containment is confirmed globally against the container
-//! header probed before any frame is decoded — two corrupt frames can vouch
-//! for each other's order, but not for an extent the container never
-//! declared. Every dropped frame is reported downstream as an event, and a
-//! timeline the gate cannot trust fails the run with a coded error: no
-//! combination of inputs yields silent content loss on a successful exit.
+//! that produced the pixels. Container clocks are allowed to jump — MPEG-TS
+//! PCR discontinuities, 33-bit pts wrap-arounds, and spliced clock domains
+//! are all legal — and no local evidence can distinguish a legal jump from
+//! a corrupt one, so this module never tries. Instead, every decoded frame
+//! passes the [`Segmenter`], which cuts the container clock into monotone
+//! *segments* and projects them onto one continuous logical clock;
+//! everything downstream (sampler ticks, range end, chunk placement, wire
+//! time ranges) consumes only the logical clock. A single-segment stream —
+//! every normal file — projects identically: logical time equals container
+//! time to the last bit.
 //!
-//! One failure shape earns a second chance: when the failing pass's own
-//! audit shows the *rejected* frames forming a longer self-consistent
-//! timeline than everything the declared origin released, the error
-//! carries an [`AnchorFault`] indicting the clock anchor rather than the
-//! frames, and the retry layer above [`FrameSource`] re-runs the whole
-//! pass once with the elected origin ([`Anchor::Rebased`]) — container
-//! reopened, seek reprojected, everything re-decoded. A rebased pass that
-//! fails again is final: the anchor token has no third state, so no retry
-//! loop exists to fabricate a timeline for a majority-corrupt input.
+//! The contract this buys: every decodable frame is either sampled onto the
+//! logical timeline or dropped with a signal (the first drop emits
+//! [`Event::UnplaceableTimestamp`], the pass total
+//! [`Event::TimestampsDropped`]); every committed clock seam is announced
+//! as [`Event::TimelineDiscontinuity`]; and timestamps alone never fail a
+//! run — a wrong segmentation threshold mislabels a seam, it cannot lose
+//! content wholesale. Decode and I/O failures keep their own coded errors.
+//!
+//! Segment state is owned by the decode thread alone; only released frames
+//! and signals cross the channel. Fast seeking speaks the container clock
+//! and is therefore exact only within the stream's first segment: a later
+//! segment's container offset is unknowable before its frames are decoded,
+//! so a windowed decode of a multi-segment stream finds its window where
+//! the container clock says it is, while labels follow the logical clock.
 
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -46,73 +50,42 @@ use crate::types::{TimeRange, Ts};
 
 use super::scale::Rescaler;
 use super::{
-    ErrorBudget, Recv, Stop, Timeline, VideoStream, best_video_stream, classify_receive,
+    ErrorBudget, Recv, Stop, VideoStream, best_video_stream, classify_receive,
     decode_error, duration_seconds, open_input,
 };
 
-/// The clock anchor one decode pass trusts — the pass token of the origin
-/// rebase, with two states and one legal transition.
+/// Seconds on the container's presentation clock, 0-based at the declared
+/// stream start — the clock decoded frames arrive on. A distinct type from
+/// the logical clock so a container timestamp cannot be handed downstream
+/// unprojected.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+struct ContainerTs(f64);
+
+/// Seconds on the run's logical clock — the monotone timeline everything
+/// downstream (sampler ticks, range end, chunker, wire ranges) consumes.
 ///
-/// Every first pass runs [`Anchor::Declared`] and behaves exactly as it
-/// always has. Only when that pass fails with an [`AnchorFault`] does the
-/// retry layer mint the [`Anchor::Rebased`] anchor for the single retry;
-/// a rebased pass has no successor state, so "retry loop" is not a
-/// representable program.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Anchor {
-    /// Trust the container header: origin at the best video stream's
-    /// declared start, extent from the declared duration. The fast path;
-    /// normal files never leave it.
-    Declared,
-    /// Trust the origin elected by a failed declared pass's dropped-frame
-    /// evidence, in seconds on the container's absolute clock.
-    Rebased {
-        /// The elected origin ([`AnchorFault::elected`]).
-        origin: f64,
-    },
+/// Only [`Segment::project`] mints values, and the segmenter advances
+/// segment anchors monotonically, so the instants a decode pass releases
+/// are non-decreasing by construction, not by runtime check.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+struct LogicalTs(f64);
+
+impl LogicalTs {
+    /// Narrow to the pipeline's frame timestamp; `None` when the value
+    /// overflows `f32` — unreachable for fenced segments, checked anyway
+    /// because [`Ts`] is the finite-by-construction boundary.
+    fn to_ts(self) -> Option<Ts> {
+        Ts::new(self.0 as f32)
+    }
 }
 
-/// The typed verdict a timeline failure carries when its own evidence
-/// indicts the clock anchor rather than the frames: the dropped frames'
-/// original pts form a monotone chain *longer* than everything the
-/// declared origin managed to release, so the rejected timeline is more
-/// self-consistent than the accepted one.
-///
-/// Travels as the [`Error`]'s source — the same channel, the same error
-/// code ([`ErrorCode::InputCorrupt`]), zero new plumbing through the
-/// decode thread — and is read back by the retry layer above
-/// [`FrameSource`] via [`AnchorFault::in_error`].
+/// One committed clock seam: the container clock read `container` where
+/// the logical clock continues at `logical`. Reported downstream as
+/// [`Event::TimelineDiscontinuity`].
 #[derive(Debug, Clone, Copy)]
-pub struct AnchorFault {
-    /// The origin the failed pass trusted, seconds on the container's
-    /// absolute clock.
-    pub declared: f64,
-    /// The elected origin: the dropped chain's head pts, seconds on the
-    /// container's absolute clock.
-    pub elected: f64,
-}
-
-impl std::fmt::Display for AnchorFault {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the timeline anchor is suspect: declared origin {:.3}s, \
-             the dropped frames' own chain elects {:.3}s",
-            self.declared, self.elected
-        )
-    }
-}
-
-impl std::error::Error for AnchorFault {}
-
-impl AnchorFault {
-    /// The fault carried by `e`, when `e` is a timeline failure whose
-    /// dropped-frame evidence elected a rebased origin; `None` for every
-    /// other error — including timeline failures whose evidence sided
-    /// with the declared anchor.
-    pub fn in_error(e: &Error) -> Option<&AnchorFault> {
-        std::error::Error::source(e)?.downcast_ref()
-    }
+struct Discontinuity {
+    container: ContainerTs,
+    logical: LogicalTs,
 }
 
 /// One sampled RGB frame, already downscaled for composition.
@@ -157,13 +130,15 @@ pub enum SampleSpec {
 /// enough that a stalled consumer bounds memory at a few small frames.
 const CHANNEL_FRAMES: usize = 8;
 
-/// One message from the decode thread: a sampled frame, or the record of a
-/// frame the timeline gate dropped. Drops ride the same channel because the
-/// worker cannot borrow the caller's event sink across the thread boundary;
-/// [`FrameSource::next_frame`] turns them into events on the consumer side.
+/// One message from the decode thread: a sampled frame or a timeline
+/// signal (a dropped frame, a committed clock seam). Signals ride the same
+/// channel because the worker cannot borrow the caller's event sink across
+/// the thread boundary; [`FrameSource::next_frame`] turns them into events
+/// on the consumer side.
 enum Msg {
     Frame(RgbFrame),
-    Dropped { ts: f32, committed: Option<f32> },
+    Dropped { ts: f32, last: Option<f32> },
+    Discontinuity { container: f64, logical: f64 },
 }
 
 /// A stream of sampled frames decoded on a background thread.
@@ -182,8 +157,8 @@ pub struct FrameSource<'e> {
     stop: Stop,
     aspect: Option<f32>,
     done: bool,
-    /// Receives the first-drop warning ([`Event::UnplaceableTimestamp`]) and
-    /// the end-of-decode drop summary ([`Event::TimestampsDropped`]).
+    /// Receives the run's timeline signals: the first-drop warning, the
+    /// end-of-decode drop summary, and every committed clock seam.
     events: &'e dyn EventSink,
     /// Frames the decode pass dropped off the timeline so far.
     drops: u64,
@@ -198,7 +173,7 @@ impl<'e> FrameSource<'e> {
     /// precise error codes; mid-stream failures surface from `next_frame`.
     /// `events` receives a [`Event::SeekFallback`] when a seek to a window
     /// start fails and decoding degrades to a sequential read, then rides
-    /// along for the stream's lifetime to report timeline-gate drops (see
+    /// along for the stream's lifetime to report timeline signals (see
     /// [`FrameSource::next_frame`]).
     ///
     /// The [`Stop`] guarding this open is self-minted, not taken from the
@@ -214,56 +189,22 @@ impl<'e> FrameSource<'e> {
         threads: Option<NonZeroUsize>,
         events: &'e dyn EventSink,
     ) -> Result<Self> {
-        Self::open_anchored(input, spec, min_edge, threads, events, Anchor::Declared)
-    }
-
-    /// [`FrameSource::open`] with an explicit clock anchor — the door the
-    /// origin-rebase retry walks through.
-    ///
-    /// [`Anchor::Declared`] is byte-identical to [`FrameSource::open`].
-    /// [`Anchor::Rebased`] re-anchors the pass on the elected origin: every
-    /// logical timestamp and the window seek below are projected through
-    /// the corrected clock, and the plausible extent degrades to unbounded
-    /// — a container whose declared origin was voted down cannot be
-    /// trusted about its declared extent either (on MPEG-TS the duration
-    /// derives from the same poisoned pts extremes; a poisoned head was
-    /// observed to yield a 0.03s "duration" that would out-window every
-    /// legal frame). The monotone gate, the consecutive cap, and the EOF
-    /// audit still bound the damage, and a rebased pass that cannot form a
-    /// majority timeline stays a final [`ErrorCode::InputCorrupt`].
-    pub fn open_anchored(
-        input: &Source,
-        spec: SampleSpec,
-        min_edge: u32,
-        threads: Option<NonZeroUsize>,
-        events: &'e dyn EventSink,
-        anchor: Anchor,
-    ) -> Result<Self> {
         // Built before the container so it can ride into libav's interrupt
         // callback, arming every blocking I/O call in this context.
         let stop = Stop::new();
         let mut ictx = open_input(input, &stop, &[])?;
-        let mut video = best_video_stream(&ictx, input)?;
-        // The timeline gate's global anchor. Declared: read from the
-        // container header before any frame is decoded (a container that
-        // declares no duration leaves the extent unbounded and the gate
-        // falls back to purely local confirmation). Rebased: the elected
-        // origin replaces the clock and the extent is unbounded — see
-        // this constructor's contract.
-        let window = match anchor {
-            Anchor::Declared => {
-                PlausibleWindow::from_declared(duration_seconds(&ictx, input).ok())
-            }
-            Anchor::Rebased { origin } => {
-                video.timeline = Timeline::rebased(origin);
-                PlausibleWindow::from_declared(None)
-            }
-        };
+        let video = best_video_stream(&ictx, input)?;
+        // The declared duration seeds the segmenter's extent fence — a
+        // label prior, never a verdict (see [`Segmenter`]); a container
+        // that declares none leaves only the flat floor.
+        let duration = duration_seconds(&ictx, input).ok();
 
         // Seek before building the decoder so no flush is needed. The seek
         // speaks the container's absolute clock, so the logical 0-based
-        // `start` is projected through the timeline. An unseekable stream
-        // degrades to a decode-and-discard up to the sampler's first tick.
+        // `start` is projected through the timeline; this is exact only
+        // within the stream's first timeline segment (see the module docs).
+        // An unseekable stream degrades to a decode-and-discard up to the
+        // sampler's first tick.
         if let SampleSpec::Fps { start, .. } = &spec
             && *start > 0.0
         {
@@ -298,10 +239,6 @@ impl<'e> FrameSource<'e> {
             .map_err(|e| decode_error("opening video decoder", e).with_input(input.as_path()))?;
 
         let (tx, rx) = sync_channel(CHANNEL_FRAMES);
-        let clock = AnchorClock {
-            declared: video.timeline.origin(),
-            time_base: video.time_base,
-        };
         let stop_flag = stop.clone();
         let thread = std::thread::Builder::new()
             .name("agent-video-decode".into())
@@ -311,7 +248,7 @@ impl<'e> FrameSource<'e> {
                     video,
                     decoder,
                     gate: PacketGate::new(&spec),
-                    path: FramePath::new(spec, window, clock),
+                    path: FramePath::new(spec, duration),
                     rescaler: Rescaler::new(min_edge),
                     tx,
                     stop: stop_flag,
@@ -344,14 +281,12 @@ impl<'e> FrameSource<'e> {
 
     /// Read the next sampled frame, or `None` after a clean end of stream.
     ///
-    /// Frames arrive in non-decreasing timestamp order, within the stream's
-    /// declared extent ([`TimelineGate`]). Dropped frames are never silent:
-    /// the first drop emits [`Event::UnplaceableTimestamp`], a clean end of
-    /// stream with any drops emits [`Event::TimestampsDropped`], and a
-    /// timeline the gate cannot trust (see [`MAX_TS_OUTLIERS`]) surfaces
-    /// here as [`ErrorCode::InputCorrupt`] — carrying an [`AnchorFault`]
-    /// when the dropped frames' evidence indicts the clock anchor (the
-    /// origin-rebase election; see the module docs).
+    /// Frames arrive in non-decreasing *logical* timestamp order (see
+    /// [`Segmenter`]). Timeline trouble is signal, never verdict: the first
+    /// dropped frame emits [`Event::UnplaceableTimestamp`], a clean end of
+    /// stream with any drops emits [`Event::TimestampsDropped`], and every
+    /// committed clock seam emits [`Event::TimelineDiscontinuity`] — no
+    /// combination of timestamps alone produces an error here.
     ///
     /// A decode-thread panic surfaces here as an [`Error`] with
     /// [`ErrorCode::DecodeFailed`], never as a silently truncated stream —
@@ -372,14 +307,17 @@ impl<'e> FrameSource<'e> {
                     self.aspect = Some(w as f32 / h as f32);
                     return Ok(Some(frame));
                 }
-                Ok(Ok(Msg::Dropped { ts, committed })) => {
+                Ok(Ok(Msg::Dropped { ts, last })) => {
                     if self.drops == 0 {
-                        self.events.event(Event::UnplaceableTimestamp {
-                            ts,
-                            last: committed,
-                        });
+                        self.events.event(Event::UnplaceableTimestamp { ts, last });
                     }
                     self.drops += 1;
+                }
+                Ok(Ok(Msg::Discontinuity { container, logical })) => {
+                    self.events.event(Event::TimelineDiscontinuity {
+                        container_ts: container,
+                        logical_ts: logical,
+                    });
                 }
                 Ok(Err(e)) => {
                     self.done = true;
@@ -455,7 +393,7 @@ impl Drop for FrameSource<'_> {
 /// `start`.
 ///
 /// The grid state is a ratchet: once advanced it never rewinds, so the
-/// caller must feed non-decreasing timestamps. [`TimelineGate`] enforces
+/// caller must feed non-decreasing timestamps. [`Segmenter`] enforces
 /// that upstream; the saturation in [`Tick::wants`] is a float-rounding
 /// guard, not a corruption policy.
 struct Tick {
@@ -601,491 +539,565 @@ impl PacketGate {
     }
 }
 
-/// Ceiling shared by the gate's two failure counters. Below it, drops
-/// degrade the output (with signal); above it, the timeline is declared
-/// broken and the run fails — the same discipline as the demux-error cap
-/// in [`crate::media`].
-const MAX_TS_OUTLIERS: u32 = 64;
+/// Frames a candidate run must accumulate before it becomes (or replaces)
+/// the committed segment. Three defeats the observed one- and two-frame
+/// poisoned stream heads outright, bounds every false candidate's cost to
+/// two signaled frames (under 0.1s at 30 fps), and commits a real
+/// discontinuity within three frames of its seam.
+const SEGMENT_CONFIRM_FRAMES: usize = 3;
 
-/// Earliest plausible presentation timestamp, in seconds. Legitimate
-/// negative timestamps exist (edit-list pre-roll, priming frames) but stay
-/// within single seconds of zero; this bound is generous by an order of
-/// magnitude, so it only excludes wrap-around garbage.
-const EARLIEST_PLAUSIBLE_TS: f32 = -60.0;
+/// Floor of the in-segment forward fence, seconds — the previous
+/// paradigm's EOF jump floor, value and rationale unchanged: admits every
+/// sane inter-frame gap while keeping an unvouched forward jump below
+/// chunk scale.
+const FORWARD_FENCE_FLOOR: f64 = 10.0;
 
-/// Slack over the declared duration: `max = duration * FACTOR + SECONDS`.
-/// The slack covers header imprecision (rounded durations, files that grew
-/// after the header was written) — not corruption magnitude. Corruption
-/// that lands *inside* the slack is indistinguishable from a legal splice,
-/// and its damage is bounded by the extent the container itself declared.
-const EXTENT_SLACK_FACTOR: f32 = 2.0;
-const EXTENT_SLACK_SECONDS: f32 = 300.0;
+/// Extent-fence slack over the declared duration: `fence = duration ×
+/// FACTOR + SLACK` — the previous paradigm's plausible-extent slack,
+/// repurposed from a corruption verdict into a label prior. The slack
+/// covers header imprecision (rounded durations, files that grew after
+/// the header was written); on containers whose declared duration derives
+/// from pts extremes (MPEG-TS) corruption can widen the fence upward,
+/// never inward, so legal cadences always fit.
+const EXTENT_FENCE_FACTOR: f64 = 2.0;
+const EXTENT_FENCE_SLACK: f64 = 300.0;
 
-/// Unconfirmed forward reach granted to the final frame at EOF when the
-/// confirmed timeline never jumped itself, in seconds. The final frame has
-/// no successor to vouch for it, so *some* bound must exist — an unbounded
-/// release lets a single corrupt tail pts append a garbage chunk (and, on
-/// containers whose declared duration derives from pts extremes, the
-/// extent window cannot catch it). Ten seconds admits every sane
-/// inter-frame or inter-keyframe gap while capping what an unvouched tail
-/// can fabricate at below chunk scale.
-const EOF_JUMP_FLOOR: f32 = 10.0;
+/// Pre-roll allowance for the stream's first segment, seconds. Legitimate
+/// negative timestamps (edit-list pre-roll, priming frames) stay within
+/// single seconds of zero; a first segment opening below this bound means
+/// the declared origin was dragged (or the pts counter wrapped), and the
+/// segment is re-anchored at the stream head instead of trusted verbatim.
+const PREROLL_ALLOWANCE: f64 = -60.0;
 
-/// The stream's plausible presentation extent: the timeline gate's global
-/// anchor, resolved from the container's own declared duration before any
-/// frame is decoded.
-///
-/// Monotonicity is confirmable only locally — a successor vouches for
-/// order, and two corrupt frames can vouch for each other — so order alone
-/// cannot tell a legal timeline from a mutually-consistent corrupt one.
-/// Containment can: the container states its extent up front, and a
-/// corrupt pts (bit garbage, a wrapped 33-bit counter) lands orders of
-/// magnitude outside it. Frames outside the extent are dropped before they
-/// can be held, committed, or confirm anything; frames inside it are
-/// treated as content, because at that scale corruption is
-/// indistinguishable from a legal splice and bounded by the declared
-/// extent itself.
-///
-/// Two honest degradations: a container that declares no duration
-/// (fragmented MP4, raw streams) leaves the extent unbounded above, and a
-/// container whose declared duration is itself computed from pts extremes
-/// (MPEG-TS) can be widened *upward* by the very corruption — never
-/// inward — so legal frames always stay plausible and the residual risk is
-/// admitting in-extent corruption, which the monotone gate, the failure
-/// counters, and the EOF jump rule still bound.
+/// Nominal inter-frame gap before any is observed, seconds (25 fps).
+/// Seeds the seam width and the jitter bound for keyframe-paced decodes
+/// until the first released delta replaces it.
+const FALLBACK_NOMINAL_GAP: f64 = 0.04;
+
+/// One committed span of the logical timeline: a run of frames whose
+/// container timestamps advanced plausibly. `logical = container + shift`;
+/// the first segment of a well-anchored stream has `shift == 0.0` exactly,
+/// so a single-segment file — every normal file — reproduces the container
+/// clock bit for bit.
 #[derive(Debug, Clone, Copy)]
-struct PlausibleWindow {
-    max: f32,
+struct Segment {
+    shift: f64,
+    /// Container ts of the last frame this segment released.
+    last: ContainerTs,
 }
 
-impl PlausibleWindow {
-    fn from_declared(duration: Option<f32>) -> Self {
-        Self {
-            max: duration.map_or(f32::INFINITY, |d| {
-                d.max(0.0) * EXTENT_SLACK_FACTOR + EXTENT_SLACK_SECONDS
-            }),
+impl Segment {
+    /// The segment for a confirmed run starting at `first`, projected so
+    /// its first frame lands on `anchor`. `anchor == first` yields the
+    /// exact identity: IEEE subtraction of equal finite values is `0.0`,
+    /// and adding `0.0` never changes a finite timestamp.
+    fn anchored(anchor: f64, first: ContainerTs) -> Segment {
+        Segment {
+            shift: anchor - first.0,
+            last: first,
         }
     }
 
-    fn contains(self, ts: Ts) -> bool {
-        (EARLIEST_PLAUSIBLE_TS..=self.max).contains(&ts.get())
+    /// Project a container timestamp onto the logical clock.
+    fn project(&self, ts: ContainerTs) -> LogicalTs {
+        LogicalTs(ts.0 + self.shift)
+    }
+}
+
+/// A run of frames awaiting confirmation: the head of the stream before
+/// any segment is confirmed, or a challenger opened by a discontinuity
+/// candidate. Non-empty by construction, bounded by
+/// [`SEGMENT_CONFIRM_FRAMES`]; the frames are owned here until they are
+/// released into a segment or dropped wholesale — no third fate exists.
+struct Buffered {
+    frames: Vec<(ContainerTs, ffmpeg::frame::Video)>,
+}
+
+impl Buffered {
+    fn new(ts: ContainerTs, frame: ffmpeg::frame::Video) -> Buffered {
+        Buffered {
+            frames: vec![(ts, frame)],
+        }
+    }
+
+    fn push(&mut self, ts: ContainerTs, frame: ffmpeg::frame::Video) {
+        self.frames.push((ts, frame));
+    }
+
+    fn first(&self) -> ContainerTs {
+        self.frames.first().expect("buffered runs are non-empty").0
+    }
+
+    fn last(&self) -> ContainerTs {
+        self.frames.last().expect("buffered runs are non-empty").0
+    }
+
+    fn len(&self) -> usize {
+        self.frames.len()
+    }
+}
+
+/// The committed side of the segmenter: the stream head still gathering
+/// its first confirmation, or a confirmed segment streaming frames.
+enum Current {
+    Head(Buffered),
+    Confirmed(Segment),
+}
+
+/// Segmenter state. A challenger can only exist alongside a current run:
+/// "challenger with nothing to challenge" is not representable.
+enum State {
+    /// No frame seen yet.
+    Unopened,
+    Open {
+        current: Current,
+        /// A candidate run contradicting `current`, gathering confirmation.
+        challenger: Option<Buffered>,
+    },
+}
+
+/// What one segmenter step yielded. Drops precede releases: a killed
+/// challenger's frames fell off the timeline before the step's releases
+/// continued it.
+#[derive(Default)]
+struct SegStep {
+    /// Frames released onto the logical clock, in order.
+    released: Vec<(LogicalTs, ffmpeg::frame::Video)>,
+    /// Container timestamps of frames dropped off the timeline.
+    dropped: Vec<ContainerTs>,
+    /// A clock seam committed by this step.
+    cut: Option<Discontinuity>,
+}
+
+/// Drop a whole buffered run off the timeline, one signal per frame.
+fn drop_run(buf: Buffered, step: &mut SegStep) {
+    step.dropped.extend(buf.frames.into_iter().map(|(ts, _)| ts));
+}
+
+/// Cuts the container clock into monotone segments and projects them onto
+/// one continuous logical clock.
+///
+/// The paradigm: there is no ground truth separating a broken clock from a
+/// legal discontinuity (MPEG-TS PCR jumps, 26.5-hour pts wrap-arounds, and
+/// spliced clock domains are all legal), so nothing here passes verdicts
+/// on the input. Frames are content; timestamps are labels; a wrong
+/// threshold mislabels a seam instead of losing content.
+///
+/// Three local heuristics decide where segments end, all bounded, none
+/// fatal:
+///
+/// - A backward jump beyond the jitter bound (twice the nominal frame gap
+///   — the depth B-frame reordering can jitter presentation order) opens a
+///   challenger; a backward step within it is decoder noise and drops that
+///   frame with a signal, as the previous paradigm did.
+/// - A forward jump beyond the fence (`max(`[`FORWARD_FENCE_FLOOR`]`, 2 ×`
+///   the largest released gap`)` — the previous EOF rule generalized to
+///   every frame) opens a challenger; smaller forward gaps are legal
+///   pacing (timelapse splices, keyframe cadence) and pass through.
+/// - Runs without released precedent — the stream head and every
+///   challenger — fence instead against the declared extent
+///   ([`EXTENT_FENCE_FACTOR`]`/`[`EXTENT_FENCE_SLACK`]), so a keyframe-only
+///   decode teaches itself minute-scale cadence at the head while a
+///   far-future poisoned timestamp still cannot join any run.
+///
+/// A challenger must gather [`SEGMENT_CONFIRM_FRAMES`] frames to commit.
+/// Committing seals the current segment at its last released instant and
+/// continues the logical clock one nominal gap later (a
+/// [`Discontinuity`]); a challenger contradicted first is dropped whole,
+/// with signals, at most `SEGMENT_CONFIRM_FRAMES - 1` frames each. That
+/// bound is what keeps alternating poisoned timestamps from shredding the
+/// stream: the poisoned half dies challenger by challenger while the legal
+/// half streams on uninterrupted.
+///
+/// The first confirmed segment projects identically (`shift == 0`) when it
+/// opens within [`PREROLL_ALLOWANCE`]; below that — a poisoned head packet
+/// dragged the container's declared start, so legal content rebased far
+/// negative — it re-anchors at the first container timestamp the stream
+/// produced, giving content sane labels without any global verdict on
+/// which clock was "right".
+///
+/// Owned by the decode thread alone; only released frames and signals
+/// cross the channel. Infallible by design: timestamps relabel or drop
+/// frames with signals, they never construct an error.
+struct Segmenter {
+    state: State,
+    /// The first container ts the stream produced: the re-anchor point for
+    /// a first segment that opens outside the pre-roll allowance.
+    stream_head: Option<ContainerTs>,
+    /// Forward fence for runs without released precedent, from the
+    /// declared extent.
+    extent_fence: f64,
+    /// Last released in-segment gap: the seam width and the jitter scale.
+    /// In a keyframe-only decode this is the keyframe cadence, so the
+    /// jitter bound scales with it — a small backward resync there costs a
+    /// frame or two (signaled) instead of a seam.
+    nominal_gap: f64,
+    /// Largest released in-segment gap: the forward fence's precedent.
+    /// Learning is capped at the extent fence so a confirmed challenger
+    /// carrying a corrupt gap cannot widen the fence without bound.
+    max_released_gap: f64,
+    /// Highest logical instant released — the monotonicity invariant,
+    /// stated where it is produced.
+    #[cfg(debug_assertions)]
+    watermark: f64,
+}
+
+impl Segmenter {
+    fn new(duration: Option<f32>, nominal_gap: f64) -> Segmenter {
+        let declared = duration
+            .map(f64::from)
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .unwrap_or(0.0);
+        Segmenter {
+            state: State::Unopened,
+            stream_head: None,
+            extent_fence: declared * EXTENT_FENCE_FACTOR + EXTENT_FENCE_SLACK,
+            nominal_gap,
+            max_released_gap: 0.0,
+            #[cfg(debug_assertions)]
+            watermark: f64::NEG_INFINITY,
+        }
+    }
+
+    /// Feed the next decoded frame; get back the frames it released, the
+    /// frames it dropped, and any clock seam it committed.
+    fn admit(&mut self, ts: ContainerTs, frame: ffmpeg::frame::Video) -> SegStep {
+        let mut step = SegStep::default();
+        if self.stream_head.is_none() {
+            self.stream_head = Some(ts);
+        }
+        // Work on the state by value: every arm builds the successor state
+        // whole, so a half-transitioned segmenter cannot be observed.
+        match std::mem::replace(&mut self.state, State::Unopened) {
+            State::Unopened => {
+                self.state = State::Open {
+                    current: Current::Head(Buffered::new(ts, frame)),
+                    challenger: None,
+                };
+            }
+            State::Open { current, challenger } => {
+                self.state = self.step(current, challenger, ts, frame, &mut step);
+            }
+        }
+        step
+    }
+
+    /// End of stream. An unconfirmed challenger is dropped — the same rule
+    /// as mid-stream: an unvouched tail cannot commit a seam. An
+    /// unconfirmed head is the whole stream (nothing ever contradicted
+    /// it), so it confirms: a two-frame video is content, not a fragment.
+    fn finish(&mut self) -> SegStep {
+        let mut step = SegStep::default();
+        if let State::Open { current, challenger } =
+            std::mem::replace(&mut self.state, State::Unopened)
+        {
+            if let Some(ch) = challenger {
+                drop_run(ch, &mut step);
+            }
+            if let Current::Head(buf) = current {
+                self.confirm_first(buf, &mut step);
+            }
+        }
+        step
+    }
+
+    /// One step of an opened stream: route the frame to the run it
+    /// continues, or make it the new challenger. Returns the successor
+    /// state.
+    fn step(
+        &mut self,
+        current: Current,
+        challenger: Option<Buffered>,
+        ts: ContainerTs,
+        frame: ffmpeg::frame::Video,
+        step: &mut SegStep,
+    ) -> State {
+        if self.fits_current(&current, ts) {
+            // The established run continues: a pending challenger was a
+            // blip (an isolated poisoned run) and dies with a signal.
+            if let Some(ch) = challenger {
+                drop_run(ch, step);
+            }
+            State::Open {
+                current: self.advance(current, ts, frame, step),
+                challenger: None,
+            }
+        } else if challenger.as_ref().is_some_and(|ch| self.fits_run(ch, ts)) {
+            let mut ch = challenger.expect("checked by is_some_and");
+            ch.push(ts, frame);
+            if ch.len() < SEGMENT_CONFIRM_FRAMES {
+                State::Open {
+                    current,
+                    challenger: Some(ch),
+                }
+            } else {
+                State::Open {
+                    current: Current::Confirmed(self.commit(current, ch, step)),
+                    challenger: None,
+                }
+            }
+        } else {
+            // Fits nothing: this frame opens the (replacement) challenger.
+            if let Some(old) = challenger {
+                drop_run(old, step);
+            }
+            State::Open {
+                current,
+                challenger: Some(Buffered::new(ts, frame)),
+            }
+        }
+    }
+
+    /// Whether `ts` continues the committed run.
+    fn fits_current(&self, current: &Current, ts: ContainerTs) -> bool {
+        match current {
+            Current::Head(buf) => self.fits_run(buf, ts),
+            Current::Confirmed(seg) => {
+                let gap = ts.0 - seg.last.0;
+                (-self.jitter()..=self.fence()).contains(&gap)
+            }
+        }
+    }
+
+    /// Whether `ts` continues an unconfirmed run: monotone, within the
+    /// extent fence (no released precedent exists to fence with).
+    fn fits_run(&self, buf: &Buffered, ts: ContainerTs) -> bool {
+        let gap = ts.0 - buf.last().0;
+        (0.0..=self.extent_fence).contains(&gap)
+    }
+
+    /// Backward tolerance inside a confirmed segment: ~2 frame durations,
+    /// the depth B-frame reordering can jitter presentation order.
+    fn jitter(&self) -> f64 {
+        2.0 * self.nominal_gap
+    }
+
+    /// Forward fence inside a confirmed segment: twice the largest jump
+    /// the stream itself released, floored at [`FORWARD_FENCE_FLOOR`].
+    fn fence(&self) -> f64 {
+        FORWARD_FENCE_FLOOR.max(2.0 * self.max_released_gap)
+    }
+
+    /// Advance the committed run with a frame that fits it.
+    fn advance(
+        &mut self,
+        current: Current,
+        ts: ContainerTs,
+        frame: ffmpeg::frame::Video,
+        step: &mut SegStep,
+    ) -> Current {
+        match current {
+            Current::Head(mut buf) => {
+                buf.push(ts, frame);
+                if buf.len() < SEGMENT_CONFIRM_FRAMES {
+                    Current::Head(buf)
+                } else {
+                    Current::Confirmed(self.confirm_first(buf, step))
+                }
+            }
+            Current::Confirmed(mut seg) => {
+                if ts < seg.last {
+                    // Backward within the jitter bound: decoder noise, not
+                    // a discontinuity — drop the frame, keep the segment.
+                    step.dropped.push(ts);
+                } else {
+                    self.release(&mut seg, ts, frame, step);
+                }
+                Current::Confirmed(seg)
+            }
+        }
+    }
+
+    /// Confirm the stream's first segment: identity within the pre-roll
+    /// allowance, re-anchored at the stream head otherwise (a dragged
+    /// declared origin — see the type docs).
+    fn confirm_first(&mut self, buf: Buffered, step: &mut SegStep) -> Segment {
+        let first = buf.first();
+        let anchor = if first.0 >= PREROLL_ALLOWANCE {
+            first.0
+        } else {
+            self.stream_head
+                .expect("set on the first admitted frame")
+                .0
+        };
+        self.open_segment(Segment::anchored(anchor, first), buf, step)
+    }
+
+    /// Commit a confirmed challenger: seal the current run and continue
+    /// the logical clock one nominal gap past its last released instant.
+    fn commit(&mut self, current: Current, ch: Buffered, step: &mut SegStep) -> Segment {
+        match current {
+            // The head never confirmed: its short run is dropped whole
+            // (with signals) and the challenger becomes the stream's first
+            // segment. No seam is announced — there is no committed clock
+            // to seam from.
+            Current::Head(buf) => {
+                drop_run(buf, step);
+                self.confirm_first(ch, step)
+            }
+            Current::Confirmed(seg) => {
+                let seam = seg.project(seg.last).0 + self.nominal_gap;
+                let first = ch.first();
+                step.cut = Some(Discontinuity {
+                    container: first,
+                    logical: LogicalTs(seam),
+                });
+                self.open_segment(Segment::anchored(seam, first), ch, step)
+            }
+        }
+    }
+
+    /// Release a confirmed run into `seg`, oldest first.
+    fn open_segment(&mut self, mut seg: Segment, buf: Buffered, step: &mut SegStep) -> Segment {
+        let mut frames = buf.frames.into_iter();
+        let (first, frame) = frames.next().expect("buffered runs are non-empty");
+        debug_assert!(first == seg.last, "a segment opens at its first frame");
+        self.emit(&seg, first, frame, step);
+        for (ts, frame) in frames {
+            self.release(&mut seg, ts, frame, step);
+        }
+        seg
+    }
+
+    /// Release one frame into `seg`, learning its gap statistics.
+    fn release(
+        &mut self,
+        seg: &mut Segment,
+        ts: ContainerTs,
+        frame: ffmpeg::frame::Video,
+        step: &mut SegStep,
+    ) {
+        let gap = ts.0 - seg.last.0;
+        debug_assert!(gap >= 0.0, "in-segment releases are monotone");
+        // Precedent learning is capped at the extent fence: a confirmed
+        // challenger may legally carry a large gap, but nothing beyond the
+        // declared extent may widen future fences.
+        if gap > 0.0 && gap <= self.extent_fence {
+            self.nominal_gap = gap;
+            self.max_released_gap = self.max_released_gap.max(gap);
+        }
+        seg.last = ts;
+        self.emit(seg, ts, frame, step);
+    }
+
+    fn emit(
+        &mut self,
+        seg: &Segment,
+        ts: ContainerTs,
+        frame: ffmpeg::frame::Video,
+        step: &mut SegStep,
+    ) {
+        let logical = seg.project(ts);
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                logical.0 >= self.watermark,
+                "the logical clock never rewinds"
+            );
+            self.watermark = logical.0;
+        }
+        step.released.push((logical, frame));
     }
 }
 
 /// One dropped frame's identity, reported downstream as a diagnostic.
 #[derive(Debug, Clone, Copy)]
 struct Unplaced {
-    ts: Ts,
-    committed: Option<Ts>,
+    /// Container timestamp of the dropped frame.
+    ts: f32,
+    /// Last released logical timestamp, when any.
+    last: Option<f32>,
 }
 
-/// A decoded frame's identity at the gate: the logical timestamp the
-/// pipeline speaks and the original stream pts it was minted from. The pts
-/// rides along so a dropped frame's evidence survives verbatim in the
-/// anchor election ([`DropRing`]) — logical seconds are `f32` and already
-/// relative to the possibly-poisoned origin; the raw pts is neither.
-#[derive(Debug, Clone, Copy)]
-struct Stamp {
-    ts: Ts,
-    pts: i64,
-}
-
-/// The conversion facts the gate needs to express an elected origin on the
-/// container's absolute clock: the origin this pass trusted (seconds) and
-/// the stream's seconds per pts unit.
-#[derive(Debug, Clone, Copy)]
-struct AnchorClock {
-    declared: f64,
-    time_base: f64,
-}
-
-/// The original pts of the frames the gate dropped, ring-bounded at
-/// [`MAX_TS_OUTLIERS`] entries — the same ceiling that bounds the gate's
-/// failure counters bounds its evidence, so the buffer is saturated by the
-/// time any counter can trip.
-struct DropRing {
-    pts: Vec<i64>,
-    /// Overwrite cursor once the ring is full: index of the oldest entry.
-    next: usize,
-}
-
-impl DropRing {
-    fn new() -> Self {
-        Self {
-            pts: Vec::new(),
-            next: 0,
-        }
-    }
-
-    fn record(&mut self, pts: i64) {
-        if self.pts.len() < MAX_TS_OUTLIERS as usize {
-            self.pts.push(pts);
-        } else {
-            self.pts[self.next] = pts;
-            self.next = (self.next + 1) % self.pts.len();
-        }
-    }
-
-    /// The retained drops, oldest first.
-    fn in_order(&self) -> Vec<i64> {
-        let (tail, head) = self.pts.split_at(self.next);
-        head.iter().chain(tail).copied().collect()
-    }
-}
-
-/// A monotone chain elected from dropped pts: its first element (the
-/// candidate origin) and its length (its vote weight).
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Chain {
-    head: i64,
-    len: u64,
-}
-
-/// The longest non-decreasing chain (subsequence) in `pts`, which must be
-/// in arrival order. Ties prefer the earliest head — the more conservative
-/// origin, keeping every chain member at a non-negative logical time.
-/// O(n²) dynamic programming; `pts` is ring-bounded at
-/// [`MAX_TS_OUTLIERS`] entries.
-fn monotone_chain(pts: &[i64]) -> Option<Chain> {
-    // best[i]: the strongest chain ending at pts[i].
-    let mut best: Vec<Chain> = Vec::with_capacity(pts.len());
-    for (i, &x) in pts.iter().enumerate() {
-        let mut b = Chain { head: x, len: 1 };
-        for j in 0..i {
-            if pts[j] <= x {
-                let c = Chain {
-                    head: best[j].head,
-                    len: best[j].len + 1,
-                };
-                if c.len > b.len || (c.len == b.len && c.head < b.head) {
-                    b = c;
-                }
-            }
-        }
-        best.push(b);
-    }
-    best.into_iter()
-        .reduce(|a, b| match (b.len > a.len, b.len == a.len && b.head < a.head) {
-            (true, _) | (false, true) => b,
-            _ => a,
-        })
-}
-
-/// What one gate step yielded: at most one released frame and at most one
-/// drop record; both `None` when the frame was held.
-struct GateStep {
-    release: Option<(Ts, ffmpeg::frame::Video)>,
-    dropped: Option<Unplaced>,
-}
-
-impl GateStep {
-    fn hold() -> Self {
-        Self {
-            release: None,
-            dropped: None,
-        }
-    }
-}
-
-/// Admits decoded frames onto a monotone timeline inside the stream's
-/// declared extent ([`PlausibleWindow`]).
-///
-/// A frame outside the extent is dropped immediately: it can never be
-/// held, never commit the timeline, and never confirm another frame — so
-/// mutually-vouching corrupt pairs die at the anchor instead of hijacking
-/// `committed`. A frame inside the extent is released one frame late, once
-/// its successor confirms it (`successor ts >= its ts`). An in-extent
-/// outlier is identifiable only in retrospect, by three points — the
-/// committed timeline `c` (last released ts), the held frame `h`, and the
-/// newcomer `n`:
-///
-/// - `n >= h`: the stream vouches for `h`; release it. A legitimate
-///   forward jump (splice, timelapse gap) is exactly this case.
-/// - `c <= n < h`: `n` continues the committed timeline, so `h` was the
-///   outlier; drop `h`.
-/// - `n < c`: `n` fell behind frames already released; drop `n`.
-///
-/// At the stream head (`committed == None`) two contradicting points
-/// genuinely cannot be attributed; the gate sides with the successor and
-/// *accounts* the drop — the honest contract is a conservative pass with a
-/// signal, not a guess dressed up as knowledge. The extent anchor makes
-/// this ambiguity rare (real head corruption is usually out of extent),
-/// and the damage is one frame either way.
-///
-/// Failure accounting distinguishes what a drop means:
-///
-/// - `implausible` (out of extent): certainly corrupt; dropping them loses
-///   no placeable content, so they only feed the consecutive counter and
-///   the end-of-stream sanity check.
-/// - `conflicted` (in extent): frames that *could* have been content. When
-///   they exceed [`MAX_TS_OUTLIERS`] *and* reach a third of all placeable
-///   frames (`2 * conflicted >= released`), the output's completeness is
-///   no longer vouched for and the run fails — alternating corruption can
-///   no longer buy unlimited silent drops with interleaved releases.
-/// - `consecutive` (either kind, reset by every release): a timeline that
-///   never recovers — e.g. a poisoned `committed` shadowing every later
-///   legal frame — fails fast instead of draining the stream.
-///
-/// All failures are [`ErrorCode::InputCorrupt`]; every drop below the
-/// thresholds is reported to the consumer (see [`Msg::Dropped`]), so
-/// degraded output is never silent. Every dropped frame's original pts is
-/// additionally retained in a [`DropRing`]; a failure verdict holds the
-/// anchor election over that evidence ([`TimelineGate::elect`]) and, when
-/// it passes, carries the resulting [`AnchorFault`] to the retry layer.
-struct TimelineGate {
-    window: PlausibleWindow,
-    /// Converts elected raw pts back onto the container's absolute clock.
-    clock: AnchorClock,
-    /// The frame awaiting its successor's confirmation.
-    held: Option<(Stamp, ffmpeg::frame::Video)>,
-    /// Timestamp of the last released frame: the committed timeline.
-    committed: Option<Ts>,
-    /// Consecutive drops since the last release.
-    consecutive: u32,
-    /// Cumulative in-extent drops: frames that could have been content.
-    conflicted: u64,
-    /// Cumulative out-of-extent drops: certainly-corrupt timestamps.
-    implausible: u64,
-    /// Cumulative released frames.
-    released: u64,
-    /// Largest forward gap between consecutively released frames: the
-    /// stream's own jump precedent, consulted by the EOF release rule.
-    max_released_gap: f32,
-    /// Original pts of every dropped frame (most recent
-    /// [`MAX_TS_OUTLIERS`]): the anchor election's evidence.
-    drops: DropRing,
-}
-
-impl TimelineGate {
-    fn new(window: PlausibleWindow, clock: AnchorClock) -> Self {
-        Self {
-            window,
-            clock,
-            held: None,
-            committed: None,
-            consecutive: 0,
-            conflicted: 0,
-            implausible: 0,
-            released: 0,
-            max_released_gap: 0.0,
-            drops: DropRing::new(),
-        }
-    }
-
-    /// Feed the next decoded frame; get back its confirmed predecessor when
-    /// that predecessor earned release, the drop record when a frame fell
-    /// off the timeline, or the failure verdict.
-    fn admit(&mut self, stamp: Stamp, frame: ffmpeg::frame::Video) -> Result<GateStep> {
-        let ts = stamp.ts;
-        if !self.window.contains(ts) {
-            self.implausible += 1;
-            return self.charge(stamp);
-        }
-        let Some((held, held_frame)) = self.held.take() else {
-            self.held = Some((stamp, frame));
-            return Ok(GateStep::hold());
-        };
-        if ts >= held.ts {
-            self.held = Some((stamp, frame));
-            Ok(GateStep {
-                release: Some(self.release(held.ts, held_frame)),
-                dropped: None,
-            })
-        } else if self.committed.is_some_and(|c| ts < c) {
-            // The newcomer fell behind released frames: it is the outlier.
-            self.held = Some((held, held_frame));
-            self.conflicted += 1;
-            self.charge(stamp)
-        } else {
-            // The newcomer continues the committed timeline (or no timeline
-            // is committed yet — the unattributable stream head): the held
-            // frame it contradicts was the outlier.
-            self.held = Some((stamp, frame));
-            self.conflicted += 1;
-            self.charge(held)
-        }
-    }
-
-    /// End of stream: the final frame has no successor to vouch for it.
-    /// Release it only when it stays within the stream's own jump
-    /// precedent; an unvouched jump beyond precedent is dropped (with
-    /// signal) rather than fabricating timeline the stream never showed.
-    /// Then verify the whole pass: more drops than releases means the
-    /// timestamps were garbage wholesale, not scattered noise.
-    fn finish(&mut self) -> Result<GateStep> {
-        let step = match self.held.take() {
-            None => GateStep::hold(),
-            Some((stamp, frame)) => match self.committed {
-                Some(c) if stamp.ts.get() - c.get() > self.eof_allowance() => {
-                    self.conflicted += 1;
-                    self.charge(stamp)?
-                }
-                _ => GateStep {
-                    release: Some(self.release(stamp.ts, frame)),
-                    dropped: None,
-                },
-            },
-        };
-        let dropped = self.conflicted + self.implausible;
-        if dropped > self.released {
-            return Err(self.corrupt(format!(
-                "{dropped} of {} decoded frames fell off the plausible timeline; \
-                 the input's timestamps are broken",
-                dropped + self.released
-            )));
-        }
-        Ok(step)
-    }
-
-    /// Unconfirmed forward reach granted at EOF: twice the largest jump the
-    /// confirmed timeline itself exhibited, floored at [`EOF_JUMP_FLOOR`].
-    /// A stream that spliced before may splice at its end; one that never
-    /// jumped cannot suddenly do so on its very last, unvouched frame.
-    fn eof_allowance(&self) -> f32 {
-        (2.0 * self.max_released_gap).max(EOF_JUMP_FLOOR)
-    }
-
-    fn release(&mut self, ts: Ts, frame: ffmpeg::frame::Video) -> (Ts, ffmpeg::frame::Video) {
-        if let Some(c) = self.committed {
-            self.max_released_gap = self.max_released_gap.max(ts.get() - c.get());
-        }
-        self.committed = Some(ts);
-        self.consecutive = 0;
-        self.released += 1;
-        (ts, frame)
-    }
-
-    /// Account one dropped frame and pass verdict on the counters.
-    fn charge(&mut self, offending: Stamp) -> Result<GateStep> {
-        self.drops.record(offending.pts);
-        self.consecutive += 1;
-        if self.consecutive > MAX_TS_OUTLIERS {
-            return Err(self.corrupt(format!(
-                "{} consecutive frames off the timeline (last released {:?}, \
-                 offending {}); the input's timeline never recovers",
-                self.consecutive,
-                self.committed.map(Ts::get),
-                offending.ts.get()
-            )));
-        }
-        if self.conflicted > u64::from(MAX_TS_OUTLIERS) && 2 * self.conflicted >= self.released {
-            return Err(self.corrupt(format!(
-                "{} of {} plausible frames conflicted with the timeline \
-                 (last released {:?}); the input's timeline is untrustworthy",
-                self.conflicted,
-                self.conflicted + self.released,
-                self.committed.map(Ts::get)
-            )));
-        }
-        Ok(GateStep {
-            release: None,
-            dropped: Some(Unplaced {
-                ts: offending.ts,
-                committed: self.committed,
-            }),
-        })
-    }
-
-    /// A timeline failure, carrying the anchor election when it passes.
-    fn corrupt(&self, reason: String) -> Error {
-        let err = Error::new(ErrorCode::InputCorrupt, reason);
-        match self.elect() {
-            Some(fault) => err.with_source(fault),
-            None => err,
-        }
-    }
-
-    /// The anchor election over this pass's evidence: `Some` exactly when
-    /// the dropped frames' original pts form a monotone chain longer than
-    /// the released count — the rejected timeline is more self-consistent
-    /// than the accepted one, so the failure indicts the anchor, not the
-    /// frames. Threshold-free by design: a majority vote between the two
-    /// timelines the pass actually observed.
-    fn elect(&self) -> Option<AnchorFault> {
-        let chain = monotone_chain(&self.drops.in_order())?;
-        (chain.len > self.released).then_some(AnchorFault {
-            declared: self.clock.declared,
-            elected: chain.head as f64 * self.clock.time_base,
-        })
-    }
-}
-
-/// The verdict path between one decoded frame and the channel — timeline
-/// gate, range-end stop, sampler — composed exactly as the worker runs
-/// them. Pure over `(ts, frame)` pairs; the worker adds only scaling and
-/// sending, so the whole admission path (including the EOF release) is
+/// The verdict path between one decoded frame and the channel — segmenter,
+/// range-end stop, sampler — composed exactly as the worker runs them.
+/// Pure over `(ts, frame)` pairs; the worker adds only scaling and
+/// sending, so the whole admission path (including the EOF flush) is
 /// testable without a decoder.
 struct FramePath {
-    gate: TimelineGate,
+    seg: Segmenter,
     sampler: Sampler,
-    /// Stop decoding once the released timeline confirmably reaches this
-    /// bound (range sampling).
+    /// Stop decoding once the released logical clock reaches this bound
+    /// (range sampling). Released instants are non-decreasing by
+    /// construction, so the first release at or past the end is final.
     end: Option<f32>,
-    /// One released frame has reached `end`; the next released frame
-    /// confirms the stop. Stopping is irreversible and unsignaled, so it
-    /// demands the same standard as a release plus one: released
-    /// timestamps are non-decreasing, so a second released frame past the
-    /// end cannot be the mutually-vouched half of an isolated corrupt
-    /// pair — that pair's survivor stays held and is contradicted by the
-    /// next legal frame instead of truncating the range.
-    past_end: bool,
+    /// Last released logical instant — context for drop reports.
+    last: Option<f32>,
 }
 
 /// What the worker must do after feeding one frame (or EOF) to the path.
+#[derive(Default)]
 struct Step {
-    /// Sampler-approved frame to scale and send.
-    send: Option<(Ts, ffmpeg::frame::Video)>,
-    /// A frame dropped off the timeline, to report downstream.
-    dropped: Option<Unplaced>,
-    /// The released timeline has confirmably passed the range end.
+    /// Sampler-approved frames to scale and send, in logical order.
+    send: Vec<(Ts, ffmpeg::frame::Video)>,
+    /// Frames dropped off the timeline, to report downstream.
+    dropped: Vec<Unplaced>,
+    /// A committed clock seam, to report downstream.
+    cut: Option<Discontinuity>,
+    /// The released logical clock reached the range end.
     stop: bool,
 }
 
 impl FramePath {
-    fn new(spec: SampleSpec, window: PlausibleWindow, clock: AnchorClock) -> Self {
+    fn new(spec: SampleSpec, duration: Option<f32>) -> Self {
         let end = match &spec {
             SampleSpec::Fps { end, .. } => *end,
             _ => None,
         };
+        // The segmenter's initial nominal gap: the tick step when fps is
+        // known, the fallback for keyframe-paced decodes — both only until
+        // the first released delta replaces them.
+        let gap = match &spec {
+            SampleSpec::Fps { fps, .. } | SampleSpec::Mixed { fps, .. } => 1.0 / f64::from(*fps),
+            SampleSpec::Keyframes => FALLBACK_NOMINAL_GAP,
+        };
         Self {
-            gate: TimelineGate::new(window, clock),
+            seg: Segmenter::new(duration, gap),
             sampler: Sampler::new(spec),
             end,
-            past_end: false,
+            last: None,
         }
     }
 
-    fn admit(&mut self, stamp: Stamp, frame: ffmpeg::frame::Video) -> Result<Step> {
-        let gate = self.gate.admit(stamp, frame)?;
-        Ok(self.place(gate))
+    fn admit(&mut self, ts: ContainerTs, frame: ffmpeg::frame::Video) -> Step {
+        let seg = self.seg.admit(ts, frame);
+        self.place(seg)
     }
 
-    /// End of stream: release what the gate still holds (subject to its
-    /// EOF rule) through the same range-end/sampler path as any other
-    /// frame.
-    fn finish(&mut self) -> Result<Step> {
-        let gate = self.gate.finish()?;
-        Ok(self.place(gate))
+    /// End of stream: flush what the segmenter still buffers through the
+    /// same range-end/sampler path as any other frame.
+    fn finish(&mut self) -> Step {
+        let seg = self.seg.finish();
+        self.place(seg)
     }
 
-    fn place(&mut self, gate: GateStep) -> Step {
+    fn place(&mut self, seg: SegStep) -> Step {
         let mut step = Step {
-            send: None,
-            dropped: gate.dropped,
-            stop: false,
+            cut: seg.cut,
+            ..Step::default()
         };
-        let Some((ts, frame)) = gate.release else {
-            return step;
-        };
-        if let Some(end) = self.end
-            && ts.get() >= end
-        {
-            step.stop = self.past_end;
-            self.past_end = true;
-            return step;
+        for ts in seg.dropped {
+            step.dropped.push(Unplaced {
+                ts: ts.0 as f32,
+                last: self.last,
+            });
         }
-        if self.sampler.wants(ts.get(), frame.is_key()) {
-            step.send = Some((ts, frame));
+        for (logical, frame) in seg.released {
+            // `f32` overflow of a fenced logical instant is unreachable;
+            // the finite-by-type boundary skips rather than panics.
+            let Some(ts) = logical.to_ts() else { continue };
+            self.last = Some(ts.get());
+            if let Some(end) = self.end
+                && ts.get() >= end
+            {
+                // Monotone releases: everything from here on is past the
+                // end. Stop without sending.
+                step.stop = true;
+                continue;
+            }
+            if self.sampler.wants(ts.get(), frame.is_key()) {
+                step.send.push((ts, frame));
+            }
         }
         step
     }
@@ -1098,9 +1110,9 @@ struct Worker {
     decoder: ffmpeg::decoder::Video,
     /// Demux-level packet gate: what it rejects never reaches the decoder.
     gate: PacketGate,
-    /// Frame-level admission: timeline gate → range end → sampler. What it
-    /// sends is non-decreasing and in-extent by construction; what it drops
-    /// is reported through the channel.
+    /// Frame-level admission: segmenter → range end → sampler. What it
+    /// sends is monotone on the logical clock by construction; what it
+    /// drops or relabels is reported through the channel.
     path: FramePath,
     rescaler: Rescaler,
     tx: SyncSender<std::result::Result<Msg, Error>>,
@@ -1174,10 +1186,10 @@ impl Worker {
             Err(e) => return Err(decode_error("flushing decoder at end of stream", e)),
         }
         self.drain()?;
-        // The last decoded frame has no successor to vouch for it; the
-        // gate's EOF rule decides whether it is released or dropped, and
-        // the whole pass's drop accounting is verified.
-        let step = self.path.finish()?;
+        // Flush the segmenter: an unconfirmed tail challenger is dropped
+        // (with signals); an unconfirmed head — a stream shorter than one
+        // confirmation — is released whole.
+        let step = self.path.finish();
         if matches!(self.apply(step)?, Flow::Stop) {
             return Ok(());
         }
@@ -1199,8 +1211,9 @@ impl Worker {
     /// hung up.
     fn drain(&mut self) -> Result<Flow> {
         loop {
-            // A fresh buffer per frame: the gate takes ownership of each
-            // decoded frame, holding it until its successor confirms it.
+            // A fresh buffer per frame: the segmenter takes ownership of
+            // each decoded frame, buffering it while its run awaits
+            // confirmation.
             let mut frame = ffmpeg::frame::Video::empty();
             match classify_receive(self.decoder.receive_frame(&mut frame)) {
                 Recv::Frame => {}
@@ -1209,38 +1222,45 @@ impl Worker {
             }
 
             // best-effort timestamp, pts fallback. No pts at all, or a pts
-            // whose seconds conversion is non-finite (absurd pts × time_base
-            // overflowing f32) = unplaceable, skip. This is the single mint
-            // point of [`Ts`]: past here timestamps are finite by type.
+            // whose seconds conversion is non-finite, is unplaceable: skip.
+            // Past here the container clock is finite by construction.
             let Some(pts) = frame.timestamp().or(frame.pts()) else {
                 continue;
             };
-            let Some(ts) = Ts::new(self.video.ts_seconds(pts)) else {
+            let secs = self.video.timeline.seconds(pts, self.video.time_base);
+            if !secs.is_finite() {
                 continue;
-            };
-            let step = self.path.admit(Stamp { ts, pts }, frame)?;
+            }
+            let step = self.path.admit(ContainerTs(secs), frame);
             if matches!(self.apply(step)?, Flow::Stop) {
                 return Ok(Flow::Stop);
             }
         }
     }
 
-    /// Perform one [`Step`]'s effects: report a drop, scale and send a
-    /// released frame. `Flow::Stop` when past the range end or the consumer
-    /// hung up.
+    /// Perform one [`Step`]'s effects: report drops and seams, scale and
+    /// send released frames. `Flow::Stop` when past the range end or the
+    /// consumer hung up.
     fn apply(&mut self, step: Step) -> Result<Flow> {
-        if let Some(unplaced) = step.dropped
-            && self
-                .tx
-                .send(Ok(Msg::Dropped {
-                    ts: unplaced.ts.get(),
-                    committed: unplaced.committed.map(Ts::get),
-                }))
-                .is_err()
-        {
-            return Ok(Flow::Stop);
+        for unplaced in step.dropped {
+            let msg = Msg::Dropped {
+                ts: unplaced.ts,
+                last: unplaced.last,
+            };
+            if self.tx.send(Ok(msg)).is_err() {
+                return Ok(Flow::Stop);
+            }
         }
-        if let Some((ts, frame)) = step.send {
+        if let Some(cut) = step.cut {
+            let msg = Msg::Discontinuity {
+                container: cut.container.0,
+                logical: cut.logical.0,
+            };
+            if self.tx.send(Ok(msg)).is_err() {
+                return Ok(Flow::Stop);
+            }
+        }
+        for (ts, frame) in step.send {
             let rgb = self.rescaler.rgb(&frame)?;
             if self.tx.send(Ok(Msg::Frame(RgbFrame { ts, rgb }))).is_err() {
                 return Ok(Flow::Stop);
@@ -1297,508 +1317,355 @@ mod tests {
         );
     }
 
-    /// Pts unit used by the test clock: pts are minted from seconds so the
-    /// gate's raw-pts evidence stays exact for the values tests use.
-    const TB: f64 = 1.0 / 90_000.0;
+    /// A segmenter as a fixed-fps decode at 30 fps would build it, over a
+    /// container declaring `duration` seconds (`None` = undeclared).
+    fn segmenter(duration: Option<f32>) -> Segmenter {
+        Segmenter::new(duration, 1.0 / 30.0)
+    }
 
-    fn clock() -> AnchorClock {
-        AnchorClock {
-            declared: 0.0,
-            time_base: TB,
+    fn admit(seg: &mut Segmenter, v: f64) -> SegStep {
+        seg.admit(ContainerTs(v), ffmpeg::frame::Video::empty())
+    }
+
+    fn released(step: &SegStep) -> Vec<f64> {
+        step.released.iter().map(|(l, _)| l.0).collect()
+    }
+
+    fn dropped(step: &SegStep) -> Vec<f64> {
+        step.dropped.iter().map(|ts| ts.0).collect()
+    }
+
+    /// Feed `values` then finish; collect every released logical instant.
+    fn drain_releases(seg: &mut Segmenter, values: &[f64]) -> Vec<f64> {
+        let mut out = Vec::new();
+        for &v in values {
+            out.extend(released(&admit(seg, v)));
+        }
+        out.extend(released(&seg.finish()));
+        out
+    }
+
+    fn assert_close(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len(), "{actual:?} vs {expected:?}");
+        for (a, e) in actual.iter().zip(expected) {
+            assert!((a - e).abs() < 1e-9, "{actual:?} vs {expected:?}");
         }
     }
 
-    fn stamp(v: f32) -> Stamp {
-        Stamp {
-            ts: Ts::new(v).expect("finite test ts"),
-            pts: (f64::from(v) / TB).round() as i64,
+    #[test]
+    fn projects_a_clean_stream_identically() {
+        let mut seg = segmenter(Some(2.0));
+        let out = drain_releases(&mut seg, &[0.0, 0.1, 0.2, 0.3, 0.4]);
+        // Bit-exact, not approximate: the identity segment adds 0.0.
+        assert_eq!(out, vec![0.0, 0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn buffers_the_head_until_confirmation() {
+        let mut seg = segmenter(Some(2.0));
+        assert!(released(&admit(&mut seg, 0.0)).is_empty());
+        assert!(released(&admit(&mut seg, 0.1)).is_empty());
+        assert_eq!(released(&admit(&mut seg, 0.2)), vec![0.0, 0.1, 0.2]);
+        assert_eq!(released(&admit(&mut seg, 0.3)), vec![0.3], "streams on");
+    }
+
+    #[test]
+    fn emits_no_signals_on_a_clean_pass() {
+        let mut seg = segmenter(Some(2.0));
+        for i in 0..60 {
+            let step = admit(&mut seg, f64::from(i) * 0.1);
+            assert!(step.dropped.is_empty(), "clean streams drop nothing");
+            assert!(step.cut.is_none(), "clean streams commit no seams");
         }
-    }
-
-    /// A gate with no extent anchor: purely local (successor) confirmation.
-    fn unanchored() -> TimelineGate {
-        TimelineGate::new(PlausibleWindow::from_declared(None), clock())
-    }
-
-    /// A gate anchored to a container declaring `duration` seconds.
-    fn anchored(duration: f32) -> TimelineGate {
-        TimelineGate::new(PlausibleWindow::from_declared(Some(duration)), clock())
-    }
-
-    /// Feed one timestamp through the gate; map a released frame to its ts.
-    fn admit(gate: &mut TimelineGate, v: f32) -> Result<Option<f32>> {
-        gate.admit(stamp(v), ffmpeg::frame::Video::empty())
-            .map(|step| step.release.map(|(t, _)| t.get()))
-    }
-
-    fn release(gate: &mut TimelineGate, v: f32) -> Option<f32> {
-        admit(gate, v).expect("within the gate's failure thresholds")
-    }
-
-    fn finish(gate: &mut TimelineGate) -> Option<f32> {
-        gate.finish()
-            .expect("finish verdict passes")
-            .release
-            .map(|(t, _)| t.get())
+        let step = seg.finish();
+        assert!(step.dropped.is_empty() && step.cut.is_none());
     }
 
     #[test]
-    fn releases_frames_once_their_successor_confirms_them() {
-        let mut gate = unanchored();
-        assert_eq!(release(&mut gate, 0.0), None, "first frame is held");
-        assert_eq!(release(&mut gate, 0.5), Some(0.0));
-        assert_eq!(release(&mut gate, 1.0), Some(0.5));
-        assert_eq!(
-            finish(&mut gate),
-            Some(1.0),
-            "EOF releases the final in-precedent frame"
-        );
-        assert_eq!(finish(&mut gate), None);
-    }
-
-    #[test]
-    fn drops_a_far_future_outlier_and_keeps_the_frames_after_it() {
-        // The adversarial shape: one corrupt pts must die alone instead of
-        // making every later legal frame unsampleable (silent truncation).
-        // Unanchored, so the three-point rule alone must handle it.
-        let mut gate = unanchored();
-        assert_eq!(release(&mut gate, 0.0), None);
-        assert_eq!(release(&mut gate, 1e30), Some(0.0), "not yet contradicted");
-        assert_eq!(
-            release(&mut gate, 0.5),
-            None,
-            "0.5 continues the committed timeline, so 1e30 is dropped"
-        );
-        assert_eq!(release(&mut gate, 1.0), Some(0.5), "legal frames flow on");
-        assert_eq!(finish(&mut gate), Some(1.0));
-    }
-
-    #[test]
-    fn drops_implausible_timestamps_before_they_can_vouch_for_anything() {
-        // The extent anchor: an out-of-extent frame is never held, never
-        // committed, and never confirms the held frame — so a corrupt
-        // successor cannot release a frame, and a corrupt pair cannot
-        // hijack the committed timeline.
-        let mut gate = anchored(10.0);
-        assert_eq!(release(&mut gate, 1.0), None, "held");
-        let step = gate
-            .admit(stamp(86_400.0), ffmpeg::frame::Video::empty())
-            .expect("one implausible drop is within thresholds");
-        assert!(step.release.is_none(), "corrupt frame confirms nothing");
-        assert_eq!(
-            step.dropped.map(|u| u.ts.get()),
-            Some(86_400.0),
-            "the drop is reported, not silent"
-        );
-        assert_eq!(
-            release(&mut gate, 1.5),
-            Some(1.0),
-            "the held frame survives the corrupt interloper"
-        );
-    }
-
-    #[test]
-    fn survives_a_mutually_vouching_corrupt_pair_via_the_extent_anchor() {
-        // Two increasing corrupt frames vouch for each other's order; only
-        // the extent anchor can tell them from a legal splice. With it,
-        // committed is never poisoned and every legal frame flows.
-        let mut gate = anchored(10.0);
-        release(&mut gate, 0.0);
-        assert_eq!(release(&mut gate, 1e29), None, "out of extent: dropped");
-        assert_eq!(release(&mut gate, 1e30), None, "out of extent: dropped");
-        assert_eq!(release(&mut gate, 0.5), Some(0.0));
-        assert_eq!(release(&mut gate, 1.0), Some(0.5));
-        assert_eq!(finish(&mut gate), Some(1.0));
-    }
-
-    #[test]
-    fn admits_a_forward_jump_its_successors_follow() {
-        // A splice / timelapse gap: the jump target is vouched for by the
-        // frame after it and lies within the declared extent.
-        let mut gate = anchored(4000.0);
-        assert_eq!(release(&mut gate, 0.0), None);
-        assert_eq!(release(&mut gate, 1.0), Some(0.0));
-        assert_eq!(release(&mut gate, 3600.0), Some(1.0));
-        assert_eq!(release(&mut gate, 3600.5), Some(3600.0), "the jump holds");
-    }
-
-    #[test]
-    fn drops_a_backward_outlier_below_the_committed_timeline() {
-        let mut gate = unanchored();
-        assert_eq!(release(&mut gate, 5.0), None);
-        assert_eq!(release(&mut gate, 6.0), Some(5.0));
-        assert_eq!(release(&mut gate, 2.0), None, "behind the timeline: drop");
-        assert_eq!(release(&mut gate, 7.0), Some(6.0), "the held frame stays");
-    }
-
-    #[test]
-    fn trusts_the_successor_when_no_timeline_is_committed() {
-        // The stream head is genuinely unattributable: two points, no
-        // anchor between them. The contract is a conservative pass — side
-        // with the successor — plus an accounted, reported drop; either
-        // choice can be wrong and either way loses exactly one frame.
-        let mut gate = unanchored();
-        assert_eq!(release(&mut gate, 10.0), None);
-        let step = gate
-            .admit(stamp(5.0), ffmpeg::frame::Video::empty())
-            .expect("one head drop is within thresholds");
-        assert!(step.release.is_none(), "10.0 is dropped");
-        assert_eq!(
-            step.dropped.map(|u| u.ts.get()),
-            Some(10.0),
-            "the ambiguous head drop is reported"
-        );
-        assert_eq!(release(&mut gate, 5.5), Some(5.0));
-    }
-
-    #[test]
-    fn fails_when_an_in_extent_pair_hijacks_the_timeline() {
-        // In-extent corruption that poisons `committed` shadows every later
-        // legal frame; the consecutive counter must end that loudly instead
-        // of draining the stream into silence.
-        let mut gate = anchored(3600.0);
-        release(&mut gate, 0.0);
-        release(&mut gate, 3000.0);
-        release(&mut gate, 3001.0);
-        let mut verdict = Ok(None);
-        for i in 0..=MAX_TS_OUTLIERS {
-            verdict = admit(&mut gate, 1.0 + i as f32 * 0.1);
-            if verdict.is_err() {
-                break;
-            }
+    fn drops_backward_jitter_inside_a_segment() {
+        let mut seg = segmenter(Some(2.0));
+        for v in [0.0, 0.1, 0.2] {
+            admit(&mut seg, v);
         }
-        let err = verdict.expect_err("a never-recovering timeline must fail");
-        assert_eq!(err.code, ErrorCode::InputCorrupt);
+        // nominal gap is 0.1, jitter bound 0.2: a small backward step is
+        // decoder noise, dropped with a signal, no challenger.
+        let step = admit(&mut seg, 0.15);
+        assert_eq!(dropped(&step), vec![0.15]);
+        assert!(step.cut.is_none());
+        assert_eq!(released(&admit(&mut seg, 0.3)), vec![0.3]);
     }
 
     #[test]
-    fn heals_scattered_conflicts_below_the_density_threshold() {
-        // Isolated in-extent outliers over a long stream cost nothing: each
-        // is contradicted by the next legal frame, drops stay far below the
-        // release count, and no failure accrues.
-        let mut gate = unanchored();
-        release(&mut gate, 0.0);
-        for i in 1..=60u32 {
-            let t = i as f32;
-            assert_eq!(release(&mut gate, t), Some(t - 1.0));
-            assert_eq!(release(&mut gate, t - 2.0), None, "outlier dropped");
+    fn commits_a_seam_on_a_confirmed_backward_jump() {
+        let mut seg = segmenter(Some(100.0));
+        for v in [5.0, 5.1, 5.2] {
+            admit(&mut seg, v);
         }
-        assert_eq!(release(&mut gate, 61.0), Some(60.0), "stream flows on");
+        assert!(released(&admit(&mut seg, 1.0)).is_empty(), "buffered");
+        assert!(released(&admit(&mut seg, 1.1)).is_empty(), "buffered");
+        let step = admit(&mut seg, 1.2);
+        let cut = step.cut.expect("a confirmed backward jump commits a seam");
+        // The new segment continues one nominal gap (0.1) past the seal.
+        assert!((cut.logical.0 - 5.3).abs() < 1e-9);
+        assert!((cut.container.0 - 1.0).abs() < 1e-9);
+        assert_close(&released(&step), &[5.3, 5.4, 5.5]);
+        assert_close(&released(&admit(&mut seg, 1.3)), &[5.6]);
     }
 
     #[test]
-    fn fails_when_conflicted_drops_stop_being_isolated() {
-        // Alternating good/bad frames interleave releases with drops, so a
-        // consecutive counter never fires — the gen-3 blind spot. The
-        // cumulative density rule fails the run once in-extent drops exceed
-        // the budget AND a third of all placeable frames.
-        let mut gate = unanchored();
-        release(&mut gate, 0.0);
-        let mut verdict = Ok(None);
-        'outer: for i in 1..=(2 * MAX_TS_OUTLIERS) {
-            let t = i as f32;
-            for v in [t, t - 0.5] {
-                verdict = admit(&mut gate, v);
-                if verdict.is_err() {
-                    break 'outer;
-                }
-            }
+    fn kills_an_unconfirmed_challenger_when_the_segment_resumes() {
+        let mut seg = segmenter(Some(2.0));
+        for v in [0.0, 0.1, 0.2] {
+            admit(&mut seg, v);
         }
-        let err = verdict.expect_err("pervasive alternating conflicts must fail");
-        assert_eq!(err.code, ErrorCode::InputCorrupt);
+        assert!(released(&admit(&mut seg, 500.0)).is_empty(), "buffered");
+        let step = admit(&mut seg, 0.3);
+        assert_eq!(dropped(&step), vec![500.0], "the blip dies with a signal");
+        assert_eq!(released(&step), vec![0.3], "the segment streams on");
+        assert!(step.cut.is_none(), "no seam was committed");
     }
 
     #[test]
-    fn fails_at_eof_when_drops_outnumber_releases() {
-        // A short stream whose frames are mostly off-timeline must not
-        // report success on the residue: finish() audits the whole pass.
-        let mut gate = anchored(10.0);
-        release(&mut gate, 0.0);
-        release(&mut gate, 0.5);
-        for i in 0..4 {
-            assert_eq!(release(&mut gate, 90_000.0 + i as f32), None);
+    fn bounds_alternating_poison_to_the_poisoned_half() {
+        // The fragment-storm shape: every other frame jumps +24h. Each
+        // poisoned frame opens a challenger that the next legal frame
+        // kills, so loss is exactly the poisoned half, every drop is
+        // signaled, no seam is committed, and the logical clock stays on
+        // the legal half.
+        let mut seg = segmenter(Some(2.0));
+        let mut kept = Vec::new();
+        let mut lost = 0;
+        for i in 0..60 {
+            let t = f64::from(i) * 0.033;
+            let step = admit(&mut seg, t);
+            kept.extend(released(&step));
+            lost += step.dropped.len();
+            assert!(step.cut.is_none());
+            let step = admit(&mut seg, t + 86_400.0);
+            kept.extend(released(&step));
+            lost += step.dropped.len();
+            assert!(step.cut.is_none());
         }
-        let err = gate
-            .finish()
-            .map(|_| ())
-            .expect_err("garbage-majority stream fails");
-        assert_eq!(err.code, ErrorCode::InputCorrupt);
+        let tail = seg.finish();
+        lost += tail.dropped.len();
+        kept.extend(released(&tail));
+        assert_eq!(kept.len(), 60, "the legal half survives whole");
+        assert_eq!(lost, 60, "loss is bounded to the poisoned half");
+        assert!(kept.iter().all(|&t| t < 2.1), "duration does not explode");
+        assert!(kept.windows(2).all(|w| w[0] <= w[1]));
     }
 
     #[test]
-    fn releases_the_final_frame_within_the_streams_gap_precedent() {
-        let mut gate = unanchored();
-        release(&mut gate, 0.0);
-        release(&mut gate, 1.0);
+    fn releases_an_in_fence_forward_gap_in_segment() {
+        // Legal pacing (a timelapse splice) below the fence floor passes
+        // through on the identity projection — it must not be shredded
+        // into segments.
+        let mut seg = segmenter(Some(60.0));
+        for v in [0.0, 0.1, 0.2] {
+            admit(&mut seg, v);
+        }
+        assert_eq!(released(&admit(&mut seg, 5.0)), vec![5.0]);
+        assert_eq!(released(&admit(&mut seg, 5.1)), vec![5.1]);
+    }
+
+    #[test]
+    fn learns_the_forward_fence_from_released_gaps() {
+        let mut seg = segmenter(Some(100.0));
+        // Head learns an 8s cadence: fence becomes max(10, 2×8) = 16.
+        for v in [0.0, 8.0, 16.0] {
+            admit(&mut seg, v);
+        }
         assert_eq!(
-            finish(&mut gate),
-            Some(1.0),
-            "a clean tail is released, not truncated"
+            released(&admit(&mut seg, 31.0)),
+            vec![31.0],
+            "a 15s gap fits the learned fence"
         );
-    }
-
-    #[test]
-    fn releases_an_eof_jump_the_stream_has_precedent_for() {
-        // Keyframe-sparse streams gap by minutes; the EOF rule must scale
-        // with the stream's own observed jumps, not a fixed constant.
-        let mut gate = anchored(400.0);
-        release(&mut gate, 0.0);
-        release(&mut gate, 100.0);
-        release(&mut gate, 200.0);
-        assert_eq!(finish(&mut gate), Some(200.0), "100s precedent covers it");
-    }
-
-    #[test]
-    fn drops_an_unconfirmed_eof_jump_without_precedent() {
-        // S2's shape: a corrupt pts on the very last frame has no successor
-        // to contradict it. A stream that never jumped cannot suddenly jump
-        // at EOF; the frame is dropped with a report, not released into a
-        // garbage chunk.
-        let mut gate = unanchored();
-        release(&mut gate, 0.0);
-        release(&mut gate, 0.5);
-        release(&mut gate, 500.0);
-        let step = gate.finish().expect("one tail drop is within thresholds");
-        assert!(step.release.is_none(), "the unvouched jump is not released");
-        assert_eq!(
-            step.dropped.map(|u| u.ts.get()),
-            Some(500.0),
-            "the tail drop is reported"
-        );
-    }
-
-    #[test]
-    fn releases_a_lone_frame_at_eof_without_an_anchor() {
-        // A single-frame stream has no committed timeline to measure a jump
-        // against; the extent window is the only filter.
-        let mut gate = anchored(10.0);
-        release(&mut gate, 5.0);
-        assert_eq!(finish(&mut gate), Some(5.0));
-    }
-
-    #[test]
-    fn rebases_when_dropped_chain_outweighs_released() {
-        // The anchor-fault signature: a released minority against a longer
-        // monotone chain of drops. The EOF audit fails the pass, and the
-        // error carries the election — the chain's head pts, back on the
-        // container's absolute clock, is the corrected origin.
-        let mut gate = anchored(10.0);
-        release(&mut gate, 0.0);
-        release(&mut gate, 0.5);
-        for i in 0..4 {
-            assert_eq!(release(&mut gate, 90_000.0 + i as f32), None, "dropped");
-        }
-        let err = gate
-            .finish()
-            .map(|_| ())
-            .expect_err("drops outnumber releases");
-        assert_eq!(err.code, ErrorCode::InputCorrupt);
-        let fault = AnchorFault::in_error(&err)
-            .expect("a 4-drop chain against 2 releases elects a rebase");
-        assert_eq!(fault.declared, 0.0);
         assert!(
-            (fault.elected - 90_000.0).abs() < 1e-3,
-            "the chain head is the elected origin: {}",
-            fault.elected
+            released(&admit(&mut seg, 100.0)).is_empty(),
+            "a 69s gap beyond the fence opens a challenger"
         );
     }
 
     #[test]
-    fn withholds_the_fault_when_releases_outnumber_the_chain() {
-        // The election is a majority vote: when the accepted timeline is
-        // the longer one, a timeline failure stays a plain InputCorrupt —
-        // the guarantee that keeps release-majority inputs (edit-list
-        // pre-roll among them) from ever being re-anchored.
-        let mut gate = unanchored();
-        release(&mut gate, 0.0);
-        let mut verdict = Ok(None);
-        'outer: for i in 1..=(2 * MAX_TS_OUTLIERS) {
-            let t = i as f32;
-            for v in [t, t - 0.5] {
-                verdict = admit(&mut gate, v);
-                if verdict.is_err() {
-                    break 'outer;
-                }
-            }
-        }
-        let err = verdict.expect_err("pervasive alternating conflicts must fail");
+    fn teaches_keyframe_cadence_through_the_head() {
+        // A keyframe-only decode of a sparse stream: minute-scale gaps are
+        // its legal cadence. The head fences against the declared extent,
+        // not the flat floor, so the cadence confirms and then becomes its
+        // own precedent.
+        let mut seg = Segmenter::new(Some(500.0), FALLBACK_NOMINAL_GAP);
+        let out = drain_releases(&mut seg, &[0.0, 100.0, 200.0, 300.0, 400.0]);
+        assert_eq!(out, vec![0.0, 100.0, 200.0, 300.0, 400.0]);
+    }
+
+    #[test]
+    fn fences_the_head_against_a_far_future_jump() {
+        let mut seg = segmenter(Some(2.0));
+        assert!(released(&admit(&mut seg, 0.0)).is_empty());
         assert!(
-            AnchorFault::in_error(&err).is_none(),
-            "released majority: the declared anchor stands"
+            released(&admit(&mut seg, 86_400.0)).is_empty(),
+            "beyond the extent fence: a challenger, not a head frame"
         );
+        let step = admit(&mut seg, 0.033);
+        assert_eq!(dropped(&step), vec![86_400.0], "the blip dies signaled");
+        assert_eq!(released(&admit(&mut seg, 0.066)), vec![0.0, 0.033, 0.066]);
     }
 
     #[test]
-    fn carries_the_fault_out_of_a_consecutive_failure() {
-        // The budget branch: a poisoned committed timeline shadows every
-        // later frame until the consecutive counter trips; the shadowed
-        // frames' own chain wins the election. The first drop was evicted
-        // from the full ring, so the retained chain heads at the second.
-        let mut gate = anchored(3600.0);
-        release(&mut gate, 3000.0);
-        release(&mut gate, 3001.0);
-        let mut verdict = Ok(None);
-        for i in 0..=MAX_TS_OUTLIERS {
-            verdict = admit(&mut gate, 1.0 + i as f32 * 0.1);
-            if verdict.is_err() {
-                break;
-            }
-        }
-        let err = verdict.expect_err("a never-recovering timeline must fail");
-        let fault = AnchorFault::in_error(&err).expect("a 64-chain against 1 release elects");
-        assert!(
-            (fault.elected - 1.1).abs() < 1e-3,
-            "elected origin {} heads the retained chain",
-            fault.elected
+    fn replaces_an_unconfirmed_head_with_its_confirmed_challenger() {
+        // The poisoned-head shape: the first packets dragged the declared
+        // origin a day forward, so the head reads ~0 and legal content
+        // rebases to -86398. The challenger confirms, the dead head is
+        // dropped with signals, and the first segment re-anchors at the
+        // stream head — content keeps sane labels, no verdict, no retry.
+        let mut seg = segmenter(Some(0.1));
+        admit(&mut seg, 0.0);
+        admit(&mut seg, 0.033);
+        assert!(released(&admit(&mut seg, -86_398.0)).is_empty());
+        assert!(released(&admit(&mut seg, -86_397.966)).is_empty());
+        let step = admit(&mut seg, -86_397.933);
+        assert_eq!(
+            dropped(&step),
+            vec![0.0, 0.033],
+            "the dead head is dropped with signals"
         );
+        assert!(step.cut.is_none(), "no committed clock existed to seam");
+        assert_close(&released(&step), &[0.0, 0.034, 0.067]);
     }
 
     #[test]
-    fn finds_the_longest_chain_across_noise() {
-        let chain = monotone_chain(&[10, 1, 2, 100, 3]).expect("non-empty evidence");
-        assert_eq!(chain, Chain { head: 1, len: 3 });
+    fn anchors_an_opening_segment_within_preroll_identically() {
+        // Edit-list pre-roll: legitimate negative timestamps close to zero
+        // project identically — byte-for-byte what the container said.
+        let mut seg = segmenter(Some(4.0));
+        let out = drain_releases(&mut seg, &[-0.5, -0.4, -0.3, 0.0, 0.1]);
+        assert_eq!(out, vec![-0.5, -0.4, -0.3, 0.0, 0.1]);
     }
 
     #[test]
-    fn prefers_the_earliest_head_between_equal_chains() {
-        let chain = monotone_chain(&[5, 6, 1, 2]).expect("non-empty evidence");
-        assert_eq!(chain, Chain { head: 1, len: 2 });
-    }
-
-    #[test]
-    fn elects_nothing_from_no_evidence() {
-        assert!(monotone_chain(&[]).is_none());
-    }
-
-    #[test]
-    fn evicts_the_oldest_drops_beyond_ring_capacity() {
-        let mut ring = DropRing::new();
-        let cap = i64::from(MAX_TS_OUTLIERS);
-        for pts in 0..cap + 2 {
-            ring.record(pts);
+    fn drops_an_unconfirmed_challenger_at_eof() {
+        // A corrupt pts on the very last frame has no successor to vouch
+        // for it: dropped with a signal, never released into a garbage
+        // label.
+        let mut seg = segmenter(Some(2.0));
+        for v in [0.0, 0.1, 0.2] {
+            admit(&mut seg, v);
         }
-        let ordered = ring.in_order();
-        assert_eq!(ordered.len(), MAX_TS_OUTLIERS as usize);
-        assert_eq!(ordered.first().copied(), Some(2), "oldest two evicted");
-        assert_eq!(ordered.last().copied(), Some(cap + 1), "newest retained");
+        admit(&mut seg, 86_400.0);
+        let step = seg.finish();
+        assert_eq!(dropped(&step), vec![86_400.0]);
+        assert!(step.released.is_empty());
     }
 
-    /// Drive one timestamp through a [`FramePath`]; map the step to
-    /// `(sent ts, dropped ts, stop)`.
-    fn path_admit(path: &mut FramePath, v: f32) -> Result<(Option<f32>, Option<f32>, bool)> {
-        path.admit(stamp(v), ffmpeg::frame::Video::empty())
-            .map(step_view)
+    #[test]
+    fn confirms_a_short_head_at_eof() {
+        // A stream shorter than one confirmation is content, not a
+        // fragment: nothing ever contradicted it.
+        let mut seg = segmenter(Some(1.0));
+        admit(&mut seg, 0.0);
+        admit(&mut seg, 0.1);
+        assert_eq!(released(&seg.finish()), vec![0.0, 0.1]);
     }
 
-    fn step_view(step: Step) -> (Option<f32>, Option<f32>, bool) {
+    #[test]
+    fn releases_a_lone_frame_at_eof() {
+        let mut seg = segmenter(Some(10.0));
+        admit(&mut seg, 5.0);
+        assert_eq!(released(&seg.finish()), vec![5.0]);
+    }
+
+    #[test]
+    fn keeps_the_logical_clock_monotone_across_seams() {
+        // Three clock domains, each internally sane: two seams, all
+        // content preserved, and the concatenation is non-decreasing.
+        let mut seg = segmenter(Some(3.0));
+        let mut values = Vec::new();
+        values.extend((0..10).map(|i| f64::from(i) * 0.033));
+        values.extend((0..10).map(|i| 43_200.0 + f64::from(i) * 0.033));
+        values.extend((0..10).map(|i| 20.0 + f64::from(i) * 0.033));
+        let out = drain_releases(&mut seg, &values);
+        assert_eq!(out.len(), 30, "every frame survives");
+        assert!(out.windows(2).all(|w| w[0] <= w[1]), "monotone: {out:?}");
+        assert!(out.iter().all(|&t| t < 2.0), "labels stay near content");
+    }
+
+    /// Drive one container timestamp through a [`FramePath`]; map the step
+    /// to `(sent, dropped, stop)` timestamps.
+    fn path_admit(path: &mut FramePath, v: f64) -> (Vec<f32>, Vec<f32>, bool) {
+        let step = path.admit(ContainerTs(v), ffmpeg::frame::Video::empty());
+        step_view(step)
+    }
+
+    fn step_view(step: Step) -> (Vec<f32>, Vec<f32>, bool) {
         (
-            step.send.map(|(t, _)| t.get()),
-            step.dropped.map(|u| u.ts.get()),
+            step.send.iter().map(|(t, _)| t.get()).collect(),
+            step.dropped.iter().map(|u| u.ts).collect(),
             step.stop,
         )
     }
 
     fn range_path(end: f32) -> FramePath {
-        // A dense tick grid so every distinct released ts is sampled.
+        // A dense tick grid so every released ts is sampled.
         FramePath::new(
             SampleSpec::Fps {
                 fps: 1000.0,
                 start: 0.0,
                 end: Some(end),
             },
-            PlausibleWindow::from_declared(None),
-            clock(),
+            None,
         )
     }
 
     #[test]
-    fn stops_only_after_two_released_frames_confirm_the_range_end() {
+    fn stops_the_range_at_the_first_release_past_the_end() {
         let mut path = range_path(2.0);
-        assert_eq!(path_admit(&mut path, 0.0).expect("ok"), (None, None, false));
-        assert_eq!(
-            path_admit(&mut path, 1.0).expect("ok"),
-            (Some(0.0), None, false)
-        );
-        assert_eq!(
-            path_admit(&mut path, 2.5).expect("ok"),
-            (Some(1.0), None, false)
-        );
-        assert_eq!(
-            path_admit(&mut path, 3.0).expect("ok"),
-            (None, None, false),
-            "first release past the end arms the stop but sends nothing"
-        );
-        assert_eq!(
-            path_admit(&mut path, 3.5).expect("ok"),
-            (None, None, true),
-            "the second released frame past the end confirms the stop"
-        );
+        assert_eq!(path_admit(&mut path, 0.0).0, Vec::<f32>::new());
+        assert_eq!(path_admit(&mut path, 0.5).0, Vec::<f32>::new());
+        assert_eq!(path_admit(&mut path, 1.0).0, vec![0.0, 0.5, 1.0]);
+        let (sent, _, stop) = path_admit(&mut path, 2.5);
+        assert!(sent.is_empty(), "past the end sends nothing");
+        assert!(stop, "monotone releases make the first crossing final");
     }
 
     #[test]
-    fn does_not_stop_the_range_on_an_isolated_future_outlier() {
-        // A lone in-extent corrupt pts past the range end must not truncate
-        // the range: it is contradicted by the next legal frame and dropped,
-        // and sampling continues.
+    fn does_not_stop_the_range_on_an_out_of_fence_outlier() {
+        // A lone corrupt pts past the range end must not truncate the
+        // range: it opens a challenger, the next legal frame kills it, and
+        // sampling continues.
         let mut path = range_path(2.0);
-        path_admit(&mut path, 0.0).expect("ok");
+        path_admit(&mut path, 0.0);
+        path_admit(&mut path, 0.5);
+        path_admit(&mut path, 1.0);
         assert_eq!(
-            path_admit(&mut path, 1.0).expect("ok"),
-            (Some(0.0), None, false)
+            path_admit(&mut path, 15.0),
+            (vec![], vec![], false),
+            "the outlier is buffered, not trusted to stop anything"
         );
         assert_eq!(
-            path_admit(&mut path, 5.0).expect("ok"),
-            (Some(1.0), None, false),
-            "the outlier is held, not yet trusted to stop anything"
-        );
-        assert_eq!(
-            path_admit(&mut path, 1.2).expect("ok"),
-            (None, Some(5.0), false),
+            path_admit(&mut path, 1.1),
+            (vec![1.1], vec![15.0], false),
             "the next legal frame contradicts the outlier"
         );
-        assert_eq!(
-            path_admit(&mut path, 1.4).expect("ok"),
-            (Some(1.2), None, false),
-            "the range keeps sampling"
-        );
+        assert_eq!(path_admit(&mut path, 1.2).0, vec![1.2], "keeps sampling");
     }
 
     #[test]
-    fn finish_applies_the_range_end_to_the_eof_release() {
-        // The EOF release goes through the same range gate as any frame: a
-        // tail at or past the end is not sent (S2's deliver-path shape).
+    fn finish_flushes_a_short_head_through_the_sampler() {
+        let mut path = FramePath::new(SampleSpec::Keyframes, None);
+        path_admit(&mut path, 0.0);
+        path_admit(&mut path, 1.0);
+        let (sent, dropped, stop) = step_view(path.finish());
+        assert_eq!(sent, vec![0.0, 1.0], "a short clean stream is content");
+        assert!(dropped.is_empty() && !stop);
+    }
+
+    #[test]
+    fn finish_applies_the_range_end_to_the_flush() {
         let mut path = range_path(2.0);
-        path_admit(&mut path, 0.0).expect("ok");
-        assert_eq!(
-            path_admit(&mut path, 2.5).expect("ok"),
-            (Some(0.0), None, false)
-        );
-        let step = path.finish().expect("finish verdict passes");
-        assert_eq!(
-            step_view(step),
-            (None, None, false),
-            "the tail past the range end is released by the gate but not sent"
-        );
-    }
-
-    #[test]
-    fn finish_sends_the_eof_release_through_the_sampler() {
-        let mut path = FramePath::new(
-            SampleSpec::Keyframes,
-            PlausibleWindow::from_declared(None),
-            clock(),
-        );
-        path_admit(&mut path, 0.0).expect("ok");
-        assert_eq!(
-            path_admit(&mut path, 1.0).expect("ok"),
-            (Some(0.0), None, false)
-        );
-        let step = path.finish().expect("finish verdict passes");
-        assert_eq!(
-            step_view(step),
-            (Some(1.0), None, false),
-            "a clean tail reaches the consumer"
-        );
+        path_admit(&mut path, 0.0);
+        path_admit(&mut path, 2.5);
+        let (sent, _, stop) = step_view(path.finish());
+        assert_eq!(sent, vec![0.0], "the in-range head frame is sent");
+        assert!(stop, "the tail past the range end is released but not sent");
     }
 
     #[test]

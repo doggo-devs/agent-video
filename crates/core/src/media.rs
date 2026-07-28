@@ -377,20 +377,6 @@ impl Timeline {
         }
     }
 
-    /// A timeline anchored at an explicitly elected origin (seconds on the
-    /// container's absolute clock) instead of the stream-declared start —
-    /// the corrected clock of an origin-rebased decode pass (see
-    /// [`crate::media::decode`]'s origin-rebase contract).
-    pub(crate) fn rebased(origin: f64) -> Timeline {
-        Timeline { origin }
-    }
-
-    /// The container-absolute origin in seconds — what [`Timeline::seconds`]
-    /// subtracts and [`Timeline::seek_target`] adds back.
-    pub(crate) fn origin(&self) -> f64 {
-        self.origin
-    }
-
     /// Convert a raw pts in `time_base` units (seconds per pts unit) to
     /// seconds on the pipeline's 0-based clock. Negative results are real:
     /// they place the pts before the video's first frame (edit-list

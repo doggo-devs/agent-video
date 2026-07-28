@@ -18,7 +18,7 @@ use crate::media::decode::{FrameSource, SampleSpec};
 use crate::source::Source;
 use crate::types::{CandidateFrame, TimeRange};
 
-pub use crate::media::decode::{Anchor, RgbFrame};
+pub use crate::media::decode::RgbFrame;
 
 /// Streaming source of sampled frames — the pipeline-facing name for
 /// [`FrameSource`]. Carries the run's event-sink borrow: decode-time
@@ -39,21 +39,16 @@ pub struct StreamParams<'a> {
     pub threads: Option<NonZeroUsize>,
     /// Receives any decode-open diagnostics.
     pub events: &'a dyn EventSink,
-    /// The clock anchor this pass trusts: [`Anchor::Declared`] for every
-    /// first pass, [`Anchor::Rebased`] only for the single retry the
-    /// origin-rebase mechanism grants (see [`crate::media::decode`]).
-    pub anchor: Anchor,
 }
 
 impl<'a> StreamParams<'a> {
     fn open(&self, input: &Source, spec: SampleSpec) -> crate::error::Result<FrameStream<'a>> {
-        FrameSource::open_anchored(
+        FrameSource::open(
             input,
             spec,
             pipe_edge(self.cell_min_edge, self.score_edge),
             self.threads,
             self.events,
-            self.anchor,
         )
     }
 }
@@ -97,6 +92,11 @@ pub fn stream_range<'a>(
 /// Open a streaming extractor from `start` to `end`, or to EOF when `end` is
 /// `None` — the `process --from/--until` window. Timestamps stay absolute.
 /// Decode-open diagnostics include a seek fallback, if any.
+///
+/// The window seek speaks the container clock, so it is exact only within
+/// the stream's first timeline segment; past a clock discontinuity the
+/// decode finds the window where the container clock says it is (see
+/// [`crate::media::decode`]'s module docs).
 pub fn stream_window<'a>(
     input: &Source,
     fps: f32,
