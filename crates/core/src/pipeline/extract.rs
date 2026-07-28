@@ -7,16 +7,18 @@
 //! within a single competition set instead of per-chunk.
 
 use std::mem;
+use std::sync::Arc;
 
-use anyhow::Result;
 use image::GrayImage;
 
 use crate::config::Config;
-use crate::error::{Error, ErrorCode, ErrorContext};
+use crate::error::{Error, ErrorCode, ErrorContext, Result};
 use crate::event::EventSink;
 use crate::source::Source;
 use crate::subtitle::Subtitles;
-use crate::types::{CandidateFrame, CanvasSpec, ScoredFrame, TimeRange, format_ts};
+use crate::types::{
+    Aspect, CandidateFrame, CanvasSpec, GridSubtitles, ScoredFrame, TimeRange, format_ts,
+};
 use crate::{compose, dedup, layout, sample, score, wire};
 
 use super::candidates::CandidateStream;
@@ -38,6 +40,9 @@ use super::{OutputSink, SubtitleSource};
 /// `stop` bounds the subtitle-extraction reads on a stalled source; the
 /// sampling pass decodes behind its own self-minted token (see
 /// [`crate::media::decode::FrameSource::open`]).
+///
+/// Every failure is a coded [`Error`]: the exit-code contract is stated by
+/// the signature, not recovered by downcasting.
 pub fn extract_range(
     input: &Source,
     sink: OutputSink<'_>,
@@ -84,8 +89,8 @@ pub fn extract_range(
     let mut candidates: Vec<ScoredFrame> = Vec::new();
     // Tail grayscale of the previously scored batch: batches are consecutive
     // in time, so it is the true predecessor of the next batch's first frame.
-    let mut prev_tail: Option<GrayImage> = None;
-    let mut aspect = 1.0_f32;
+    let mut prev_tail: Option<Arc<GrayImage>> = None;
+    let mut aspect = Aspect::SQUARE;
 
     while let Some(judged) = stream.next_batch()? {
         if let Some(a) = stream.aspect() {
@@ -147,8 +152,7 @@ pub fn extract_range(
                 format_ts(range.end())
             ),
         )
-        .with_context(ErrorContext::default().with_input(input.as_path()))
-        .into());
+        .with_context(ErrorContext::default().with_input(input.as_path())));
     }
 
     let scores: Vec<f32> = picked.iter().map(|f| f.score.get()).collect();
@@ -157,9 +161,9 @@ pub fn extract_range(
 
     let file = "grid_extract.jpg";
     let image = session.emit_image(file, &jpeg)?;
-    let mut grid_meta = build_grid_draft(&picked, &[], lay.template).into_meta(image);
+    let grid_meta = build_grid_draft(&picked, &[], lay.template).into_meta(image);
 
-    grid_meta.subtitles = match subs {
+    let subtitles = match subs {
         // One span, one assignment: every cue overlapping the requested
         // range lands on the single grid, even when the picked frames
         // cover a narrower stretch than the range itself.
@@ -167,7 +171,7 @@ pub fn extract_range(
             .assign(range, &[grid_meta.time_range])
             .pop()
             .expect("one span yields exactly one assignment"),
-        None => crate::types::GridSubtitles::NoSource,
+        None => GridSubtitles::NoSource,
     };
 
     // `range` marks the document as an extract; the constructor derives the
@@ -177,7 +181,7 @@ pub fn extract_range(
         input.to_string(),
         wire::Segment::from(range),
         cfg.settings(),
-        vec![grid_meta.into()],
+        vec![wire::Grid::new(grid_meta, subtitles)],
     );
 
     // No subtitles.txt: the range-sliced cues already travel in the metadata.
@@ -189,10 +193,10 @@ pub fn extract_range(
 fn flush_batch_to_candidates(
     batch: &mut Vec<CandidateFrame>,
     candidates: &mut Vec<ScoredFrame>,
-    prev_tail: &mut Option<GrayImage>,
+    prev_tail: &mut Option<Arc<GrayImage>>,
     weights: &score::Weights,
     spec: &CanvasSpec,
-    aspect: f32,
+    aspect: Aspect,
     min_gap: f32,
 ) {
     if batch.is_empty() {
@@ -202,7 +206,7 @@ fn flush_batch_to_candidates(
     // Keep the buffer's capacity across flushes: mem::take would leave a
     // zero-capacity Vec that reallocates as the next batch refills it.
     let drained = mem::replace(batch, Vec::with_capacity(batch.capacity()));
-    let mut scored = score::score_frames(drained, weights, prev_tail.as_ref());
+    let mut scored = score::score_frames(drained, weights, prev_tail.as_deref());
     *prev_tail = tail;
     let capacity = layout::grid_capacity(spec, aspect);
     let selected = score::select_top_k(&scored, capacity, min_gap);

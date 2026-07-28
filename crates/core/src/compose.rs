@@ -5,13 +5,13 @@
 use std::sync::LazyLock;
 
 use ab_glyph::{FontRef, PxScale};
-use anyhow::{Context, Result};
 use image::imageops::FilterType;
 use image::{Rgb, RgbImage};
 use imageproc::drawing::{self, draw_filled_rect_mut};
 use imageproc::rect::Rect as IpRect;
 use rayon::prelude::*;
 
+use crate::error::{Error, ErrorCode, Result};
 use crate::layout::Layout;
 use crate::types::{Rect, ScoredFrame};
 
@@ -155,7 +155,16 @@ fn draw_timestamp(img: &mut RgbImage, font: &FontRef, x: u32, y: u32, ts: f32) {
 fn encode_jpeg(img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
-    enc.encode_image(img).context("JPEG encoding failed")?;
+    // Unreachable for validated canvas geometry (`CanvasSpec::new` caps the
+    // edge below JPEG's dimension limit), but a decoded frame's own size is
+    // the input's word — fail the artifact with a code, don't panic.
+    enc.encode_image(img).map_err(|e| {
+        Error::new(
+            ErrorCode::OutputWriteFailed,
+            format!("encoding {}x{} JPEG: {e}", img.width(), img.height()),
+        )
+        .with_source(e)
+    })?;
     Ok(buf)
 }
 
@@ -169,7 +178,7 @@ mod tests {
         use crate::types::{SceneDiff, Score, Ts};
         ScoredFrame {
             ts: Ts::new(ts).expect("finite test ts"),
-            gray: GrayImage::new(1, 1),
+            gray: Arc::new(GrayImage::new(1, 1)),
             rgb: Arc::new(RgbImage::from_pixel(32, 18, Rgb([100, 120, 140]))),
             score: Score::new(0.0).expect("zero score is valid"),
             scene_diff: SceneDiff::new(0.0).expect("zero diff is valid"),
@@ -187,7 +196,8 @@ mod tests {
     fn renders_nonempty_jpeg() {
         let spec = crate::types::CanvasSpec::new(1024, 256).expect("valid test spec");
         let frames: Vec<_> = (0..4).map(|i| frame(i as f32)).collect();
-        let layout = crate::layout::compute(&[0.0; 4], &[], 16.0 / 9.0, &spec);
+        let aspect = crate::types::Aspect::new(16.0 / 9.0).expect("finite positive test aspect");
+        let layout = crate::layout::compute(&[0.0; 4], &[], aspect, &spec);
         let bytes = render(&frames, &layout, &[], 92, 4).expect("render ok");
         assert!(bytes.len() > 100, "JPEG should have real content");
         assert_eq!(&bytes[0..2], &[0xff, 0xd8]);

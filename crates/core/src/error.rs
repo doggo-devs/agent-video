@@ -2,8 +2,10 @@
 //! Structured error types with codes for programmatic handling.
 //!
 //! The harness layer receives [`Error`] with a machine-readable [`ErrorCode`]
-//! and human-readable reason. Internal modules may use `anyhow` for convenience;
-//! public API boundaries convert to this type.
+//! and human-readable reason. This crate speaks [`Error`] end to end — its
+//! public entry points return [`Result`], and `anyhow` is a dev-dependency
+//! only, so an uncoded error reaching a boundary is a compile error, not a
+//! runtime surprise. Bugs are panics, never coded errors.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -128,6 +130,13 @@ impl Error {
         }
     }
 
+    /// The machine-readable context, when any was attached — the programmatic
+    /// counterpart of the paths rendered by [`Display`](fmt::Display), so
+    /// callers never have to parse the message.
+    pub fn context(&self) -> Option<&ErrorContext> {
+        self.context.as_deref()
+    }
+
     pub fn with_context(mut self, ctx: ErrorContext) -> Self {
         self.context = Some(Box::new(ctx));
         self
@@ -170,9 +179,27 @@ impl std::error::Error for Error {
 /// Convenience type alias for Results using our Error.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Prepend a caller-side note to a coded error's reason — the typed analogue
+/// of `anyhow::Context`: the note leads, the original reason follows, and the
+/// code, context, and source ride through untouched.
+pub trait Context<T> {
+    /// Decorate the error's reason with `note` on the failure path.
+    fn context(self, note: impl fmt::Display) -> Result<T>;
+}
+
+impl<T> Context<T> for Result<T> {
+    fn context(self, note: impl fmt::Display) -> Result<T> {
+        self.map_err(|mut e| {
+            e.reason = format!("{note}: {}", e.reason);
+            e
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn error_code_exit_codes_in_range() {
@@ -221,5 +248,32 @@ mod tests {
             .map(|e| e.code)
             .expect("coded error survives .context()");
         assert_eq!(code, ErrorCode::DecodeFailed);
+    }
+
+    #[test]
+    fn exposes_machine_readable_context_without_display_parsing() {
+        let e = Error::new(ErrorCode::InputCorrupt, "broken timeline")
+            .with_input("clip.mp4")
+            .with_context(ErrorContext::default().with_output("out/"));
+        let ctx = e.context().expect("attached context is readable back");
+        assert_eq!(ctx.output_path.as_deref(), Some(Path::new("out/")));
+        assert!(
+            Error::new(ErrorCode::InputCorrupt, "bare").context().is_none(),
+            "no context was attached, none is invented"
+        );
+    }
+
+    #[test]
+    fn typed_context_decorates_reason_and_keeps_code() {
+        let decorated: Result<()> = Err(Error::new(ErrorCode::DecodeFailed, "boom")
+            .with_input("clip.mp4"))
+        .context("while probing");
+        let e = decorated.expect_err("context maps the error branch");
+        assert_eq!(e.code, ErrorCode::DecodeFailed);
+        assert_eq!(e.reason, "while probing: boom");
+        assert!(
+            e.context().is_some_and(|c| c.input_path.is_some()),
+            "machine-readable context rides through"
+        );
     }
 }

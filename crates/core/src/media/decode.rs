@@ -276,22 +276,49 @@ impl Drop for FrameSource {
 /// tick, one tick per frame, robust to pts gaps. Frames decoded before a seek
 /// target (keyframe preroll) fall before the first tick and are discarded
 /// here.
+///
+/// Tick instants are indexed, never accumulated: the next instant is
+/// `start + idx * step`, and advancing past a frame computes the new index
+/// directly. Two failure shapes of the accumulating form (`next += step`)
+/// are unrepresentable here: a corrupt far-future pts (finite by [`Ts`],
+/// but arbitrary) has no loop to spin — the old advance never terminated
+/// once `step` fell below the accumulator's ULP — and hours of ticks have
+/// no error to accumulate, each instant being one multiplication away from
+/// `start`.
 struct Tick {
-    next: f32,
-    step: f32,
+    start: f64,
+    step: f64,
+    /// Index of the next tick: its instant is `start + idx * step`.
+    idx: u64,
 }
 
 impl Tick {
+    fn new(start: f32, step: f64) -> Self {
+        Self {
+            start: f64::from(start),
+            step,
+            idx: 0,
+        }
+    }
+
+    /// The next tick instant, exact up to one f64 rounding.
+    fn next_instant(&self) -> f64 {
+        self.start + self.idx as f64 * self.step
+    }
+
     fn wants(&mut self, ts: f32) -> bool {
         // A sliver of tolerance absorbs float noise in pts arithmetic;
         // anything larger would visibly shift the sampling instants.
-        let eps = self.step * 1e-3;
-        if ts + eps < self.next {
+        let reach = f64::from(ts) + self.step * 1e-3;
+        if reach < self.next_instant() {
             return false;
         }
-        while self.next <= ts + eps {
-            self.next += self.step;
-        }
+        // The last tick index at or before `reach`, computed directly. The
+        // `as` cast saturates, bounding a corrupt far-future pts at
+        // `u64::MAX`; `max` keeps the index monotonic against float
+        // rounding at the tick boundary.
+        let reached = ((reach - self.start) / self.step) as u64;
+        self.idx = reached.max(self.idx).saturating_add(1);
         true
     }
 }
@@ -307,23 +334,22 @@ enum Sampler {
         fill: Vec<TimeRange>,
         idx: usize,
         tick: Option<Tick>,
-        step: f32,
+        step: f64,
     },
 }
 
 impl Sampler {
     fn new(spec: SampleSpec) -> Self {
         match spec {
-            SampleSpec::Fps { fps, start, .. } => Sampler::Fps(Tick {
-                next: start,
-                step: 1.0 / fps,
-            }),
+            SampleSpec::Fps { fps, start, .. } => {
+                Sampler::Fps(Tick::new(start, 1.0 / f64::from(fps)))
+            }
             SampleSpec::Keyframes => Sampler::All,
             SampleSpec::Mixed { fps, fill } => Sampler::Mixed {
                 fill,
                 idx: 0,
                 tick: None,
-                step: 1.0 / fps,
+                step: 1.0 / f64::from(fps),
             },
         }
     }
@@ -344,10 +370,7 @@ impl Sampler {
                 }
                 match fill.get(*idx) {
                     Some(r) if ts >= r.start() => tick
-                        .get_or_insert(Tick {
-                            next: r.start(),
-                            step: *step,
-                        })
+                        .get_or_insert_with(|| Tick::new(r.start(), *step))
                         .wants(ts),
                     _ => is_key,
                 }
@@ -555,10 +578,7 @@ mod tests {
 
     #[test]
     fn tick_takes_one_frame_per_step() {
-        let mut tick = Tick {
-            next: 0.0,
-            step: 1.0,
-        };
+        let mut tick = Tick::new(0.0, 1.0);
         assert!(tick.wants(0.0));
         assert!(!tick.wants(0.5), "still inside the first step");
         assert!(tick.wants(1.2));
@@ -568,12 +588,40 @@ mod tests {
 
     #[test]
     fn tick_absorbs_float_noise_just_below_the_instant() {
-        let mut tick = Tick {
-            next: 1.0,
-            step: 1.0,
-        };
+        let mut tick = Tick::new(1.0, 1.0);
         assert!(tick.wants(0.999999), "owns the 1.0 tick despite pts noise");
         assert!(!tick.wants(1.5));
+    }
+
+    #[test]
+    fn stops_when_a_corrupt_pts_outruns_the_step() {
+        // A finite but absurd pts (what `Ts` still admits): on the old
+        // accumulating advance, `next += step` became a floating no-op once
+        // `step < ULP(next) / 2` and the decode thread spun forever. The
+        // indexed advance must answer immediately.
+        let mut tick = Tick::new(0.0, 1.0 / 30.0);
+        assert!(tick.wants(1e30), "corrupt frame still owns the pending tick");
+        assert!(
+            !tick.wants(0.0),
+            "the tick grid stays monotonic after the jump"
+        );
+    }
+
+    #[test]
+    fn keeps_tick_instants_on_grid_after_hours_of_ticks() {
+        // Ten hours of single-step advances at a step that is inexact in
+        // binary: the old f32 accumulator drifted by whole seconds here;
+        // indexed instants stay on the grid.
+        let mut tick = Tick::new(0.0, 0.1);
+        for _ in 0..360_000 {
+            assert!(tick.wants((tick.next_instant() + 0.01) as f32));
+        }
+        let expected = 360_000.0 * 0.1;
+        assert!(
+            (tick.next_instant() - expected).abs() < 1e-3,
+            "tick grid drifted: {} vs {expected}",
+            tick.next_instant()
+        );
     }
 
     #[test]

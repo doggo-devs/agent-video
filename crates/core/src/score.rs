@@ -489,20 +489,25 @@ pub fn select_top_k(frames: &[ScoredFrame], k: usize, min_gap: f32) -> Vec<usize
 pub const DEFAULT_HERO_SCENE_DIFF: f32 = 70.0;
 
 /// Pick hero frames from an already-selected set: those whose raw scene
-/// difference (at least `scene_diff_min`, in `0..=255` units) marks a hard
-/// scene change. Returns at most `max_heroes` indices (into the passed
-/// slice), strongest change first.
+/// difference (at least `scene_diff_min`) marks a hard scene change. Returns
+/// at most `max_heroes` indices (into the passed slice), strongest change
+/// first.
 ///
 /// The criterion is an absolute magnitude, not a within-set statistic: rank
 /// normalization spreads scores over `0..=100` by construction, so any
 /// statistical outlier test on them fires at a content-independent rate. Raw
-/// `scene_diff` has fixed units, which makes "no cuts, no heroes" hold across
-/// chunks and videos. An empty result means a uniform grid. Callers derive
-/// `max_heroes` from grid capacity (a hero occupies 4 cells, so at most
-/// `capacity / 4` heroes are placeable).
-pub fn pick_heroes(selected: &[ScoredFrame], max_heroes: usize, scene_diff_min: f32) -> Vec<usize> {
+/// `scene_diff` has fixed units — the threshold is a [`SceneDiff`] like the
+/// values it gates — which makes "no cuts, no heroes" hold across chunks and
+/// videos. An empty result means a uniform grid. Callers derive `max_heroes`
+/// from grid capacity (a hero occupies 4 cells, so at most `capacity / 4`
+/// heroes are placeable).
+pub fn pick_heroes(
+    selected: &[ScoredFrame],
+    max_heroes: usize,
+    scene_diff_min: SceneDiff,
+) -> Vec<usize> {
     let mut heroes: Vec<usize> = (0..selected.len())
-        .filter(|&i| selected[i].scene_diff.get() >= scene_diff_min)
+        .filter(|&i| selected[i].scene_diff.get() >= scene_diff_min.get())
         .collect();
     heroes.sort_by(|&a, &b| {
         selected[b]
@@ -547,7 +552,7 @@ mod tests {
     fn scored(ts: f32, score: f32) -> ScoredFrame {
         ScoredFrame {
             ts: crate::types::Ts::new(ts).expect("finite test ts"),
-            gray: GrayImage::new(1, 1),
+            gray: Arc::new(GrayImage::new(1, 1)),
             rgb: Arc::new(RgbImage::new(1, 1)),
             score: Score::new(score).expect("test score in 0..=100"),
             scene_diff: SceneDiff::new(0.0).expect("zero diff is valid"),
@@ -572,6 +577,15 @@ mod tests {
 
     fn weights(scene: f32, clarity: f32, edge: f32) -> Weights {
         Weights::new(scene, clarity, edge).expect("valid test weights")
+    }
+
+    /// The default hero threshold as the [`SceneDiff`] `pick_heroes` takes.
+    fn default_min_diff() -> SceneDiff {
+        min_diff(DEFAULT_HERO_SCENE_DIFF)
+    }
+
+    fn min_diff(v: f32) -> SceneDiff {
+        SceneDiff::new(v).expect("test threshold in 0..=255")
     }
 
     #[test]
@@ -645,7 +659,7 @@ mod tests {
     fn diffs_first_frame_against_boundary_context() {
         let candidate = |gray: GrayImage| CandidateFrame {
             ts: crate::types::Ts::new(0.0).expect("finite test ts"),
-            gray,
+            gray: Arc::new(gray),
             rgb: Arc::new(RgbImage::new(1, 1)),
         };
         let black = GrayImage::from_pixel(8, 8, Luma([0]));
@@ -769,7 +783,7 @@ mod tests {
             with_diff(2.0, 20.0),
             with_diff(3.0, 90.0),
         ];
-        let heroes = pick_heroes(&fs, 3, DEFAULT_HERO_SCENE_DIFF);
+        let heroes = pick_heroes(&fs, 3, default_min_diff());
         assert_eq!(heroes, vec![3]);
     }
 
@@ -783,7 +797,7 @@ mod tests {
             with_diff(2.0, 60.0),
         ];
         fs[2].score = Score::new(99.0).expect("test score in 0..=100");
-        let heroes = pick_heroes(&fs, 3, DEFAULT_HERO_SCENE_DIFF);
+        let heroes = pick_heroes(&fs, 3, default_min_diff());
         assert!(heroes.is_empty(), "no cut means a uniform grid");
     }
 
@@ -791,10 +805,10 @@ mod tests {
     fn lowered_threshold_admits_softer_cuts() {
         let fs = vec![with_diff(0.0, 15.0), with_diff(1.0, 65.0)];
         assert!(
-            pick_heroes(&fs, 3, DEFAULT_HERO_SCENE_DIFF).is_empty(),
+            pick_heroes(&fs, 3, default_min_diff()).is_empty(),
             "65 is same-scene motion at the default threshold"
         );
-        assert_eq!(pick_heroes(&fs, 3, 60.0), vec![1]);
+        assert_eq!(pick_heroes(&fs, 3, min_diff(60.0)), vec![1]);
     }
 
     #[test]
@@ -806,7 +820,7 @@ mod tests {
             with_diff(2.0, 10.0),
             with_diff(3.0, 140.0),
         ];
-        let t = DEFAULT_HERO_SCENE_DIFF;
+        let t = default_min_diff();
         assert_eq!(pick_heroes(&fs, 2, t), vec![3, 1], "strongest change first");
         assert_eq!(
             pick_heroes(&fs, 1, t),

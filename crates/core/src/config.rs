@@ -13,7 +13,7 @@ use std::num::NonZeroUsize;
 use crate::error::{Error, ErrorCode};
 use crate::probe::SampleStrategy;
 use crate::score::Weights;
-use crate::types::{CanvasSpec, Detail, Quality};
+use crate::types::{CanvasSpec, Detail, Quality, SceneDiff};
 
 /// Default dedup sliding window, in kept frames.
 const DEFAULT_DEDUP_WINDOW: NonZeroUsize = NonZeroUsize::new(8).unwrap();
@@ -332,23 +332,25 @@ impl RenderCfg {
     }
 }
 
-/// Hero-selection parameters. `scene_diff` is a mean absolute grayscale
-/// difference in `0..=255`; a threshold outside that range would silently
-/// disable heroes (`--max-heroes 0` is the explicit way to do that).
+/// Hero-selection parameters. The threshold is a [`SceneDiff`] — the same
+/// currency as the per-frame values it gates — so "finite, in `0..=255`" is
+/// its constructor's contract, not a re-verification here; a threshold
+/// outside that range would silently disable heroes (`--max-heroes 0` is the
+/// explicit way to do that).
 #[derive(Debug, Clone, Copy)]
 struct HeroCfg {
-    scene_diff_min: f32,
+    scene_diff_min: SceneDiff,
     max_per_grid: usize,
 }
 
 impl HeroCfg {
     fn new(scene_diff_min: f32, max_per_grid: usize) -> crate::error::Result<Self> {
-        if !scene_diff_min.is_finite() || !(0.0..=255.0).contains(&scene_diff_min) {
+        let Some(scene_diff_min) = SceneDiff::new(scene_diff_min) else {
             return invalid(
                 "hero_scene_diff",
                 format!("{scene_diff_min} (must be finite and in 0..=255)"),
             );
-        }
+        };
         Ok(Self {
             scene_diff_min,
             max_per_grid,
@@ -587,6 +589,7 @@ impl Config {
         })
     }
 
+    /// Longer canvas edge in pixels.
     pub fn max_edge(&self) -> u32 {
         self.canvas.edge()
     }
@@ -603,48 +606,59 @@ impl Config {
         self.canvas
     }
 
+    /// Base sampling fps for `process`.
     pub fn base_fps(&self) -> f32 {
         self.sampling.base_fps
     }
 
+    /// Sampling fps for `extract`: the detail tier's fps densified 3×, or an
+    /// explicit `--base-fps` verbatim.
     pub fn extract_fps(&self) -> f32 {
         self.sampling.extract_fps
     }
 
+    /// Chunk length in seconds — the grid-sealing throttle.
     pub fn chunk_seconds(&self) -> f32 {
         self.sampling.chunk_seconds
     }
 
+    /// Floor under the minimum temporal gap between selected frames, seconds.
     pub fn min_gap(&self) -> f32 {
         self.sampling.min_gap
     }
 
+    /// Shorter edge (px) of the grayscale image scoring convolutions run on.
     pub fn score_edge(&self) -> u32 {
         self.sampling.score_edge
     }
 
+    /// pHash Hamming distance threshold for dedup; at most 64.
     pub fn hash_threshold(&self) -> u32 {
         self.dedup.hash_threshold
     }
 
+    /// Dedup sliding window size, in kept frames.
     pub fn dedup_window(&self) -> NonZeroUsize {
         self.dedup.window
     }
 
+    /// Scoring dimension weights.
     pub fn weights(&self) -> Weights {
         self.weights
     }
 
+    /// JPEG output quality, in `1..=100`.
     pub fn jpeg_quality(&self) -> u8 {
         self.render.jpeg_quality
     }
 
+    /// Hero frame border thickness in pixels.
     pub fn hero_border_px(&self) -> u32 {
         self.render.hero_border_px
     }
 
     /// Minimum raw `scene_diff` for a frame to qualify as a hero.
-    pub fn hero_scene_diff(&self) -> f32 {
+    pub fn hero_scene_diff(&self) -> SceneDiff {
         self.hero.scene_diff_min
     }
 
@@ -653,6 +667,7 @@ impl Config {
         self.hero.max_per_grid
     }
 
+    /// The resolved sampling strategy.
     pub fn strategy(&self) -> SampleStrategy {
         self.strategy.strategy
     }
@@ -664,22 +679,27 @@ impl Config {
         self.strategy.explicit
     }
 
+    /// Gap threshold (seconds) for adaptive sparse-region fill.
     pub fn gap_threshold(&self) -> f32 {
         self.strategy.gap_threshold
     }
 
+    /// Minimum keyframes required for keyframe/adaptive strategies.
     pub fn min_keyframes(&self) -> usize {
         self.strategy.min_keyframes
     }
 
+    /// Max duration (seconds) allowed for fixed-fps sampling without `--force`.
     pub fn max_duration(&self) -> f32 {
         self.strategy.max_duration
     }
 
+    /// Whether `--force` allows fixed-fps past the max-duration limit.
     pub fn force_long_video(&self) -> bool {
         self.strategy.force_long_video
     }
 
+    /// The resolved settings echoed into the output document.
     pub fn settings(&self) -> crate::types::Settings {
         crate::types::Settings {
             max_edge: self.max_edge(),
@@ -832,7 +852,7 @@ mod tests {
         };
         let cfg = Config::new(2000, Some(Profile::Action), &ov, StrategyOpts::default())
             .expect("config builds");
-        assert_eq!(cfg.hero_scene_diff(), 80.0, "CLI outranks the profile");
+        assert_eq!(cfg.hero_scene_diff().get(), 80.0, "CLI outranks the profile");
         assert_eq!(
             cfg.base_fps(),
             3.0,

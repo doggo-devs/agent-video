@@ -22,10 +22,8 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use anyhow::{Context, Result};
-
 use crate::config::Config;
-use crate::error::{Error, ErrorCode, ErrorContext};
+use crate::error::{Context as _, Error, ErrorCode, ErrorContext, Result};
 use crate::event::{Event, EventSink};
 use crate::media;
 use crate::probe::{KeyframeInfo, SampleStrategy};
@@ -146,6 +144,9 @@ pub struct ProcessOpts<'a> {
 }
 
 /// Run the full `process` pipeline.
+///
+/// Every failure is a coded [`Error`]: the exit-code contract is stated by
+/// the signature, not recovered by downcasting.
 pub fn process(
     input: &Source,
     sink: OutputSink<'_>,
@@ -178,7 +179,15 @@ pub fn process(
     let pool = builder
         .thread_name(|i| format!("agent-video-{i}"))
         .build()
-        .context("building rayon thread pool")?;
+        .map_err(|e| {
+            // The pool size is configuration (`--threads`); a pool the OS
+            // cannot provide is a config problem, not a bug.
+            Error::new(
+                ErrorCode::InvalidConfig,
+                format!("building rayon thread pool: {e}"),
+            )
+            .with_source(e)
+        })?;
 
     // The orchestrator stays on the calling thread; only worker jobs run on
     // the pool. Inside the pool it would deadlock a single-thread pool — the
@@ -257,11 +266,7 @@ fn adaptive_stream(ctx: &RunCtx<'_>, info: &KeyframeInfo) -> Result<sample::Fram
         ctx.events.event(Event::AdaptiveFallbackFixedFps {
             coverage_percent: 100.0 * covered / info.duration,
         });
-        return Ok(sample::stream_frames(
-            ctx.input,
-            cfg.base_fps(),
-            ctx.stream_params(),
-        )?);
+        return sample::stream_frames(ctx.input, cfg.base_fps(), ctx.stream_params());
     }
 
     for region in &fill {
@@ -270,12 +275,7 @@ fn adaptive_stream(ctx: &RunCtx<'_>, info: &KeyframeInfo) -> Result<sample::Fram
             end: region.end(),
         });
     }
-    Ok(sample::stream_mixed(
-        ctx.input,
-        cfg.base_fps(),
-        fill,
-        ctx.stream_params(),
-    )?)
+    sample::stream_mixed(ctx.input, cfg.base_fps(), fill, ctx.stream_params())
 }
 
 /// Resolve the strategy against a window (`--from/--until`).
@@ -293,8 +293,7 @@ fn resolve_windowed_strategy(cfg: &Config, window: Option<Window>) -> Result<Sam
         return Err(Error::new(
             ErrorCode::InvalidRange,
             "--from/--until require the fixed-fps strategy; drop --strategy or the window",
-        )
-        .into());
+        ));
     }
     Ok(SampleStrategy::FixedFps)
 }
@@ -316,8 +315,8 @@ fn resolve_plan(
         SampleStrategy::FixedFps if cfg.force_long_video() => Ok(ResolvedPlan::FixedFps {
             probed_duration: None,
         }),
-        // `.context` keeps the probe's own error code downcastable, so the
-        // exit code names the real cause rather than a generic wrapper.
+        // The typed `.context` decorates the reason and keeps the code, so
+        // the exit code names the real cause rather than a generic wrapper.
         SampleStrategy::FixedFps => {
             let duration = probe::probe_duration(input, stop)
                 .context("cannot verify duration safety for fixed-fps sampling (use --force to skip this check)")?;
@@ -395,8 +394,7 @@ fn validate_fixed_fps(
                 w.start(),
                 duration
             ),
-        )
-        .into());
+        ));
     }
     // The decode-cost guard applies to what is actually decoded: the
     // window span when clamped, the whole video otherwise.
@@ -416,8 +414,7 @@ fn validate_fixed_fps(
                  or a narrower --from/--until",
                 cfg.max_duration()
             ),
-        )
-        .into());
+        ));
     }
     Ok(())
 }
@@ -435,8 +432,7 @@ fn validate_keyframe_sufficiency(cfg: &Config, info: &KeyframeInfo) -> Result<()
                 info.count(),
                 cfg.min_keyframes()
             ),
-        )
-        .into());
+        ));
     }
     Ok(())
 }
@@ -464,8 +460,7 @@ pub(crate) fn validate_input(input: &Source) -> Result<()> {
             ErrorCode::InputUnreadable,
             format!("input {} is a directory, not a video file", path.display()),
         )
-        .with_context(ErrorContext::default().with_input(path))
-        .into());
+        .with_context(ErrorContext::default().with_input(path)));
     }
     Ok(())
 }
@@ -543,8 +538,7 @@ fn reject_empty_run(input: &Source, metas: &[GridMeta]) -> Result<()> {
             ErrorCode::NoFramesExtracted,
             "no frames decoded from the video stream; is the input empty or corrupt?",
         )
-        .with_context(ErrorContext::default().with_input(input.as_path()))
-        .into());
+        .with_context(ErrorContext::default().with_input(input.as_path())));
     }
     Ok(())
 }
@@ -586,15 +580,13 @@ mod tests {
     fn rejects_missing_input_with_not_found_code() {
         let err = validate_input(&Source::classify("definitely_missing_video.mp4"))
             .expect_err("missing input must fail");
-        let code = err.downcast_ref::<Error>().map(|e| e.code);
-        assert_eq!(code, Some(ErrorCode::InputNotFound));
+        assert_eq!(err.code, ErrorCode::InputNotFound);
     }
 
     #[test]
     fn rejects_directory_input_as_unreadable() {
         let err = validate_input(&Source::classify(".")).expect_err("directory input must fail");
-        let code = err.downcast_ref::<Error>().map(|e| e.code);
-        assert_eq!(code, Some(ErrorCode::InputUnreadable));
+        assert_eq!(err.code, ErrorCode::InputUnreadable);
     }
 
     #[test]
@@ -627,8 +619,7 @@ mod tests {
     fn rejects_empty_run_with_no_frames_code() {
         let err = reject_empty_run(&Source::classify("video.mp4"), &[])
             .expect_err("zero grids must fail, not write grids: []");
-        let code = err.downcast_ref::<Error>().map(|e| e.code);
-        assert_eq!(code, Some(ErrorCode::NoFramesExtracted));
+        assert_eq!(err.code, ErrorCode::NoFramesExtracted);
     }
 
     #[test]
@@ -721,8 +712,7 @@ mod tests {
         let cfg = cfg_with_strategy(Some(SampleStrategy::Adaptive));
         let err = resolve_windowed_strategy(&cfg, window())
             .expect_err("explicit adaptive + window must fail");
-        let code = err.downcast_ref::<Error>().map(|e| e.code);
-        assert_eq!(code, Some(ErrorCode::InvalidRange));
+        assert_eq!(err.code, ErrorCode::InvalidRange);
     }
 
     #[test]

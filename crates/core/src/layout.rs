@@ -18,7 +18,7 @@
 
 use std::mem;
 
-use crate::types::{CanvasSpec, LayoutKind, Rect};
+use crate::types::{Aspect, CanvasSpec, LayoutKind, Rect};
 
 /// A computed grid: one rectangle per frame (in input order) plus canvas size
 /// and the template name driven by hero count.
@@ -29,7 +29,9 @@ pub struct Layout {
     /// cell — composition skips it, and hero eviction treats it as below any
     /// readable floor. Capacity-driven callers never see it in practice.
     pub rects: Vec<Option<Rect>>,
+    /// Canvas width in pixels.
     pub canvas_w: u32,
+    /// Canvas height in pixels.
     pub canvas_h: u32,
     /// Template for metadata, named by hero count.
     pub template: LayoutKind,
@@ -41,24 +43,12 @@ pub struct Layout {
 /// while [`compute`] only keeps it roughly square. A cell's shorter edge is
 /// `min_cell_edge`, so its area is `min_cell_edge² × max(aspect, 1/aspect)`.
 /// Returns at least 1.
-pub fn grid_capacity(spec: &CanvasSpec, aspect: f32) -> usize {
-    let aspect = sane_aspect(aspect);
+pub fn grid_capacity(spec: &CanvasSpec, aspect: Aspect) -> usize {
+    let aspect = aspect.get();
     let edge = spec.edge() as f32;
     let long_ratio = aspect.max(1.0 / aspect);
     let cell_area = (spec.min_cell_edge() as f32).powi(2) * long_ratio;
     ((edge * edge) / cell_area).floor().max(1.0) as usize
-}
-
-/// Guard against a degenerate aspect (0, negative, NaN, inf), which would
-/// round the whole geometry into zero-sized rects or a NaN canvas. Frames
-/// decoded by [`crate::sample`] always yield a finite positive aspect, so the
-/// square fallback is defense in depth for other callers, not a normal path.
-fn sane_aspect(aspect: f32) -> f32 {
-    if aspect.is_finite() && aspect > 0.0 {
-        aspect
-    } else {
-        1.0
-    }
 }
 
 fn template_kind(hero_count: usize) -> LayoutKind {
@@ -72,12 +62,13 @@ fn template_kind(hero_count: usize) -> LayoutKind {
 
 /// Compute the layout for the frames whose scores are given (one per frame,
 /// in time order), where `heroes` lists hero frame indices. `aspect` is the
-/// source frame `w/h`.
+/// source frame `w/h` — finite and positive by [`Aspect`]'s construction, so
+/// the geometry below cannot round into zero-sized rects or a NaN canvas.
 ///
 /// Scores rank normal frames for promotion into a short hero row; they play
 /// no other role. The returned `rects` are aligned with the input frame order.
-pub fn compute(scores: &[f32], heroes: &[usize], aspect: f32, spec: &CanvasSpec) -> Layout {
-    let aspect = sane_aspect(aspect);
+pub fn compute(scores: &[f32], heroes: &[usize], aspect: Aspect, spec: &CanvasSpec) -> Layout {
+    let aspect = aspect.get();
     if scores.is_empty() {
         return Layout {
             rects: Vec::new(),
@@ -191,6 +182,10 @@ mod tests {
         crate::types::CanvasSpec::new(8000, 512).expect("valid test spec")
     }
 
+    fn asp(v: f32) -> Aspect {
+        Aspect::new(v).expect("finite positive test aspect")
+    }
+
     /// Uniform scores for `n` frames (promotion order irrelevant).
     fn flat(n: usize) -> Vec<f32> {
         vec![50.0; n]
@@ -233,7 +228,7 @@ mod tests {
 
     #[test]
     fn lays_out_uniform_landscape() {
-        let l = compute(&flat(12), &[], 16.0 / 9.0, &spec());
+        let l = compute(&flat(12), &[], asp(16.0 / 9.0), &spec());
         assert_eq!(l.template, LayoutKind::Uniform);
         assert_eq!(l.rects.len(), 12);
         assert_tiles(&l);
@@ -241,7 +236,7 @@ mod tests {
 
     #[test]
     fn lays_out_uniform_portrait() {
-        let l = compute(&flat(12), &[], 9.0 / 16.0, &spec());
+        let l = compute(&flat(12), &[], asp(9.0 / 16.0), &spec());
         assert_tiles(&l);
         // Portrait cells are taller than wide.
         let r = l.rects[0].expect("cell placed");
@@ -253,7 +248,7 @@ mod tests {
 
     #[test]
     fn landscape_cell_is_wider_than_tall() {
-        let l = compute(&flat(12), &[], 16.0 / 9.0, &spec());
+        let l = compute(&flat(12), &[], asp(16.0 / 9.0), &spec());
         let r = l.rects[0].expect("cell placed");
         assert!(
             r.w() > r.h(),
@@ -265,7 +260,7 @@ mod tests {
     fn awkward_frame_count_still_tiles() {
         // 7 is prime: cannot tile a rectangle exactly.
         for n in [3, 5, 7, 11, 13] {
-            let l = compute(&flat(n), &[], 16.0 / 9.0, &spec());
+            let l = compute(&flat(n), &[], asp(16.0 / 9.0), &spec());
             assert_tiles(&l);
         }
     }
@@ -276,7 +271,7 @@ mod tests {
         // hero; frame 1 stays in a normal row for the size comparison.
         let mut scores = vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 90.0];
         scores[0] = 95.0;
-        let l = compute(&scores, &[0], 16.0 / 9.0, &spec());
+        let l = compute(&scores, &[0], asp(16.0 / 9.0), &spec());
         assert_eq!(l.template, LayoutKind::HeroLeft);
         assert_tiles(&l);
         let hero = l.rects[0].expect("hero placed");
@@ -291,28 +286,28 @@ mod tests {
     fn deduplicates_repeated_hero_index() {
         // A repeated index must occupy one hero slot, not two. HERO_LEFT
         // (single hero) is the correct template.
-        let l = compute(&flat(10), &[0, 0], 16.0 / 9.0, &spec());
+        let l = compute(&flat(10), &[0, 0], asp(16.0 / 9.0), &spec());
         assert_eq!(l.template, LayoutKind::HeroLeft);
         assert_tiles(&l);
     }
 
     #[test]
     fn dual_hero_names_template() {
-        let l = compute(&flat(10), &[0, 1], 16.0 / 9.0, &spec());
+        let l = compute(&flat(10), &[0, 1], asp(16.0 / 9.0), &spec());
         assert_eq!(l.template, LayoutKind::DualHero);
         assert_tiles(&l);
     }
 
     #[test]
     fn three_heroes_make_top_strip() {
-        let l = compute(&flat(12), &[0, 1, 2], 16.0 / 9.0, &spec());
+        let l = compute(&flat(12), &[0, 1, 2], asp(16.0 / 9.0), &spec());
         assert_eq!(l.template, LayoutKind::TopStrip);
         assert_tiles(&l);
     }
 
     #[test]
     fn portrait_hero_lays_out_left_column() {
-        let l = compute(&flat(10), &[0], 9.0 / 16.0, &spec());
+        let l = compute(&flat(10), &[0], asp(9.0 / 16.0), &spec());
         assert_tiles(&l);
         // Hero anchors at the top-left: hero rows transpose to left columns.
         let hero = l.rects[0].expect("hero placed");
@@ -322,7 +317,7 @@ mod tests {
     #[test]
     fn hero_only_chunk_tiles_without_normals() {
         // Eviction can leave nothing but heroes; rows shrink to fit them.
-        let l = compute(&flat(2), &[0, 1], 16.0 / 9.0, &spec());
+        let l = compute(&flat(2), &[0, 1], asp(16.0 / 9.0), &spec());
         assert_eq!(l.template, LayoutKind::DualHero);
         assert_tiles(&l);
     }
@@ -333,32 +328,31 @@ mod tests {
         // halving the cell floor quadruples how many frames fit.
         let hi = grid_capacity(
             &crate::types::CanvasSpec::new(8000, 512).expect("valid test spec"),
-            1.0,
+            Aspect::SQUARE,
         );
         let lo = grid_capacity(
             &crate::types::CanvasSpec::new(8000, 256).expect("valid test spec"),
-            1.0,
+            Aspect::SQUARE,
         );
         assert_eq!(lo, hi * 4);
     }
 
     #[test]
-    fn degenerate_aspect_falls_back_to_square() {
-        // 0, NaN, and inf would otherwise produce zero-sized rects or a NaN
-        // canvas; the layout must stay a valid tiling.
-        for aspect in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-            let l = compute(&flat(6), &[], aspect, &spec());
-            assert_tiles(&l);
+    fn extreme_aspect_keeps_capacity_positive() {
+        // Aspect is finite and positive by construction; the arithmetic floor
+        // must still never report zero capacity at the extremes.
+        for aspect in [Aspect::from_dims(1, 4096), Aspect::from_dims(4096, 1)] {
+            let aspect = aspect.expect("non-zero dims form an aspect");
             assert!(
                 grid_capacity(&spec(), aspect) >= 1,
-                "capacity stays positive for aspect {aspect}"
+                "capacity stays positive for aspect {aspect:?}"
             );
         }
     }
 
     #[test]
     fn single_frame_fills_whole_canvas() {
-        let l = compute(&flat(1), &[], 1.0, &spec());
+        let l = compute(&flat(1), &[], Aspect::SQUARE, &spec());
         assert_eq!(l.rects.len(), 1);
         assert_tiles(&l);
         let r = l.rects[0].expect("cell placed");

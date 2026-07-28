@@ -12,18 +12,23 @@ use std::sync::Arc;
 
 use image::RgbImage;
 
+use crate::types::TimeRange;
+
 /// Minimum number of frames dropped as duplicates inside a kept-frame gap for
 /// the gap to count as a static stretch. One drop could be a flicker; a few
 /// spanning drops are evidence that the scene genuinely held still. Gaps
 /// without drops (sparse keyframe sampling) are left alone.
 const MIN_STATIC_DROPS: usize = 3;
 
-/// A detected static stretch: the scene held still over `[start, end]` and
-/// `rgb` (the kept frame at `start`) stands in for the whole range.
+/// A detected static stretch: the scene held still over `range` and `rgb`
+/// (the kept frame at the range's start) stands in for the whole span.
+/// Carrying a [`TimeRange`] makes `start <= end` a construction fact, not a
+/// consumer-side re-proof.
 #[derive(Debug)]
 pub struct Stretch {
-    pub start: f32,
-    pub end: f32,
+    /// The still span on the timeline.
+    pub range: TimeRange,
+    /// The representative frame, shared with the pipeline via [`Arc`].
     pub rgb: Arc<RgbImage>,
 }
 
@@ -54,6 +59,7 @@ pub struct StretchDetector {
 }
 
 impl StretchDetector {
+    /// A detector requiring kept-frame gaps of at least `min_span` seconds.
     pub fn new(min_span: f32) -> Self {
         Self {
             min_span,
@@ -70,18 +76,18 @@ impl StretchDetector {
     /// previous kept frame qualifies, then makes this frame the new
     /// representative candidate.
     pub fn note_kept(&mut self, ts: f32, rgb: &Arc<RgbImage>) -> Option<Stretch> {
-        let stretch = match &self.last_kept {
-            Some((prev_ts, prev_rgb))
-                if ts - prev_ts >= self.min_span && self.drop_count() >= MIN_STATIC_DROPS =>
-            {
-                Some(Stretch {
-                    start: *prev_ts,
-                    end: ts,
+        let stretch = self.last_kept.as_ref().and_then(|(prev_ts, prev_rgb)| {
+            // The range doubles as the gap proof: timestamps are fed in
+            // order, so `new` only fails on a backwards pair — which is no
+            // stretch — and the span check subsumes the ordering.
+            let range = TimeRange::new(*prev_ts, ts)?;
+            (range.duration() >= self.min_span && self.drop_count() >= MIN_STATIC_DROPS).then(
+                || Stretch {
+                    range,
                     rgb: prev_rgb.clone(),
-                })
-            }
-            _ => None,
-        };
+                },
+            )
+        });
         self.last_kept = Some((ts, rgb.clone()));
         self.drops = None;
         stretch
@@ -101,11 +107,8 @@ impl StretchDetector {
             return None;
         }
         let (prev_ts, rgb) = self.last_kept.take()?;
-        (drops.last_ts - prev_ts >= self.min_span).then_some(Stretch {
-            start: prev_ts,
-            end: drops.last_ts,
-            rgb,
-        })
+        let range = TimeRange::new(prev_ts, drops.last_ts)?;
+        (range.duration() >= self.min_span).then_some(Stretch { range, rgb })
     }
 }
 
@@ -132,7 +135,7 @@ mod tests {
         drop_range(&mut det, 0.0, 5);
         let stretch = det.note_kept(75.0, &rgb()).expect("gap qualifies");
 
-        assert_eq!((stretch.start, stretch.end), (0.0, 75.0));
+        assert_eq!((stretch.range.start(), stretch.range.end()), (0.0, 75.0));
     }
 
     #[test]
@@ -166,7 +169,7 @@ mod tests {
         drop_range(&mut det, 1.0, 69);
         let stretch = det.finish().expect("trailing stretch qualifies");
 
-        assert_eq!((stretch.start, stretch.end), (1.0, 70.0));
+        assert_eq!((stretch.range.start(), stretch.range.end()), (1.0, 70.0));
     }
 
     #[test]

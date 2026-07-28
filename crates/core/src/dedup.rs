@@ -50,7 +50,7 @@ impl Deduper {
     pub fn judge(&mut self, frames: Vec<CandidateFrame>) -> Vec<(CandidateFrame, bool)> {
         let hashes: Vec<ImageHash> = frames
             .par_iter()
-            .map(|frame| self.hasher.hash_image(&frame.gray))
+            .map(|frame| self.hasher.hash_image(frame.gray.as_ref()))
             .collect();
 
         frames
@@ -90,7 +90,7 @@ mod tests {
     fn flat_frame(ts: f32, level: u8) -> CandidateFrame {
         CandidateFrame {
             ts: crate::types::Ts::new(ts).expect("finite test ts"),
-            gray: GrayImage::from_pixel(64, 64, image::Luma([level])),
+            gray: Arc::new(GrayImage::from_pixel(64, 64, image::Luma([level]))),
             rgb: Arc::new(RgbImage::new(1, 1)),
         }
     }
@@ -155,7 +155,7 @@ mod tests {
         }
         let mk = |ts, g| CandidateFrame {
             ts: crate::types::Ts::new(ts).expect("finite test ts"),
-            gray: g,
+            gray: Arc::new(g),
             rgb: Arc::new(RgbImage::new(1, 1)),
         };
         let kept = dedup(vec![mk(0.0, a), mk(1.0, b)], 8, 8);

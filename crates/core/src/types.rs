@@ -43,6 +43,7 @@ impl Ts {
         v.is_finite().then_some(Self(v))
     }
 
+    /// The wrapped timestamp in seconds, finite.
     pub fn get(self) -> f32 {
         self.0
     }
@@ -73,15 +74,16 @@ impl Ord for Ts {
 
 /// A sampled frame before scoring: what extract, dedup, and chunking carry.
 ///
-/// Holds only downscaled derivatives, never the source-resolution buffer. The
-/// RGB is shared via [`Arc`] so retaining a static-stretch representative is a
-/// pointer clone rather than a ~1.4 MB deep copy.
+/// Holds only downscaled derivatives, never the source-resolution buffer.
+/// Both derivatives are shared via [`Arc`], so retaining a representative —
+/// a static-stretch RGB or a chunk-boundary grayscale tail — is a pointer
+/// clone rather than a deep copy.
 #[derive(Debug, Clone)]
 pub struct CandidateFrame {
     /// Presentation timestamp.
     pub ts: Ts,
     /// Small grayscale image used for scoring convolutions.
-    pub gray: GrayImage,
+    pub gray: Arc<GrayImage>,
     /// Small RGB image pasted onto the grid during composition.
     pub rgb: Arc<RgbImage>,
 }
@@ -94,7 +96,7 @@ pub struct ScoredFrame {
     /// Presentation timestamp.
     pub ts: Ts,
     /// Small grayscale image, retained because `extract` re-scores globally.
-    pub gray: GrayImage,
+    pub gray: Arc<GrayImage>,
     /// Small RGB image pasted onto the grid during composition.
     pub rgb: Arc<RgbImage>,
     /// Final weighted score.
@@ -122,6 +124,7 @@ impl Score {
         (v.is_finite() && (0.0..=100.0).contains(&v)).then_some(Self(v))
     }
 
+    /// The wrapped score, finite and in `0..=100`.
     pub fn get(self) -> f32 {
         self.0
     }
@@ -139,6 +142,38 @@ impl SceneDiff {
         (v.is_finite() && (0.0..=255.0).contains(&v)).then_some(Self(v))
     }
 
+    /// The wrapped difference, finite and in `0..=255`.
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+/// Source frame aspect ratio (`w/h`): finite and strictly positive by
+/// construction.
+///
+/// Minted where aspect is born — the decode boundary, from a decoded frame's
+/// own dimensions ([`Aspect::from_dims`]) — so layout geometry never has to
+/// re-check for the 0/NaN/inf that would round every cell to nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Aspect(f32);
+
+impl Aspect {
+    /// The square ratio — the capacity-planning default before any frame
+    /// has been decoded.
+    pub const SQUARE: Aspect = Aspect(1.0);
+
+    /// Wrap a ratio, or `None` unless it is finite and strictly positive.
+    pub fn new(v: f32) -> Option<Self> {
+        (v.is_finite() && v > 0.0).then_some(Self(v))
+    }
+
+    /// The ratio of decoded frame dimensions, or `None` when either edge is
+    /// zero. Non-zero `u32` edges always divide into a finite positive `f32`.
+    pub fn from_dims(w: u32, h: u32) -> Option<Self> {
+        (w > 0 && h > 0).then(|| Self(w as f32 / h as f32))
+    }
+
+    /// The wrapped ratio, finite and strictly positive.
     pub fn get(self) -> f32 {
         self.0
     }
@@ -166,18 +201,22 @@ impl Rect {
             .then_some(Self { x, y, w, h })
     }
 
+    /// Left edge in pixels.
     pub fn x(&self) -> u32 {
         self.x
     }
 
+    /// Top edge in pixels.
     pub fn y(&self) -> u32 {
         self.y
     }
 
+    /// Width in pixels; at least 1.
     pub fn w(&self) -> u32 {
         self.w
     }
 
+    /// Height in pixels; at least 1.
     pub fn h(&self) -> u32 {
         self.h
     }
@@ -315,6 +354,8 @@ pub struct CanvasSpec {
 }
 
 impl CanvasSpec {
+    /// Validate canvas geometry: the canvas must fit one legible cell and
+    /// stay within the JPEG dimension limit.
     pub fn new(edge: u32, min_cell_edge: u32) -> crate::error::Result<Self> {
         use crate::error::{Error, ErrorCode};
         // Reject a canvas too small for one legible cell (would "succeed" as a
@@ -337,10 +378,12 @@ impl CanvasSpec {
         })
     }
 
+    /// Longer canvas edge in pixels.
     pub fn edge(&self) -> u32 {
         self.edge
     }
 
+    /// Target shorter edge of a single cell, in pixels.
     pub fn min_cell_edge(&self) -> u32 {
         self.min_cell_edge
     }
@@ -362,10 +405,12 @@ impl TimeRange {
         (start.is_finite() && end.is_finite() && start <= end).then_some(Self { start, end })
     }
 
+    /// Start of the range in seconds.
     pub fn start(&self) -> f32 {
         self.start
     }
 
+    /// End of the range in seconds; at least `start`.
     pub fn end(&self) -> f32 {
         self.end
     }
@@ -395,19 +440,18 @@ pub enum GridImage {
     Base64(String),
 }
 
-/// Per-grid subtitle outcome.
+/// Per-grid subtitle outcome — the *result* of subtitle resolution.
 ///
-/// The states a bare `Option<String>` collapsed — "resolution never ran",
-/// "the run has no subtitle source", and "a source exists but no cue overlaps
-/// this range" — are distinct constructors here, so downstream code can tell
-/// "not found" from "not looked for" by type. On the wire only
-/// [`GridSubtitles::Text`] survives, as [`crate::wire::Grid::subtitles`].
-#[derive(Debug, Clone, Default, PartialEq)]
+/// The states a bare `Option<String>` collapsed — "the run has no subtitle
+/// source" and "a source exists but no cue overlaps this range" — are
+/// distinct constructors here, so downstream code can tell them apart by
+/// type. "Resolution never ran" is not a state of this type at all: a
+/// [`GridMeta`] carries no subtitle slot, and the wire shape is only
+/// constructible by pairing one with a resolved outcome
+/// ([`crate::wire::Grid::new`]). On the wire only [`GridSubtitles::Text`]
+/// survives, as [`crate::wire::Grid::subtitles`].
+#[derive(Debug, Clone, PartialEq)]
 pub enum GridSubtitles {
-    /// Subtitle resolution has not run for this grid yet (worker drafts,
-    /// static entries before the output pass).
-    #[default]
-    Unresolved,
     /// The run resolved no subtitle source at all.
     NoSource,
     /// A source exists, but no cue overlaps this grid's time range.
@@ -416,16 +460,25 @@ pub enum GridSubtitles {
     Text(String),
 }
 
-/// Metadata for one rendered grid image; converts into [`crate::wire::Grid`]
-/// at the output boundary.
+/// Metadata for one rendered grid image.
+///
+/// Deliberately has no subtitle slot: subtitle resolution is a separate
+/// output-boundary step, and the wire shape ([`crate::wire::Grid`]) can only
+/// be built by pairing this with its resolved [`GridSubtitles`] — a grid
+/// whose resolution was forgotten does not typecheck, instead of silently
+/// serializing as "no subtitles".
 #[derive(Debug, Clone)]
 pub struct GridMeta {
+    /// Image payload, produced by the output session.
     pub image: GridImage,
+    /// Span of the frames on this grid.
     pub time_range: TimeRange,
+    /// Number of frames composed onto the grid.
     pub total_frames: usize,
+    /// Hero frames, empty for uniform grids.
     pub key_frames: Vec<KeyFrameMeta>,
+    /// Layout template label.
     pub layout: LayoutKind,
-    pub subtitles: GridSubtitles,
 }
 
 /// A grid's metadata before its image payload exists.
@@ -437,9 +490,13 @@ pub struct GridMeta {
 /// via [`GridDraft::into_meta`] at emission.
 #[derive(Debug, Clone)]
 pub struct GridDraft {
+    /// Span of the frames on this grid.
     pub time_range: TimeRange,
+    /// Number of frames composed onto the grid.
     pub total_frames: usize,
+    /// Hero frames, empty for uniform grids.
     pub key_frames: Vec<KeyFrameMeta>,
+    /// Layout template label.
     pub layout: LayoutKind,
 }
 
@@ -452,7 +509,6 @@ impl GridDraft {
             total_frames: self.total_frames,
             key_frames: self.key_frames,
             layout: self.layout,
-            subtitles: GridSubtitles::Unresolved,
         }
     }
 }
@@ -601,6 +657,18 @@ mod tests {
         let mut v = [ts(9.0), ts(-0.5), ts(3.0)];
         v.sort();
         assert_eq!(v, [ts(-0.5), ts(3.0), ts(9.0)]);
+    }
+
+    #[test]
+    fn rejects_degenerate_aspect() {
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(Aspect::new(bad).is_none(), "aspect {bad} must be rejected");
+        }
+        assert!(Aspect::new(16.0 / 9.0).is_some());
+        assert!(Aspect::from_dims(0, 9).is_none(), "zero width");
+        assert!(Aspect::from_dims(16, 0).is_none(), "zero height");
+        let a = Aspect::from_dims(1920, 1080).expect("real dims form an aspect");
+        assert!((a.get() - 16.0 / 9.0).abs() < 1e-6);
     }
 
     #[test]

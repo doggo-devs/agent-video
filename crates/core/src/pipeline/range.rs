@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Time range parsing (`extract --range`) and the `process` attention window.
 
-use anyhow::Result;
-
-use crate::error::{Error, ErrorCode};
+use crate::error::{Error, ErrorCode, Result};
 use crate::types::TimeRange;
 
 /// Parse a `MM:SS-MM:SS` (or `SS-SS`) range into a [`TimeRange`]. Each bound
@@ -24,8 +22,7 @@ pub fn parse_range(s: &str) -> Result<TimeRange> {
         return Err(Error::new(
             ErrorCode::InvalidRange,
             format!("range end ({end}s) must be after start ({start}s)"),
-        )
-        .into());
+        ));
     }
     Ok(TimeRange::new(start, end).expect("end > start implies a valid range"))
 }
@@ -63,8 +60,7 @@ impl Window {
             return Err(Error::new(
                 ErrorCode::InvalidRange,
                 format!("--from must be a finite, non-negative number of seconds, got {start}"),
-            )
-            .into());
+            ));
         }
         if let Some(end) = until
             && (!end.is_finite() || end <= start)
@@ -72,8 +68,7 @@ impl Window {
             return Err(Error::new(
                 ErrorCode::InvalidRange,
                 format!("--until ({end}s) must be finite and after --from ({start}s)"),
-            )
-            .into());
+            ));
         }
         Ok(Some(Self { start, end: until }))
     }
@@ -85,15 +80,14 @@ impl Window {
 }
 
 /// The shared clock grammar with `--range`'s error currency: a rejection
-/// must carry [`ErrorCode::InvalidRange`] (exit 31), not the uncoded exit 1
-/// a bare anyhow error would degrade to.
+/// must carry [`ErrorCode::InvalidRange`] (exit 31) — a contract the typed
+/// [`Result`] now states in the signature.
 fn parse_clock(s: &str) -> Result<f32> {
     crate::types::parse_clock(s).ok_or_else(|| {
         Error::new(
             ErrorCode::InvalidRange,
             format!("invalid time '{s}': expected [HH:]MM:SS or seconds, finite and non-negative"),
         )
-        .into()
     })
 }
 
@@ -149,13 +143,13 @@ mod tests {
 
     #[test]
     fn maps_every_parse_failure_to_invalid_range_code() {
-        // main() picks the exit code by downcasting to the coded Error; a
-        // bare anyhow error would degrade InvalidRange(31) to exit 1.
+        // main() picks the exit code from the typed Error; the signature
+        // guarantees a code, this pins that it is the right one.
         for s in ["abc-5", "1:2:3:4-9", "NaN-1", "01:35-01:23", "5"] {
             let err = parse_range(s).expect_err("malformed range must fail");
             assert_eq!(
-                err.downcast_ref::<Error>().map(|e| e.code),
-                Some(ErrorCode::InvalidRange),
+                err.code,
+                ErrorCode::InvalidRange,
                 "range '{s}' must carry the InvalidRange code"
             );
         }

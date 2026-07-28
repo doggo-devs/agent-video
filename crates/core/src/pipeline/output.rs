@@ -5,10 +5,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
-
 use crate::config::Config;
-use crate::error::{Error, ErrorCode, ErrorContext};
+use crate::error::{Context as _, Error, ErrorCode, ErrorContext, Result};
 use crate::event::{Event, EventSink};
 use crate::source::Source;
 use crate::subtitle::Subtitles;
@@ -142,14 +140,12 @@ impl<'a> OutputSession<'a> {
                 // making staging the only complete copy. Drop must preserve
                 // it from here on.
                 self.preserve_staging = true;
-                let preserved = |e: anyhow::Error| {
-                    e.context(format!(
-                        "the completed run is preserved in {}; re-running rebuilds it",
-                        staging.display()
-                    ))
-                };
-                sweep_stale(dir).map_err(preserved)?;
-                promote(dir, &staging).map_err(preserved)?;
+                let preserved = format!(
+                    "the completed run is preserved in {}; re-running rebuilds it",
+                    staging.display()
+                );
+                sweep_stale(dir).context(&preserved)?;
+                promote(dir, &staging).context(&preserved)?;
                 events.event(Event::GridsWritten {
                     count: meta.grids.len(),
                     dir,
@@ -262,39 +258,38 @@ pub struct Timeline {
 /// sources, unreadable files) and must happen before any grid hits the disk,
 /// not here at the tail of the run. Every cue inside `timeline.processed`
 /// lands on exactly one grid ([`Subtitles::assign`]), so the unsampled
-/// head/tail and inter-grid gaps cannot swallow text. `events` receives the
-/// commit's [`Event::GridsWritten`] in file mode.
+/// head/tail and inter-grid gaps cannot swallow text. This is where each
+/// [`GridMeta`] is paired with its [`GridSubtitles`] outcome — the pairing
+/// [`wire::Grid::new`] requires, so no grid can reach the wire unresolved.
+/// `events` receives the commit's [`Event::GridsWritten`] in file mode.
+///
+/// [`Metadata`]: wire::Metadata
 pub fn write_outputs(
     session: OutputSession<'_>,
     input: &Source,
     cfg: &Config,
     timeline: Timeline,
-    mut grid_metas: Vec<GridMeta>,
+    grid_metas: Vec<GridMeta>,
     subs: Option<&Subtitles>,
     events: &dyn EventSink,
 ) -> Result<()> {
-    match subs {
+    let subtitles: Vec<GridSubtitles> = match subs {
         Some(subs) => {
             let spans: Vec<TimeRange> = grid_metas.iter().map(|g| g.time_range).collect();
-            for (grid, assigned) in grid_metas
-                .iter_mut()
-                .zip(subs.assign(timeline.processed, &spans))
-            {
-                grid.subtitles = assigned;
-            }
+            subs.assign(timeline.processed, &spans)
         }
-        None => {
-            for grid in &mut grid_metas {
-                grid.subtitles = GridSubtitles::NoSource;
-            }
-        }
-    }
+        None => vec![GridSubtitles::NoSource; grid_metas.len()],
+    };
 
     let meta = wire::Metadata::process(
         input.to_string(),
         timeline.duration,
         cfg.settings(),
-        grid_metas.into_iter().map(Into::into).collect(),
+        grid_metas
+            .into_iter()
+            .zip(subtitles)
+            .map(|(meta, subtitles)| wire::Grid::new(meta, subtitles))
+            .collect(),
     );
 
     // The SRT payload materializes only for the commit: verbatim sources
@@ -310,7 +305,6 @@ fn write_file(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
         Error::new(ErrorCode::OutputWriteFailed, format!("writing {name}: {e}"))
             .with_context(ErrorContext::default().with_output(&path))
             .with_source(e)
-            .into()
     })
 }
 

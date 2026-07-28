@@ -146,7 +146,7 @@ pub fn candidate_frames_from_rgbs(frames: Vec<RgbFrame>, score_edge: u32) -> Vec
 fn candidate_frame_from_rgb(frame: RgbFrame, score_edge: u32) -> CandidateFrame {
     CandidateFrame {
         ts: frame.ts,
-        gray: to_gray(&frame.rgb, score_edge),
+        gray: Arc::new(to_gray(&frame.rgb, score_edge)),
         rgb: Arc::new(frame.rgb),
     }
 }

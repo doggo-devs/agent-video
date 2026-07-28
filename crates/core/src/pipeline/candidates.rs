@@ -8,11 +8,10 @@
 //! two subcommands select surviving frames with the same machinery and
 //! cannot drift apart — the property the tests below pin down.
 
-use anyhow::Result;
-
 use crate::dedup::Deduper;
+use crate::error::Result;
 use crate::sample::{self, RgbFrame};
-use crate::types::CandidateFrame;
+use crate::types::{Aspect, CandidateFrame};
 
 /// One judged frame: the candidate and whether dedup kept it.
 pub type Judged = (CandidateFrame, bool);
@@ -25,17 +24,18 @@ pub trait RgbSource {
     /// The next decoded frame, or `None` after a clean end of stream.
     fn next_frame(&mut self) -> Result<Option<RgbFrame>>;
     /// Source frame aspect ratio, known once at least one frame was read.
-    fn aspect(&self) -> Option<f32>;
+    fn aspect(&self) -> Option<Aspect>;
 }
 
 impl RgbSource for sample::FrameStream {
     fn next_frame(&mut self) -> Result<Option<RgbFrame>> {
-        // `?` lifts the typed `error::Error` into `anyhow::Error`, keeping it
-        // downcastable so the CLI can still recover the exit code.
-        Ok(sample::FrameStream::next_frame(self)?)
+        sample::FrameStream::next_frame(self)
     }
-    fn aspect(&self) -> Option<f32> {
-        sample::FrameStream::aspect(self)
+    fn aspect(&self) -> Option<Aspect> {
+        // Minted here, at the pipeline's edge of the decoder: a degenerate
+        // ratio reads as "not known yet", so layout keeps its square default
+        // instead of ever seeing a 0/NaN aspect.
+        sample::FrameStream::aspect(self).and_then(Aspect::new)
     }
 }
 
@@ -56,6 +56,8 @@ pub struct CandidateStream<'a, S> {
 }
 
 impl<'a, S: RgbSource> CandidateStream<'a, S> {
+    /// Wire a frame source to the judging machinery: deduper, batch size
+    /// (floored at 1), scoring-grayscale edge, and optional worker pool.
     pub fn new(
         source: S,
         deduper: Deduper,
@@ -73,7 +75,7 @@ impl<'a, S: RgbSource> CandidateStream<'a, S> {
     }
 
     /// Source frame aspect ratio, known once at least one frame was read.
-    pub fn aspect(&self) -> Option<f32> {
+    pub fn aspect(&self) -> Option<Aspect> {
         self.source.aspect()
     }
 
@@ -116,8 +118,8 @@ mod tests {
         fn next_frame(&mut self) -> Result<Option<RgbFrame>> {
             Ok(self.frames.next())
         }
-        fn aspect(&self) -> Option<f32> {
-            Some(1.0)
+        fn aspect(&self) -> Option<Aspect> {
+            Some(Aspect::SQUARE)
         }
     }
 

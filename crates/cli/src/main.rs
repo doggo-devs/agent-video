@@ -450,7 +450,9 @@ fn run() -> anyhow::Result<()> {
         } => {
             let run = MediaRun::new(&io, &opts, strategy)?;
             let window = pipeline::Window::from_args(from, until)?;
-            pipeline::process(
+            // `?` + `Ok`: the typed core error converts into anyhow here at
+            // the top; `exit_code_of` reads its code back via downcast.
+            Ok(pipeline::process(
                 &run.source,
                 run.sink,
                 &run.cfg,
@@ -464,13 +466,13 @@ fn run() -> anyhow::Result<()> {
                     stop: media::Stop::new(),
                     events: &StderrEvents,
                 },
-            )
+            )?)
         }
         Command::Extract { io, range, opts } => {
             // `extract` has no strategy flags: it always samples its explicit
             // range at fixed fps, so the defaults are inert here.
             let run = MediaRun::new(&io, &opts, StrategyOpts::default())?;
-            pipeline::extract_range(
+            Ok(pipeline::extract_range(
                 &run.source,
                 run.sink,
                 &run.cfg,
@@ -478,7 +480,7 @@ fn run() -> anyhow::Result<()> {
                 run.subs,
                 &media::Stop::new(),
                 &StderrEvents,
-            )
+            )?)
         }
         Command::Mcp => harness::mcp::server::serve_stdio(),
         Command::InstallWhisper { model } => {

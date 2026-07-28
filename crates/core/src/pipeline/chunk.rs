@@ -1,30 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Per-chunk processing: score → select → layout → compose.
 
-use anyhow::Result;
+use std::sync::Arc;
+
 use image::GrayImage;
 
+use crate::error::Result;
 use crate::types::{
-    CandidateFrame, GridDraft, GridPosition, KeyFrameMeta, LayoutKind, ScoredFrame, TimeRange,
+    Aspect, CandidateFrame, GridDraft, GridPosition, KeyFrameMeta, LayoutKind, SceneDiff,
+    ScoredFrame, TimeRange,
 };
 use crate::{compose, layout, score};
 
+/// One chunk's finished render: the grid index, its JPEG bytes, and the
+/// metadata draft awaiting an image payload at emission.
 #[derive(Debug)]
 pub struct GridResult {
+    /// Chunk index, assigned at spawn; drives emission order and file names.
     pub ci: usize,
+    /// Encoded grid image.
     pub jpeg: Vec<u8>,
+    /// Metadata draft, completed by the output session at emission.
     pub draft: GridDraft,
 }
 
+/// Everything a chunk worker needs, copied per job: canvas geometry, source
+/// aspect, scoring weights, and render knobs.
 #[derive(Clone, Copy)]
 pub struct ProcessChunkEnv {
+    /// Canvas geometry for layout.
     pub spec: crate::types::CanvasSpec,
-    pub aspect: f32,
+    /// Source frame aspect ratio.
+    pub aspect: Aspect,
+    /// Scoring dimension weights.
     pub weights: score::Weights,
+    /// Floor under the span-derived minimum selection gap, in seconds.
     pub min_gap_floor: f32,
+    /// JPEG output quality.
     pub jpeg_quality: u8,
+    /// Hero frame border thickness in pixels.
     pub hero_border_px: u32,
-    pub hero_scene_diff: f32,
+    /// Minimum raw scene difference for a frame to qualify as a hero.
+    pub hero_scene_diff: SceneDiff,
+    /// Cap on hero frames per grid.
     pub max_heroes: usize,
 }
 
@@ -36,10 +54,10 @@ pub struct ProcessChunkEnv {
 pub fn process_chunk(
     ci: usize,
     chunk: Vec<CandidateFrame>,
-    prev_tail: Option<GrayImage>,
+    prev_tail: Option<Arc<GrayImage>>,
     env: ProcessChunkEnv,
 ) -> Result<GridResult> {
-    let mut chunk = score::score_frames(chunk, &env.weights, prev_tail.as_ref());
+    let mut chunk = score::score_frames(chunk, &env.weights, prev_tail.as_deref());
 
     // Derived here rather than stored in env, so it cannot drift from inputs.
     let capacity = layout::grid_capacity(&env.spec, env.aspect);
@@ -73,7 +91,7 @@ pub fn process_chunk(
 fn evict_for_heroes(
     picked: &mut Vec<ScoredFrame>,
     heroes: &mut [usize],
-    aspect: f32,
+    aspect: Aspect,
     spec: &crate::types::CanvasSpec,
 ) -> layout::Layout {
     let scores: Vec<f32> = picked.iter().map(|f| f.score.get()).collect();
@@ -132,6 +150,8 @@ pub fn extract_selected(
     picked
 }
 
+/// Freeze the picked frames into a metadata draft: time span, frame count,
+/// hero key-frame entries, and the layout template label.
 pub fn build_grid_draft(
     picked: &[ScoredFrame],
     heroes: &[usize],
@@ -174,7 +194,7 @@ mod tests {
         use crate::types::{SceneDiff, Score, Ts};
         ScoredFrame {
             ts: Ts::new(ts).expect("finite test ts"),
-            gray: GrayImage::new(1, 1),
+            gray: Arc::new(GrayImage::new(1, 1)),
             rgb: Arc::new(RgbImage::new(1, 1)),
             score: Score::new(0.0).expect("zero score is valid"),
             scene_diff: SceneDiff::new(0.0).expect("zero diff is valid"),
@@ -211,7 +231,7 @@ mod tests {
         let mut picked: Vec<ScoredFrame> = (0..16).map(|i| scored(i as f32, i as f32)).collect();
         let mut heroes = vec![15];
 
-        let lay = evict_for_heroes(&mut picked, &mut heroes, 1.0, &spec);
+        let lay = evict_for_heroes(&mut picked, &mut heroes, Aspect::SQUARE, &spec);
 
         assert!(picked.len() < 16, "hero displaced some frames");
         assert!(
@@ -238,7 +258,7 @@ mod tests {
             (0..4).map(|i| scored(i as f32, 50.0 + i as f32)).collect();
         let mut heroes = vec![3];
 
-        let lay = evict_for_heroes(&mut picked, &mut heroes, 1.0, &spec);
+        let lay = evict_for_heroes(&mut picked, &mut heroes, Aspect::SQUARE, &spec);
 
         assert_eq!(picked.len(), 4, "no frame evicted");
         assert_eq!(heroes, vec![3]);

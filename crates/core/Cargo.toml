@@ -43,6 +43,10 @@ ab_glyph = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true, optional = true }
-anyhow = { workspace = true }
 rayon = "1"
 base64 = "0.22"
+
+[dev-dependencies]
+# Interop pin only: `preserves_error_code_through_context` proves a coded
+# Error survives an anyhow consumer's `.context()` wrapping.
+anyhow = { workspace = true }

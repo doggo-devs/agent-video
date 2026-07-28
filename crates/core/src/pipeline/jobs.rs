@@ -7,14 +7,33 @@
 //! yet deliverable): [`OrderedJobs::spawn`] blocks until there is room, which
 //! is what bounds memory when jobs carry large payloads.
 //!
-//! The dispatcher knows nothing about panics: a job that unwinds without
-//! sending wedges its sequence number forever, so callers must catch unwinds
-//! inside the job and encode them into `T`.
+//! The dispatcher owes no trust to its jobs: every spawned job reports
+//! through a completion guard that sends on drop — normal return and unwind
+//! alike — so a sequence number can never stay outstanding with no message
+//! coming. A job that dies before producing a result surfaces as an error
+//! from [`OrderedJobs::spawn`] or [`OrderedJobs::finish`], never as a wedge.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use anyhow::{Context, Result};
+/// A spawned job unwound before producing a result: its completion guard
+/// fired during the unwind and delivered nothing. By this module's contract
+/// that is a bug in the job, surfaced as a typed error so a generic caller
+/// can still fail its run instead of wedging.
+#[derive(Debug)]
+pub struct JobPanicked {
+    /// Sequence number of the job that died.
+    pub seq: usize,
+}
+
+impl fmt::Display for JobPanicked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "job {} panicked before producing a result", self.seq)
+    }
+}
+
+impl std::error::Error for JobPanicked {}
 
 /// Order-preserving parallel job dispatcher with a hard buffering cap.
 ///
@@ -25,8 +44,8 @@ pub struct OrderedJobs<T> {
     /// Hard cap on buffered jobs (`outstanding + ready`).
     limit: usize,
     /// `None` once `finish` has run; jobs hold clones until they complete.
-    tx: Option<Sender<(usize, T)>>,
-    rx: Receiver<(usize, T)>,
+    tx: Option<Sender<(usize, Option<T>)>>,
+    rx: Receiver<(usize, Option<T>)>,
     /// Completed out-of-order results waiting for their turn.
     ready: BTreeMap<usize, T>,
     outstanding: usize,
@@ -56,12 +75,14 @@ impl<T: Send + 'static> OrderedJobs<T> {
     /// number. Returns any results that became deliverable while waiting, in
     /// spawn order.
     ///
-    /// `job` must not unwind: catch panics inside and encode them into `T`.
+    /// A job that unwinds without producing a result surfaces as an error
+    /// here or in [`Self::finish`]; catching panics inside the job and
+    /// encoding them into `T` still gives the richer per-job error.
     pub fn spawn(
         &mut self,
         pool: &rayon::ThreadPool,
         job: impl FnOnce(usize) -> T + Send + 'static,
-    ) -> Result<Vec<T>> {
+    ) -> Result<Vec<T>, JobPanicked> {
         let mut done = Vec::new();
         self.recv_until(self.limit - 1, &mut done)?;
         let seq = self.next_spawn;
@@ -70,14 +91,19 @@ impl<T: Send + 'static> OrderedJobs<T> {
         self.peak_buffered = self.peak_buffered.max(self.outstanding + self.ready.len());
         let tx = self.tx.as_ref().expect("sender lives until finish").clone();
         pool.spawn_fifo(move || {
-            let _ = tx.send((seq, job(seq)));
+            let mut completion = Completion {
+                tx,
+                seq,
+                result: None,
+            };
+            completion.result = Some(job(seq));
         });
         Ok(done)
     }
 
     /// Wait for every outstanding job and return the remaining results in
-    /// spawn order. Errors if a job vanished without sending a result.
-    pub fn finish(&mut self) -> Result<Vec<T>> {
+    /// spawn order. Errors if a job died without producing a result.
+    pub fn finish(&mut self) -> Result<Vec<T>, JobPanicked> {
         self.tx = None;
         let mut done = Vec::new();
         self.recv_until(0, &mut done)?;
@@ -93,11 +119,10 @@ impl<T: Send + 'static> OrderedJobs<T> {
 
     /// Absorb completions (blocking while more than `max_buffered` jobs are
     /// buffered) and move deliverable results into `done` in spawn order.
-    fn recv_until(&mut self, max_buffered: usize, done: &mut Vec<T>) -> Result<()> {
+    fn recv_until(&mut self, max_buffered: usize, done: &mut Vec<T>) -> Result<(), JobPanicked> {
         loop {
             while let Ok((seq, result)) = self.rx.try_recv() {
-                self.outstanding -= 1;
-                self.ready.insert(seq, result);
+                self.absorb(seq, result)?;
             }
 
             while let Some(result) = self.ready.remove(&self.next_emit) {
@@ -109,13 +134,43 @@ impl<T: Send + 'static> OrderedJobs<T> {
                 return Ok(());
             }
 
+            // Never a wedge: every outstanding job holds a completion guard
+            // whose drop sends, so this recv is always fulfilled. Disconnect
+            // with jobs outstanding is unreachable by construction — a
+            // violated invariant here is a bug, and bugs are panics.
             let (seq, result) = self
                 .rx
                 .recv()
-                .context("job disappeared without sending a result")?;
-            self.outstanding -= 1;
-            self.ready.insert(seq, result);
+                .expect("every outstanding job holds a completion guard that sends on drop");
+            self.absorb(seq, result)?;
         }
+    }
+
+    /// Account one completion. `None` is a job that died without a result —
+    /// its guard fired during an unwind — reported as this dispatcher's
+    /// error instead of a forever-missing sequence number.
+    fn absorb(&mut self, seq: usize, result: Option<T>) -> Result<(), JobPanicked> {
+        self.outstanding -= 1;
+        let result = result.ok_or(JobPanicked { seq })?;
+        self.ready.insert(seq, result);
+        Ok(())
+    }
+}
+
+/// Reports a job's completion on drop: a normal return carries
+/// `Some(result)`, an unwind out of the job carries `None`. Tying the send
+/// to drop removes the state the dispatcher could not recover from — a
+/// spawned sequence number that never reports.
+struct Completion<T> {
+    tx: Sender<(usize, Option<T>)>,
+    seq: usize,
+    result: Option<T>,
+}
+
+impl<T> Drop for Completion<T> {
+    fn drop(&mut self) {
+        // A closed channel means the dispatcher already gave up on results.
+        let _ = self.tx.send((self.seq, self.result.take()));
     }
 }
 
@@ -192,5 +247,30 @@ mod tests {
         let delivered = jobs.finish().expect("finish");
 
         assert_eq!(delivered, vec![0, 10, 20, 30]);
+    }
+
+    #[test]
+    fn surfaces_a_vanished_job_instead_of_blocking_spawn() {
+        // A pool whose panic handler swallows the unwind: the job dies and
+        // the pool lives on. On the old shape the next spawn blocked forever
+        // on the wedged sequence number; the completion guard now reports
+        // the death and spawn errors out.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .panic_handler(|_| {})
+            .build()
+            .expect("test pool builds");
+        let mut jobs: OrderedJobs<usize> = OrderedJobs::new(limit(1));
+
+        jobs.spawn(&pool, |_| -> usize {
+            // resume_unwind skips the panic hook: no backtrace noise.
+            std::panic::resume_unwind(Box::new("job dies before sending"))
+        })
+        .expect("first spawn has room");
+
+        let err = jobs
+            .spawn(&pool, |seq| seq)
+            .expect_err("dead job must surface as an error, not a wedge");
+        assert!(err.to_string().contains("panicked"), "got: {err:#}");
     }
 }

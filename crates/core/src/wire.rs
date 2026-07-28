@@ -6,7 +6,7 @@
 //! types from the self-spawned child's stdout — one definition, so a field
 //! rename is a compile error in the consumer instead of a runtime parse
 //! failure. Rich pipeline types convert *into* this module at the output
-//! boundary ([`Grid::from`]) and are never reconstructed from it: wire
+//! boundary ([`Grid::new`]) and are never reconstructed from it: wire
 //! shapes are plain data with no invariants to bypass.
 
 use serde::{Deserialize, Serialize};
@@ -27,11 +27,14 @@ use crate::types::{
 /// [`Metadata::coverage`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
+    /// The input path or URL, echoed verbatim.
     pub source: String,
     duration: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     range: Option<Segment>,
+    /// The resolved settings echoed back to the consumer.
     pub settings: Settings,
+    /// One entry per rendered grid, in time order.
     pub grids: Vec<Grid>,
 }
 
@@ -100,10 +103,12 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// Start of the segment in seconds.
     pub fn start(self) -> f32 {
         self.start
     }
 
+    /// End of the segment in seconds; at least `start`.
     pub fn end(self) -> f32 {
         self.end
     }
@@ -148,9 +153,12 @@ pub struct Grid {
     pub image: GridImage,
     /// `"MM:SS-MM:SS"` (`"H:MM:SS"` past an hour).
     pub time_range: String,
+    /// Number of frames composed onto the grid.
     pub total_frames: usize,
+    /// Hero frames, omitted from uniform grids' JSON when empty.
     #[serde(default)]
     pub key_frames: Vec<KeyFrameMeta>,
+    /// Layout template label.
     pub layout: LayoutKind,
     /// `MM:SS text` cue lines assigned to this grid (every cue in the
     /// processed range lands on exactly one grid); absent when the run
@@ -159,17 +167,20 @@ pub struct Grid {
     pub subtitles: Option<String>,
 }
 
-impl From<GridMeta> for Grid {
-    fn from(meta: GridMeta) -> Self {
+impl Grid {
+    /// Pair one rendered grid with its resolved subtitle outcome — the only
+    /// door onto the wire shape, so a grid cannot reach `metadata.json`
+    /// before subtitle resolution has run for it.
+    pub fn new(meta: GridMeta, subtitles: GridSubtitles) -> Self {
         Grid {
             image: meta.image,
             time_range: meta.time_range.to_string(),
             total_frames: meta.total_frames,
             key_frames: meta.key_frames,
             layout: meta.layout,
-            subtitles: match meta.subtitles {
+            subtitles: match subtitles {
                 GridSubtitles::Text(text) => Some(text),
-                _ => None,
+                GridSubtitles::NoSource | GridSubtitles::NoCueInRange => None,
             },
         }
     }
@@ -191,8 +202,14 @@ mod tests {
                 grid_position: GridPosition::Hero,
             }],
             layout: LayoutKind::Uniform,
-            subtitles: GridSubtitles::Text("00:01 hi".to_string()),
         }
+    }
+
+    fn grid(image: GridImage) -> Grid {
+        Grid::new(
+            grid_meta(image),
+            GridSubtitles::Text("00:01 hi".to_string()),
+        )
     }
 
     fn settings() -> Settings {
@@ -213,9 +230,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_json() {
-        let meta = doc(vec![Grid::from(grid_meta(GridImage::Base64(
-            "QUJD".to_string(),
-        )))]);
+        let meta = doc(vec![grid(GridImage::Base64("QUJD".to_string()))]);
         let json = serde_json::to_string(&meta).expect("serialize");
         let back: Metadata = serde_json::from_str(&json).expect("deserialize own output");
         assert_eq!(back.source, "v.mp4");
@@ -235,25 +250,24 @@ mod tests {
     fn serializes_grid_image_under_original_key() {
         // The flattened enum must keep the exact `"file"` / `"base64"` JSON
         // keys, with only one present at a time.
-        let json = serde_json::to_value(Grid::from(grid_meta(GridImage::File(
-            "grid_001.jpg".to_string(),
-        ))))
-        .expect("serialize file grid");
+        let json = serde_json::to_value(grid(GridImage::File("grid_001.jpg".to_string())))
+            .expect("serialize file grid");
         assert_eq!(json["file"], "grid_001.jpg");
         assert!(json.get("base64").is_none(), "file variant omits base64");
 
-        let json =
-            serde_json::to_value(Grid::from(grid_meta(GridImage::Base64("QUJD".to_string()))))
-                .expect("serialize base64 grid");
+        let json = serde_json::to_value(grid(GridImage::Base64("QUJD".to_string())))
+            .expect("serialize base64 grid");
         assert_eq!(json["base64"], "QUJD");
         assert!(json.get("file").is_none(), "base64 variant omits file");
     }
 
     #[test]
     fn omits_absent_range_and_subtitles() {
-        let mut rich = grid_meta(GridImage::File("grid_001.jpg".to_string()));
-        rich.subtitles = GridSubtitles::NoSource;
-        let json = serde_json::to_value(doc(vec![rich.into()])).expect("serialize");
+        let rich = Grid::new(
+            grid_meta(GridImage::File("grid_001.jpg".to_string())),
+            GridSubtitles::NoSource,
+        );
+        let json = serde_json::to_value(doc(vec![rich])).expect("serialize");
         assert!(
             json.get("range").is_none(),
             "process documents carry no range key"
@@ -276,9 +290,7 @@ mod tests {
     /// for the public `metadata.json` / `--json` contract.
     #[test]
     fn keeps_process_wire_json_byte_identical() {
-        let meta = doc(vec![Grid::from(grid_meta(GridImage::File(
-            "grid_001.jpg".to_string(),
-        )))]);
+        let meta = doc(vec![grid(GridImage::File("grid_001.jpg".to_string()))]);
         assert_eq!(
             serde_json::to_string(&meta).expect("serialize"),
             r#"{"source":"v.mp4","duration":90.0,"settings":{"max_edge":2048,"quality":"low","detail":"standard"},"grids":[{"file":"grid_001.jpg","time_range":"00:00-01:30","total_frames":12,"key_frames":[{"timestamp":"00:10","score":5,"grid_position":"hero"}],"layout":"UNIFORM","subtitles":"00:01 hi"}]}"#
@@ -293,9 +305,7 @@ mod tests {
             "v.mp4".to_string(),
             segment(1.0, 3.0),
             settings(),
-            vec![Grid::from(grid_meta(GridImage::File(
-                "grid_001.jpg".to_string(),
-            )))],
+            vec![grid(GridImage::File("grid_001.jpg".to_string()))],
         );
         assert_eq!(
             serde_json::to_string(&meta).expect("serialize"),

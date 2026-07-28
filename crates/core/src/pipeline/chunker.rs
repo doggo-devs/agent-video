@@ -15,10 +15,11 @@
 
 use std::collections::BTreeMap;
 use std::mem;
+use std::sync::Arc;
 
-use anyhow::Result;
 use image::GrayImage;
 
+use crate::error::{Error, ErrorCode, Result};
 use crate::event::EventSink;
 use crate::types::{CandidateFrame, Ts};
 
@@ -40,7 +41,7 @@ pub(super) enum Event {
     /// `None` for the first chunk).
     Chunk {
         frames: Vec<CandidateFrame>,
-        prev_tail: Option<GrayImage>,
+        prev_tail: Option<Arc<GrayImage>>,
     },
     /// A static stretch to render as a single representative image.
     Static(Stretch),
@@ -63,8 +64,9 @@ pub(super) struct Chunker {
     carry: Vec<CandidateFrame>,
     /// Grayscale of the previously emitted chunk's last frame — scene-diff
     /// boundary context, so the next chunk's first frame is scored against
-    /// its true predecessor instead of a hardcoded zero.
-    prev_chunk_tail: Option<GrayImage>,
+    /// its true predecessor instead of a hardcoded zero. Shared, not copied:
+    /// retaining the tail is a pointer clone, like the RGB representative.
+    prev_chunk_tail: Option<Arc<GrayImage>>,
     high_water_mark: Option<usize>,
     /// Timestamp of the last placed frame; frames whose ts falls behind it
     /// cannot be placed and are skipped (see [`Chunker::push`]).
@@ -110,7 +112,8 @@ impl Chunker {
     /// so a violation means the input's own timestamps are broken — the frame
     /// cannot be placed in any chunk and is skipped. More than
     /// [`MAX_TS_REGRESSIONS`] such frames mean the whole timeline is garbage,
-    /// and the run fails instead of silently mangling chunk boundaries.
+    /// and the run fails with [`ErrorCode::InputCorrupt`] instead of silently
+    /// mangling chunk boundaries.
     ///
     /// `events` receives one [`crate::event::Event::UnplaceableTimestamp`] on
     /// the first skipped frame; the sink is a parameter, not stored, so this
@@ -125,13 +128,18 @@ impl Chunker {
         if self.last_ts.is_some_and(|last| frame.ts < last) {
             self.ts_regressions += 1;
             if self.ts_regressions > MAX_TS_REGRESSIONS {
-                anyhow::bail!(
-                    "{} frames with backwards timestamps (last placed {:?}, offending {}); \
-                     the input's timeline is broken",
-                    self.ts_regressions,
-                    self.last_ts.map(Ts::get),
-                    frame.ts.get()
-                );
+                // A timeline this broken is a property of the input, not a
+                // bug: the harness must see INPUT_CORRUPT, not an uncoded exit.
+                return Err(Error::new(
+                    ErrorCode::InputCorrupt,
+                    format!(
+                        "{} frames with backwards timestamps (last placed {:?}, offending {}); \
+                         the input's timeline is broken",
+                        self.ts_regressions,
+                        self.last_ts.map(Ts::get),
+                        frame.ts.get()
+                    ),
+                ));
             }
             if self.ts_regressions == 1 {
                 events.event(crate::event::Event::UnplaceableTimestamp {
@@ -232,7 +240,7 @@ mod tests {
     fn frame(ts: f32) -> CandidateFrame {
         CandidateFrame {
             ts: Ts::new(ts).expect("finite test ts"),
-            gray: GrayImage::new(1, 1),
+            gray: Arc::new(GrayImage::new(1, 1)),
             rgb: Arc::new(RgbImage::new(1, 1)),
         }
     }
@@ -380,6 +388,29 @@ mod tests {
     }
 
     #[test]
+    fn maps_timeline_corruption_to_input_corrupt() {
+        let mut chunker = Chunker::new(60.0, 1.0);
+
+        chunker
+            .push(frame(1000.0), true, 4, &Discard)
+            .expect("place anchor");
+        for i in 0..MAX_TS_REGRESSIONS {
+            chunker
+                .push(frame(i as f32), true, 4, &Discard)
+                .expect("regressions within the cap are skipped");
+        }
+
+        let err = chunker
+            .push(frame(0.5), true, 4, &Discard)
+            .expect_err("exceeding the regression cap must fail");
+        assert_eq!(
+            err.code,
+            ErrorCode::InputCorrupt,
+            "a broken input timeline is input corruption, not a bug"
+        );
+    }
+
+    #[test]
     fn extends_duration_by_sampling_coverage() {
         let mut chunker = Chunker::new(60.0, 2.0);
 
@@ -406,7 +437,7 @@ mod tests {
         let statics: Vec<(f32, f32)> = events
             .iter()
             .filter_map(|e| match e {
-                Event::Static(s) => Some((s.start, s.end)),
+                Event::Static(s) => Some((s.range.start(), s.range.end())),
                 Event::Chunk { .. } => None,
             })
             .collect();

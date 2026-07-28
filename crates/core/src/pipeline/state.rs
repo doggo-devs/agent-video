@@ -13,13 +13,14 @@
 use std::mem;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::Arc;
 
-use anyhow::Result;
 use image::GrayImage;
 
 use crate::config::Config;
+use crate::error::Result;
 use crate::event::EventSink;
-use crate::types::{CandidateFrame, GridMeta, LayoutKind, TimeRange};
+use crate::types::{Aspect, CandidateFrame, GridMeta, LayoutKind};
 use crate::{compose, layout};
 
 use super::chunk::{GridResult, ProcessChunkEnv, process_chunk};
@@ -34,6 +35,14 @@ const MIN_EXTRACT_BATCH_FRAMES: usize = 32;
 /// Upper bound for an extraction batch.
 const MAX_EXTRACT_BATCH_FRAMES: usize = 240;
 
+/// One chunk worker's outcome: the caught unwind of a panicking worker, or
+/// its typed result. The panic is a value only for the trip back to the
+/// orchestrator thread, where [`worker_result`] resumes it — a bug never
+/// masquerades as a coded, recoverable error.
+type ChunkOutcome = std::thread::Result<Result<GridResult>>;
+
+/// The effectful `process` orchestrator: judged frames in, grids and static
+/// entries out through the run's output session.
 pub struct ProcessState<'a> {
     cfg: &'a Config,
     /// The run's output session: incremental grid/static writes go through it,
@@ -48,7 +57,7 @@ pub struct ProcessState<'a> {
     chunker: Chunker,
     /// Chunk jobs in flight: assigns chunk indexes, caps buffered chunks at
     /// `max_in_flight`, and hands results back in chunk order.
-    jobs: OrderedJobs<Result<GridResult>>,
+    jobs: OrderedJobs<ChunkOutcome>,
     grid_metas: Vec<GridMeta>,
     static_seq: usize,
     static_metas: Vec<GridMeta>,
@@ -58,6 +67,8 @@ pub struct ProcessState<'a> {
 }
 
 impl<'a> ProcessState<'a> {
+    /// Wire the shell to its run: config, worker pool, output session,
+    /// in-flight cap, and diagnostic sink.
     pub fn new(
         cfg: &'a Config,
         pool: &'a rayon::ThreadPool,
@@ -71,7 +82,7 @@ impl<'a> ProcessState<'a> {
             pool,
             env: ProcessChunkEnv {
                 spec: cfg.canvas_spec(),
-                aspect: 1.0,
+                aspect: Aspect::SQUARE,
                 weights: cfg.weights(),
                 min_gap_floor: cfg.min_gap(),
                 jpeg_quality: cfg.jpeg_quality(),
@@ -88,7 +99,9 @@ impl<'a> ProcessState<'a> {
         }
     }
 
-    pub fn set_aspect(&mut self, aspect: f32) {
+    /// Update the source aspect ratio once the decoder reports it; grid
+    /// capacity is re-derived from it on demand.
+    pub fn set_aspect(&mut self, aspect: Aspect) {
         self.env.aspect = aspect;
     }
 
@@ -105,8 +118,12 @@ impl<'a> ProcessState<'a> {
     pub fn finish(mut self) -> Result<(f32, Vec<GridMeta>)> {
         let events = self.chunker.finish(self.capacity());
         self.handle_events(events)?;
-        for result in self.jobs.finish()? {
-            self.emit_grid(result?)?;
+        for outcome in self
+            .jobs
+            .finish()
+            .expect("chunk jobs catch unwinds and always deliver an outcome")
+        {
+            self.emit_grid(worker_result(outcome)?)?;
         }
 
         // Interleave static entries with grids by start time. Both lists are
@@ -137,23 +154,22 @@ impl<'a> ProcessState<'a> {
     /// Render and record one static-stretch entry: the last visually-distinct
     /// frame stands in for the whole unchanged range.
     fn emit_static(&mut self, stretch: Stretch) -> Result<()> {
-        let Stretch { start, end, rgb } = stretch;
+        let Stretch { range, rgb } = stretch;
         self.static_seq += 1;
-        let jpeg = compose::render_single(&rgb, start, self.cfg.jpeg_quality())?;
+        let jpeg = compose::render_single(&rgb, range.start(), self.cfg.jpeg_quality())?;
         let file = format!("static_{:03}.jpg", self.static_seq);
         let image = self.session.emit_image(&file, &jpeg)?;
         self.events.event(crate::event::Event::StaticCollapsed {
-            start,
-            end,
+            start: range.start(),
+            end: range.end(),
             file: &file,
         });
         self.static_metas.push(GridMeta {
             image,
-            time_range: TimeRange::new(start, end).expect("static stretch has start <= end"),
+            time_range: range,
             total_frames: 1,
             key_frames: Vec::new(),
             layout: LayoutKind::Static,
-            subtitles: crate::types::GridSubtitles::Unresolved,
         });
         Ok(())
     }
@@ -161,25 +177,27 @@ impl<'a> ProcessState<'a> {
     fn spawn_chunk(
         &mut self,
         chunk: Vec<CandidateFrame>,
-        prev_tail: Option<GrayImage>,
+        prev_tail: Option<Arc<GrayImage>>,
     ) -> Result<()> {
         // `jobs` enforces the in-flight cap here: one batch can seal several
         // chunks, so waiting for room at the spawn boundary is what bounds
         // buffered chunks.
         let env = self.env;
         // The catch serves unwind builds (tests, downstream consumers on
-        // the default profile), where a chunk-worker panic must surface as
-        // this run's error, not silently lose a grid. This workspace's
-        // release binaries build with `panic = "abort"` and terminate
-        // before reaching it.
-        let results = self.jobs.spawn(self.pool, move |ci| {
-            panic::catch_unwind(AssertUnwindSafe(|| {
-                process_chunk(ci, chunk, prev_tail, env)
-            }))
-            .unwrap_or_else(|panic| Err(panic_to_anyhow(panic)))
-        })?;
-        for result in results {
-            self.emit_grid(result?)?;
+        // the default profile), where a chunk-worker panic must reach the
+        // orchestrator instead of aborting inside rayon; `worker_result`
+        // resumes it there. This workspace's release binaries build with
+        // `panic = "abort"` and terminate before reaching it.
+        let results = self
+            .jobs
+            .spawn(self.pool, move |ci| {
+                panic::catch_unwind(AssertUnwindSafe(|| {
+                    process_chunk(ci, chunk, prev_tail, env)
+                }))
+            })
+            .expect("chunk jobs catch unwinds and always deliver an outcome");
+        for outcome in results {
+            self.emit_grid(worker_result(outcome)?)?;
         }
         Ok(())
     }
@@ -204,15 +222,11 @@ pub fn extract_batch_frames(fps: f32, chunk_seconds: f32) -> usize {
         .clamp(MIN_EXTRACT_BATCH_FRAMES, MAX_EXTRACT_BATCH_FRAMES)
 }
 
-fn panic_to_anyhow(payload: Box<dyn std::any::Any + Send>) -> anyhow::Error {
-    use anyhow::anyhow;
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        anyhow!("worker panic: {s}")
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        anyhow!("worker panic: {s}")
-    } else {
-        anyhow!("worker panic (unknown payload)")
-    }
+/// Unwrap one worker outcome: a typed error fails the run; a caught panic is
+/// a bug and resumes unwinding on the orchestrator thread with its original
+/// payload — the typed error channel carries codes only, never bugs.
+fn worker_result(outcome: ChunkOutcome) -> Result<GridResult> {
+    outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 #[cfg(test)]
@@ -478,13 +492,10 @@ mod tests {
     }
 
     #[test]
-    fn maps_worker_panic_payloads_to_messages() {
-        let from_str = panic_to_anyhow(Box::new("boom"));
-        let from_string = panic_to_anyhow(Box::new(String::from("boom")));
-        let from_other = panic_to_anyhow(Box::new(42u8));
-
-        assert!(from_str.to_string().contains("worker panic"));
-        assert!(from_string.to_string().contains("worker panic"));
-        assert!(from_other.to_string().contains("worker panic"));
+    #[should_panic(expected = "boom")]
+    fn resumes_worker_panic_on_the_orchestrator() {
+        // A worker panic is a bug: it must re-raise with its original
+        // payload, never flatten into a coded, recoverable error.
+        let _ = worker_result(Err(Box::new(String::from("boom"))));
     }
 }
