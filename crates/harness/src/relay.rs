@@ -264,10 +264,21 @@ fn handle_connect(client: TcpStream, authority: &str, tunneling: Tunneling) -> s
 }
 
 /// Forward an absolute-form http request: screen the target, dial it,
-/// rewrite the request line to origin-form, drop the hop-by-hop headers
-/// (`Connection`/`Proxy-Connection` and every header they name, per
-/// RFC 7230 §6.1), force `Connection: close`, then splice both directions
-/// until EOF.
+/// rewrite the request line to origin-form, drop the request's hop-by-hop
+/// headers (`Connection`/`Proxy-Connection` and every header they name,
+/// per RFC 7230 §6.1), force `Connection: close`, then splice both
+/// directions until EOF.
+///
+/// The §6.1 strip is request-direction only, deliberately. The response
+/// path is a raw byte splice the relay never parses; stripping there
+/// would cost a response-head parser interleaved with the still-flowing
+/// request body, and buy nothing: the forced `Connection: close` makes
+/// the origin close after one response, the splice propagates that EOF,
+/// so whatever hop-by-hop headers the origin names, the transport
+/// behavior the client observes is exactly one response then close. A
+/// stale `Keep-Alive` reaching libav or yt-dlp — the relay's only
+/// clients — at worst makes them reconnect for the next request, which
+/// is this relay's per-connection model anyway.
 fn handle_absolute(
     client: TcpStream,
     method: &str,
@@ -301,7 +312,9 @@ fn handle_absolute(
     // §6.1 that strips `Connection`/`Proxy-Connection` themselves and
     // every header they name: `Connection: keep-alive, TE` marks
     // `Keep-Alive` and `TE` as addressed to this hop, so forwarding them
-    // would misstate the relay's behavior to the origin.
+    // would misstate the relay's behavior to the origin. The response
+    // direction gets no such treatment — see the fn doc for why the raw
+    // splice below is the whole story there.
     let headers: Vec<&str> = header_lines.take_while(|line| !line.is_empty()).collect();
     let named_hop_by_hop: Vec<String> = headers
         .iter()

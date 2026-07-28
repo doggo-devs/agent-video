@@ -151,8 +151,11 @@ pub fn serve_stdio() -> anyhow::Result<()> {
 /// environment is their own business.
 ///
 /// Must run while the process is still single-threaded. That is a call-site
-/// obligation the type system cannot state, so debug builds enforce it with
-/// a live thread count instead of trusting the caller.
+/// obligation the type system cannot state; the argument for it is
+/// positional — first statement of [`serve_stdio`], before anything that
+/// spawns threads — and debug builds on Linux additionally check it with a
+/// live thread count. Where the platform exposes no cheap count the check
+/// is vacuous and the position carries the obligation alone.
 fn scrub_no_proxy_env() {
     debug_assert!(
         live_thread_count().is_none_or(|threads| threads == 1),
@@ -160,9 +163,12 @@ fn scrub_no_proxy_env() {
          environment now races concurrent getenv — move the call earlier in boot"
     );
     // SAFETY: the process is single-threaded here, so no concurrent getenv
-    // can race the mutation — asserted above in debug builds, upheld by
-    // being the first statement of `serve_stdio`, before the tracing
-    // subscriber, the tokio runtime, or any library that spawns threads.
+    // can race the mutation. The argument is positional: this is the first
+    // statement of `serve_stdio`, before the tracing subscriber, the tokio
+    // runtime, or any library that spawns threads. The debug assertion
+    // above verifies it only where the platform exposes a thread count
+    // (Linux); elsewhere `live_thread_count` is `None`, the assertion is
+    // vacuously true, and the positional argument stands on its own.
     unsafe {
         std::env::remove_var("no_proxy");
         std::env::remove_var("NO_PROXY");
