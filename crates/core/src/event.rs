@@ -62,6 +62,16 @@ pub enum Event<'a> {
     /// End-of-decode accounting: `count` decoded frames were dropped off
     /// the timeline over the whole pass. Emitted only when `count > 0`.
     TimestampsDropped { count: u64 },
+    /// A decode pass failed on its timeline, but the dropped frames' own
+    /// pts formed a longer self-consistent timeline than everything the
+    /// declared origin released — the clock anchor, not the input, was
+    /// judged broken — and the run is retried once with the elected
+    /// origin. Both values are seconds on the container's absolute clock:
+    /// `declared` is the header origin the failed pass trusted, `elected`
+    /// the dropped chain's head. Diagnostic only; the retry itself is
+    /// decided by the pipeline (see `crate::media::decode`'s origin-rebase
+    /// contract).
+    OriginRebased { declared: f64, elected: f64 },
     /// A run finished writing `count` grids to `dir`.
     GridsWritten { count: usize, dir: &'a Path },
     /// An embedded subtitle stream held no text cues; the auto path continues

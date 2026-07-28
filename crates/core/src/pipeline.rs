@@ -26,6 +26,7 @@ use crate::config::Config;
 use crate::error::{Context as _, Error, ErrorCode, ErrorContext, Result};
 use crate::event::{Event, EventSink};
 use crate::media;
+use crate::media::decode::AnchorFault;
 use crate::probe::{KeyframeInfo, SampleStrategy};
 use crate::source::Source;
 use crate::subtitle::Subtitles;
@@ -34,6 +35,7 @@ use crate::{dedup, probe, sample};
 
 use candidates::CandidateStream;
 use output::OutputSession;
+use sample::Anchor;
 use state::{ProcessState, extract_batch_frames};
 
 pub use crate::subtitle::SubtitleSource;
@@ -68,13 +70,15 @@ struct RunCtx<'a> {
 
 impl<'a> RunCtx<'a> {
     /// The extractor knobs every sampling shape shares, derived once from
-    /// the run's config and thread cap.
-    fn stream_params(&self) -> sample::StreamParams<'a> {
+    /// the run's config and thread cap; `anchor` is the pass token of the
+    /// current attempt (see [`rebase_or_fail`]).
+    fn stream_params(&self, anchor: Anchor) -> sample::StreamParams<'a> {
         sample::StreamParams {
             cell_min_edge: self.cfg.min_frame_size(),
             score_edge: self.cfg.score_edge(),
             threads: self.ffmpeg_threads,
             events: self.events,
+            anchor,
         }
     }
 }
@@ -202,9 +206,34 @@ pub fn process(
         probed_duration: plan.probed_duration(),
         events,
     };
-    // Every strategy reduces to one decode pass; the tail is shared.
-    let session = OutputSession::open(sink)?;
-    let stream = match plan {
+    // Every strategy reduces to one decode pass; the tail is shared. The
+    // loop is the origin-rebase retry (see [`rebase_or_fail`]): iteration
+    // one runs the declared anchor — byte-identical to a loop-free run —
+    // and only an anchor-faulted failure earns the single rebased second
+    // iteration, so the loop body executes at most twice. Each attempt
+    // opens a fresh session: a failed pass's partial artifacts never left
+    // staging, and a fresh open clears them.
+    let mut anchor = Anchor::Declared;
+    loop {
+        let session = OutputSession::open(sink)?;
+        let stream = open_stream(&ctx, &plan, window, anchor)?;
+        match process_stream(&ctx, session, stream, window) {
+            Ok(()) => return Ok(()),
+            Err(e) => anchor = rebase_or_fail(anchor, e, events)?,
+        }
+    }
+}
+
+/// Open the decode stream a resolved plan calls for, announcing the
+/// sampling mode as an event; `anchor` is the clock the pass trusts.
+fn open_stream<'a>(
+    ctx: &RunCtx<'a>,
+    plan: &ResolvedPlan,
+    window: Option<Window>,
+    anchor: Anchor,
+) -> Result<sample::FrameStream<'a>> {
+    let (input, cfg, events) = (ctx.input, ctx.cfg, ctx.events);
+    match plan {
         ResolvedPlan::FixedFps { .. } => match window {
             Some(w) => {
                 events.event(Event::FixedFpsWindow {
@@ -217,14 +246,14 @@ pub fn process(
                     cfg.base_fps(),
                     w.start(),
                     w.end(),
-                    ctx.stream_params(),
-                )?
+                    ctx.stream_params(anchor),
+                )
             }
             None => {
                 events.event(Event::FixedFps {
                     fps: cfg.base_fps(),
                 });
-                sample::stream_frames(input, cfg.base_fps(), ctx.stream_params())?
+                sample::stream_frames(input, cfg.base_fps(), ctx.stream_params(anchor))
             }
         },
         ResolvedPlan::Keyframes(info) => {
@@ -234,11 +263,33 @@ pub fn process(
                 mean_gap: info.mean_gap(),
                 max_gap: info.max_gap(),
             });
-            sample::stream_keyframes(input, ctx.stream_params())?
+            sample::stream_keyframes(input, ctx.stream_params(anchor))
         }
-        ResolvedPlan::Adaptive(info) => adaptive_stream(&ctx, &info)?,
-    };
-    process_stream(&ctx, session, stream, window)
+        ResolvedPlan::Adaptive(info) => adaptive_stream(ctx, info, anchor),
+    }
+}
+
+/// The anchor token's single legal transition, applied to a failed pass.
+///
+/// An [`Anchor::Declared`] pass whose error carries an [`AnchorFault`] —
+/// the timeline gate's evidence that the rejected frames outweigh the
+/// accepted ones — earns the one rebased retry: the elected origin becomes
+/// the next pass's anchor and the run announces it as
+/// [`Event::OriginRebased`]. Every other failure is final — no fault, or a
+/// pass already rebased — so the retry cannot loop.
+fn rebase_or_fail(anchor: Anchor, e: Error, events: &dyn EventSink) -> Result<Anchor> {
+    match (anchor, AnchorFault::in_error(&e)) {
+        (Anchor::Declared, Some(fault)) => {
+            events.event(Event::OriginRebased {
+                declared: fault.declared,
+                elected: fault.elected,
+            });
+            Ok(Anchor::Rebased {
+                origin: fault.elected,
+            })
+        }
+        _ => Err(e),
+    }
 }
 
 /// Build the adaptive sampling stream: keyframes everywhere, fixed-fps fill
@@ -249,6 +300,7 @@ pub fn process(
 fn adaptive_stream<'a>(
     ctx: &RunCtx<'a>,
     info: &KeyframeInfo,
+    anchor: Anchor,
 ) -> Result<sample::FrameStream<'a>> {
     let cfg = ctx.cfg;
     let fill = merge_regions(
@@ -269,7 +321,7 @@ fn adaptive_stream<'a>(
         ctx.events.event(Event::AdaptiveFallbackFixedFps {
             coverage_percent: 100.0 * covered / info.duration,
         });
-        return sample::stream_frames(ctx.input, cfg.base_fps(), ctx.stream_params());
+        return sample::stream_frames(ctx.input, cfg.base_fps(), ctx.stream_params(anchor));
     }
 
     for region in &fill {
@@ -278,7 +330,7 @@ fn adaptive_stream<'a>(
             end: region.end(),
         });
     }
-    sample::stream_mixed(ctx.input, cfg.base_fps(), fill, ctx.stream_params())
+    sample::stream_mixed(ctx.input, cfg.base_fps(), fill, ctx.stream_params(anchor))
 }
 
 /// Resolve the strategy against a window (`--from/--until`).
@@ -578,6 +630,60 @@ mod tests {
     use super::*;
     use crate::event::Discard;
     use crate::probe::MonotonicTimestamps;
+
+    /// Records event debug renderings, for pinning emitted diagnostics.
+    #[derive(Default)]
+    struct Seen(std::sync::Mutex<Vec<String>>);
+
+    impl EventSink for Seen {
+        fn event(&self, event: Event<'_>) {
+            self.0
+                .lock()
+                .expect("event recorder lock")
+                .push(format!("{event:?}"));
+        }
+    }
+
+    fn faulted_error() -> Error {
+        Error::new(ErrorCode::InputCorrupt, "broken timeline").with_source(AnchorFault {
+            declared: 86_400.0,
+            elected: 1.5,
+        })
+    }
+
+    #[test]
+    fn grants_the_single_rebased_retry_on_an_anchor_fault() {
+        let seen = Seen::default();
+        let next = rebase_or_fail(Anchor::Declared, faulted_error(), &seen)
+            .expect("a faulted declared pass earns the retry");
+        assert_eq!(next, Anchor::Rebased { origin: 1.5 });
+        assert!(
+            seen.0
+                .lock()
+                .expect("event recorder lock")
+                .iter()
+                .any(|e| e.contains("OriginRebased")),
+            "the rebase is announced as a diagnostic"
+        );
+    }
+
+    #[test]
+    fn keeps_a_faultless_failure_final() {
+        let err = rebase_or_fail(
+            Anchor::Declared,
+            Error::new(ErrorCode::InputCorrupt, "broken timeline"),
+            &Discard,
+        )
+        .expect_err("no anchor evidence, no retry");
+        assert_eq!(err.code, ErrorCode::InputCorrupt);
+    }
+
+    #[test]
+    fn refuses_a_second_rebase() {
+        let err = rebase_or_fail(Anchor::Rebased { origin: 1.5 }, faulted_error(), &Discard)
+            .expect_err("a rebased pass's failure is final");
+        assert_eq!(err.code, ErrorCode::InputCorrupt);
+    }
 
     #[test]
     fn rejects_missing_input_with_not_found_code() {

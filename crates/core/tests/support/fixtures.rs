@@ -109,6 +109,36 @@ pub fn with_srt_sidecar(duration: f32) -> Option<Fixture> {
     })
 }
 
+/// [`h264_talk`] re-cut with `-ss` before `-i` plus stream copy: the mp4
+/// edit list makes presentation start at 0 (header `start_time = 0`) while
+/// the copied packets from the preceding keyframe keep legitimate negative
+/// pts (down to `cut`'s distance from that keyframe) — the legal shape the
+/// origin rebase must never fire on: releases hold the majority, so the
+/// declared anchor always wins the election.
+pub fn edit_list_cut(duration: f32, cut: f32) -> Option<Fixture> {
+    let base = h264_talk(duration)?;
+    let args: Vec<String> = [
+        "-ss",
+        &format!("{cut}"),
+        "-i",
+        base.media.to_str().expect("fixture path is utf-8"),
+        "-c",
+        "copy",
+        "cut.mp4",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let dir = cached("edit-list-cut", &args, &["cut.mp4"], |scratch| {
+        run_ffmpeg(scratch, &args);
+    });
+    Some(Fixture {
+        media: dir.join("cut.mp4"),
+        sidecar: None,
+        duration: duration - cut,
+    })
+}
+
 /// Regression shape for 7f7191f: two sine segments concat'd with different
 /// sample rates — audio decode must follow the mid-stream change.
 ///

@@ -85,6 +85,11 @@ impl EventSink for StderrEvents {
             Event::TimestampsDropped { count } => eprintln!(
                 "  warning: {count} frame(s) dropped: timestamps off the stream's timeline"
             ),
+            Event::OriginRebased { declared, elected } => eprintln!(
+                "warning: the container's declared clock origin ({declared:.3}s) is \
+                 contradicted by the dropped frames' own timeline; \
+                 retrying once with origin {elected:.3}s"
+            ),
             Event::GridsWritten { count, dir } => {
                 eprintln!("wrote {count} grid(s) to {}", dir.display());
             }
