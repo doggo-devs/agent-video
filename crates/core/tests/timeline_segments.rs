@@ -303,7 +303,11 @@ fn bounds_alternating_poison_with_signals() {
 
     let ts = drain(&fx.media, full_speed(), &events).expect("timestamps never fail a run");
 
-    assert!(ts.len() >= 30, "the legal half survives: {} frames", ts.len());
+    assert!(
+        ts.len() >= 30,
+        "the legal half survives: {} frames",
+        ts.len()
+    );
     assert!(
         ts.iter().all(|&t| (-1.0..100.0).contains(&t)),
         "the logical duration does not explode"
@@ -510,7 +514,11 @@ fn quarantines_a_sub_ten_second_forward_blip() {
 
     let ts = drain(&fx.media, full_speed(), &events).expect("timestamps never fail a run");
 
-    assert!(ts.len() >= 55, "the legal frames survive whole: {} frames", ts.len());
+    assert!(
+        ts.len() >= 55,
+        "the legal frames survive whole: {} frames",
+        ts.len()
+    );
     assert!(
         ts.iter().all(|&t| (-0.1..3.0).contains(&t)),
         "the blip never enters the released history: {:?}..{:?}",

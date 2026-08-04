@@ -319,14 +319,20 @@ fn handle_absolute(
     let named_hop_by_hop: Vec<String> = headers
         .iter()
         .filter(|line| is_connection_header(header_name(line)))
-        .flat_map(|line| line.split_once(':').map_or("", |(_, value)| value).split(','))
+        .flat_map(|line| {
+            line.split_once(':')
+                .map_or("", |(_, value)| value)
+                .split(',')
+        })
         .map(|token| token.trim().to_ascii_lowercase())
         .collect();
     let mut rewritten = format!("{method} {path_and_query} {version}\r\n");
     for line in headers {
         let name = header_name(line);
         if is_connection_header(name)
-            || named_hop_by_hop.iter().any(|h| name.eq_ignore_ascii_case(h))
+            || named_hop_by_hop
+                .iter()
+                .any(|h| name.eq_ignore_ascii_case(h))
         {
             continue;
         }
@@ -762,7 +768,9 @@ mod tests {
         let forwarded: Vec<&str> = head.lines().skip(1).collect();
         for name in ["te:", "keep-alive:"] {
             assert!(
-                !forwarded.iter().any(|l| l.to_ascii_lowercase().starts_with(name)),
+                !forwarded
+                    .iter()
+                    .any(|l| l.to_ascii_lowercase().starts_with(name)),
                 "header named in Connection must not reach the origin: {head:?}"
             );
         }

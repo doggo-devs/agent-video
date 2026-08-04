@@ -852,7 +852,11 @@ mod tests {
         };
         let cfg = Config::new(2000, Some(Profile::Action), &ov, StrategyOpts::default())
             .expect("config builds");
-        assert_eq!(cfg.hero_scene_diff().get(), 80.0, "CLI outranks the profile");
+        assert_eq!(
+            cfg.hero_scene_diff().get(),
+            80.0,
+            "CLI outranks the profile"
+        );
         assert_eq!(
             cfg.base_fps(),
             3.0,

@@ -57,8 +57,8 @@ use crate::types::{TimeRange, Ts};
 
 use super::scale::Rescaler;
 use super::{
-    ErrorBudget, Recv, Stop, VideoStream, best_video_stream, classify_receive,
-    decode_error, duration_seconds, open_input,
+    ErrorBudget, Recv, Stop, VideoStream, best_video_stream, classify_receive, decode_error,
+    duration_seconds, open_input,
 };
 
 /// Seconds on the container's presentation clock, 0-based at the declared
@@ -144,11 +144,19 @@ const CHANNEL_FRAMES: usize = 8;
 /// on the consumer side.
 enum Msg {
     Frame(RgbFrame),
-    Dropped { ts: f32, last: Option<f32> },
-    Discontinuity { container: f64, logical: f64 },
+    Dropped {
+        ts: f32,
+        last: Option<f32>,
+    },
+    Discontinuity {
+        container: f64,
+        logical: f64,
+    },
     /// A window seek reported success but landed beyond every decodable
     /// frame; the worker rewound to the stream head and reads sequentially.
-    SeekRecovered { start: f32 },
+    SeekRecovered {
+        start: f32,
+    },
 }
 
 /// A stream of sampled frames decoded on a background thread.
@@ -354,7 +362,8 @@ impl<'e> FrameSource<'e> {
                     return match self.join() {
                         Ok(()) => {
                             if self.drops > 0 {
-                                self.events.event(Event::TimestampsDropped { count: self.drops });
+                                self.events
+                                    .event(Event::TimestampsDropped { count: self.drops });
                             }
                             Ok(None)
                         }
@@ -688,7 +697,8 @@ struct SegStep {
 
 /// Drop a whole buffered run off the timeline, one signal per frame.
 fn drop_run(buf: Buffered, step: &mut SegStep) {
-    step.dropped.extend(buf.frames.into_iter().map(|(ts, _)| ts));
+    step.dropped
+        .extend(buf.frames.into_iter().map(|(ts, _)| ts));
 }
 
 /// Cuts the container clock into monotone segments and projects them onto
@@ -797,7 +807,10 @@ impl Segmenter {
                     challenger: None,
                 };
             }
-            State::Open { current, challenger } => {
+            State::Open {
+                current,
+                challenger,
+            } => {
                 self.state = self.step(current, challenger, ts, frame, &mut step);
             }
         }
@@ -814,8 +827,10 @@ impl Segmenter {
     /// video is content, not a fragment.
     fn finish(&mut self) -> SegStep {
         let mut step = SegStep::default();
-        if let State::Open { current, challenger } =
-            std::mem::replace(&mut self.state, State::Unopened)
+        if let State::Open {
+            current,
+            challenger,
+        } = std::mem::replace(&mut self.state, State::Unopened)
         {
             match current {
                 Current::Head(buf) => {
@@ -970,9 +985,7 @@ impl Segmenter {
         let anchor = if first.0 >= PREROLL_ALLOWANCE {
             first.0
         } else {
-            self.stream_head
-                .expect("set on the first admitted frame")
-                .0
+            self.stream_head.expect("set on the first admitted frame").0
         };
         self.open_segment(Segment::anchored(anchor, first), buf, step)
     }
@@ -1366,7 +1379,11 @@ impl Worker {
             }
             self.frames_sent += 1;
         }
-        Ok(if step.stop { Flow::Stop } else { Flow::Continue })
+        Ok(if step.stop {
+            Flow::Stop
+        } else {
+            Flow::Continue
+        })
     }
 }
 
@@ -1599,7 +1616,10 @@ mod tests {
         kept.extend(released(&tail));
         lost.extend(dropped(&tail));
         assert_eq!(kept.len(), 59, "every legal frame survives: {kept:?}");
-        assert!(kept.iter().all(|&t| t < 2.0), "labels stay at content scale");
+        assert!(
+            kept.iter().all(|&t| t < 2.0),
+            "labels stay at content scale"
+        );
         assert_close(&lost, &[10.0 * 0.033 + 9.5]);
     }
 

@@ -217,7 +217,10 @@ mod tests {
         let Decision::Confirm { consequence, .. } = d else {
             panic!("expected Confirm, got {d:?}");
         };
-        assert!(consequence.contains("aborted mid-transfer"), "{consequence}");
+        assert!(
+            consequence.contains("aborted mid-transfer"),
+            "{consequence}"
+        );
     }
 
     #[test]
@@ -231,7 +234,10 @@ mod tests {
         let Decision::Confirm { consequence, .. } = d else {
             panic!("expected Confirm, got {d:?}");
         };
-        assert!(!consequence.contains("aborted mid-transfer"), "{consequence}");
+        assert!(
+            !consequence.contains("aborted mid-transfer"),
+            "{consequence}"
+        );
     }
 
     #[test]

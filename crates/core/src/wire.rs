@@ -286,8 +286,8 @@ mod tests {
     fn serializes_empty_key_frames_as_empty_array() {
         let mut meta = grid_meta(GridImage::File("grid_001.jpg".to_string()));
         meta.key_frames = Vec::new();
-        let json = serde_json::to_string(&Grid::new(meta, GridSubtitles::NoSource))
-            .expect("serialize");
+        let json =
+            serde_json::to_string(&Grid::new(meta, GridSubtitles::NoSource)).expect("serialize");
         assert!(
             json.contains(r#""key_frames":[]"#),
             "empty key_frames must stay on the wire as []: {json}"
@@ -296,7 +296,8 @@ mod tests {
 
     #[test]
     fn defaults_absent_key_frames_to_empty_on_read() {
-        let json = r#"{"file":"g.jpg","time_range":"00:00-01:30","total_frames":1,"layout":"UNIFORM"}"#;
+        let json =
+            r#"{"file":"g.jpg","time_range":"00:00-01:30","total_frames":1,"layout":"UNIFORM"}"#;
         let grid: Grid = serde_json::from_str(json).expect("deserialize without key_frames");
         assert!(grid.key_frames.is_empty());
     }

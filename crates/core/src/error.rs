@@ -258,16 +258,18 @@ mod tests {
         let ctx = e.context().expect("attached context is readable back");
         assert_eq!(ctx.output_path.as_deref(), Some(Path::new("out/")));
         assert!(
-            Error::new(ErrorCode::InputCorrupt, "bare").context().is_none(),
+            Error::new(ErrorCode::InputCorrupt, "bare")
+                .context()
+                .is_none(),
             "no context was attached, none is invented"
         );
     }
 
     #[test]
     fn typed_context_decorates_reason_and_keeps_code() {
-        let decorated: Result<()> = Err(Error::new(ErrorCode::DecodeFailed, "boom")
-            .with_input("clip.mp4"))
-        .context("while probing");
+        let decorated: Result<()> =
+            Err(Error::new(ErrorCode::DecodeFailed, "boom").with_input("clip.mp4"))
+                .context("while probing");
         let e = decorated.expect_err("context maps the error branch");
         assert_eq!(e.code, ErrorCode::DecodeFailed);
         assert_eq!(e.reason, "while probing: boom");
