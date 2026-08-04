@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# Regenerate discovery surfaces from tool/schema.ts before every commit, so
-# committed artifacts can never drift from the single source (ci.yml still
-# enforces this server-side). Wired via `git config core.hooksPath .githooks`,
-# run automatically by the root package.json `prepare` script.
+# Two gates ci.yml also enforces server-side, run here so a push cannot fail
+# on them: rustfmt over the whole tree, and discovery surfaces regenerated
+# from tool/schema.ts so committed artifacts can never drift from the single
+# source. Wired via `git config core.hooksPath .githooks`, run automatically
+# by the root package.json `prepare` script.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
+
+# Reject rather than reformat: rewriting files mid-commit would sweep in
+# unstaged work the author deliberately held back.
+cargo fmt --check >/dev/null || {
+    echo "pre-commit: rustfmt gate failed — run \`cargo fmt\` and restage" >&2
+    exit 1
+}
 
 bun run gen:surfaces >/dev/null
 git add surfaces .agents/plugins/marketplace.json
