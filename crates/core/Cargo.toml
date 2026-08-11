@@ -30,7 +30,7 @@ static-ffmpeg = [
 ]
 
 [dependencies]
-ffmpeg-next = { version = "8", default-features = false, features = [
+ffmpeg-next = { version = "9", default-features = false, features = [
     "codec",
     "format",
     "software-scaling",
