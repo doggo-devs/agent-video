@@ -245,7 +245,7 @@ pub(super) fn transcribe_flow(
             )));
         }
     };
-    let (transcript, clipped) = render_transcript(&srt);
+    let transcript = render_transcript(&srt);
     // Honesty over silence: a transcript that stops mid-video says so.
     let truncation_note = decoded_seconds
         .filter(|&a| crate::probe::materially_truncated(a, probe.duration))
@@ -258,17 +258,11 @@ pub(super) fn transcribe_flow(
             )
         })
         .unwrap_or_default();
-    let clip_note = if clipped {
-        "The transcript exceeds the inline budget and is clipped here; grids carry the full \
-         text sliced per range. "
-    } else {
-        ""
-    };
     let next = plan_response(&args.source, &probe, &deps.config);
     json_result(&VideoBody::Transcript {
         transcript,
         guidance: format!(
-            "{truncation_note}{clip_note}Transcript cached — it rides along with every grid \
+            "{truncation_note}Transcript cached — it rides along with every grid \
              from now on. {}",
             next.guidance
         ),
@@ -297,25 +291,13 @@ fn transcript_swept() -> Fault {
     )
 }
 
-/// Inline budget for the transcript payload of a `transcribe` reply.
-/// Roughly half an hour of dense speech fits; past it the text clips at a
-/// cue boundary and the guidance says so — the full transcript still rides
-/// along with grids, pre-sliced per grid.
-const TRANSCRIPT_INLINE_MAX_BYTES: usize = 32 * 1024;
-
-/// Render cached SRT as `MM:SS text` cue lines, clipped to
-/// [`TRANSCRIPT_INLINE_MAX_BYTES`] at a cue boundary. The bool reports
-/// whether clipping occurred.
-fn render_transcript(srt: &str) -> (String, bool) {
+/// Render the cached SRT as `MM:SS text` cue lines.
+fn render_transcript(srt: &str) -> String {
     let mut out = String::new();
     for cue in agent_video_core::subtitle::parse_srt(srt) {
-        let line = format!("{} {}\n", format_ts(cue.start), cue.text);
-        if out.len() + line.len() > TRANSCRIPT_INLINE_MAX_BYTES {
-            return (out.trim_end().to_string(), true);
-        }
-        out.push_str(&line);
+        out.push_str(&format!("{} {}\n", format_ts(cue.start), cue.text));
     }
-    (out.trim_end().to_string(), false)
+    out.trim_end().to_string()
 }
 
 #[cfg(test)]

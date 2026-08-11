@@ -330,10 +330,9 @@ pub enum VideoBody {
         consequence: String,
         tokens: Vec<OfferedToken>,
     },
-    /// The product of `transcribe: true`: the transcript itself, as
-    /// `MM:SS text` cue lines — possibly clipped to the inline budget, in
-    /// which case `guidance` says so. The full transcript is cached and
-    /// rides along with every grid afterwards, sliced per grid.
+    /// The product of `transcribe: true`: the transcript itself, whole, as
+    /// `MM:SS text` cue lines. It is also cached and rides along with every
+    /// grid afterwards, sliced per grid.
     Transcript {
         transcript: String,
         guidance: String,
