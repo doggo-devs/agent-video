@@ -357,6 +357,7 @@ mod tests {
                 downloads: Mutex::new(0),
                 finished: Mutex::new(0),
                 last_cancel: Mutex::new(None),
+                short_attempts: Mutex::new(0),
             },
         )
     }

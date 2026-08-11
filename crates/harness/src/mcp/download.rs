@@ -22,7 +22,7 @@ use super::tracker::{Admission, Poll, Settlement};
 use super::wire::{failed, json_result, pending_result};
 use crate::cache::url_key;
 use crate::fault::Fault;
-use crate::fetch::{CancelSignal, DownloadIo, Downloaded, ProgressFn, rip_key};
+use crate::fetch::{Attempt, CancelSignal, DownloadIo, Downloaded, ProgressFn, Shortfall, rip_key};
 use crate::plan::{format_bytes, plan_response, size_label};
 use crate::schema::{RecommendedCall, VideoArgs, VideoBody};
 use crate::tokens::{Dest, DownloadPlan, Token};
@@ -37,6 +37,43 @@ pub(super) const DOWNLOAD_ABANDON_LIMIT: Duration = Duration::from_secs(10 * 60)
 
 /// Sampling tick of the sync grace window's poll loop.
 const SYNC_POLL_TICK: Duration = Duration::from_millis(200);
+
+/// How a job spends its retries. The ladder's length *is* the retry count:
+/// there is no way to schedule an attempt without naming the wait before
+/// it, so a tight loop against a bursty backend cannot be written here.
+#[derive(Debug, Clone, Copy)]
+struct Retries {
+    /// Wait before each retry, in order.
+    ladder: &'static [Duration],
+    /// Wall clock since the job began past which no further attempt
+    /// starts, whatever the ladder still offers.
+    budget: Duration,
+}
+
+/// Production policy. The bursts this exists for outlast a tight loop —
+/// observed as minutes of a CDN backend serving a truncated part — so the
+/// waits are tens of seconds, not milliseconds. The budget keeps a job
+/// that already burned its time on a stalled attempt (the yt-dlp watchdog
+/// gives up after `NO_PROGRESS_LIMIT`) from starting a second one it
+/// cannot finish.
+const RETRIES: Retries = Retries {
+    // In-crate tests drive the ladder's shape, never its clock: a test
+    // that waited out a real burst would put every download test in this
+    // crate on a two-minute leash.
+    ladder: if cfg!(test) {
+        &[Duration::ZERO, Duration::ZERO]
+    } else {
+        &[Duration::from_secs(30), Duration::from_secs(90)]
+    },
+    budget: Duration::from_secs(5 * 60),
+};
+
+/// Longest a backoff may leave the tracker without a word. Abandonment is
+/// judged on silence, so a wait longer than this is split into ticks that
+/// re-report the last byte count.
+const HEARTBEAT_TICK: Duration = Duration::from_secs(60);
+
+const _: () = assert!(HEARTBEAT_TICK.as_secs() < DOWNLOAD_ABANDON_LIMIT.as_secs());
 
 // Each downloader's stall bound must sit inside the tracker's abandon
 // limit, so a network-stalled download always dies (yt-dlp: the watchdog
@@ -170,7 +207,7 @@ fn perform_download(
         Ok(r) => r,
         Err(e) => return failed(&e).into(),
     };
-    let fetch = |progress: ProgressFn<'_>| -> Result<Downloaded, Fault> {
+    let mut fetch = |progress: ProgressFn<'_>| -> Result<Attempt, Fault> {
         match plan.dest {
             Dest::Cache => deps
                 .cache
@@ -210,52 +247,12 @@ fn perform_download(
                 }),
         }
     };
-    let Downloaded {
-        mut path,
-        mut warning,
-    } = match fetch(&mut *progress) {
-        Ok(d) => d,
-        Err(e) => return failed(&e).into(),
-    };
-    // A container whose tracks stop early was served truncated (an expired
-    // CDN session, a flaky segment fetch). Caching it would pin the URL to
-    // a silently broken rip, so verify before answering.
-    if let Some(issue) = crate::probe::coverage_shortfall(&path) {
-        match plan.dest {
-            // One fresh attempt: a new fetch gets a new CDN session, which
-            // heals most truncations. The retry adopts over the same cache
-            // names, so a failed retry keeps the first copy.
-            Dest::Cache => match fetch(&mut *progress) {
-                Ok(retried) => match crate::probe::coverage_shortfall(&retried.path) {
-                    None => {
-                        path = retried.path;
-                        warning = retried.warning;
-                    }
-                    Some(issue) => {
-                        path = retried.path;
-                        warning = join_warning(
-                            retried.warning,
-                            format!(
-                                "{issue} even after a fresh retry — the source itself serves \
-                                 a truncated stream; grids and transcription stop where the \
-                                 tracks end"
-                            ),
-                        );
-                    }
-                },
-                Err(fault) => {
-                    warning = join_warning(warning, retry_failure_note(&issue, &fault));
-                }
-            },
-            // Keep files belong to the user: report, never second-guess.
-            Dest::Keep => {
-                warning = join_warning(
-                    warning,
-                    format!("{issue} — the source may have served a truncated stream"),
-                );
-            }
-        }
-    }
+    let mut beat = Beat::new(progress);
+    let Downloaded { path, warning } =
+        match fetch_complete(plan.dest, cancel, &mut beat, &mut fetch, RETRIES) {
+            Ok(d) => d,
+            Err(e) => return failed(&e).into(),
+        };
     // Sweep before building the response, which describes files on disk. The
     // rip that just landed survives via the eviction grace window.
     let _ = deps.cache.evict(SystemTime::now());
@@ -320,15 +317,212 @@ fn perform_download(
     }
 }
 
-/// Degradation note for a coverage retry that itself failed: the first
-/// copy is served, but the cause of the failed retry — kind and message —
-/// must survive into the warning instead of being incinerated.
-fn retry_failure_note(issue: &str, fault: &Fault) -> String {
-    format!(
-        "{issue}, and a fresh retry failed ({}: {}) — keeping this copy; grids and \
-         transcription stop where the tracks end",
-        fault.kind, fault.message
-    )
+/// The job's voice to the tracker, and its memory of what it last said.
+/// Every byte count the downloaders report passes through here, so a
+/// backoff can repeat the last one instead of inventing a number or
+/// falling silent.
+struct Beat<'a> {
+    inner: ProgressFn<'a>,
+    seen: (u64, Option<u64>),
+}
+
+impl<'a> Beat<'a> {
+    fn new(inner: ProgressFn<'a>) -> Self {
+        Beat {
+            inner,
+            seen: (0, None),
+        }
+    }
+
+    fn report(&mut self, downloaded: u64, total: Option<u64>) {
+        self.seen = (downloaded, total);
+        (self.inner)(downloaded, total);
+    }
+
+    /// Wait `delay`, telling the tracker the job is alive. Abandonment is
+    /// judged on silence ([`super::tracker::JobSlot`]'s `last_progress`),
+    /// and a sleeping thread is indistinguishable from a wedged one, so
+    /// the wait is split into [`HEARTBEAT_TICK`] pieces that re-report the
+    /// last byte count — never backwards from the caller's view, since the
+    /// sync waiter forwards growth only.
+    ///
+    /// Returns whether the job still owns itself: a disowned job stops
+    /// waiting and stops retrying.
+    fn wait(&mut self, delay: Duration, cancel: &CancelSignal) -> bool {
+        let deadline = Instant::now() + delay;
+        loop {
+            if cancel.is_cancelled() {
+                return false;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            std::thread::sleep(left.min(HEARTBEAT_TICK));
+            let (downloaded, total) = self.seen;
+            (self.inner)(downloaded, total);
+        }
+    }
+}
+
+/// Why an attempt did not settle the job.
+enum Setback {
+    /// The source served short; a fresh extraction may land elsewhere.
+    Short(Shortfall),
+    /// The attempt failed outright, transiently.
+    Failed(Fault),
+}
+
+/// Fetch until the rip is complete, the budget runs out, or the failure is
+/// one no fresh extraction can heal.
+///
+/// The loop lives at this layer — above both downloaders, below the
+/// protocol — because only a whole new invocation re-runs extraction, and
+/// re-extraction is the only thing that changes the signed URL a flaky CDN
+/// backend pinned the rip to. yt-dlp's own retries resume that same URL
+/// and cannot help. And it lives here rather than in the model's hands
+/// because a retry from up there costs a consent round-trip apiece: the
+/// job is already detached behind the tracker, so spending the time here
+/// costs the caller nothing but a pending poll.
+///
+/// A short rip that nonetheless landed is kept as the fallback: retries
+/// adopt over the same cache names, so a failed retry still leaves the
+/// first copy, and a caller who asked to keep a file is told what is
+/// wrong with it rather than having it second-guessed.
+fn fetch_complete(
+    dest: Dest,
+    cancel: &CancelSignal,
+    beat: &mut Beat<'_>,
+    fetch: &mut dyn for<'p> FnMut(ProgressFn<'p>) -> Result<Attempt, Fault>,
+    retries: Retries,
+) -> Result<Downloaded, Fault> {
+    let started = Instant::now();
+    let mut fallback: Option<Downloaded> = None;
+    let mut attempts: u32 = 0;
+    let mut waits = retries.ladder.iter();
+    loop {
+        attempts += 1;
+        let setback = {
+            let mut report = |downloaded, total| beat.report(downloaded, total);
+            match fetch(&mut report) {
+                Ok(Attempt::Complete(done)) => return Ok(done),
+                Ok(Attempt::Short { evidence, landed }) => {
+                    // Keep destinations belong to the user: a landed file is
+                    // reported, never re-fetched behind their back.
+                    if landed.is_some() && dest == Dest::Keep {
+                        return Ok(short_landing(landed, evidence, attempts)
+                            .expect("a landed rip yields a landing"));
+                    }
+                    fallback = fallback.or(landed);
+                    Setback::Short(evidence)
+                }
+                // Only a transient fault is worth a second attempt; a
+                // missing binary or a rejected URL fails the same way
+                // forever, and repeating it just burns the caller's clock.
+                Err(fault) if !fault.kind.retriable() => return Err(fault),
+                Err(fault) => Setback::Failed(fault),
+            }
+        };
+        let Some(&delay) = waits.next() else {
+            return verdict(setback, fallback, attempts, started.elapsed());
+        };
+        if started.elapsed() + delay >= retries.budget || !beat.wait(delay, cancel) {
+            return verdict(setback, fallback, attempts, started.elapsed());
+        }
+    }
+}
+
+/// Settle a job whose attempts are spent: serve the incomplete rip if one
+/// landed, otherwise report the last setback with the shape of the
+/// failure — how many attempts, over how long — because a caller who
+/// retries immediately, three times, loses to a burst that outlasts all
+/// three.
+fn verdict(
+    last: Setback,
+    fallback: Option<Downloaded>,
+    attempts: u32,
+    span: Duration,
+) -> Result<Downloaded, Fault> {
+    match last {
+        Setback::Short(evidence) => {
+            if let Some(landed) = short_landing(fallback, evidence.clone(), attempts) {
+                return Ok(landed);
+            }
+            Err(Fault::transient(format!(
+                "the source served an incomplete rip on every attempt ({}, {}): {}. \
+                 {RETRY_HINT}, or pick a different format so the download resolves to a \
+                 different stored object",
+                attempt_count(attempts),
+                span_label(span),
+                evidence.describe()
+            )))
+        }
+        Setback::Failed(fault) => match fallback {
+            Some(landed) => Ok(Downloaded {
+                warning: join_warning(
+                    landed.warning,
+                    format!(
+                        "the rip is incomplete and a fresh attempt failed ({}: {}) — keeping \
+                         this copy; grids and transcription stop where the tracks end",
+                        fault.kind, fault.message
+                    ),
+                ),
+                ..landed
+            }),
+            None if attempts > 1 => Err(Fault::new(
+                fault.kind,
+                format!(
+                    "{} ({}, {}). {RETRY_HINT}",
+                    fault.message,
+                    attempt_count(attempts),
+                    span_label(span)
+                ),
+            )),
+            None => Err(fault),
+        },
+    }
+}
+
+/// What a caller can actually do about an exhausted ladder. Named once:
+/// the wait is the whole advice, and it is the part every immediate retry
+/// in the wild got wrong.
+const RETRY_HINT: &str = "the attempts above were already spread over that window, so this \
+     fault outlasts an immediate retry — wait a few minutes before confirming again";
+
+/// Serve an incomplete rip that landed anyway, with the evidence attached:
+/// the file is real and usable up to where its tracks end, and saying so
+/// beats failing a download the caller can still work with.
+fn short_landing(
+    landed: Option<Downloaded>,
+    evidence: Shortfall,
+    attempts: u32,
+) -> Option<Downloaded> {
+    let landed = landed?;
+    let note = format!(
+        "{} after {} — the source itself serves a truncated stream; grids and transcription \
+         stop where the tracks end",
+        evidence.describe(),
+        attempt_count(attempts)
+    );
+    Some(Downloaded {
+        warning: join_warning(landed.warning, note),
+        ..landed
+    })
+}
+
+fn attempt_count(attempts: u32) -> String {
+    match attempts {
+        1 => "1 attempt".to_string(),
+        n => format!("{n} attempts"),
+    }
+}
+
+fn span_label(span: Duration) -> String {
+    let secs = span.as_secs();
+    match secs {
+        0..60 => format!("over {secs}s"),
+        _ => format!("over {}m{:02}s", secs / 60, secs % 60),
+    }
 }
 
 /// Append a degradation note to an optional existing warning.
@@ -407,16 +601,188 @@ pub(super) fn keep_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn landed(name: &str) -> Downloaded {
+        Downloaded {
+            path: PathBuf::from(name),
+            warning: None,
+        }
+    }
+
+    fn short(landed: Option<Downloaded>) -> Result<Attempt, Fault> {
+        Ok(Attempt::Short {
+            evidence: Shortfall::Transfer {
+                got: 75_497_472,
+                expected: 103_894_225,
+            },
+            landed,
+        })
+    }
+
+    /// Drive `fetch_complete` over a scripted sequence of attempts;
+    /// returns its verdict and how many attempts it spent.
+    fn run(dest: Dest, script: Vec<Result<Attempt, Fault>>) -> (Result<Downloaded, Fault>, usize) {
+        let mut script = script.into_iter();
+        let mut spent = 0;
+        let mut sink = |_, _| {};
+        let mut beat = Beat::new(&mut sink);
+        let mut fetch = |_: ProgressFn<'_>| {
+            spent += 1;
+            script.next().expect("the script covers every attempt")
+        };
+        let result = fetch_complete(dest, &CancelSignal::new(), &mut beat, &mut fetch, RETRIES);
+        (result, spent)
+    }
 
     #[test]
-    fn retry_failure_note_names_the_fault() {
-        let fault = Fault::transient("connection reset by peer");
-        let note = retry_failure_note("video track ends at 00:31", &fault);
-        assert!(note.contains("video track ends at 00:31"), "{note}");
-        assert!(
-            note.contains("transient: connection reset by peer"),
-            "the retry's cause must survive into the warning: {note}"
+    fn retries_a_short_rip_without_the_caller() {
+        let (result, attempts) = run(
+            Dest::Cache,
+            vec![
+                short(None),
+                short(None),
+                Ok(Attempt::Complete(landed("v.mp4"))),
+            ],
         );
-        assert!(note.contains("keeping this copy"), "{note}");
+
+        assert_eq!(
+            attempts, 3,
+            "the burst must be outlasted here, not by the model"
+        );
+        assert_eq!(
+            result.expect("the third attempt landed").path,
+            PathBuf::from("v.mp4")
+        );
+    }
+
+    #[test]
+    fn reports_an_exhausted_burst_with_its_shape() {
+        let (result, attempts) = run(Dest::Cache, vec![short(None), short(None), short(None)]);
+
+        assert_eq!(attempts, 3, "the ladder bounds the attempts");
+        let fault = result.expect_err("nothing landed");
+        assert_eq!(fault.kind, crate::fault::FaultKind::Transient);
+        assert!(fault.message.contains("3 attempts"), "{fault}");
+        assert!(
+            fault.message.contains("72 MiB of the 99 MiB"),
+            "the evidence rides along: {fault}"
+        );
+        assert!(
+            fault.message.contains("wait a few minutes"),
+            "a burst outlasts an immediate retry, and the caller must hear it: {fault}"
+        );
+    }
+
+    #[test]
+    fn serves_a_short_rip_that_landed_when_retries_run_out() {
+        let (result, _) = run(
+            Dest::Cache,
+            vec![short(Some(landed("first.mp4"))), short(None), short(None)],
+        );
+
+        let served = result.expect("an incomplete file still beats no file");
+        assert_eq!(
+            served.path,
+            PathBuf::from("first.mp4"),
+            "retries adopt over the same names, so the first copy survives"
+        );
+        let warning = served.warning.expect("the shortfall must be disclosed");
+        assert!(warning.contains("truncated"), "{warning}");
+    }
+
+    #[test]
+    fn keeps_a_landed_file_without_second_guessing_the_user() {
+        let (result, attempts) = run(Dest::Keep, vec![short(Some(landed("user.mp4")))]);
+
+        assert_eq!(
+            attempts, 1,
+            "a keep file belongs to the user, not to the retry loop"
+        );
+        let served = result.expect("the file landed");
+        assert!(served.warning.expect("disclosed").contains("truncated"));
+    }
+
+    #[test]
+    fn retries_a_keep_download_that_landed_nothing() {
+        let (result, attempts) = run(
+            Dest::Keep,
+            vec![short(None), Ok(Attempt::Complete(landed("user.mp4")))],
+        );
+
+        assert_eq!(
+            attempts, 2,
+            "nothing landed, so there is nothing to second-guess"
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn refuses_to_retry_a_fault_no_re_extraction_can_heal() {
+        let (result, attempts) = run(
+            Dest::Cache,
+            vec![Err(Fault::environment("yt-dlp is not installed"))],
+        );
+
+        assert_eq!(attempts, 1, "a missing binary fails the same way forever");
+        assert_eq!(
+            result.expect_err("fatal").kind,
+            crate::fault::FaultKind::Environment
+        );
+    }
+
+    #[test]
+    fn stops_retrying_once_the_job_is_disowned() {
+        let cancel = CancelSignal::new();
+        let mut sink = |_, _| {};
+        let mut beat = Beat::new(&mut sink);
+        let mut spent = 0;
+        let mut fetch = |_: ProgressFn<'_>| {
+            spent += 1;
+            cancel.cancel();
+            short(None)
+        };
+
+        let result = fetch_complete(Dest::Cache, &cancel, &mut beat, &mut fetch, RETRIES);
+
+        assert_eq!(spent, 1, "a job that lost its slot must not keep working");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn backoff_heartbeats_keep_the_slot_alive() {
+        let mut reported: Vec<(u64, Option<u64>)> = Vec::new();
+        {
+            let mut sink = |downloaded, total| reported.push((downloaded, total));
+            let mut beat = Beat::new(&mut sink);
+            beat.report(1024, Some(4096));
+            let alive = beat.wait(Duration::from_millis(1), &CancelSignal::new());
+            assert!(alive);
+        }
+
+        assert_eq!(
+            reported,
+            vec![(1024, Some(4096)), (1024, Some(4096))],
+            "a silent backoff is indistinguishable from a wedged thread, so the wait \
+             re-reports the last count instead of inventing one"
+        );
+    }
+
+    #[test]
+    fn a_spent_ladder_reports_the_cause_that_ended_it() {
+        let (result, _) = run(
+            Dest::Cache,
+            vec![
+                Err(Fault::transient("connection reset by peer")),
+                Err(Fault::transient("connection reset by peer")),
+                Err(Fault::transient("connection reset by peer")),
+            ],
+        );
+        let fault = result.expect_err("nothing landed");
+        assert!(
+            fault.message.contains("connection reset by peer"),
+            "{fault}"
+        );
+        assert!(fault.message.contains("3 attempts"), "{fault}");
     }
 }

@@ -220,6 +220,58 @@ pub struct Downloaded {
     pub warning: Option<String>,
 }
 
+/// Evidence that a fetch delivered less than the source promised.
+///
+/// The two arms are one fact seen by two observers — the downloader
+/// counting bytes against the advertised length, and the demuxer reading
+/// the landed container — and they share one cure: run extraction again,
+/// so a fresh signed URL (and, on a multi-tier CDN, a different backend)
+/// serves the bytes. Resuming cannot help; a resumed range is pinned to
+/// the backend that already served short.
+///
+/// Deliberately not a [`Fault`]: a short rip is the retry loop's input,
+/// never the caller's verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Shortfall {
+    /// The transfer ended before the advertised length.
+    Transfer { got: u64, expected: u64 },
+    /// The container's tracks stop before its declared extent, named as
+    /// [`crate::probe::coverage_shortfall`] phrases it.
+    Coverage(String),
+}
+
+impl Shortfall {
+    /// One clause naming the evidence, for warnings and faults.
+    pub fn describe(&self) -> String {
+        match self {
+            Shortfall::Transfer { got, expected } => format!(
+                "the transfer stopped at {} of the {} the source advertised",
+                format_bytes(*got),
+                format_bytes(*expected)
+            ),
+            Shortfall::Coverage(issue) => issue.clone(),
+        }
+    }
+}
+
+/// What one fetch attempt produced. Completeness is the axis, not
+/// success: a short rip is neither `Ok` for the caller nor a `Fault`, and
+/// splitting it across `Result` is what once made a downloader-observed
+/// shortfall cost a consent round-trip while a disk-observed one was
+/// retried for free.
+#[derive(Debug)]
+pub enum Attempt {
+    /// Complete media, ready to publish.
+    Complete(Downloaded),
+    /// The source served short. `landed` carries the incomplete media when
+    /// it reached its final path anyway — a truncated container is still a
+    /// file — and is `None` when nothing publishable exists.
+    Short {
+        evidence: Shortfall,
+        landed: Option<Downloaded>,
+    },
+}
+
 /// Walk the source chain: a direct media link claims the URL first,
 /// anything it cannot open goes to yt-dlp.
 ///
@@ -278,16 +330,44 @@ pub fn download(
     relay: &PolicyRelay,
     cancel: &CancelSignal,
     progress: ProgressFn<'_>,
-) -> Result<Downloaded, Fault> {
-    match &plan.recipe {
+) -> Result<Attempt, Fault> {
+    let attempt = match &plan.recipe {
         // The direct client owns its own per-connection screen via
         // `GuardedResolver`, so it needs no relay; only the subprocess path
         // does.
-        Recipe::Direct(recipe) => direct::download(url, recipe, io, cfg, cancel, progress),
+        Recipe::Direct(recipe) => direct::download(url, recipe, io, cfg, cancel, progress)?,
         // yt-dlp takes no cancel signal: its watchdog kills a stalled child
         // within `ytdlp::NO_PROGRESS_LIMIT`, which a compile-time assertion
         // in `mcp::download` keeps inside the tracker's abandon limit.
-        Recipe::Ytdlp(recipe) => ytdlp::download(url, recipe, io, cfg, relay, progress),
+        Recipe::Ytdlp(recipe) => ytdlp::download(url, recipe, io, cfg, relay, progress)?,
+    };
+    Ok(verify_coverage(attempt))
+}
+
+/// The second observer: a rip whose tracks stop before the container's
+/// declared extent is short even when every advertised byte arrived — a
+/// fragment fetch that gave up mid-stream still muxes a well-formed file.
+/// Applied once, above both sources, so every downloader and every retry
+/// is judged by the same evidence.
+fn verify_coverage(attempt: Attempt) -> Attempt {
+    judge_coverage(attempt, crate::probe::coverage_shortfall)
+}
+
+/// Which observer to ask is production's business; what its answer *means*
+/// is a state transition, and it is spelled here so it can be exercised
+/// without a truncated container on disk. An attempt already known to be
+/// short is never re-judged: the first evidence is the specific one, and a
+/// second opinion could only blur it.
+fn judge_coverage(attempt: Attempt, observe: impl Fn(&Path) -> Option<String>) -> Attempt {
+    let Attempt::Complete(landed) = attempt else {
+        return attempt;
+    };
+    match observe(&landed.path) {
+        Some(issue) => Attempt::Short {
+            evidence: Shortfall::Coverage(issue),
+            landed: Some(landed),
+        },
+        None => Attempt::Complete(landed),
     }
 }
 
@@ -304,6 +384,69 @@ mod tests {
     use super::*;
     use crate::config::{default_config, test_dirs};
     use std::path::Path;
+
+    fn complete(name: &str) -> Attempt {
+        Attempt::Complete(Downloaded {
+            path: PathBuf::from(name),
+            warning: None,
+        })
+    }
+
+    #[test]
+    fn a_rip_whose_tracks_stop_early_is_short_but_still_served() {
+        let judged = judge_coverage(complete("v.mp4"), |_| {
+            Some("the audio track covers only 00:31 of the 08:51 timeline".to_string())
+        });
+
+        match judged {
+            Attempt::Short {
+                evidence: Shortfall::Coverage(issue),
+                landed,
+            } => {
+                assert!(issue.contains("00:31"), "{issue}");
+                assert_eq!(
+                    landed.expect("a truncated container is still a file").path,
+                    PathBuf::from("v.mp4"),
+                    "the file must ride along, or a spent ladder has nothing to serve"
+                );
+            }
+            other => panic!("expected a coverage shortfall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_clean_rip_passes_the_coverage_observer_untouched() {
+        let judged = judge_coverage(complete("v.mp4"), |_| None);
+
+        assert!(matches!(judged, Attempt::Complete(_)), "{judged:?}");
+    }
+
+    #[test]
+    fn a_transfer_shortfall_is_never_relabelled_as_a_coverage_one() {
+        // The downloader's evidence carries the two byte counts; the
+        // container observer's carries a timeline. Re-judging an attempt
+        // that is already short would trade the specific for the vague.
+        let short = Attempt::Short {
+            evidence: Shortfall::Transfer {
+                got: 10,
+                expected: 100,
+            },
+            landed: None,
+        };
+
+        let judged = judge_coverage(short, |_| panic!("a short attempt must not be re-observed"));
+
+        assert!(
+            matches!(
+                judged,
+                Attempt::Short {
+                    evidence: Shortfall::Transfer { .. },
+                    ..
+                }
+            ),
+            "{judged:?}"
+        );
+    }
 
     #[test]
     fn rip_key_changes_with_analysis_height() {

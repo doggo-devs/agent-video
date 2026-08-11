@@ -640,6 +640,49 @@ mod tests {
     }
 
     #[test]
+    fn a_short_rip_costs_the_caller_no_consent_round_trip() {
+        // The defect this pins: a CDN backend serving a truncated part made
+        // the download fail, and every retry had to come from the model as
+        // a fresh confirm — a full consent round-trip apiece. One confirm
+        // must outlast the burst.
+        let env = env_with_fetcher(
+            probe(90.0, vec![]),
+            false,
+            FakeFetcher {
+                info: SourceInfo {
+                    headline: "A video.".to_string(),
+                    title: None,
+                    options: vec![analysis_option()],
+                },
+                gate: None,
+                warning: None,
+                downloads: Mutex::new(0),
+                finished: Mutex::new(0),
+                last_cancel: Mutex::new(None),
+                short_attempts: Mutex::new(2),
+            },
+        );
+        let url = "https://example.com/v.mp4";
+
+        let offer = body_of(&call(&env, serde_json::json!({"source": url})));
+        let token = offered_tokens(&offer).remove(0);
+        let done = body_of(&call(
+            &env,
+            serde_json::json!({"source": url, "confirm": token}),
+        ));
+
+        assert_eq!(
+            done["status"], "plan",
+            "one confirm must land the rip: {done}"
+        );
+        assert_eq!(
+            *env.fetcher.downloads.lock().expect("downloads"),
+            3,
+            "the re-extractions happen here, behind the one consent the model gave"
+        );
+    }
+
+    #[test]
     fn surfaces_download_warning_before_guidance() {
         // A degraded download (media landed, subtitles did not) must inform
         // the model instead of failing or staying silent.
@@ -657,6 +700,7 @@ mod tests {
                 downloads: Mutex::new(0),
                 finished: Mutex::new(0),
                 last_cancel: Mutex::new(None),
+                short_attempts: Mutex::new(0),
             },
         );
         let url = "https://example.com/v.mp4";
@@ -736,6 +780,7 @@ mod tests {
                 downloads: Mutex::new(0),
                 finished: Mutex::new(0),
                 last_cancel: Mutex::new(None),
+                short_attempts: Mutex::new(0),
             },
         );
         // Shortest representable grace window keeps the test fast.
@@ -796,6 +841,7 @@ mod tests {
                 downloads: Mutex::new(0),
                 finished: Mutex::new(0),
                 last_cancel: Mutex::new(None),
+                short_attempts: Mutex::new(0),
             },
         );
         Arc::get_mut(&mut env.deps)
@@ -1006,6 +1052,7 @@ mod tests {
                 downloads: Mutex::new(0),
                 finished: Mutex::new(0),
                 last_cancel: Mutex::new(None),
+                short_attempts: Mutex::new(0),
             },
         );
         Arc::get_mut(&mut env.deps)

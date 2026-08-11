@@ -26,8 +26,8 @@ use ureq::unversioned::transport::{
 };
 
 use super::{
-    CancelSignal, DownloadIo, DownloadOption, Downloaded, ProgressFn, Recipe, SourceInfo,
-    estimate_label,
+    Attempt, CancelSignal, DownloadIo, DownloadOption, Downloaded, ProgressFn, Recipe, Shortfall,
+    SourceInfo, estimate_label,
 };
 use crate::config::Config;
 use crate::fault::Fault;
@@ -289,23 +289,36 @@ pub fn download(
     cfg: &Config,
     cancel: &CancelSignal,
     progress: ProgressFn<'_>,
-) -> Result<Downloaded, Fault> {
+) -> Result<Attempt, Fault> {
     let (dest, reserved) = match io {
         DownloadIo::Cache { dir, key } => (dir.join(format!("{key}.{}", recipe.ext)), false),
         DownloadIo::Keep { dir } => (reserve_available_path(&dir.join(&recipe.filename))?, true),
     };
-    if let Err(e) = download_direct(url, &dest, cfg, cancel, progress) {
-        // Release the name: a failed keep download must not leave an empty
-        // placeholder squatting on the user's filename.
+    // Release the name on anything but a complete transfer: neither a
+    // failure nor a short body may leave a placeholder — or worse, a
+    // truncated file — squatting on the user's filename.
+    let release = || {
         if reserved {
             let _ = std::fs::remove_file(&dest);
         }
-        return Err(e);
+    };
+    match download_direct(url, &dest, cfg, cancel, progress) {
+        Err(e) => {
+            release();
+            Err(e)
+        }
+        Ok(Transfer::Short(evidence)) => {
+            release();
+            Ok(Attempt::Short {
+                evidence,
+                landed: None,
+            })
+        }
+        Ok(Transfer::Complete(_)) => Ok(Attempt::Complete(Downloaded {
+            path: dest,
+            warning: None,
+        })),
     }
-    Ok(Downloaded {
-        path: dest,
-        warning: None,
-    })
 }
 
 // ── link identity ──
@@ -420,16 +433,26 @@ pub fn head_content_length(url: &VettedUrl, cfg: &Config) -> Option<u64> {
     res.body().content_length().filter(|&len| len > 0)
 }
 
+/// What one direct transfer left behind.
+pub enum Transfer {
+    /// Every advertised byte arrived and `dest` is published.
+    Complete(u64),
+    /// The body ended early; nothing is published and the `.part` is gone.
+    /// A truncated file must never reach the cache under the name of a
+    /// complete one — the next call would serve it as a hit.
+    Short(Shortfall),
+}
+
 /// Download `url` to `dest`, refusing to exceed `max_bytes`: known oversize
 /// is refused before the first byte, unknown-length streams are cut off
-/// mid-flight. The `.part` file never survives a failure.
+/// mid-flight. The `.part` file never survives a failure or a short body.
 pub fn download_direct(
     url: &VettedUrl,
     dest: &Path,
     cfg: &Config,
     cancel: &CancelSignal,
     progress: ProgressFn<'_>,
-) -> Result<u64, Fault> {
+) -> Result<Transfer, Fault> {
     let max_bytes = cfg.download.max_bytes.get();
     let mut res = agent(cfg, cancel)
         .get(url.as_str())
@@ -470,10 +493,20 @@ pub fn download_direct(
         cancel,
         progress,
     )
-    .and_then(|(file, bytes)| publish(file, &part, dest, cancel).map(|()| bytes));
-    result.inspect_err(|_| {
+    // A body that ends before Content-Length is the same fact yt-dlp
+    // reports as `Downloaded N bytes, expected M bytes`: the source served
+    // short, and only a fresh request can land elsewhere.
+    .and_then(|streamed| match streamed {
+        Streamed::Short(evidence) => Ok(Transfer::Short(evidence)),
+        Streamed::Complete(file, bytes) => {
+            publish(file, &part, dest, cancel).map(|()| Transfer::Complete(bytes))
+        }
+    });
+    // The staging file outlives neither a failure nor a shortfall.
+    if !matches!(result, Ok(Transfer::Complete(_))) {
         let _ = std::fs::remove_file(&part);
-    })
+    }
+    result
 }
 
 /// Publish a fully-written staging file at its final name. The staging
@@ -514,12 +547,24 @@ fn publish(
         .map_err(|e| Fault::environment(format!("cannot finalize {}: {e}", dest.display())))
 }
 
-/// Stream the body into `part`; returns the still-open write handle so the
-/// caller can decide durability before publishing — ownership of the bytes
-/// and of the fsync travel together. The cancel signal is checked before
-/// every read: while data flows, that is at least once per received chunk,
-/// and a read blocked on a silent peer is unblocked by the stall guard
-/// within [`CANCEL_TICK`].
+/// What streaming the body into `part` produced.
+#[derive(Debug)]
+enum Streamed {
+    /// Every advertised byte arrived; the still-open write handle rides
+    /// along so the caller can decide durability before publishing —
+    /// ownership of the bytes and of the fsync travel together.
+    Complete(std::fs::File, u64),
+    /// The body ended before its advertised length, whether the peer
+    /// closed cleanly or hung up mid-read. The reason it stopped is not
+    /// the point: what the caller needs is that the rip is short and a
+    /// fresh request may land on a healthier backend.
+    Short(Shortfall),
+}
+
+/// Stream the body into `part`. The cancel signal is checked before every
+/// read: while data flows, that is at least once per received chunk, and a
+/// read blocked on a silent peer is unblocked by the stall guard within
+/// [`CANCEL_TICK`].
 fn stream_to_part(
     reader: &mut dyn Read,
     part: &Path,
@@ -527,19 +572,35 @@ fn stream_to_part(
     total: Option<u64>,
     cancel: &CancelSignal,
     progress: ProgressFn<'_>,
-) -> Result<(std::fs::File, u64), Fault> {
+) -> Result<Streamed, Fault> {
     let mut file = std::fs::File::create(part)
         .map_err(|e| Fault::environment(format!("cannot write {}: {e}", part.display())))?;
     let mut buf = [0u8; 64 * 1024];
     let mut bytes: u64 = 0;
     let mut last_report = Instant::now();
+    // A stream that ends short of what the server promised is short
+    // however it ended; only an unpromised length leaves the transport
+    // error as the whole story.
+    let short = |bytes: u64| match total {
+        Some(expected) if bytes < expected => Some(Shortfall::Transfer {
+            got: bytes,
+            expected,
+        }),
+        _ => None,
+    };
     loop {
         if cancel.is_cancelled() {
             return Err(Fault::transient(CANCELLED_NOTE));
         }
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| Fault::transient(format!("download failed mid-stream: {e}")))?;
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                return match short(bytes) {
+                    Some(evidence) => Ok(Streamed::Short(evidence)),
+                    None => Err(Fault::transient(format!("download failed mid-stream: {e}"))),
+                };
+            }
+        };
         if n == 0 {
             break;
         }
@@ -560,7 +621,10 @@ fn stream_to_part(
         }
     }
     progress(bytes, total.or(Some(bytes)));
-    Ok((file, bytes))
+    Ok(match short(bytes) {
+        Some(evidence) => Streamed::Short(evidence),
+        None => Streamed::Complete(file, bytes),
+    })
 }
 
 #[cfg(test)]
@@ -844,6 +908,68 @@ mod tests {
             "observed within ticks, not at the idle limit"
         );
         assert!(err.to_string().contains("cancelled"), "{err}");
+    }
+
+    #[test]
+    fn a_body_shorter_than_content_length_publishes_nothing() {
+        // The direct twin of yt-dlp's short transfer: the server promises
+        // 100 bytes and hangs up at 40. Publishing that under the cache
+        // key would pin the URL to a silently broken rip that every later
+        // call serves as a hit.
+        let dir = crate::tempdir::TempDir::new("av-direct-short");
+        let mut cfg = crate::config::default_config(&crate::config::test_dirs(Path::new("/h/u")));
+        cfg.network.allow_private_hosts = true;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = std::io::Read::read(&mut s, &mut [0u8; 1024]);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nonly forty bytes of the \
+                      hundred promised",
+                );
+            }
+        });
+        let url = crate::netguard::vet(&format!("http://{addr}/v.mp4"), &cfg).expect("vetted");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        let recipe = DirectRecipe {
+            ext: "mp4".to_string(),
+            filename: "v.mp4".to_string(),
+        };
+
+        let attempt = download(
+            &url,
+            &recipe,
+            DownloadIo::Cache {
+                dir: &cache,
+                key: "k",
+            },
+            &cfg,
+            &CancelSignal::new(),
+            &mut |_, _| {},
+        )
+        .expect("a short body is not a failure, it is a short attempt");
+
+        match attempt {
+            Attempt::Short {
+                evidence: Shortfall::Transfer { got, expected },
+                landed,
+            } => {
+                assert_eq!(expected, 100, "the advertised length is the evidence");
+                assert!(got < expected, "got {got}");
+                assert!(landed.is_none(), "nothing incomplete may be published");
+            }
+            other => panic!("expected a short transfer, got {other:?}"),
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&cache)
+            .expect("cache dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the .part must be gone: {leftovers:?}"
+        );
     }
 
     #[test]

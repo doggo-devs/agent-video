@@ -13,7 +13,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use super::{DownloadIo, Downloaded, ProgressFn, SourceInfo};
+use super::{Attempt, DownloadIo, Downloaded, ProgressFn, Shortfall, SourceInfo};
 use crate::config::Config;
 use crate::cookies::CookieHandle;
 use crate::fault::Fault;
@@ -134,9 +134,10 @@ fn stack_warnings(first: Option<String>, second: Option<String>) -> Option<Strin
 
 // ── spawning ──
 
-/// Diagnostics only ever read the tail (`stderr_tail`, `is_auth_failure`),
-/// so keep at most this many bytes and let whole lines fall off the front.
-const STDERR_TAIL_LIMIT: usize = 64 * 1024;
+/// Diagnostics only ever read the tail (`stderr_tail`, `is_auth_failure`,
+/// `short_transfer`), so keep at most this many bytes per pipe and let
+/// whole lines fall off the front.
+const LOG_TAIL_LIMIT: usize = 64 * 1024;
 
 /// Line-oriented tail buffer bounded to `limit` bytes: once appending a
 /// line pushes the total over, whole lines fall off the front. The newest
@@ -231,6 +232,25 @@ fn error_lines(stderr: &str) -> String {
     } else {
         errors.join("\n")
     }
+}
+
+/// yt-dlp's own short-transfer verdict, parsed for its two numbers:
+/// `Downloaded 75497472 bytes, expected 103894225 bytes`. An exact parse,
+/// not a keyword sniff — the numbers *are* the evidence, and they ride
+/// into the caller-facing message when every attempt comes up short.
+///
+/// yt-dlp reports this on its screen channel (stdout) while retries are
+/// still pending and on stderr once they are exhausted, so callers search
+/// both tails. The last occurrence wins: it is the attempt that gave up.
+fn short_transfer(log: &str) -> Option<Shortfall> {
+    log.lines().rev().find_map(|line| {
+        let (_, rest) = line.rsplit_once("Downloaded ")?;
+        let (got, rest) = rest.split_once(" bytes, expected ")?;
+        let (expected, _) = rest.split_once(" bytes")?;
+        let got: u64 = got.trim().parse().ok()?;
+        let expected: u64 = expected.trim().parse().ok()?;
+        (got < expected).then_some(Shortfall::Transfer { got, expected })
+    })
 }
 
 /// yt-dlp stderr markers meaning "this source wants a login", not "retry":
@@ -549,6 +569,38 @@ impl Drop for WatchdogGuard {
 const PROGRESS_PREFIX: &str = "AVDL ";
 const PROGRESS_TEMPLATE: &str = "download:AVDL %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s";
 
+/// Sentinel marking the one stdout line that names the media's final path.
+/// stdout carries three kinds of line — progress, this, and yt-dlp's own
+/// chatter — and each is recognised by what it *is*: the open-world
+/// default this replaces ("whatever did not parse as progress is the
+/// filepath") let a `[download] Destination: …` line pass for the media
+/// path, which is why the chatter had to be muted with `--quiet` — taking
+/// yt-dlp's short-transfer diagnostics down with it.
+const FILEPATH_PREFIX: &str = "AVFP ";
+
+/// One classified stdout line. Closed world by construction: adding a
+/// channel means adding a variant, not widening a default.
+#[derive(Debug, PartialEq)]
+enum Line<'a> {
+    /// A `--progress-template` line: bytes moved, total when known.
+    Progress(u64, Option<u64>),
+    /// The `--print after_move:` line: the media's final path.
+    Filepath(&'a str),
+    /// Anything else yt-dlp says. Never a path, always a diagnostic.
+    Chatter(&'a str),
+}
+
+/// Classify one stdout line by its sentinel.
+fn classify(line: &str) -> Line<'_> {
+    if let Some((downloaded, total)) = parse_progress(line) {
+        return Line::Progress(downloaded, total);
+    }
+    match line.strip_prefix(FILEPATH_PREFIX) {
+        Some(path) => Line::Filepath(path.trim()),
+        None => Line::Chatter(line),
+    }
+}
+
 /// Parse one `--progress-template` line; `None` for foreign lines.
 pub fn parse_progress(line: &str) -> Option<(u64, Option<u64>)> {
     let rest = line.strip_prefix(PROGRESS_PREFIX)?;
@@ -670,7 +722,7 @@ pub fn download(
     cfg: &Config,
     relay: &PolicyRelay,
     progress: ProgressFn<'_>,
-) -> Result<Downloaded, Fault> {
+) -> Result<Attempt, Fault> {
     let landing = Landing::prepare(io, recipe.subs)?;
     let cookies = acquire_cookies(cfg)?;
     let args = download_args(url, recipe, &landing, cfg, relay, &cookies);
@@ -681,20 +733,54 @@ pub fn download(
     // rotated past the jar, and the model must hear it from this call, not
     // from the next download's auth failure.
     let jar_warning = commit_cookies(cookies);
-    let warning = stack_warnings(settle_outcome(&run)?, jar_warning);
+    // yt-dlp's own completeness verdict outranks its exit code: a child
+    // that never finished the transfer served a short rip, whatever it
+    // exited with, and a short rip is the retry loop's business — the
+    // exit code alone cannot tell it from a dead host.
+    let short = short_transfer(&run.chatter).or_else(|| short_transfer(&run.stderr));
+    let warning = match settle_outcome(&run) {
+        Ok(warning) => stack_warnings(warning, jar_warning),
+        Err(fault) => return short_or(short, jar_warning, fault),
+    };
     if let Some(e) = run.read_error {
         return Err(Fault::transient(format!(
             "reading yt-dlp output failed mid-download: {e}"
         )));
     }
     let Some(filepath) = run.filepath else {
-        return Err(Fault::bad_input(format!(
-            "yt-dlp finished without producing a file — the size cap (download.max_bytes) \
-             may have aborted it: {}",
-            stderr_tail(&run.stderr)
-        )));
+        return short_or(
+            short,
+            warning,
+            Fault::bad_input(format!(
+                "yt-dlp finished without producing a file — the size cap (download.max_bytes) \
+                 may have aborted it: {}",
+                stderr_tail(&run.stderr)
+            )),
+        );
     };
-    landing.publish(filepath, warning, cfg)
+    Ok(Attempt::Complete(landing.publish(filepath, warning, cfg)?))
+}
+
+/// Report a failed run as short when yt-dlp said so, otherwise as the
+/// fault. A warning collected on the way (a failed cookie write-back) has
+/// no caller to reach on either path — the loop above only ever surfaces
+/// its own final verdict — so it is logged rather than dropped: the remote
+/// session may have rotated past the jar.
+fn short_or(
+    short: Option<Shortfall>,
+    warning: Option<String>,
+    fault: Fault,
+) -> Result<Attempt, Fault> {
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    match short {
+        Some(evidence) => Ok(Attempt::Short {
+            evidence,
+            landed: None,
+        }),
+        None => Err(fault),
+    }
 }
 
 /// Where a yt-dlp run's files land and how they are published once the
@@ -815,18 +901,29 @@ fn download_args(
     relay: &PolicyRelay,
     cookies: &CookieHandle,
 ) -> Vec<String> {
+    // `--no-quiet` is load-bearing, and not a default: `--print` turns
+    // quiet on by itself. Quiet suppresses yt-dlp's screen channel, and
+    // that channel carries the diagnostic that tells a short transfer from
+    // a dead host — `Got error: Downloaded N bytes, expected M bytes`,
+    // reported per pending retry and never repeated on stderr, which only
+    // ever shows the terminal `Did not get any data blocks`. The chatter
+    // this lets through is safe because stdout lines are typed by sentinel
+    // ([`classify`]) rather than by falling through a default.
+    //
+    // No `--retries` either: yt-dlp already defaults to 10, and every one
+    // of them resumes the *same* signed URL — the one pinned to the backend
+    // that served short. Only a fresh invocation re-runs extraction, which
+    // is why the retry loop lives above this process, in `mcp::download`.
     let mut args: Vec<String> = [
         "--no-playlist",
         "--no-simulate",
-        "--quiet",
+        "--no-quiet",
         "--progress",
         "--newline",
         "--progress-delta",
         "1",
         "--progress-template",
         PROGRESS_TEMPLATE,
-        "--print",
-        "after_move:filepath",
         "-f",
         &recipe.format,
         "--max-filesize",
@@ -839,6 +936,8 @@ fn download_args(
     .into_iter()
     .map(String::from)
     .collect();
+    args.push("--print".to_string());
+    args.push(format!("after_move:{FILEPATH_PREFIX}%(filepath)s"));
     args.push("-o".to_string());
     args.push(landing.media_template().to_string_lossy().into_owned());
     if let Some(sub) = landing.subtitle_template() {
@@ -869,8 +968,11 @@ struct ChildRun {
     outcome: ChildOutcome,
     /// Bounded stderr tail for diagnostics.
     stderr: String,
-    /// yt-dlp's `after_move:filepath` line: the media's final path, ground
-    /// truth that the file landed.
+    /// Bounded tail of yt-dlp's stdout chatter — its screen channel, where
+    /// pending-retry diagnostics are reported ([`short_transfer`]).
+    chatter: String,
+    /// yt-dlp's `after_move:` line: the media's final path, ground truth
+    /// that the file landed.
     filepath: Option<PathBuf>,
     /// A failed stdout read — not EOF: a lost filepath line must not be
     /// misdiagnosed as "no file produced".
@@ -910,7 +1012,7 @@ fn run_child(
     let stderr_thread = {
         let activity = activity.clone();
         std::thread::spawn(move || {
-            let mut tail = TailBuf::new(STDERR_TAIL_LIMIT);
+            let mut tail = TailBuf::new(LOG_TAIL_LIMIT);
             for line in BufReader::new(stderr_pipe).lines() {
                 let Ok(line) = line else { break };
                 let _ = activity.send(Pulse::Chatter);
@@ -923,6 +1025,7 @@ fn run_child(
     let watchdog = WatchdogGuard::spawn(child, watchdog_rx, activity.clone(), STALL_LIMITS);
 
     let mut filepath: Option<PathBuf> = None;
+    let mut chatter = TailBuf::new(LOG_TAIL_LIMIT);
     let mut read_error: Option<std::io::Error> = None;
     for line in BufReader::new(stdout_pipe).lines() {
         let line = match line {
@@ -932,17 +1035,23 @@ fn run_child(
                 break;
             }
         };
-        if let Some((downloaded, total)) = parse_progress(&line) {
+        match classify(&line) {
             // The one site that claims byte progress — the same parse feeds
             // the tracker, so both stall clocks agree on what "moving" means.
-            let _ = activity.send(Pulse::Bytes);
-            progress(downloaded, total);
-            continue;
-        }
-        let _ = activity.send(Pulse::Chatter);
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            filepath = Some(PathBuf::from(trimmed));
+            Line::Progress(downloaded, total) => {
+                let _ = activity.send(Pulse::Bytes);
+                progress(downloaded, total);
+            }
+            Line::Filepath(path) => {
+                let _ = activity.send(Pulse::Chatter);
+                if !path.is_empty() {
+                    filepath = Some(PathBuf::from(path));
+                }
+            }
+            Line::Chatter(text) => {
+                let _ = activity.send(Pulse::Chatter);
+                chatter.push_line(text);
+            }
         }
     }
 
@@ -954,6 +1063,7 @@ fn run_child(
     Ok(ChildRun {
         outcome,
         stderr,
+        chatter: chatter.into_string(),
         filepath,
         read_error,
     })
@@ -1043,6 +1153,105 @@ mod tests {
         let fault = settle_exit(exit_status(1), false, "ERROR: no formats")
             .expect_err("no media ⇒ failure");
         assert!(fault.to_string().contains("no formats"), "{fault}");
+    }
+
+    #[test]
+    fn parses_the_short_transfer_verdict_with_its_numbers() {
+        // yt-dlp's own line, as it reaches the screen channel while
+        // retries are still pending.
+        let log = "[download] Destination: /tmp/rip.mp4\n\
+                   [download] Got error: Downloaded 75497472 bytes, expected 103894225 bytes. \
+                   Retrying (1/10)...";
+
+        assert_eq!(
+            short_transfer(log),
+            Some(Shortfall::Transfer {
+                got: 75_497_472,
+                expected: 103_894_225
+            })
+        );
+    }
+
+    #[test]
+    fn reads_the_last_short_transfer_report() {
+        let log = "Got error: Downloaded 10 bytes, expected 100 bytes. Retrying (1/10)...\n\
+                   ERROR: [download] Got error: Downloaded 40 bytes, expected 100 bytes. \
+                   Giving up after 10 retries";
+
+        assert_eq!(
+            short_transfer(log),
+            Some(Shortfall::Transfer {
+                got: 40,
+                expected: 100
+            }),
+            "the attempt that gave up is the evidence"
+        );
+    }
+
+    #[test]
+    fn ignores_logs_without_a_shortfall() {
+        assert_eq!(short_transfer("ERROR: Did not get any data blocks"), None);
+        assert_eq!(
+            short_transfer("Downloaded 100 bytes, expected 100 bytes"),
+            None,
+            "a complete transfer is not a shortfall"
+        );
+    }
+
+    #[test]
+    fn chatter_never_becomes_the_media_path() {
+        // Regression: with stdout typed by "anything that is not progress
+        // is the filepath", this line published a log message as the media
+        // path — which is why the chatter had to be muted, taking the
+        // short-transfer diagnostics with it.
+        assert_eq!(
+            classify("[download] Destination: /tmp/rip.f30032.mp4"),
+            Line::Chatter("[download] Destination: /tmp/rip.f30032.mp4")
+        );
+        assert_eq!(
+            classify(&format!("{FILEPATH_PREFIX}/tmp/rip.mp4")),
+            Line::Filepath("/tmp/rip.mp4")
+        );
+        assert_eq!(
+            classify("AVDL 1024 4096 NA"),
+            Line::Progress(1024, Some(4096))
+        );
+    }
+
+    #[test]
+    fn download_args_name_the_media_path_channel_and_keep_yt_dlp_talking() {
+        let relay = crate::relay::PolicyRelay::start(false).expect("relay starts");
+        let mut cfg =
+            crate::config::default_config(&crate::config::test_dirs(Path::new("/home/u")));
+        cfg.network.allow_private_hosts = true;
+        let cookies = acquire_cookies(&cfg).expect("anonymous cookies stage cleanly");
+        let url = crate::netguard::vet("https://example.com/watch", &cfg).expect("well-formed");
+        let landing = Landing::prepare(
+            DownloadIo::Keep {
+                dir: Path::new("/keep"),
+            },
+            false,
+        )
+        .expect("keep landing");
+        let recipe = YtdlpRecipe {
+            format: "best".to_string(),
+            subs: false,
+        };
+
+        let args = download_args(&url, &recipe, &landing, &cfg, &relay, &cookies);
+
+        let print = args.iter().position(|a| a == "--print").expect("--print");
+        assert!(
+            args[print + 1].starts_with(&format!("after_move:{FILEPATH_PREFIX}")),
+            "the media path must arrive on its own sentinel: {}",
+            args[print + 1]
+        );
+        assert!(
+            args.iter().any(|a| a == "--no-quiet"),
+            "`--print` turns quiet on by itself, and quiet mutes the diagnostics that \
+             tell a short transfer from a dead host: {args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "--quiet"), "{args:?}");
     }
 
     #[test]

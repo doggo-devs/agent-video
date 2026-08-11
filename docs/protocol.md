@@ -99,8 +99,26 @@ deliberately coarser than core's `ErrorCode`: anything finer is prose in the
 |--------|--------------|-----------|---------------|
 | `bad_input` | the caller | The source or arguments are wrong — a missing file, a bad range, a stale token, corrupt or out-of-bounds input. Retrying the identical call cannot succeed. | Fix the arguments or the source and call again. |
 | `environment` | the user | This installation lacks a capability (a protocol not compiled in, a missing decoder, absent yt-dlp or whisper weights) or the machine refuses (permissions, disk). | Tell the user; do not blindly retry. |
-| `transient` | nobody | Plausibly a passing condition — network, a remote server, a stalled child. Retrying may succeed. This is the only retriable kind. | Retry, possibly after a delay. |
+| `transient` | nobody | Plausibly a passing condition — network, a remote server, a stalled child. Retrying may succeed. This is the only retriable kind. | Retry, possibly after a delay. A download reports this only after retrying itself (see below), so the delay it names is the advice, not a formality. |
 | `internal` | us | A bug in agent-video: the harness built core's arguments wrong, core output failed to parse, an uncoded child exit or a signal. | Report it; retrying is unlikely to help. |
+
+### Downloads retry themselves before they fail
+
+A retry that costs the model a fresh `confirm` costs a full consent round-trip,
+so downloads spend their own retries first. A flaky CDN backend that serves a
+truncated object is the motivating case: the shortfall — whether the transfer
+stopped before its advertised length or the landed container's tracks stop
+early — is the same fact under one type, and its only cure is re-running
+extraction, since a resumed range is pinned to the backend that already served
+short.
+
+The job re-fetches on its own thread, spaced, inside a wall-clock budget, and
+heartbeats the tracker while it waits, so a caller that has detached keeps
+seeing honest `pending` bodies. What reaches the caller is the *outcome of the
+ladder*: a complete rip, or a `transient` fault naming how many attempts were
+spent over how long and what the shortfall was. An incomplete rip that landed
+anyway is served with a warning rather than withheld — and a `keep` download is
+never silently re-fetched, since that file belongs to the user.
 
 ### How core errors cross the boundary
 

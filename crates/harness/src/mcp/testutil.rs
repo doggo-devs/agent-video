@@ -19,8 +19,8 @@ use super::tracker::Tracker;
 use crate::config::{Config, default_config, test_dirs};
 use crate::fault::Fault;
 use crate::fetch::{
-    CancelSignal, DownloadIo, DownloadOption, Downloaded, ProgressFn, Recipe, SourceInfo,
-    direct::DirectRecipe,
+    Attempt, CancelSignal, DownloadIo, DownloadOption, Downloaded, ProgressFn, Recipe, Shortfall,
+    SourceInfo, direct::DirectRecipe,
 };
 use crate::relay::PolicyRelay;
 use crate::schema::ProbeSummary;
@@ -76,7 +76,7 @@ impl<T: UrlFetcher> UrlFetcher for Arc<T> {
         relay: &PolicyRelay,
         cancel: &CancelSignal,
         progress: ProgressFn<'_>,
-    ) -> Result<Downloaded, Fault> {
+    ) -> Result<Attempt, Fault> {
         (**self).download(plan, io, cfg, relay, cancel, progress)
     }
 }
@@ -158,6 +158,9 @@ pub(crate) struct FakeFetcher {
     /// ticks); the surrounding settle may still be in flight.
     pub(crate) finished: Mutex<u32>,
     pub(crate) last_cancel: Mutex<Option<CancelSignal>>,
+    /// Leading attempts that report a short rip, as a flaky CDN backend
+    /// does; each fetch consumes one.
+    pub(crate) short_attempts: Mutex<u32>,
 }
 
 impl UrlFetcher for FakeFetcher {
@@ -178,7 +181,7 @@ impl UrlFetcher for FakeFetcher {
         _relay: &PolicyRelay,
         cancel: &CancelSignal,
         progress: ProgressFn<'_>,
-    ) -> Result<Downloaded, Fault> {
+    ) -> Result<Attempt, Fault> {
         *self.downloads.lock().expect("downloads") += 1;
         *self.last_cancel.lock().expect("last_cancel") = Some(cancel.clone());
         if let Some(gate) = &self.gate {
@@ -192,14 +195,30 @@ impl UrlFetcher for FakeFetcher {
             DownloadIo::Cache { dir, key } => dir.join(format!("{key}.mp4")),
             DownloadIo::Keep { dir } => dir.join("v.mp4"),
         };
+        let short = {
+            let mut left = self.short_attempts.lock().expect("short_attempts");
+            let short = *left > 0;
+            *left = left.saturating_sub(1);
+            short
+        };
+        if short {
+            *self.finished.lock().expect("finished") += 1;
+            return Ok(Attempt::Short {
+                evidence: Shortfall::Transfer {
+                    got: 8,
+                    expected: 16,
+                },
+                landed: None,
+            });
+        }
         let mut f = std::fs::File::create(&dest).expect("create download");
         f.write_all(b"fake video bytes").expect("write");
         progress(16, Some(16));
         *self.finished.lock().expect("finished") += 1;
-        Ok(Downloaded {
+        Ok(Attempt::Complete(Downloaded {
             path: dest,
             warning: self.warning.clone(),
-        })
+        }))
     }
 }
 
@@ -272,6 +291,7 @@ pub(crate) fn env(probe_summary: ProbeSummary, whisper_available: bool) -> TestE
             downloads: Mutex::new(0),
             finished: Mutex::new(0),
             last_cancel: Mutex::new(None),
+            short_attempts: Mutex::new(0),
         },
     )
 }

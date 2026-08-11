@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::fault::Fault;
-use crate::fetch::{self, CancelSignal, DownloadIo, Downloaded, ProgressFn, SourceInfo};
+use crate::fetch::{self, Attempt, CancelSignal, DownloadIo, ProgressFn, SourceInfo};
 use crate::gate::KeyedGate;
 use crate::mcp::core_run::{CoreRunner, SelfSpawn};
 use crate::mcp::tracker::Tracker;
@@ -42,7 +42,7 @@ pub trait UrlFetcher: Send + Sync {
         relay: &PolicyRelay,
         cancel: &CancelSignal,
         progress: ProgressFn<'_>,
-    ) -> Result<Downloaded, Fault>;
+    ) -> Result<Attempt, Fault>;
 }
 
 /// Transcription capability; absence degrades to an install hint.
@@ -87,7 +87,7 @@ impl UrlFetcher for RealFetcher {
         relay: &PolicyRelay,
         cancel: &CancelSignal,
         progress: ProgressFn<'_>,
-    ) -> Result<Downloaded, Fault> {
+    ) -> Result<Attempt, Fault> {
         // Re-vet at execution time: consent may be redeemed long after the
         // probe, and DNS may have moved underneath the plan.
         let vetted = crate::netguard::vet(&plan.url, cfg)?;
