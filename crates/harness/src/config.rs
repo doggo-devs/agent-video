@@ -123,12 +123,12 @@ pub struct DownloadCfg {
     /// Sized against the job, not the impatience: a download that outlives
     /// this window is answered with a poll, and every poll costs a full
     /// model round trip that buys nothing but a byte count. Five minutes
-    /// covers the retry ladder's own budget
-    /// ([`crate::mcp::download`]), so the common shapes — a rip that
-    /// lands, a burst that is outlasted, a ladder that gives up — all
-    /// resolve inside one call. Pending remains the fallback for
-    /// genuinely long transfers, where it states a real fact about the
-    /// source rather than a fact about this timer.
+    /// covers the retry ladder's own budget (the download module's fetch
+    /// retry window), so the common shapes — a rip that lands, a burst
+    /// that is outlasted, a ladder that gives up — all resolve inside
+    /// one call. Pending remains the fallback for genuinely long
+    /// transfers, where it states a real fact about the source rather
+    /// than a fact about this timer.
     pub sync_wait_seconds: NonZeroU32,
 }
 
