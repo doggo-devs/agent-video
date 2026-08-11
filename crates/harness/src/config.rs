@@ -116,10 +116,19 @@ pub struct DownloadCfg {
     pub max_bytes: NonZeroU64,
     /// Analysis rips are capped at this frame height (grid quality ceiling).
     pub analysis_max_height: NonZeroU32,
-    /// How long a confirmed download may block the call before detaching.
-    /// Generous by default: for an agent, one blocked call is cheaper than
-    /// a chain of pending polls — each poll costs a full model round trip.
-    /// Pending remains the fallback for genuinely long downloads.
+    /// How long a `video` call may block on a running download — the one
+    /// that started it and every later call that observes it — before
+    /// answering Pending.
+    ///
+    /// Sized against the job, not the impatience: a download that outlives
+    /// this window is answered with a poll, and every poll costs a full
+    /// model round trip that buys nothing but a byte count. Five minutes
+    /// covers the retry ladder's own budget
+    /// ([`crate::mcp::download`]), so the common shapes — a rip that
+    /// lands, a burst that is outlasted, a ladder that gives up — all
+    /// resolve inside one call. Pending remains the fallback for
+    /// genuinely long transfers, where it states a real fact about the
+    /// source rather than a fact about this timer.
     pub sync_wait_seconds: NonZeroU32,
 }
 
@@ -471,7 +480,7 @@ pub fn default_config(dirs: &BaseDirs) -> Config {
         download: DownloadCfg {
             max_bytes: nz64(2 * GIB),
             analysis_max_height: nz32(480),
-            sync_wait_seconds: nz32(90),
+            sync_wait_seconds: nz32(300),
         },
         budget: BudgetCfg {
             auto_run: nz32(2),

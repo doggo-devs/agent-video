@@ -107,6 +107,73 @@ pub(super) fn progress_message(downloaded: u64, total: Option<u64>) -> String {
     format!("downloading: {}{total_text}", format_bytes(downloaded))
 }
 
+/// Snapshot of a live download: how far, how fast, how long watched.
+pub(super) struct Pace {
+    pub downloaded: u64,
+    pub total: Option<u64>,
+    pub rate: Option<f64>,
+    pub waited: Duration,
+}
+
+impl Pace {
+    pub fn eta(&self) -> Option<Duration> {
+        let left = self.total?.checked_sub(self.downloaded)?;
+        let rate = self.rate?;
+        Duration::try_from_secs_f64(left as f64 / rate).ok()
+    }
+}
+
+pub(super) enum Waited {
+    Vacant,
+    Settled(CallToolResult),
+    Running(Pace),
+    Abandoned,
+}
+
+/// Wait out the grace window on `key`, forwarding progress. Every
+/// observer waits, so a poll costs wall clock instead of being free.
+pub(super) fn wait_out(key: &str, deps: &Arc<ServerDeps>, notify: &Notifier) -> Waited {
+    let window = Duration::from_secs(u64::from(deps.config.download.sync_wait_seconds.get()));
+    let started = Instant::now();
+    let deadline = started + window;
+    let mut last_sent: u64 = 0;
+    let mut first: Option<(Instant, u64)> = None;
+    loop {
+        match deps.downloads.poll(key, DOWNLOAD_ABANDON_LIMIT) {
+            Poll::Vacant => return Waited::Vacant,
+            Poll::Settled(result) => return Waited::Settled(result),
+            Poll::Abandoned => return Waited::Abandoned,
+            Poll::Running { downloaded, total } => {
+                // MCP progress must not go backwards; a coverage retry
+                // rewinds the byte count, so only growth is reported.
+                if downloaded > last_sent {
+                    last_sent = downloaded;
+                    notify(
+                        downloaded as f64,
+                        total.map(|t| t as f64),
+                        progress_message(downloaded, total),
+                    );
+                }
+                let (since, base) = *first.get_or_insert((Instant::now(), downloaded));
+                let now = Instant::now();
+                if now >= deadline {
+                    return Waited::Running(Pace {
+                        downloaded,
+                        total,
+                        rate: rate_of(downloaded.saturating_sub(base), now - since),
+                        waited: now - started,
+                    });
+                }
+            }
+        }
+        std::thread::sleep(SYNC_POLL_TICK);
+    }
+}
+
+fn rate_of(bytes: u64, span: Duration) -> Option<f64> {
+    (bytes > 0 && span >= Duration::from_secs(1)).then(|| bytes as f64 / span.as_secs_f64())
+}
+
 /// Start the download on its own thread, then wait out a sync grace window:
 /// fast downloads answer inline, slow ones detach into the tracker and are
 /// polled by later calls.
@@ -125,69 +192,30 @@ pub(super) fn execute_download(
         return analysis_response(source, &cached, None, deps);
     }
     let key = slot_key(source, plan.dest);
-    // Claim the slot atomically: a concurrent confirm for the same URL
-    // must observe this job instead of spawning a second downloader into
-    // the same cache entry.
-    let reporter = match deps.downloads.admit(&key, DOWNLOAD_ABANDON_LIMIT) {
-        Admission::Started(reporter) => reporter,
-        Admission::Running { downloaded, total } => return pending_result(downloaded, total),
-        Admission::Settled(result) => return result,
-    };
-    {
-        let deps = Arc::clone(deps);
-        let source = source.to_string();
-        // The reporter is the thread's only voice. MCP progress
-        // notifications are rendered by whoever holds a live request —
-        // never by this thread, whose spawning request (and its progress
-        // token) may complete long before the download does.
-        std::thread::spawn(move || {
-            let cancel = reporter.cancel_signal();
-            let mut progress = |bytes: u64, total: Option<u64>| reporter.progress(bytes, total);
-            let settlement =
-                perform_download(&source, &plan, &token, &deps, &cancel, &mut progress);
-            reporter.settle(settlement);
-        });
-    }
-    let window = Duration::from_secs(u64::from(deps.config.download.sync_wait_seconds.get()));
-    let deadline = Instant::now() + window;
-    let mut last_sent: u64 = 0;
-    loop {
-        match deps.downloads.poll(&key, DOWNLOAD_ABANDON_LIMIT) {
-            Poll::Settled(result) => return result,
-            Poll::Running { downloaded, total } => {
-                // MCP progress must not go backwards; a coverage retry
-                // rewinds the byte count, so only growth is reported.
-                if downloaded > last_sent {
-                    last_sent = downloaded;
-                    notify(
-                        downloaded as f64,
-                        total.map(|t| t as f64),
-                        progress_message(downloaded, total),
-                    );
-                }
-                if Instant::now() >= deadline {
-                    return pending_result(downloaded, total);
-                }
-            }
-            // Our own thread died without settling: reported once, the slot
-            // is free for a retry.
-            Poll::Abandoned => {
-                return failed(&Fault::transient(
-                    "the download thread died before reporting a result — call again to retry",
-                ));
-            }
-            // The slot vanished mid-wait: a concurrent call for the same
-            // source consumed the outcome. The executed actions are
-            // idempotent — a retry serves the landed rip or replays the
-            // keep receipt — so redirecting the caller is safe.
-            Poll::Vacant => {
-                return failed(&Fault::transient(
-                    "this download was resolved by a concurrent call for the same source — \
-                     call again",
-                ));
-            }
+    match deps.downloads.admit(&key, DOWNLOAD_ABANDON_LIMIT) {
+        Admission::Started(reporter) => {
+            let deps = Arc::clone(deps);
+            let source = source.to_string();
+            std::thread::spawn(move || {
+                let cancel = reporter.cancel_signal();
+                let mut progress = |bytes: u64, total: Option<u64>| reporter.progress(bytes, total);
+                let settlement =
+                    perform_download(&source, &plan, &token, &deps, &cancel, &mut progress);
+                reporter.settle(settlement);
+            });
         }
-        std::thread::sleep(SYNC_POLL_TICK);
+        Admission::Running { .. } => {}
+        Admission::Settled(result) => return result,
+    }
+    match wait_out(&key, deps, notify) {
+        Waited::Settled(result) => result,
+        Waited::Running(pace) => pending_result(&pace),
+        Waited::Abandoned => failed(&Fault::transient(
+            "the download thread died before reporting a result — call again to retry",
+        )),
+        Waited::Vacant => failed(&Fault::transient(
+            "this download was resolved by a concurrent call for the same source — call again",
+        )),
     }
 }
 

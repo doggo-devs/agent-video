@@ -5,8 +5,11 @@
 //! The core JSON is read through [`agent_video_core::wire`] — the same types
 //! the child process serialized, so producer and consumer cannot drift.
 
+use std::time::Duration;
+
 use rmcp::model::{CallToolResult, ContentBlock};
 
+use super::download::Pace;
 use crate::fault::Fault;
 use crate::plan::format_bytes;
 use crate::schema::{Look, Strategy, TimeValue, VideoArgs, VideoBody, wire_names};
@@ -241,17 +244,35 @@ pub(super) fn ready_result(meta: CoreMetadata, notices: &[String]) -> CallToolRe
     CallToolResult::success(content)
 }
 
-/// Render a still-running download from a progress snapshot.
-pub(super) fn pending_result(downloaded: u64, total: Option<u64>) -> CallToolResult {
-    let total_text = total
-        .map(|t| format!(" / {}", format_bytes(t)))
-        .unwrap_or_default();
+pub(super) fn pending_result(pace: &Pace) -> CallToolResult {
+    let mut head = format!("Download in progress: {}", format_bytes(pace.downloaded));
+    if let Some(total) = pace.total.filter(|t| *t > 0) {
+        let percent = pace.downloaded.min(total) * 100 / total;
+        head += &format!(" / {} ({percent}%)", format_bytes(total));
+    }
+    if let Some(rate) = pace.rate {
+        head += &format!(", ~{}/s", format_bytes(rate as u64));
+        if let Some(left) = pace.eta() {
+            head += &format!(", ~{} left", format_span(left));
+        }
+    }
+    let waited = format_span(pace.waited);
     json_result(&VideoBody::Pending {
         message: format!(
-            "Download in progress: {}{total_text} so far. It continues in the background — \
-             call again with just the same source to check on it; the result is served once it \
-             finishes. Repeat any from/until/look after that.",
-            format_bytes(downloaded)
+            "{head}. This call already waited {waited} for it, and the transfer continues in \
+             the background — nothing failed and nothing was lost. Call again with just the \
+             same source: that call waits the same {waited} and returns the finished result \
+             the moment it lands. No argument you can pass makes it faster, so a poll buys \
+             only a fresh byte count — if the numbers above say the wait is long, report the \
+             progress to the user or do other work first, and poll after."
         ),
     })
+}
+
+fn format_span(span: Duration) -> String {
+    let secs = span.as_secs();
+    match secs {
+        0..60 => format!("{secs}s"),
+        _ => format!("{}m{:02}s", secs / 60, secs % 60),
+    }
 }

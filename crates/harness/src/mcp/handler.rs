@@ -13,12 +13,9 @@ use std::sync::Arc;
 use rmcp::model::CallToolResult;
 
 use super::deps::{Notifier, ServerDeps};
-use super::download::{
-    DOWNLOAD_ABANDON_LIMIT, execute_download, keep_response, progress_message, slot_key,
-};
+use super::download::{Waited, execute_download, keep_response, slot_key, wait_out};
 use super::invoke::{run_invocation, transcribe_flow};
 use super::probe_cache::{MediaMissing, ProbeError, probe_media};
-use super::tracker::Poll;
 use super::wire::{
     coerce_args, evicted_rip, failed, foreign_scheme, is_url, json_result, pending_result,
 };
@@ -75,26 +72,17 @@ pub fn handle_video_call(
         Ok(Intent::Raw(_) | Intent::Grid(_)) => {}
     }
 
-    // Background downloads: one poll per destination resolves each slot's
-    // whole state machine, so a URL can never sit on Pending for the whole
-    // session. Progress samples ride the *polling* request's own token.
+    // Background downloads: wait each slot so a URL never sits on Pending
+    // for the whole session. Every observer waits the same window, so a
+    // poll costs wall clock instead of being free. Progress samples ride
+    // the *polling* request's own token.
     if is_url(&args.source) {
         for dest in [Dest::Cache, Dest::Keep] {
-            match deps
-                .downloads
-                .poll(&slot_key(&args.source, dest), DOWNLOAD_ABANDON_LIMIT)
-            {
-                Poll::Vacant => {}
-                Poll::Settled(result) => return result,
-                Poll::Running { downloaded, total } => {
-                    notify(
-                        downloaded as f64,
-                        total.map(|t| t as f64),
-                        progress_message(downloaded, total),
-                    );
-                    return pending_result(downloaded, total);
-                }
-                Poll::Abandoned => {
+            match wait_out(&slot_key(&args.source, dest), deps, notify) {
+                Waited::Vacant => {}
+                Waited::Settled(result) => return result,
+                Waited::Running(pace) => return pending_result(&pace),
+                Waited::Abandoned => {
                     return failed(&Fault::transient(
                         "the background download stopped reporting progress and was abandoned — \
                          call again with the URL to start over",
