@@ -70,12 +70,22 @@ platform-derived.
 
 ### `[budget]`
 
-The grid-count ladder that gates the decision engine (`crate::plan`).
+The ladder that gates the decision engine (`crate::plan`), and the ceiling
+on what one MCP result may carry.
 
 | Key | Type | Default | Validation | Controls |
 |-----|------|---------|-----------|----------|
 | `max` | integer | `8` | must be > 0 | Chunk-count ceiling. Above it the run's chunks are widened to fit or, if even the widened chunks are too thin, it requires explicit consent. A bound on grids, never a prediction: dedup decides the real count after decode. |
 | `max_stretch_seconds` | integer | `600` | must be > 0 | Degradation floor: the most seconds one widened chunk may cover. Past it the plan is likely too thin to be useful, so running it requires explicit consent. |
+| `max_response_bytes` | integer | `8388608` (8 MiB) | must be > 0 | Bytes one MCP tool result may carry, images and text together. Grids past it are dropped from the tail and the reply names the call that resumes from the first one dropped. Raise it if you know your client's limit; the CLI path writes grids as files and is not affected. |
+
+That last key is a property of your *client*, not of this tool: nothing in
+MCP bounds a message and nothing negotiates a bound. The official
+TypeScript SDK gives a stdio client a 10 MiB read buffer, and an overflow
+there clears the whole buffer rather than the one oversized message, so
+every message after it is misparsed. That failure cannot be reported over
+the stream it just broke, which is why the ceiling is enforced before a
+reply is built rather than diagnosed after.
 
 ### `[network]`
 
@@ -140,6 +150,7 @@ sync_wait_seconds = 90
 [budget]
 max = 8
 max_stretch_seconds = 600
+max_response_bytes = 8388608  # 8 MiB
 
 [network]
 allow_private_hosts = false

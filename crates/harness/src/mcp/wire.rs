@@ -256,9 +256,100 @@ fn describe_grids(meta: &CoreMetadata, notices: &[String]) -> String {
     lines.join("\n")
 }
 
+/// The ceiling on what one tool result may carry, and the only door onto a
+/// grid answer.
+///
+/// The limit is a property of the client, not of this tool: nothing in MCP
+/// bounds a message and nothing negotiates a bound. The official
+/// TypeScript SDK defaults a stdio client's read buffer to 10 MiB, and
+/// overflow there calls `clear()` on the whole buffer before throwing — so
+/// the bytes after the oversized message are read as the start of the next
+/// one and the session desynchronises. That failure cannot be answered
+/// with an error body, because the error would ride the stream it just
+/// broke.
+///
+/// So it is never produced. [`ready_result`] is private and reachable only
+/// through [`Wire::ready`], which drops what will not fit and says which
+/// call brings it back. Grids are dropped from the tail, keeping the
+/// window's start, because that is the direction the caller can resume in.
+pub(super) struct Wire {
+    max_bytes: usize,
+}
+
+/// Charged once per response for the JSON-RPC envelope and the result
+/// wrapper around the content blocks. A fixed allowance, not a
+/// measurement: the exact framing belongs to the transport, and the
+/// ceiling is a backstop with headroom rather than a tight fit.
+const RESPONSE_OVERHEAD: usize = 4 * 1024;
+
+/// Charged per image block for its JSON keys and quoting around the
+/// base64 payload.
+const IMAGE_BLOCK_OVERHEAD: usize = 128;
+
+impl Wire {
+    pub(super) fn new(cfg: &crate::config::Config) -> Self {
+        Wire {
+            max_bytes: usize::try_from(cfg.budget.max_response_bytes.get()).unwrap_or(usize::MAX),
+        }
+    }
+
+    /// Render a document into a result that fits the ceiling.
+    pub(super) fn ready(&self, mut meta: CoreMetadata, notices: &[String]) -> CallToolResult {
+        let mut notices = notices.to_vec();
+        // The ceiling bounds the *response*, so everything the response
+        // carries is charged against it. The text block goes first and is
+        // never dropped: it holds the ranges and subtitles that make the
+        // images legible, and a caller who loses it cannot resume. It is
+        // not always small — a transcript rides along in it, one slice per
+        // grid — so charging only the images would ship past a ceiling
+        // whose name promises otherwise.
+        let spent = describe_grids(&meta, &notices).len() + RESPONSE_OVERHEAD;
+        let kept = self.fits(&meta.grids, spent);
+        if kept < meta.grids.len() {
+            let resumes_at = meta.grids[kept]
+                .time_range
+                .split('-')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let dropped = meta.grids.len() - kept;
+            let total = meta.grids.len();
+            let ceiling = crate::plan::format_bytes(self.max_bytes as u64);
+            notices.push(format!(
+                "response budget: {dropped} of {total} grids did not fit the {ceiling} \
+                 ceiling and were dropped. Call again with from: {resumes_at} for the rest, \
+                 or use the CLI (`agent-video watch -o dir/`), which writes grids as files \
+                 and has no such ceiling."
+            ));
+            meta.grids.truncate(kept);
+        }
+        ready_result(meta, &notices)
+    }
+
+    /// How many leading grids fit the ceiling, given what the response
+    /// already spends. At least one always does: a lone grid past the
+    /// budget is still better answered than withheld, and truncating to
+    /// nothing would leave the caller no way forward.
+    fn fits(&self, grids: &[agent_video_core::wire::Grid], already_spent: usize) -> usize {
+        let mut spent = already_spent;
+        for (i, grid) in grids.iter().enumerate() {
+            let cost = match &grid.image {
+                GridImage::Base64(b64) => b64.len() + IMAGE_BLOCK_OVERHEAD,
+                GridImage::File(_) => 0,
+            };
+            spent = spent.saturating_add(cost);
+            if spent > self.max_bytes {
+                return i.max(1);
+            }
+        }
+        grids.len()
+    }
+}
+
 /// Render a parsed core document: one text block, then the grid images.
 /// Takes the document by value so base64 payloads move instead of clone.
-pub(super) fn ready_result(meta: CoreMetadata, notices: &[String]) -> CallToolResult {
+/// Private on purpose — see [`Wire`].
+fn ready_result(meta: CoreMetadata, notices: &[String]) -> CallToolResult {
     let mut content = vec![ContentBlock::text(describe_grids(&meta, notices))];
     for grid in meta.grids {
         if let GridImage::Base64(b64) = grid.image {
@@ -298,5 +389,166 @@ fn format_span(span: Duration) -> String {
     match secs {
         0..60 => format!("{secs}s"),
         _ => format!("{}m{:02}s", secs / 60, secs % 60),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_video_core::types::LayoutKind;
+    use agent_video_core::wire::Grid;
+
+    fn grid(range: &str, bytes: usize) -> Grid {
+        Grid {
+            image: GridImage::Base64("x".repeat(bytes)),
+            time_range: range.to_string(),
+            total_frames: 1,
+            key_frames: Vec::new(),
+            layout: LayoutKind::Uniform,
+            subtitles: None,
+        }
+    }
+
+    fn doc(grids: Vec<Grid>) -> CoreMetadata {
+        let json = serde_json::json!({
+            "source": "v.mp4",
+            "duration": 600.0,
+            "settings": { "max_edge": 2048, "quality": "low", "detail": "standard" },
+            "grids": [],
+        });
+        let mut meta: CoreMetadata = serde_json::from_value(json).expect("document");
+        meta.grids = grids;
+        meta
+    }
+
+    fn images(result: &CallToolResult) -> usize {
+        result
+            .content
+            .iter()
+            .filter(|c| matches!(c, ContentBlock::Image(_)))
+            .count()
+    }
+
+    fn text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Serialized size of the whole result — what the ceiling is about.
+    fn wire_bytes(result: &CallToolResult) -> usize {
+        serde_json::to_string(result)
+            .expect("a result serializes")
+            .len()
+    }
+
+    /// A ceiling wide enough for `n` of the grids below, plus the text
+    /// block and framing the response also charges.
+    fn ceiling_for(n: usize) -> usize {
+        RESPONSE_OVERHEAD + 4 * 1024 + n * (64 * 1024 + IMAGE_BLOCK_OVERHEAD)
+    }
+
+    #[test]
+    fn passes_a_document_that_fits() {
+        let wire = Wire {
+            max_bytes: ceiling_for(2),
+        };
+        let r = wire.ready(
+            doc(vec![
+                grid("00:00-01:00", 64 * 1024),
+                grid("01:00-02:00", 64 * 1024),
+            ]),
+            &[],
+        );
+        assert_eq!(images(&r), 2);
+        assert!(!text(&r).contains("response budget"), "{}", text(&r));
+    }
+
+    #[test]
+    fn drops_grids_past_the_ceiling_from_the_tail() {
+        let wire = Wire {
+            max_bytes: ceiling_for(2),
+        };
+        let r = wire.ready(
+            doc(vec![
+                grid("00:00-01:00", 64 * 1024),
+                grid("01:00-02:00", 64 * 1024),
+                grid("02:00-03:00", 64 * 1024),
+            ]),
+            &[],
+        );
+        assert_eq!(images(&r), 2, "the tail goes, the window's start stays");
+    }
+
+    #[test]
+    fn keeps_the_whole_response_under_the_ceiling() {
+        let wire = Wire {
+            max_bytes: ceiling_for(2),
+        };
+        let r = wire.ready(
+            doc(vec![
+                grid("00:00-01:00", 64 * 1024),
+                grid("01:00-02:00", 64 * 1024),
+                grid("02:00-03:00", 64 * 1024),
+            ]),
+            &[],
+        );
+        assert!(
+            wire_bytes(&r) <= ceiling_for(2),
+            "the ceiling bounds the response, not just its images: {} > {}",
+            wire_bytes(&r),
+            ceiling_for(2)
+        );
+    }
+
+    #[test]
+    fn a_fat_text_block_is_charged_against_the_same_ceiling() {
+        let wire = Wire {
+            max_bytes: ceiling_for(2),
+        };
+        let mut grids = vec![
+            grid("00:00-01:00", 64 * 1024),
+            grid("01:00-02:00", 64 * 1024),
+        ];
+        // A transcript rides in the text block, one slice per grid.
+        grids[0].subtitles = Some("x".repeat(64 * 1024));
+        let r = wire.ready(doc(grids), &[]);
+        assert_eq!(
+            images(&r),
+            1,
+            "subtitles spend the budget the second image wanted"
+        );
+    }
+
+    #[test]
+    fn names_the_call_that_resumes_from_the_first_dropped_grid() {
+        let wire = Wire {
+            max_bytes: ceiling_for(1),
+        };
+        let r = wire.ready(
+            doc(vec![
+                grid("00:00-01:00", 64 * 1024),
+                grid("01:00-02:00", 64 * 1024),
+            ]),
+            &[],
+        );
+        let text = text(&r);
+        assert!(text.contains("from: 01:00"), "{text}");
+    }
+
+    #[test]
+    fn answers_one_oversized_grid_rather_than_withholding_everything() {
+        let wire = Wire { max_bytes: 10 };
+        let r = wire.ready(doc(vec![grid("00:00-01:00", 64 * 1024)]), &[]);
+        assert_eq!(
+            images(&r),
+            1,
+            "a lone grid past the budget beats an answer with no way forward"
+        );
     }
 }

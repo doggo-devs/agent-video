@@ -15,7 +15,7 @@ use super::handler::resolve_media;
 use super::probe_cache::{
     MediaMissing, ProbeError, effective_prompt_for, probe_media, transcript_id_for,
 };
-use super::wire::{evicted_rip, failed, is_url, json_result, ready_result};
+use super::wire::{Wire, evicted_rip, failed, is_url, json_result};
 use crate::core_run::run_core;
 use crate::fault::Fault;
 use crate::identity::{ContentId, fingerprint_file};
@@ -71,7 +71,7 @@ pub(super) fn run_invocation(
         subtitle.as_deref(),
         &Sink::Json,
     ) {
-        Ok(meta) => ready_result(meta, &notices),
+        Ok(meta) => Wire::new(&deps.config).ready(meta, &notices),
         Err(fault) => failed(&fault),
     }
 }
@@ -260,7 +260,6 @@ fn transcript_swept() -> Fault {
     )
 }
 
-/// Render the cached SRT as `MM:SS text` cue lines.
 /// Render the cached SRT as `MM:SS text` lines, keeping the cues that
 /// overlap `window`. Timestamps stay absolute to the source, so a slice
 /// lines up with the grids of the same range.

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * 1024 * 1024;
 
 /// A config value failed validation; the message names the key and value.
@@ -205,6 +206,19 @@ pub struct BudgetCfg {
     /// Degradation floor: max seconds one widened chunk may cover before
     /// running the plan requires explicit consent.
     pub max_stretch_seconds: NonZeroU32,
+    /// Ceiling on the bytes one tool result may carry.
+    ///
+    /// A property of the client, not of this tool: no specification bounds
+    /// an MCP message, and nothing negotiates it. The official TypeScript
+    /// SDK defaults a stdio client's read buffer to 10 MiB, and overflow
+    /// there clears the whole buffer rather than the one message,
+    /// desynchronising everything after it.
+    ///
+    /// The default leaves headroom under that 10 MiB rather than hugging
+    /// it: the buffer bounds *undrained bytes*, not one message, so
+    /// responses that pipeline behind a busy client share it. An operator
+    /// who knows their own client raises it.
+    pub max_response_bytes: NonZeroU64,
 }
 
 /// Whisper model selection: a pinned name provisioned by `install-whisper`,
@@ -399,6 +413,7 @@ struct FileDownload {
 struct FileBudget {
     max: Option<u32>,
     max_stretch_seconds: Option<u32>,
+    max_response_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -483,6 +498,7 @@ pub fn default_config(dirs: &BaseDirs) -> Config {
         budget: BudgetCfg {
             max: nz32(8),
             max_stretch_seconds: nz32(600),
+            max_response_bytes: nz64(8 * MIB),
         },
         network: NetworkCfg {
             allow_private_hosts: false,
@@ -573,6 +589,9 @@ pub fn parse_config(text: &str, dirs: &BaseDirs) -> Result<Config, ConfigError> 
         "budget.max_stretch_seconds",
     )? {
         cfg.budget.max_stretch_seconds = v;
+    }
+    if let Some(v) = nz64(file.budget.max_response_bytes, "budget.max_response_bytes")? {
+        cfg.budget.max_response_bytes = v;
     }
     if let Some(v) = file.network.allow_private_hosts {
         cfg.network.allow_private_hosts = v;
@@ -694,6 +713,7 @@ pub fn render_template(cfg: &Config) -> String {
     let BudgetCfg {
         max,
         max_stretch_seconds,
+        max_response_bytes,
     } = budget;
     let NetworkCfg {
         allow_private_hosts,
@@ -885,6 +905,22 @@ pub fn render_template(cfg: &Config) -> String {
     line(
         &mut out,
         &format!("#max_stretch_seconds = {max_stretch_seconds}"),
+    );
+    line(
+        &mut out,
+        "# Ceiling on the bytes one MCP tool result may carry. A property of your",
+    );
+    line(
+        &mut out,
+        "# client, not of this tool: nothing in the protocol bounds a message and",
+    );
+    line(
+        &mut out,
+        "# nothing negotiates it. Raise it if you know your client's limit.",
+    );
+    line(
+        &mut out,
+        &format!("#max_response_bytes = {max_response_bytes}"),
     );
     line(&mut out, "");
     line(&mut out, "[network]");
