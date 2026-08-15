@@ -164,9 +164,7 @@ enum Command {
         #[command(flatten)]
         opts: CommonOpts,
     },
-    /// Watch a video through the harness: budget ladder, cached transcript,
-    /// and the same decisions the `video` tool makes — grids written as
-    /// files for your own image reader to open.
+    /// Watch a video through the harness, writing grid files and metadata.
     Watch {
         /// Local video file path.
         #[arg(value_hint = ValueHint::FilePath)]
@@ -709,9 +707,7 @@ fn run_watch(
         other => anyhow::bail!("this subcommand takes local files only ({other:?})"),
     };
 
-    // A cached transcript rides along exactly as it does on the tool path;
-    // the in-flight rendezvous does not, because a one-shot run has no
-    // rival to wait for.
+    // Reuse landed transcripts; only the server waits on in-flight ones.
     let cache = harness::cache::Cache::new(&cfg.paths.cache, cfg.cache.max_bytes);
     let subtitle = harness::identity::fingerprint_file(std::path::Path::new(source))
         .ok()
@@ -742,8 +738,6 @@ fn run_probe(source: &str) -> anyhow::Result<()> {
     let cfg = harness::config::load_config(&dirs)?;
     let probe = probe_local(source)?;
     let plan = harness::plan::plan_response(source, &probe, &cfg);
-    // The same body the tool answers `want: "plan"` with, so the two
-    // surfaces cannot drift into two dialects of one answer.
     let body = harness::schema::VideoBody::Plan {
         probe: plan.probe,
         guidance: plan.guidance,
@@ -752,9 +746,7 @@ fn run_probe(source: &str) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(&body)?);
     Ok(())
 }
-/// `transcript`: the spoken text over a window, whisper run once and
-/// cached. The gate the tool path holds is server concurrency; a one-shot
-/// process has no rival to single-flight against.
+/// `transcript`: the spoken text over a window, cached after the first run.
 fn run_transcript(source: &str, from: Option<String>, until: Option<String>) -> anyhow::Result<()> {
     use harness::schema::TimeValue;
 
@@ -774,8 +766,6 @@ fn run_transcript(source: &str, from: Option<String>, until: Option<String>) -> 
     let fingerprint = harness::identity::fingerprint_file(media)
         .map_err(|e| anyhow::anyhow!("cannot read {source}: {e}"))?
         .id;
-    // Identity is content × recipe, derived exactly as the tool derives it,
-    // so a transcript either surface produced is found by the other.
     let prompt = harness::transcribe::effective_prompt_for(&cache, &cfg, &fingerprint);
     let id = harness::transcribe::transcript_id(&cfg, &prompt);
 

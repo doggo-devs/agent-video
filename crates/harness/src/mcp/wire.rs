@@ -256,22 +256,11 @@ fn describe_grids(meta: &CoreMetadata, notices: &[String]) -> String {
     lines.join("\n")
 }
 
-/// The ceiling on what one tool result may carry, and the only door onto a
-/// grid answer.
+/// Budgeted renderer for grid results.
 ///
-/// The limit is a property of the client, not of this tool: nothing in MCP
-/// bounds a message and nothing negotiates a bound. The official
-/// TypeScript SDK defaults a stdio client's read buffer to 10 MiB, and
-/// overflow there calls `clear()` on the whole buffer before throwing — so
-/// the bytes after the oversized message are read as the start of the next
-/// one and the session desynchronises. That failure cannot be answered
-/// with an error body, because the error would ride the stream it just
-/// broke.
-///
-/// So it is never produced. [`ready_result`] is private and reachable only
-/// through [`Wire::ready`], which drops what will not fit and says which
-/// call brings it back. Grids are dropped from the tail, keeping the
-/// window's start, because that is the direction the caller can resume in.
+/// [`Wire::ready`] is the only path that builds a grid answer: it drops
+/// tail grids that would exceed the configured response ceiling and names
+/// the `from` value that resumes the window.
 pub(super) struct Wire {
     max_bytes: usize,
 }
@@ -296,13 +285,9 @@ impl Wire {
     /// Render a document into a result that fits the ceiling.
     pub(super) fn ready(&self, mut meta: CoreMetadata, notices: &[String]) -> CallToolResult {
         let mut notices = notices.to_vec();
-        // The ceiling bounds the *response*, so everything the response
-        // carries is charged against it. The text block goes first and is
-        // never dropped: it holds the ranges and subtitles that make the
-        // images legible, and a caller who loses it cannot resume. It is
-        // not always small — a transcript rides along in it, one slice per
-        // grid — so charging only the images would ship past a ceiling
-        // whose name promises otherwise.
+        // The text block is charged first and never dropped: it carries
+        // the ranges and subtitles that make any returned image legible,
+        // and a transcript can make it large enough to matter.
         let spent = describe_grids(&meta, &notices).len() + RESPONSE_OVERHEAD;
         let kept = self.fits(&meta.grids, spent);
         if kept < meta.grids.len() {
@@ -348,7 +333,6 @@ impl Wire {
 
 /// Render a parsed core document: one text block, then the grid images.
 /// Takes the document by value so base64 payloads move instead of clone.
-/// Private on purpose — see [`Wire`].
 fn ready_result(meta: CoreMetadata, notices: &[String]) -> CallToolResult {
     let mut content = vec![ContentBlock::text(describe_grids(&meta, notices))];
     for grid in meta.grids {
@@ -440,15 +424,12 @@ mod tests {
             .collect()
     }
 
-    /// Serialized size of the whole result — what the ceiling is about.
     fn wire_bytes(result: &CallToolResult) -> usize {
         serde_json::to_string(result)
             .expect("a result serializes")
             .len()
     }
 
-    /// A ceiling wide enough for `n` of the grids below, plus the text
-    /// block and framing the response also charges.
     fn ceiling_for(n: usize) -> usize {
         RESPONSE_OVERHEAD + 4 * 1024 + n * (64 * 1024 + IMAGE_BLOCK_OVERHEAD)
     }
@@ -515,7 +496,6 @@ mod tests {
             grid("00:00-01:00", 64 * 1024),
             grid("01:00-02:00", 64 * 1024),
         ];
-        // A transcript rides in the text block, one slice per grid.
         grids[0].subtitles = Some("x".repeat(64 * 1024));
         let r = wire.ready(doc(grids), &[]);
         assert_eq!(

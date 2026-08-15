@@ -198,12 +198,6 @@ pub fn available(cfg: &Config) -> bool {
 
 // ── cache identity ──
 
-/// Cache identity of the transcript the active route would produce for
-/// this conditioning. Everything that shapes the cues is in the key:
-/// engine × model ([`Route::cache_id`]), the language hint, and a short
-/// hash of the effective `prompt`. Unconditioned runs keep the bare model
-/// identity, so transcripts from before these knobs existed stay hits.
-/// Falls back to the local model identity when no route resolves, so a
 /// Render the cached SRT as `MM:SS text` lines, keeping the cues that
 /// overlap `window`. Timestamps stay absolute to the source, so a slice
 /// lines up with the grids of the same range.
@@ -234,6 +228,12 @@ pub fn transcript_id_for(cache: &Cache, cfg: &Config, fingerprint: &ContentId) -
     transcript_id(cfg, &effective_prompt_for(cache, cfg, fingerprint))
 }
 
+/// Cache identity of the transcript the active route would produce for
+/// this conditioning. Everything that shapes the cues is in the key:
+/// engine × model ([`Route::cache_id`]), the language hint, and a short
+/// hash of the effective `prompt`. Unconditioned runs keep the bare model
+/// identity, so transcripts from before these knobs existed stay hits.
+/// Falls back to the local model identity when no route resolves, so a
 /// transcript generated before a key was removed still rides along.
 pub fn transcript_id(cfg: &Config, prompt: &str) -> String {
     let base = Route::resolve(cfg)
@@ -464,7 +464,6 @@ mod tests {
 
     #[test]
     fn timestamps_stay_absolute_to_the_source() {
-        // So a slice lines up with the grids of the same range.
         let text = render_transcript(SRT, window(7.0, 11.0));
         assert_eq!(text, "00:08 third", "not re-based to the window start");
     }

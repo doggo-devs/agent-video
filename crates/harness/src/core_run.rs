@@ -3,9 +3,7 @@
 //! becomes one parsed document.
 //!
 //! Surface-agnostic on purpose. Running a core child needs a runner and a
-//! sink, not a server's dependency graph — the transcript rendezvous a
-//! grid render may wait on is concurrency the caller owns, and a one-shot
-//! CLI has no rival to wait for.
+//! sink, not a server's dependency graph.
 //!
 //! The server and the pipeline are one binary, but a `video` call still runs
 //! `process`/`extract` in a child process rather than in-process: stdout

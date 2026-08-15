@@ -14,14 +14,12 @@ use super::time::{ArgError, Window, resolve_window};
 use super::tokens::{DownloadPlan, OfferDraft, PendingAction, Redemption, Token, Tokens};
 use agent_video_core::types::format_ts;
 
-/// Where a core run puts its pixels: the one axis on which the two
-/// surfaces differ. Everything else about an invocation is identical, so
-/// nothing else is parameterized.
+/// Output sink for a core run.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Sink {
-    /// base64 on stdout, for a caller that carries images in its reply.
+    /// Base64 on stdout.
     Json,
-    /// Files under a directory, for a caller whose reader opens paths.
+    /// Files under a directory.
     Dir(std::path::PathBuf),
 }
 
@@ -37,11 +35,10 @@ impl Sink {
         }
     }
 
-    /// Recover the run's document, which each sink places differently:
-    /// `--json` writes it to stdout, `-o` writes it beside the grids. The
-    /// two halves of a sink's contract — where the pixels go and where the
-    /// document goes — live together here, so pairing `-o` with a stdout
-    /// read is not expressible at a call site.
+    /// Recover the run's document from this sink.
+    ///
+    /// `--json` writes it to stdout; `-o` writes it beside the grids, so a
+    /// caller cannot pair file output with a stdout read by mistake.
     pub fn document(&self, stdout: &str) -> Result<CoreDocument, std::io::Error> {
         let json = match self {
             Sink::Json => std::borrow::Cow::Borrowed(stdout),
@@ -68,12 +65,11 @@ pub struct CoreInvocation {
 
 impl CoreInvocation {
     /// The complete child argv: subcommand, input, window clamp, subtitle,
-    /// the typed strategy tail, `--json`. The single render site — server
+    /// typed strategy tail, and sink. The single render site — server
     /// plumbing joins the vector here and nowhere else, and no
     /// [`CoreArgs`] field can carry it, so an invocation smuggling the
     /// input path or an output flag is unrepresentable rather than
-    /// reviewed. The sink is the caller's to choose and cannot be spelled
-    /// twice.
+    /// reviewed.
     pub fn argv(
         &self,
         media: &std::path::Path,
@@ -309,9 +305,9 @@ fn decide_inner(
     // from above and never predicts it.
     let chunks = ((span / look.chunk_seconds()).ceil() as u32).max(1);
 
-    // No plan gate here: planning before decoding earns its keep only where
-    // there is a download to avoid, and that path reaches `plan_response`
-    // directly once the rip lands.
+    // Planning before decoding earns its keep only where there is a
+    // download to avoid; that path reaches `plan_response` directly once
+    // the rip lands.
 
     // An explicit strategy is a temporal-selection request extract's dense
     // range sampling would ignore, so it stays on the process path.
@@ -336,7 +332,6 @@ fn decide_inner(
         });
     }
 
-    // Past the ceiling: widen the chunks so the window fits inside it.
     // `span > 0` makes the ceiling at least 1, as core requires.
     let stretched = (span / f64::from(max)).ceil() as u32;
     let invocation = process_invocation(look, grid.strategy, Some(stretched), window);
@@ -530,7 +525,6 @@ mod tests {
 
     #[test]
     fn bare_short_video_runs_immediately() {
-        // 90s / 60s-chunks = 2 chunks, comfortably inside the ceiling.
         let d = decide_bare(90.0, VideoArgs::bare("/v.mp4"));
         let Decision::Run { invocation, .. } = d else {
             panic!("expected Run, got {d:?}");
