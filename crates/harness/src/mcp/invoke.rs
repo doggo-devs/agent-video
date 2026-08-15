@@ -21,8 +21,8 @@ use crate::fault::Fault;
 use crate::identity::{ContentId, fingerprint_file};
 use crate::plan::{CoreInvocation, Sink, plan_response};
 use crate::schema::{TimeValue, VideoArgs, VideoBody};
-use crate::time::{ArgError, Window, resolve_window};
-use crate::transcribe;
+use crate::time::{ArgError, resolve_window};
+use crate::transcribe::{self, render_transcript};
 use agent_video_core::types::format_ts;
 
 // ── core invocation ──
@@ -258,20 +258,6 @@ fn transcript_swept() -> Fault {
         "the transcript was evicted by a concurrent cache sweep just as it was being read \
          back — call again with transcribe to regenerate it",
     )
-}
-
-/// Render the cached SRT as `MM:SS text` lines, keeping the cues that
-/// overlap `window`. Timestamps stay absolute to the source, so a slice
-/// lines up with the grids of the same range.
-fn render_transcript(srt: &str, window: Window) -> String {
-    let mut out = String::new();
-    for cue in agent_video_core::subtitle::parse_srt(srt) {
-        if f64::from(cue.end) < window.start() || f64::from(cue.start) > window.end() {
-            continue;
-        }
-        out.push_str(&format!("{} {}\n", format_ts(cue.start), cue.text));
-    }
-    out.trim_end().to_string()
 }
 
 #[cfg(test)]

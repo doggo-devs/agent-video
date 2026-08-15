@@ -40,12 +40,14 @@ use super::config::{Config, WhisperModel};
 use crate::cache::Cache;
 use crate::fault::Fault;
 use crate::identity::ContentId;
+use crate::time::Window;
 use agent_video_core::media::Stop;
 #[cfg(feature = "whisper-local")]
 use agent_video_core::media::audio::AudioCeiling;
 use agent_video_core::media::audio::{AudioSamples, WHISPER_SAMPLE_RATE};
 use agent_video_core::source::Source;
 use agent_video_core::subtitle as core_subtitle;
+use agent_video_core::types::format_ts;
 
 // ── model / path helpers ──
 
@@ -202,6 +204,20 @@ pub fn available(cfg: &Config) -> bool {
 /// hash of the effective `prompt`. Unconditioned runs keep the bare model
 /// identity, so transcripts from before these knobs existed stay hits.
 /// Falls back to the local model identity when no route resolves, so a
+/// Render the cached SRT as `MM:SS text` lines, keeping the cues that
+/// overlap `window`. Timestamps stay absolute to the source, so a slice
+/// lines up with the grids of the same range.
+pub fn render_transcript(srt: &str, window: Window) -> String {
+    let mut out = String::new();
+    for cue in agent_video_core::subtitle::parse_srt(srt) {
+        if f64::from(cue.end) < window.start() || f64::from(cue.start) > window.end() {
+            continue;
+        }
+        out.push_str(&format!("{} {}\n", format_ts(cue.start), cue.text));
+    }
+    out.trim_end().to_string()
+}
+
 /// The prompt this content gets today: the operator's, else one derived
 /// from a cached title.
 ///
@@ -408,6 +424,49 @@ mod tests {
 
     fn cfg() -> Config {
         default_config(&test_dirs(Path::new("/home/u")))
+    }
+
+    /// Three cues at 0-2s, 4-6s and 8-10s.
+    const SRT: &str = "1\n00:00:00,000 --> 00:00:02,000\nfirst\n\n\
+         2\n00:00:04,000 --> 00:00:06,000\nsecond\n\n\
+         3\n00:00:08,000 --> 00:00:10,000\nthird\n";
+
+    fn window(from: f64, until: f64) -> Window {
+        use crate::schema::TimeValue;
+        crate::time::resolve_window(
+            Some(&TimeValue::Number(from)),
+            Some(&TimeValue::Number(until)),
+            30.0,
+        )
+        .expect("a valid sub-range")
+        .0
+    }
+
+    #[test]
+    fn renders_every_cue_of_a_full_window() {
+        let text = render_transcript(SRT, window(0.0, 30.0));
+        assert_eq!(text, "00:00 first\n00:04 second\n00:08 third");
+    }
+
+    #[test]
+    fn keeps_only_cues_overlapping_the_window() {
+        let text = render_transcript(SRT, window(3.0, 7.0));
+        assert_eq!(text, "00:04 second");
+    }
+
+    #[test]
+    fn keeps_a_cue_straddling_the_window_edge() {
+        // The cue runs 4-6s and the window opens at 5s: a caller asking
+        // about 5s wants the sentence being spoken at 5s, not silence.
+        let text = render_transcript(SRT, window(5.0, 7.0));
+        assert_eq!(text, "00:04 second");
+    }
+
+    #[test]
+    fn timestamps_stay_absolute_to_the_source() {
+        // So a slice lines up with the grids of the same range.
+        let text = render_transcript(SRT, window(7.0, 11.0));
+        assert_eq!(text, "00:08 third", "not re-based to the window start");
     }
 
     #[test]

@@ -190,6 +190,19 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Transcribe a video's audio with whisper and print the cue lines.
+    /// The result is cached, and later `watch` runs carry it as subtitles.
+    Transcript {
+        /// Local video file path.
+        #[arg(value_hint = ValueHint::FilePath)]
+        source: String,
+        /// Window start, seconds or `MM:SS`; omit to start at the beginning.
+        #[arg(long)]
+        from: Option<String>,
+        /// Window end, same formats; omit to run to the end.
+        #[arg(long)]
+        until: Option<String>,
+    },
     /// Probe a video and print what the `video` tool would answer for
     /// `want: "plan"`: metadata plus the calls worth making next.
     Probe {
@@ -580,6 +593,11 @@ fn run() -> anyhow::Result<()> {
             let args = watch_args(&source, from, until, look, strategy);
             run_watch(&source, &out, &args, yes)
         }
+        Command::Transcript {
+            source,
+            from,
+            until,
+        } => run_transcript(&source, from, until),
         Command::Probe { source } => run_probe(&source),
         Command::Mcp => harness::mcp::server::serve_stdio(),
         Command::InstallWhisper { model } => {
@@ -732,6 +750,58 @@ fn run_probe(source: &str) -> anyhow::Result<()> {
         recommended_calls: plan.recommended_calls,
     };
     println!("{}", serde_json::to_string_pretty(&body)?);
+    Ok(())
+}
+/// `transcript`: the spoken text over a window, whisper run once and
+/// cached. The gate the tool path holds is server concurrency; a one-shot
+/// process has no rival to single-flight against.
+fn run_transcript(source: &str, from: Option<String>, until: Option<String>) -> anyhow::Result<()> {
+    use harness::schema::TimeValue;
+
+    let dirs = harness::config::BaseDirs::detect();
+    let cfg = harness::config::load_config(&dirs)?;
+    let probe = probe_local(source)?;
+    let media = std::path::Path::new(source);
+
+    if !harness::transcribe::available(&cfg) {
+        anyhow::bail!(
+            "no whisper transcription available — set WHISPER_API_KEY for API \
+             transcription, or compile with a GPU feature and run `agent-video \
+             install-whisper` for local inference"
+        );
+    }
+    let cache = harness::cache::Cache::new(&cfg.paths.cache, cfg.cache.max_bytes);
+    let fingerprint = harness::identity::fingerprint_file(media)
+        .map_err(|e| anyhow::anyhow!("cannot read {source}: {e}"))?
+        .id;
+    // Identity is content × recipe, derived exactly as the tool derives it,
+    // so a transcript either surface produced is found by the other.
+    let prompt = harness::transcribe::effective_prompt_for(&cache, &cfg, &fingerprint);
+    let id = harness::transcribe::transcript_id(&cfg, &prompt);
+
+    let srt_path = match cache.find_transcript(&fingerprint, &id) {
+        Some(path) => path,
+        None => {
+            let out = cache.transcript_path(&fingerprint, &id);
+            harness::transcribe::transcribe(&cfg, media, &out, &prompt, &mut |message| {
+                eprintln!("{message}");
+            })
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+            cache
+                .find_transcript(&fingerprint, &id)
+                .ok_or_else(|| anyhow::anyhow!("transcript vanished after being written"))?
+        }
+    };
+
+    let window = harness::time::resolve_window(
+        from.map(TimeValue::Text).as_ref(),
+        until.map(TimeValue::Text).as_ref(),
+        probe.duration,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e.0))?
+    .0;
+    let srt = std::fs::read_to_string(&srt_path)?;
+    println!("{}", harness::transcribe::render_transcript(&srt, window));
     Ok(())
 }
 
