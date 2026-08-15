@@ -11,6 +11,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The name `-o` mode gives the run's document. Both crates read it, so it
+/// is spelled once here rather than in each of them.
+pub const METADATA_FILENAME: &str = "metadata.json";
+
 use crate::types::{
     GridImage, GridMeta, GridSubtitles, KeyFrameMeta, LayoutKind, Settings, TimeRange,
 };

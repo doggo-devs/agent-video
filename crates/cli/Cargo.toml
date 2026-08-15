@@ -29,6 +29,7 @@ agent-video-core = { path = "../core", features = ["clap"] }
 agent-video-harness = { path = "../harness" }
 clap = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # Restore SIGPIPE to SIG_DFL at startup: the Rust runtime installs SIG_IGN,

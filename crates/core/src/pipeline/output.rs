@@ -12,6 +12,7 @@ use crate::source::Source;
 use crate::subtitle::Subtitles;
 use crate::types::{GridImage, GridMeta, GridSubtitles, TimeRange};
 use crate::wire;
+use crate::wire::METADATA_FILENAME;
 
 use super::OutputSink;
 
@@ -135,7 +136,7 @@ impl<'a> OutputSession<'a> {
                 if let Some(text) = subtitles_txt {
                     write_file(&staging, "subtitles.txt", text.as_bytes())?;
                 }
-                write_file(&staging, "metadata.json", json.as_bytes())?;
+                write_file(&staging, METADATA_FILENAME, json.as_bytes())?;
                 // Point of no return: the sweep destroys the previous run,
                 // making staging the only complete copy. Drop must preserve
                 // it from here on.
@@ -181,7 +182,7 @@ fn promote(dir: &Path, staging: &Path) -> Result<()> {
         names.push(name);
     }
     // Completion-marker ordering: metadata.json must be the last rename.
-    names.sort_unstable_by_key(|n| n == "metadata.json");
+    names.sort_unstable_by_key(|n| n == METADATA_FILENAME);
     for name in &names {
         let from = staging.join(name);
         let to = dir.join(name);
@@ -235,8 +236,10 @@ fn is_own_artifact(name: &str) -> bool {
             .and_then(|rest| rest.strip_suffix(".jpg"))
             .is_some_and(|digits| digits.len() >= 3 && digits.bytes().all(|b| b.is_ascii_digit()))
     };
-    matches!(name, "metadata.json" | "subtitles.txt" | "grid_extract.jpg")
-        || numbered_jpg("grid_")
+    matches!(
+        name,
+        METADATA_FILENAME | "subtitles.txt" | "grid_extract.jpg"
+    ) || numbered_jpg("grid_")
         || numbered_jpg("static_")
 }
 

@@ -15,10 +15,11 @@ use super::handler::resolve_media;
 use super::probe_cache::{
     MediaMissing, ProbeError, effective_prompt_for, probe_media, transcript_id_for,
 };
-use super::wire::{CoreMetadata, evicted_rip, failed, is_url, json_result, ready_result};
-use crate::fault::{Fault, FaultKind};
+use super::wire::{evicted_rip, failed, is_url, json_result, ready_result};
+use crate::core_run::run_core;
+use crate::fault::Fault;
 use crate::identity::{ContentId, fingerprint_file};
-use crate::plan::{CoreInvocation, plan_response};
+use crate::plan::{CoreInvocation, Sink, plan_response};
 use crate::schema::{TimeValue, VideoArgs, VideoBody};
 use crate::time::{ArgError, Window, resolve_window};
 use crate::transcribe;
@@ -39,6 +40,9 @@ pub(super) fn run_invocation(
     // proceeds and says so in a notice rather than staying silent. The
     // hold is dropped before core runs: the gate guards the rendezvous,
     // not the render.
+    //
+    // This is the concurrency the server owns, which is why it lives here
+    // and not in `core_run`: a one-shot caller has no rival to wait for.
     let mut notices = notices.to_vec();
     let mut transcript_in_flight = false;
     let subtitle = invocation.subtitle.clone().or_else(|| {
@@ -60,42 +64,15 @@ pub(super) fn run_invocation(
                 .to_string(),
         );
     }
-    // `--json` (inside `argv`) selects the stdout sink; no `-o` exists in
-    // that mode.
-    let args = invocation.argv(media_path, subtitle.as_deref());
-    let run = match deps.core.run(&args) {
-        Ok(run) => run,
-        Err(e) => return failed(&Fault::internal(format!("core failed to start: {e}"))),
-    };
-    if !run.exit.is_success() {
-        let detail: Vec<&str> = run.stderr.trim().lines().rev().take(5).collect();
-        let detail: Vec<&str> = detail.into_iter().rev().collect();
-        return failed(&Fault::new(
-            core_exit_kind(run.exit),
-            format!(
-                "core {} failed ({}):\n{}",
-                invocation.args.subcommand().as_str(),
-                run.exit,
-                detail.join("\n")
-            ),
-        ));
-    }
-    // BadInput, not transient: retrying the identical call would hit the
-    // same capture cap; narrowing the request is an action the model
-    // itself can take.
-    if run.stdout_truncated {
-        return failed(&Fault::bad_input(
-            "core produced more output than one call can carry — narrow the \
-             window or lower the frame density and call again",
-        ));
-    }
-    // Same wire types on both sides and truncation handled above, so a
-    // parse failure is a bug (stray bytes), not contract drift.
-    match serde_json::from_str::<CoreMetadata>(&run.stdout) {
+    match run_core(
+        deps.core.as_ref(),
+        media_path,
+        invocation,
+        subtitle.as_deref(),
+        &Sink::Json,
+    ) {
         Ok(meta) => ready_result(meta, &notices),
-        Err(e) => failed(&Fault::internal(format!(
-            "core output failed to parse ({e}) — this is an agent-video bug"
-        ))),
+        Err(fault) => failed(&fault),
     }
 }
 
@@ -104,23 +81,6 @@ pub(super) fn run_invocation(
 /// rendezvous), so the two sides cannot key apart.
 fn transcript_gate_key(fingerprint: &ContentId, transcript_id: &str) -> String {
     format!("{fingerprint}.{transcript_id}")
-}
-
-/// Recover the failure class from a core child's exit status: the exit
-/// code decades are core's published contract ([`ErrorCode::exit_code`]),
-/// so a subprocess seam loses no more than the in-process one. Uncoded
-/// exits (bugs, panics, clap usage — the harness built those arguments)
-/// and signals are ours.
-fn core_exit_kind(exit: super::core_run::CoreExit) -> FaultKind {
-    use agent_video_core::error::ErrorCode;
-    match exit {
-        super::core_run::CoreExit::Failure(code) => u8::try_from(code.get())
-            .ok()
-            .and_then(ErrorCode::from_exit_code)
-            .map(FaultKind::of)
-            .unwrap_or(FaultKind::Internal),
-        _ => FaultKind::Internal,
-    }
 }
 
 // ── transcription execution ──

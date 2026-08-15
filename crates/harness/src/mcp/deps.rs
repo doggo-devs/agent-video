@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use crate::cache::Cache;
 use crate::config::Config;
+use crate::core_run::{CoreRunner, SelfSpawn};
 use crate::fault::Fault;
 use crate::fetch::{self, Attempt, CancelSignal, DownloadIo, ProgressFn, SourceInfo};
 use crate::gate::KeyedGate;
-use crate::mcp::core_run::{CoreRunner, SelfSpawn};
 use crate::mcp::tracker::Tracker;
 use crate::probe::probe_local_file;
 use crate::relay::PolicyRelay;

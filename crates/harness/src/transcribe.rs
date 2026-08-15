@@ -37,7 +37,9 @@ use std::time::Instant;
 #[cfg(feature = "whisper-local")]
 use super::config::Backend;
 use super::config::{Config, WhisperModel};
+use crate::cache::Cache;
 use crate::fault::Fault;
+use crate::identity::ContentId;
 use agent_video_core::media::Stop;
 #[cfg(feature = "whisper-local")]
 use agent_video_core::media::audio::AudioCeiling;
@@ -200,6 +202,22 @@ pub fn available(cfg: &Config) -> bool {
 /// hash of the effective `prompt`. Unconditioned runs keep the bare model
 /// identity, so transcripts from before these knobs existed stay hits.
 /// Falls back to the local model identity when no route resolves, so a
+/// The prompt this content gets today: the operator's, else one derived
+/// from a cached title.
+///
+/// Lives here rather than beside either surface because both must derive
+/// it identically — a CLI run and a tool call that disagreed would miss
+/// each other's cached transcripts and pay whisper twice for one video.
+pub fn effective_prompt_for(cache: &Cache, cfg: &Config, fingerprint: &ContentId) -> String {
+    effective_prompt(cfg, cache.get_title(fingerprint).as_deref())
+}
+
+/// The transcript cache identity this content would get today: whisper
+/// route × language × effective prompt ([`transcript_id`]).
+pub fn transcript_id_for(cache: &Cache, cfg: &Config, fingerprint: &ContentId) -> String {
+    transcript_id(cfg, &effective_prompt_for(cache, cfg, fingerprint))
+}
+
 /// transcript generated before a key was removed still rides along.
 pub fn transcript_id(cfg: &Config, prompt: &str) -> String {
     let base = Route::resolve(cfg)

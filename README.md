@@ -18,8 +18,9 @@ transcription that rides along with every grid.
 - `crates/harness` — policy layer over the kernel: budget ladder, consent
   tokens, URL sources, disk cache, whisper transcription; `mcp` module owns
   the stdio server.
-- `crates/cli` — the `agent-video` binary: `process`, `extract`, `mcp`,
-  `install-whisper`, `cookie`. See [crates/README.md](crates/README.md).
+- `crates/cli` — the `agent-video` binary. Harness-backed: `watch`, `probe`,
+  `mcp`. Raw core: `process`, `extract`. Plus `install-whisper`, `cookie`.
+  See [crates/README.md](crates/README.md).
 - `packages/harness` — npm distribution shell (`@agent-video/cli`): resolves
   the platform binary and passes through; no logic of its own.
 - `surfaces` — discovery artifacts derived from the Rust tool schema: skill,
@@ -66,7 +67,12 @@ cargo build --release
 ## CLI quickstart
 
 ```bash
-# Smart frame selection + grid composition into a directory
+# The harness path: same decisions as the `video` tool, grids as files
+agent-video watch video.mp4 -o out/
+agent-video probe video.mp4                      # metadata + next calls
+agent-video watch video.mp4 -o out/ --from 1:23 --until 2:00 --look detailed
+
+# Raw core: no budget ladder, no cached transcript
 agent-video process video.mp4 -o out/
 
 # Straight from a URL (any protocol the build's FFmpeg can open)

@@ -14,6 +14,48 @@ use super::time::{ArgError, Window, resolve_window};
 use super::tokens::{DownloadPlan, OfferDraft, PendingAction, Redemption, Token, Tokens};
 use agent_video_core::types::format_ts;
 
+/// Where a core run puts its pixels: the one axis on which the two
+/// surfaces differ. Everything else about an invocation is identical, so
+/// nothing else is parameterized.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Sink {
+    /// base64 on stdout, for a caller that carries images in its reply.
+    Json,
+    /// Files under a directory, for a caller whose reader opens paths.
+    Dir(std::path::PathBuf),
+}
+
+impl Sink {
+    /// The core flags selecting this sink. `--json` and `-o` are the two
+    /// spellings core accepts, and they are mutually exclusive there.
+    fn render_into(&self, argv: &mut Vec<String>) {
+        match self {
+            Sink::Json => argv.push("--json".to_string()),
+            Sink::Dir(dir) => {
+                argv.extend(["-o".to_string(), dir.to_string_lossy().into_owned()]);
+            }
+        }
+    }
+
+    /// Recover the run's document, which each sink places differently:
+    /// `--json` writes it to stdout, `-o` writes it beside the grids. The
+    /// two halves of a sink's contract — where the pixels go and where the
+    /// document goes — live together here, so pairing `-o` with a stdout
+    /// read is not expressible at a call site.
+    pub fn document(&self, stdout: &str) -> Result<CoreDocument, std::io::Error> {
+        let json = match self {
+            Sink::Json => std::borrow::Cow::Borrowed(stdout),
+            Sink::Dir(dir) => std::borrow::Cow::Owned(std::fs::read_to_string(
+                dir.join(agent_video_core::wire::METADATA_FILENAME),
+            )?),
+        };
+        serde_json::from_str(&json).map_err(std::io::Error::other)
+    }
+}
+
+/// The document core emits about one run; one definition for both sides.
+pub use agent_video_core::wire::Metadata as CoreDocument;
+
 /// A fully-decided core run; the server injects source and I/O flags.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CoreInvocation {
@@ -29,9 +71,15 @@ impl CoreInvocation {
     /// the typed strategy tail, `--json`. The single render site — server
     /// plumbing joins the vector here and nowhere else, and no
     /// [`CoreArgs`] field can carry it, so an invocation smuggling the
-    /// input path, `-o` or `--json` is unrepresentable rather than
-    /// reviewed.
-    pub fn argv(&self, media: &std::path::Path, subtitle: Option<&std::path::Path>) -> Vec<String> {
+    /// input path or an output flag is unrepresentable rather than
+    /// reviewed. The sink is the caller's to choose and cannot be spelled
+    /// twice.
+    pub fn argv(
+        &self,
+        media: &std::path::Path,
+        subtitle: Option<&std::path::Path>,
+        sink: &Sink,
+    ) -> Vec<String> {
         let mut argv = vec![
             self.args.subcommand().as_str().to_string(),
             media.to_string_lossy().into_owned(),
@@ -51,7 +99,7 @@ impl CoreInvocation {
             ]);
         }
         self.args.render_tail(&mut argv);
-        argv.push("--json".to_string());
+        sink.render_into(&mut argv);
         argv
     }
 }
@@ -639,6 +687,39 @@ mod tests {
     }
 
     #[test]
+    fn a_dir_sink_spells_the_output_flag_and_never_json() {
+        let d = decide_bare(90.0, VideoArgs::bare("/v.mp4"));
+        let Decision::Run { invocation, .. } = d else {
+            panic!("expected Run, got {d:?}");
+        };
+        let dir = std::path::PathBuf::from("/out");
+        let argv = invocation.argv(Path::new("/v.mp4"), None, &Sink::Dir(dir));
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["-o".to_string(), "/out".to_string()]),
+            "{argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--json"),
+            "core rejects both sinks at once: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn a_dir_sink_reads_the_document_beside_the_grids() {
+        let dir = crate::tempdir::TempDir::new("sink-doc");
+        let doc = r#"{"source":"v.mp4","duration":9.0,"settings":{"max_edge":2048,
+            "quality":"low","detail":"standard"},"grids":[]}"#;
+        std::fs::write(dir.join(agent_video_core::wire::METADATA_FILENAME), doc)
+            .expect("write metadata");
+        let sink = Sink::Dir(dir.to_path_buf());
+        let meta = sink
+            .document("")
+            .expect("a dir sink ignores stdout and reads the file");
+        assert_eq!(meta.source, "v.mp4");
+    }
+
+    #[test]
     fn raw_over_budget_requires_consent() {
         let args = VideoArgs {
             raw: Some("process".into()),
@@ -692,7 +773,7 @@ mod tests {
             panic!("expected Run, got {d:?}");
         };
         assert_eq!(invocation.args.subcommand(), RawSubcommand::Process);
-        let argv = invocation.argv(Path::new("/v.mp4"), None);
+        let argv = invocation.argv(Path::new("/v.mp4"), None, &Sink::Json);
         assert!(
             argv.windows(2)
                 .any(|w| w == ["--strategy".to_string(), "fixed-fps".to_string()]),
@@ -713,7 +794,7 @@ mod tests {
         let Decision::Run { invocation, .. } = d else {
             panic!("expected Run, got {d:?}");
         };
-        let argv = invocation.argv(Path::new("/v.mp4"), None);
+        let argv = invocation.argv(Path::new("/v.mp4"), None, &Sink::Json);
         assert!(
             !argv.contains(&"--strategy".to_string()),
             "adaptive must render no flag: {argv:?}"
@@ -759,7 +840,7 @@ mod tests {
             panic!("expected Run");
         };
         assert_eq!(
-            invocation.argv(Path::new("/v.mp4"), Some(Path::new("/t.srt"))),
+            invocation.argv(Path::new("/v.mp4"), Some(Path::new("/t.srt")), &Sink::Json),
             [
                 "process",
                 "/v.mp4",
@@ -789,7 +870,7 @@ mod tests {
             panic!("expected Run");
         };
         assert_eq!(
-            invocation.argv(Path::new("/v.mp4"), None),
+            invocation.argv(Path::new("/v.mp4"), None, &Sink::Json),
             [
                 "extract",
                 "/v.mp4",
@@ -814,7 +895,7 @@ mod tests {
             panic!("expected Run");
         };
         assert_eq!(
-            invocation.argv(Path::new("/v.mp4"), None),
+            invocation.argv(Path::new("/v.mp4"), None, &Sink::Json),
             [
                 "process",
                 "/v.mp4",

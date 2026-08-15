@@ -21,14 +21,12 @@ use crate::transcribe;
 /// every caller — transcribe, ride-along lookup, probe decoration —
 /// derives the same text and therefore the same transcript identity.
 pub(super) fn effective_prompt_for(fingerprint: &ContentId, deps: &ServerDeps) -> String {
-    let title = deps.cache.get_title(fingerprint);
-    transcribe::effective_prompt(&deps.config, title.as_deref())
+    transcribe::effective_prompt_for(&deps.cache, &deps.config, fingerprint)
 }
 
-/// The transcript cache identity this content would get today: whisper
-/// route × language × effective prompt ([`transcribe::transcript_id`]).
+/// [`transcribe::transcript_id_for`] against the server's deps.
 pub(super) fn transcript_id_for(fingerprint: &ContentId, deps: &ServerDeps) -> String {
-    transcribe::transcript_id(&deps.config, &effective_prompt_for(fingerprint, deps))
+    transcribe::transcript_id_for(&deps.cache, &deps.config, fingerprint)
 }
 
 /// On-disk probe document: a version-tagged envelope, so a summary written

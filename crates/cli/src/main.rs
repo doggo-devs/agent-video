@@ -164,6 +164,39 @@ enum Command {
         #[command(flatten)]
         opts: CommonOpts,
     },
+    /// Watch a video through the harness: budget ladder, cached transcript,
+    /// and the same decisions the `video` tool makes — grids written as
+    /// files for your own image reader to open.
+    Watch {
+        /// Local video file path.
+        #[arg(value_hint = ValueHint::FilePath)]
+        source: String,
+        /// Output directory for the grid JPEGs and `metadata.json`.
+        #[arg(short, long, value_hint = ValueHint::DirPath)]
+        out: PathBuf,
+        /// Window start, seconds or `MM:SS`; omit to start at the beginning.
+        #[arg(long)]
+        from: Option<String>,
+        /// Window end, same formats; omit to run to the end.
+        #[arg(long)]
+        until: Option<String>,
+        /// How to look; omit for a balanced default.
+        #[arg(long, value_enum)]
+        look: Option<LookArg>,
+        /// Which moments to sample; omit for the lenient adaptive default.
+        #[arg(long, value_enum)]
+        strategy: Option<StrategyArg>,
+        /// Proceed past a decision the harness would ask a model to confirm.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Probe a video and print what the `video` tool would answer for
+    /// `want: "plan"`: metadata plus the calls worth making next.
+    Probe {
+        /// Local video file path.
+        #[arg(value_hint = ValueHint::FilePath)]
+        source: String,
+    },
     /// Serve the MCP `video` tool over stdio.
     Mcp,
     /// Download whisper weights (model + Silero VAD) into the models
@@ -190,6 +223,49 @@ enum Command {
     /// failure paths can abort; the parent reads only the exit code.
     #[command(hide = true)]
     ProbeGpu { backend: String },
+}
+
+/// The `look` presets, in the wire spelling the tool advertises. Mirrored
+/// exhaustively so a new preset fails to compile here until it is spelled.
+#[derive(Clone, Copy, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum LookArg {
+    Overview,
+    Detailed,
+    ReadText,
+    TrackMotion,
+}
+
+impl From<LookArg> for harness::schema::Look {
+    fn from(v: LookArg) -> Self {
+        use harness::schema::Look;
+        match v {
+            LookArg::Overview => Look::Overview,
+            LookArg::Detailed => Look::Detailed,
+            LookArg::ReadText => Look::ReadText,
+            LookArg::TrackMotion => Look::TrackMotion,
+        }
+    }
+}
+
+/// The `strategy` values, same mirror discipline as [`LookArg`].
+#[derive(Clone, Copy, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum StrategyArg {
+    Adaptive,
+    Keyframes,
+    Uniform,
+}
+
+impl From<StrategyArg> for harness::schema::Strategy {
+    fn from(v: StrategyArg) -> Self {
+        use harness::schema::Strategy;
+        match v {
+            StrategyArg::Adaptive => Strategy::Adaptive,
+            StrategyArg::Keyframes => Strategy::Keyframes,
+            StrategyArg::Uniform => Strategy::Uniform,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -492,6 +568,19 @@ fn run() -> anyhow::Result<()> {
                 &StderrEvents,
             )?)
         }
+        Command::Watch {
+            source,
+            out,
+            from,
+            until,
+            look,
+            strategy,
+            yes,
+        } => {
+            let args = watch_args(&source, from, until, look, strategy);
+            run_watch(&source, &out, &args, yes)
+        }
+        Command::Probe { source } => run_probe(&source),
         Command::Mcp => harness::mcp::server::serve_stdio(),
         Command::InstallWhisper { model } => {
             let dirs = harness::config::BaseDirs::detect();
@@ -507,6 +596,143 @@ fn run() -> anyhow::Result<()> {
             std::process::exit(harness::gpu::probe_child(&backend));
         }
     }
+}
+
+// ── harness-backed subcommands ──
+
+/// Build the tool's arguments from CLI flags. The wire struct is the one
+/// definition of what a call means, so the CLI cannot drift into a second
+/// dialect of the same request.
+#[allow(clippy::too_many_arguments)]
+fn watch_args(
+    source: &str,
+    from: Option<String>,
+    until: Option<String>,
+    look: Option<LookArg>,
+    strategy: Option<StrategyArg>,
+) -> harness::schema::VideoArgs {
+    use harness::schema::{TimeValue, VideoArgs};
+    VideoArgs {
+        from: from.map(TimeValue::Text),
+        until: until.map(TimeValue::Text),
+        look: look.map(Into::into),
+        strategy: strategy.map(Into::into),
+        ..VideoArgs::bare(source)
+    }
+}
+
+/// Probe a local file, or fail with the harness's own diagnosis.
+fn probe_local(source: &str) -> anyhow::Result<harness::schema::ProbeSummary> {
+    // Name what the caller actually sent. Diagnosing a URL as a missing
+    // file is a lie the tool path already refuses to tell
+    // (`mcp::wire::foreign_scheme`).
+    if let agent_video_core::source::Source::Remote(_) = Source::classify(source) {
+        anyhow::bail!(
+            "{source} is a URL, and this subcommand takes local files. Download it first \
+             — the `mcp` server handles consent and caching for you — then pass the path."
+        );
+    }
+    let path = std::path::Path::new(source);
+    if !path.exists() {
+        anyhow::bail!("{source}: no such file");
+    }
+    harness::probe::probe_local_file(path).map_err(|e| anyhow::anyhow!("{}", e.message))
+}
+
+/// `watch`: decide like the tool does, render to files.
+fn run_watch(
+    source: &str,
+    out: &std::path::Path,
+    args: &harness::schema::VideoArgs,
+    yes: bool,
+) -> anyhow::Result<()> {
+    use harness::core_run::{SelfSpawn, run_core};
+    use harness::plan::{Decision, Sink};
+
+    let dirs = harness::config::BaseDirs::detect();
+    let cfg = harness::config::load_config(&dirs)?;
+    let probe = probe_local(source)?;
+
+    let (invocation, notices) = match harness::plan::decide(args, &probe, &cfg) {
+        Decision::Run {
+            invocation,
+            notices,
+        } => (invocation, notices),
+        // Consent is a round trip for a model and a flag for a person: the
+        // decision is identical, only its delivery differs. No token
+        // registry here — one-shot processes have nothing to remember.
+        Decision::Confirm {
+            consequence,
+            offers,
+        } => {
+            if !yes {
+                eprintln!("{consequence}");
+                for offer in &offers {
+                    eprintln!("  --yes: {}", offer.effect);
+                }
+                anyhow::bail!("refusing without --yes");
+            }
+            match offers.into_iter().next().map(|o| o.action) {
+                Some(harness::tokens::PendingAction::Core(invocation)) => {
+                    (invocation, vec![consequence])
+                }
+                _ => anyhow::bail!("{consequence}"),
+            }
+        }
+        Decision::Plan(plan) => {
+            println!("{}", serde_json::to_string_pretty(&plan.probe)?);
+            return Ok(());
+        }
+        Decision::Saved { path } => {
+            println!("{}", path.display());
+            return Ok(());
+        }
+        Decision::Reject { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("this subcommand takes local files only ({other:?})"),
+    };
+
+    // A cached transcript rides along exactly as it does on the tool path;
+    // the in-flight rendezvous does not, because a one-shot run has no
+    // rival to wait for.
+    let cache = harness::cache::Cache::new(&cfg.paths.cache, cfg.cache.max_bytes);
+    let subtitle = harness::identity::fingerprint_file(std::path::Path::new(source))
+        .ok()
+        .and_then(|fp| {
+            let id = harness::transcribe::transcript_id_for(&cache, &cfg, &fp.id);
+            cache.find_transcript(&fp.id, &id)
+        });
+
+    let meta = run_core(
+        &SelfSpawn,
+        std::path::Path::new(source),
+        &invocation,
+        subtitle.as_deref(),
+        &Sink::Dir(out.to_path_buf()),
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+
+    for notice in &notices {
+        eprintln!("note: {notice}");
+    }
+    println!("{}", serde_json::to_string_pretty(&meta)?);
+    Ok(())
+}
+
+/// `probe`: the `want: "plan"` answer, on stdout.
+fn run_probe(source: &str) -> anyhow::Result<()> {
+    let dirs = harness::config::BaseDirs::detect();
+    let cfg = harness::config::load_config(&dirs)?;
+    let probe = probe_local(source)?;
+    let plan = harness::plan::plan_response(source, &probe, &cfg);
+    // The same body the tool answers `want: "plan"` with, so the two
+    // surfaces cannot drift into two dialects of one answer.
+    let body = harness::schema::VideoBody::Plan {
+        probe: plan.probe,
+        guidance: plan.guidance,
+        recommended_calls: plan.recommended_calls,
+    };
+    println!("{}", serde_json::to_string_pretty(&body)?);
+    Ok(())
 }
 
 #[cfg(test)]

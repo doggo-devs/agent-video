@@ -82,10 +82,29 @@ description: ${JSON.stringify(`${VIDEO_TOOL_DESCRIPTION} Use when the user share
 Watch a video as frame grids: timestamped JPEG canvases a VLM can read
 directly, with subtitles and key-frame metadata riding along.
 
-## MCP path (preferred)
+## CLI path (preferred where you can run commands)
 
-If the host supports MCP servers, register the stdio server and call the
-\`video\` tool — grid images arrive directly in context:
+Grids are written as files and opened with your own image reader, so no
+response-size ceiling applies. Same budget ladder, cached transcript and
+decisions as the tool:
+
+\`\`\`sh
+npx -y @agent-video/cli probe video.mp4              # metadata + next calls
+npx -y @agent-video/cli watch video.mp4 -o out/      # grids as files
+npx -y @agent-video/cli watch video.mp4 -o out/ --from 1:23 --until 2:00 --look detailed
+\`\`\`
+
+- \`out/\` receives the grid JPEGs plus \`metadata.json\`: per-grid time
+  ranges, key frames, and subtitle text. \`watch\` prints that document to
+  stdout too.
+- A decision the tool would ask a model to confirm needs \`--yes\` here.
+- URLs: download first, then pass the local path.
+- Raw core access remains \`process\` / \`extract\`; see \`--help\`.
+
+## MCP path (when the host has no shell)
+
+Register the stdio server and call the \`video\` tool — grid images arrive
+directly in context, bounded by whatever response ceiling the host imposes:
 
 \`\`\`json
 { "mcpServers": { "video": { "command": "npx", "args": ["-y", "@agent-video/cli", "mcp"] } } }
@@ -117,25 +136,10 @@ Refining parameters:
 - \`want\` — ${desc('want')}
 - \`raw\` — ${desc('raw')}
 
-## Bash path (no MCP client)
-
-Run the CLI, then open the produced grid JPEGs with the host's file/image
-reader:
-
-\`\`\`sh
-npx -y @agent-video/cli process video.mp4 -o out/
-\`\`\`
-
-- \`out/\` receives the grid JPEGs plus \`metadata.json\`: per-grid time
-  ranges, key frames, and subtitle text.
-- Single dense grid of a short range:
-  \`npx -y @agent-video/cli extract video.mp4 --range 01:23-01:35 -o out/\`
-- Sampling/strategy flags: \`npx -y @agent-video/cli process --help\`.
-
 ## URLs
 
 On the MCP path, pass the URL as \`source\` — download and consent are
-handled by the server. On the bash path, fetch the file yourself first
+handled by the server. On the CLI path, fetch the file yourself first
 (e.g. yt-dlp) and pass the local path.
 `
 

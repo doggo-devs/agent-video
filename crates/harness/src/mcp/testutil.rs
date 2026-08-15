@@ -12,11 +12,11 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use rmcp::model::{CallToolResult, ContentBlock};
 
-use super::core_run::{CoreExit, CoreRun, CoreRunner};
 use super::deps::{FileProber, ServerDeps, UrlFetcher, Whisper, null_notifier};
 use super::handler::handle_video_call;
 use super::tracker::Tracker;
 use crate::config::{Config, default_config, test_dirs};
+use crate::core_run::{CoreExit, CoreRun, CoreRunner};
 use crate::fault::Fault;
 use crate::fetch::{
     Attempt, CancelSignal, DownloadIo, DownloadOption, Downloaded, ProgressFn, Recipe, Shortfall,

@@ -7,7 +7,6 @@
 //! rmcp and hosts the blocking [`handler`], which executes against the
 //! injected capabilities in [`deps`] and answers in the shapes of `wire`.
 
-pub mod core_run;
 pub mod deps;
 mod download;
 pub mod handler;
