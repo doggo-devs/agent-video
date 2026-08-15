@@ -19,7 +19,8 @@ use super::wire::{CoreMetadata, evicted_rip, failed, is_url, json_result, ready_
 use crate::fault::{Fault, FaultKind};
 use crate::identity::{ContentId, fingerprint_file};
 use crate::plan::{CoreInvocation, plan_response};
-use crate::schema::{VideoArgs, VideoBody};
+use crate::schema::{TimeValue, VideoArgs, VideoBody};
+use crate::time::{ArgError, Window, resolve_window};
 use crate::transcribe;
 use agent_video_core::types::format_ts;
 
@@ -130,6 +131,8 @@ fn core_exit_kind(exit: super::core_run::CoreExit) -> FaultKind {
 /// exclusivity with `raw`/`confirm`/grid intent is already proven.
 pub(super) fn transcribe_flow(
     args: &VideoArgs,
+    from: Option<TimeValue>,
+    until: Option<TimeValue>,
     deps: &Arc<ServerDeps>,
     notify: &Notifier,
 ) -> CallToolResult {
@@ -245,7 +248,13 @@ pub(super) fn transcribe_flow(
             )));
         }
     };
-    let transcript = render_transcript(&srt);
+    // The window is resolved against the real duration, so an out-of-range
+    // slice is rejected here rather than answering with silence.
+    let window = match resolve_window(from.as_ref(), until.as_ref(), probe.duration) {
+        Ok((window, _)) => window,
+        Err(ArgError(message)) => return failed(&Fault::bad_input(message)),
+    };
+    let transcript = render_transcript(&srt, window);
     // Honesty over silence: a transcript that stops mid-video says so.
     let truncation_note = decoded_seconds
         .filter(|&a| crate::probe::materially_truncated(a, probe.duration))
@@ -292,9 +301,15 @@ fn transcript_swept() -> Fault {
 }
 
 /// Render the cached SRT as `MM:SS text` cue lines.
-fn render_transcript(srt: &str) -> String {
+/// Render the cached SRT as `MM:SS text` lines, keeping the cues that
+/// overlap `window`. Timestamps stay absolute to the source, so a slice
+/// lines up with the grids of the same range.
+fn render_transcript(srt: &str, window: Window) -> String {
     let mut out = String::new();
     for cue in agent_video_core::subtitle::parse_srt(srt) {
+        if f64::from(cue.end) < window.start() || f64::from(cue.start) > window.end() {
+            continue;
+        }
         out.push_str(&format!("{} {}\n", format_ts(cue.start), cue.text));
     }
     out.trim_end().to_string()
@@ -302,21 +317,20 @@ fn render_transcript(srt: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::mcp::testutil::{body_of, call, env, media_file, offered_tokens, probe, text_of};
+    use crate::mcp::testutil::{
+        body_of, call, confirm, env, media_file, offered_tokens, probe, text_of,
+    };
 
     /// Run the URL flow up to a cached analysis rip, then transcribe it.
     fn download_then_transcribe(env: &crate::mcp::testutil::TestEnv, url: &str) {
         let offer = body_of(&call(env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
         let token = offered_tokens(&offer).remove(0);
-        let done = body_of(&call(
-            env,
-            serde_json::json!({"source": url, "confirm": token}),
-        ));
+        let done = body_of(&confirm(env, url, &token));
         assert_eq!(done["status"], "plan", "{done}");
         let after = body_of(&call(
             env,
-            serde_json::json!({"source": url, "transcribe": true}),
+            serde_json::json!({"source": url, "want": "transcript"}),
         ));
         assert_eq!(after["status"], "transcript", "{after}");
     }
@@ -361,7 +375,7 @@ mod tests {
 
         let body = crate::mcp::testutil::body_of(&call(
             &env,
-            serde_json::json!({"source": url, "transcribe": true}),
+            serde_json::json!({"source": url, "want": "transcript"}),
         ));
         assert_eq!(body["kind"], "bad_input", "{body}");
         let error = body["error"].as_str().expect("error text");
@@ -387,10 +401,7 @@ mod tests {
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
         let token = offered_tokens(&offer).remove(0);
-        let done = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": token}),
-        ));
+        let done = body_of(&confirm(&env, url, &token));
         assert_eq!(done["status"], "plan", "{done}");
 
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -398,8 +409,12 @@ mod tests {
         *env.whisper.gate.lock().expect("whisper gate") = Some((entered_tx, release_rx));
 
         let body = std::thread::scope(|s| {
-            let transcriber =
-                s.spawn(|| call(&env, serde_json::json!({"source": url, "transcribe": true})));
+            let transcriber = s.spawn(|| {
+                call(
+                    &env,
+                    serde_json::json!({"source": url, "want": "transcript"}),
+                )
+            });
             entered_rx
                 .recv()
                 .expect("the transcription reached whisper");
@@ -456,7 +471,7 @@ mod tests {
         let file = media_file(&env, "talk.mp4");
         let after = body_of(&call(
             &env,
-            serde_json::json!({"source": file.to_string_lossy(), "transcribe": true}),
+            serde_json::json!({"source": file.to_string_lossy(), "want": "transcript"}),
         ));
         assert_eq!(after["status"], "transcript", "{after}");
         assert_eq!(
@@ -473,7 +488,7 @@ mod tests {
         let file = media_file(&env, "talk.mp4");
         let request = serde_json::json!({
             "source": file.to_string_lossy(),
-            "transcribe": true,
+            "want": "transcript",
         });
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -521,7 +536,7 @@ mod tests {
         let file = media_file(&env, "talk.mp4");
         let request = serde_json::json!({
             "source": file.to_string_lossy(),
-            "transcribe": true,
+            "want": "transcript",
         });
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -569,7 +584,7 @@ mod tests {
             let transcriber = s.spawn(|| {
                 call(
                     &env,
-                    serde_json::json!({"source": source.clone(), "transcribe": true}),
+                    serde_json::json!({"source": source.clone(), "want": "transcript"}),
                 )
             });
             entered_rx
@@ -610,7 +625,7 @@ mod tests {
             let transcriber = s.spawn(|| {
                 call(
                     &env,
-                    serde_json::json!({"source": source.clone(), "transcribe": true}),
+                    serde_json::json!({"source": source.clone(), "want": "transcript"}),
                 )
             });
             entered_rx

@@ -198,13 +198,12 @@ fn parse_language(value: &str) -> Result<String, ConfigError> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BudgetCfg {
-    /// Predicted grid count at or below which a call runs immediately.
-    pub auto_run: NonZeroU32,
-    /// Predicted grid count above which the plan degrades / needs consent.
+    /// Chunk-count ceiling: above it the run's chunks are widened so the
+    /// render stays bounded. An upper bound on grids, never a prediction —
+    /// dedup decides the real count after decode.
     pub max: NonZeroU32,
-    /// Degradation floor: max seconds one stretched grid may cover before
-    /// running the plan requires explicit consent. The third rung of the
-    /// same consent ladder as `auto_run` and `max`.
+    /// Degradation floor: max seconds one widened chunk may cover before
+    /// running the plan requires explicit consent.
     pub max_stretch_seconds: NonZeroU32,
 }
 
@@ -398,7 +397,6 @@ struct FileDownload {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileBudget {
-    auto_run: Option<u32>,
     max: Option<u32>,
     max_stretch_seconds: Option<u32>,
 }
@@ -483,7 +481,6 @@ pub fn default_config(dirs: &BaseDirs) -> Config {
             sync_wait_seconds: nz32(300),
         },
         budget: BudgetCfg {
-            auto_run: nz32(2),
             max: nz32(8),
             max_stretch_seconds: nz32(600),
         },
@@ -567,9 +564,6 @@ pub fn parse_config(text: &str, dirs: &BaseDirs) -> Result<Config, ConfigError> 
         "download.sync_wait_seconds",
     )? {
         cfg.download.sync_wait_seconds = v;
-    }
-    if let Some(v) = nz32(file.budget.auto_run, "budget.auto_run")? {
-        cfg.budget.auto_run = v;
     }
     if let Some(v) = nz32(file.budget.max, "budget.max")? {
         cfg.budget.max = v;
@@ -698,7 +692,6 @@ pub fn render_template(cfg: &Config) -> String {
         sync_wait_seconds,
     } = download;
     let BudgetCfg {
-        auto_run,
         max,
         max_stretch_seconds,
     } = budget;
@@ -880,7 +873,6 @@ pub fn render_template(cfg: &Config) -> String {
         &mut out,
         "# Predicted grid count at or below which a bare call runs immediately.",
     );
-    line(&mut out, &format!("#auto_run = {auto_run}"));
     line(
         &mut out,
         "# Predicted grid count above which the plan degrades / needs consent.",
@@ -998,7 +990,6 @@ mod tests {
             Path::new("/home/u/data-base/agent-video/models")
         );
         assert_eq!(cfg.paths.keep, Path::new("/home/u/downloads-base"));
-        assert_eq!(cfg.budget.auto_run.get(), 2);
         assert_eq!(cfg.budget.max.get(), 8);
         assert_eq!(cfg.budget.max_stretch_seconds.get(), 600);
         assert_eq!(cfg.download.max_bytes.get(), 2 * GIB);
@@ -1034,7 +1025,6 @@ mod tests {
             analysis_max_height = 3
             sync_wait_seconds = 4
             [budget]
-            auto_run = 5
             max = 6
             max_stretch_seconds = 7
             [network]
@@ -1051,7 +1041,6 @@ mod tests {
         assert_eq!(cfg.download.max_bytes.get(), 2);
         assert_eq!(cfg.download.analysis_max_height.get(), 3);
         assert_eq!(cfg.download.sync_wait_seconds.get(), 4);
-        assert_eq!(cfg.budget.auto_run.get(), 5);
         assert_eq!(cfg.budget.max.get(), 6);
         assert_eq!(cfg.budget.max_stretch_seconds.get(), 7);
         assert!(cfg.network.allow_private_hosts);

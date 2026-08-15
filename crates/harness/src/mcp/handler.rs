@@ -17,18 +17,40 @@ use super::download::{Waited, execute_download, keep_response, slot_key, wait_ou
 use super::invoke::{run_invocation, transcribe_flow};
 use super::probe_cache::{MediaMissing, ProbeError, probe_media};
 use super::wire::{
-    coerce_args, evicted_rip, failed, foreign_scheme, is_url, json_result, pending_result,
+    coerce_args, coerce_confirm_args, evicted_rip, failed, foreign_scheme, is_url, json_result,
+    pending_result,
 };
 use crate::fault::Fault;
 use crate::fetch::rip_key;
 use crate::offer::decide_url;
 use crate::plan::{Decision, PlanDecision, decide, redeem};
 use crate::schema::OfferedToken;
-use crate::schema::{Intent, RecommendedCall, VideoArgs, VideoBody};
+use crate::schema::{Intent, ProbeSummary, RecommendedCall, VideoArgs, VideoBody, Want};
 use crate::time::ArgError;
 use crate::tokens::{Dest, OfferDraft};
 
-// ── tool handler ──
+// ── tool handlers ──
+
+/// Handle one `video_confirm` call: redeem a token against the plan it was
+/// issued for.
+///
+/// Consent runs ahead of every slot poll — a keep confirm during a running
+/// analysis download starts the keep job rather than observing the analysis
+/// one. A confirm whose own download already runs converges inside
+/// `execute_download` (same slot, one writer).
+pub fn handle_confirm_call(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    deps: &Arc<ServerDeps>,
+    notify: &Notifier,
+) -> CallToolResult {
+    let (source, token) = match coerce_confirm_args(raw) {
+        Ok(pair) => pair,
+        Err(e) => return failed(&e),
+    };
+    let decision = redeem(&source, &token, &deps.tokens);
+    let args = VideoArgs::bare(&source);
+    execute_decision(&args, decision, None, Vec::new(), deps, notify)
+}
 
 /// Handle one `video` call end to end; never panics on model input, errors
 /// become `Failed` bodies.
@@ -53,23 +75,16 @@ pub fn handle_video_call(
         )));
     }
 
-    // Refine once: the exclusivity rules live in `VideoArgs::intent`, and
-    // every route below matches a mode that is valid by construction.
+    // Refine once: every route below matches a view that is valid by
+    // construction.
     match args.intent() {
         Err(ArgError(message)) => return failed(&Fault::bad_input(message)),
-        // Consent first: a confirm names its own plan, and the slot poll
-        // below must not swallow it — a keep confirm during a running
-        // analysis download starts the keep job, it does not observe the
-        // analysis one. A confirm for a plan whose own download already
-        // runs converges inside `execute_download` (same slot, one writer).
-        Ok(Intent::Confirm(_)) => {
-            let decision = redeem(&args, &deps.tokens);
-            return execute_decision(&args, decision, None, Vec::new(), deps, notify);
+        // Transcription is an explicit request, not a consent dance.
+        Ok(Intent::Transcript(window)) => {
+            let (from, until) = (window.from.cloned(), window.until.cloned());
+            return transcribe_flow(&args, from, until, deps, notify);
         }
-        // Transcription is an explicit request, not a consent dance: the
-        // argument itself is the intent.
-        Ok(Intent::Transcribe) => return transcribe_flow(&args, deps, notify),
-        Ok(Intent::Raw(_) | Intent::Grid(_)) => {}
+        Ok(Intent::Raw(_) | Intent::Grid(_) | Intent::Plan) => {}
     }
 
     // Background downloads: wait each slot so a URL never sits on Pending
@@ -144,9 +159,7 @@ fn local_flow(
         Err(ProbeError::Fault(e)) => return Ok(failed(&e)),
     };
     let mut decision = decide(args, &probe, &deps.config);
-    if let Decision::Plan(plan) = &mut decision {
-        offer_transcription(&args.source, plan, deps);
-    }
+    offer_transcription(&args.source, &probe, &mut decision, deps);
     Ok(execute_decision(
         args,
         decision,
@@ -157,15 +170,38 @@ fn local_flow(
     ))
 }
 
-/// Subtitle-less plans grow a transcribe recommendation (or an install hint).
-pub(super) fn offer_transcription(source: &str, plan: &mut PlanDecision, deps: &ServerDeps) {
+/// A subtitle-less source grows a transcription hint: a recommended call on
+/// a plan, a notice on a render — never a gate, so learning that whisper
+/// exists costs no round trip.
+pub(super) fn offer_transcription(
+    source: &str,
+    probe: &ProbeSummary,
+    decision: &mut Decision,
+    deps: &ServerDeps,
+) {
+    if !probe.subtitles.is_empty() {
+        return;
+    }
+    match decision {
+        Decision::Plan(plan) => offer_transcription_plan(source, plan, deps),
+        Decision::Run { notices, .. } if deps.whisper.available(&deps.config) => notices.push(
+            "no subtitles found for this source — call again with transcribe: true to \
+             generate a whisper transcript; it then rides along with every grid"
+                .to_string(),
+        ),
+        _ => {}
+    }
+}
+
+/// The plan-shaped delivery, for callers already holding a [`PlanDecision`].
+pub(super) fn offer_transcription_plan(source: &str, plan: &mut PlanDecision, deps: &ServerDeps) {
     if !plan.probe.subtitles.is_empty() {
         return;
     }
     if deps.whisper.available(&deps.config) {
         plan.recommended_calls.push(RecommendedCall {
             call: VideoArgs {
-                transcribe: Some(true),
+                want: Some(Want::Transcript),
                 ..VideoArgs::bare(source)
             },
             note: "no subtitles found — generate a whisper transcript; it then rides \
@@ -173,13 +209,14 @@ pub(super) fn offer_transcription(source: &str, plan: &mut PlanDecision, deps: &
                 .to_string(),
         });
     } else {
-        plan.guidance.push_str(
-            " No subtitles found and no whisper transcription available — set \
-             WHISPER_API_KEY for API transcription, or compile with a GPU feature and run \
-             `agent-video install-whisper` for local inference.",
-        );
+        plan.guidance.push_str(INSTALL_WHISPER_HINT);
     }
 }
+
+/// Told when a source has no subtitles and this installation cannot make any.
+const INSTALL_WHISPER_HINT: &str = " No subtitles found and no whisper transcription available — set \
+     WHISPER_API_KEY for API transcription, or compile with a GPU feature and run \
+     `agent-video install-whisper` for local inference.";
 
 /// First contact with a URL that has no cached rip: offer downloads.
 fn url_first_contact(
@@ -308,6 +345,7 @@ pub(super) fn resolve_media(source: &str, deps: &ServerDeps) -> Option<PathBuf> 
 mod tests {
     use super::*;
     use crate::fetch::SourceInfo;
+    use crate::mcp::download::DOWNLOAD_ABANDON_LIMIT;
     use crate::mcp::testutil::*;
     use rmcp::model::ContentBlock;
     use std::sync::Mutex;
@@ -380,10 +418,7 @@ mod tests {
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
         let token = offered_tokens(&offer).remove(0);
-        let done = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": token}),
-        ));
+        let done = body_of(&confirm(&env, url, &token));
         assert_eq!(done["status"], "plan", "{done}");
 
         let downloads = env.deps.config.paths.cache.join("downloads");
@@ -436,33 +471,38 @@ mod tests {
     }
 
     #[test]
-    fn long_video_plans_and_offers_transcription() {
+    fn bare_local_source_renders_instead_of_answering_with_a_menu() {
         let env = env(probe(3600.0, vec![]), true);
         let file = media_file(&env, "long.mp4");
         let r = call(&env, serde_json::json!({"source": file}));
-        let body = body_of(&r);
-        assert_eq!(body["status"], "plan");
-        let calls = body["recommended_calls"]
-            .as_array()
-            .expect("recommended calls");
         assert!(
-            calls.iter().any(|c| c["call"]["transcribe"] == true),
-            "{body}"
+            r.content
+                .iter()
+                .any(|c| matches!(c, ContentBlock::Image(_))),
+            "a file already on disk is decoded, not planned around: {:?}",
+            r.content
         );
     }
 
     #[test]
-    fn plan_without_whisper_hints_install() {
-        let env = env(probe(3600.0, vec![]), false);
+    fn subtitleless_render_notes_the_transcribe_option() {
+        let env = env(probe(3600.0, vec![]), true);
         let file = media_file(&env, "long.mp4");
-        let body = body_of(&call(&env, serde_json::json!({"source": file})));
+        let text = text_of(&call(&env, serde_json::json!({"source": file})));
         assert!(
-            body["guidance"]
-                .as_str()
-                .expect("guidance")
-                .contains("install-whisper"),
-            "{body}"
+            text.contains("transcribe: true"),
+            "the hint rides with the frames rather than standing in front of \
+             them: {text}"
         );
+    }
+
+    #[test]
+    fn subtitleless_plan_without_whisper_hints_install() {
+        let env = env(probe(3600.0, vec![]), false);
+        let summary = probe(3600.0, vec![]);
+        let mut plan = crate::plan::plan_response("/v.mp4", &summary, &env.deps.config);
+        offer_transcription_plan("/v.mp4", &mut plan, &env.deps);
+        assert!(plan.guidance.contains("install-whisper"), "{plan:?}");
     }
 
     #[test]
@@ -473,7 +513,7 @@ mod tests {
 
         let after = body_of(&call(
             &env,
-            serde_json::json!({"source": source, "transcribe": true}),
+            serde_json::json!({"source": source, "want": "transcript"}),
         ));
         assert_eq!(after["status"], "transcript", "{after}");
         assert_eq!(
@@ -510,12 +550,12 @@ mod tests {
 
         let first = body_of(&call(
             &env,
-            serde_json::json!({"source": source, "transcribe": true}),
+            serde_json::json!({"source": source, "want": "transcript"}),
         ));
         assert_eq!(first["status"], "transcript", "{first}");
         let again = body_of(&call(
             &env,
-            serde_json::json!({"source": source, "transcribe": true}),
+            serde_json::json!({"source": source, "want": "transcript"}),
         ));
         assert_eq!(again["status"], "transcript", "{again}");
         assert_eq!(
@@ -536,7 +576,7 @@ mod tests {
         let file = media_file(&env, "trunc.mp4");
         let body = body_of(&call(
             &env,
-            serde_json::json!({"source": file, "transcribe": true}),
+            serde_json::json!({"source": file, "want": "transcript"}),
         ));
         assert_eq!(body["status"], "transcript", "{body}");
         let guidance = body["guidance"].as_str().expect("guidance");
@@ -548,28 +588,12 @@ mod tests {
     }
 
     #[test]
-    fn transcribe_with_intent_rejects() {
-        let env = env(probe(90.0, vec![]), true);
-        let file = media_file(&env, "v.mp4");
-        let r = call(
-            &env,
-            serde_json::json!({"source": file, "transcribe": true, "look": "overview"}),
-        );
-        let body = body_of(&r);
-        assert_eq!(body["kind"], "bad_input", "{body}");
-        assert!(
-            body["error"].as_str().expect("error").contains("alone"),
-            "{body}"
-        );
-    }
-
-    #[test]
     fn transcribe_without_whisper_reports_environment() {
         let env = env(probe(90.0, vec![]), false);
         let file = media_file(&env, "v.mp4");
         let r = call(
             &env,
-            serde_json::json!({"source": file, "transcribe": true}),
+            serde_json::json!({"source": file, "want": "transcript"}),
         );
         let body = body_of(&r);
         assert_eq!(body["kind"], "environment", "{body}");
@@ -587,7 +611,7 @@ mod tests {
         let env = env(probe(90.0, vec![]), true);
         let r = call(
             &env,
-            serde_json::json!({"source": "https://example.com/v.mp4", "transcribe": true}),
+            serde_json::json!({"source": "https://example.com/v.mp4", "want": "transcript"}),
         );
         let body = body_of(&r);
         assert_eq!(body["kind"], "bad_input", "{body}");
@@ -608,17 +632,11 @@ mod tests {
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
         let token = offered_tokens(&offer).remove(0);
-        let done = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": token}),
-        ));
+        let done = body_of(&confirm(&env, url, &token));
         assert_eq!(done["status"], "plan", "{done}");
 
         // The token survives redemption; echoing it again must not refetch.
-        let again = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": token}),
-        ));
+        let again = body_of(&confirm(&env, url, &token));
         assert_eq!(again["status"], "plan", "{again}");
         assert_eq!(
             *env.fetcher.downloads.lock().expect("downloads"),
@@ -654,10 +672,7 @@ mod tests {
 
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         let token = offered_tokens(&offer).remove(0);
-        let done = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": token}),
-        ));
+        let done = body_of(&confirm(&env, url, &token));
 
         assert_eq!(
             done["status"], "plan",
@@ -697,10 +712,7 @@ mod tests {
         assert_eq!(offer["status"], "confirm_required", "{offer}");
 
         let token = offered_tokens(&offer).remove(0);
-        let done = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": token}),
-        ));
+        let done = body_of(&confirm(&env, url, &token));
         assert_eq!(done["status"], "plan", "{done}");
         let guidance = done["guidance"].as_str().expect("guidance");
         assert!(
@@ -729,10 +741,7 @@ mod tests {
             "the effect line names the tier: {offer}"
         );
 
-        let done = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": token}),
-        ));
+        let done = body_of(&confirm(&env, url, &token));
         assert_eq!(done["status"], "plan", "{done}");
         assert!(
             done["guidance"]
@@ -783,10 +792,7 @@ mod tests {
         assert_eq!(offer["status"], "confirm_required", "{offer}");
 
         let token = offered_tokens(&offer).remove(0);
-        let pending = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": token}),
-        ));
+        let pending = body_of(&confirm(&env, url, &token));
         assert_eq!(pending["status"], "pending", "{pending}");
 
         release.send(()).expect("release download");
@@ -842,10 +848,7 @@ mod tests {
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
         let token = offered_tokens(&offer).remove(0);
-        let pending = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": token}),
-        ));
+        let pending = body_of(&confirm(&env, url, &token));
         assert_eq!(pending["status"], "pending", "{pending}");
 
         // Rewind the job's progress clock past the abandonment limit — the
@@ -872,10 +875,7 @@ mod tests {
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
         let token = offered_tokens(&offer).remove(0);
-        let pending = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": token}),
-        ));
+        let pending = body_of(&confirm(&env, url, &token));
         assert_eq!(pending["status"], "pending", "{pending}");
         let cancel = env
             .fetcher
@@ -909,10 +909,7 @@ mod tests {
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
         let keep_token = offered_tokens(&offer).remove(0);
-        let pending = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": keep_token}),
-        ));
+        let pending = body_of(&confirm(&env, url, &keep_token));
         assert_eq!(pending["status"], "pending", "{pending}");
 
         env.deps.downloads.age(
@@ -965,10 +962,7 @@ mod tests {
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
         let keep_token = offered_tokens(&offer).remove(0);
-        let pending = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": keep_token}),
-        ));
+        let pending = body_of(&confirm(&env, url, &keep_token));
         assert_eq!(pending["status"], "pending", "{pending}");
 
         // Let the download finish and settle into a channel nobody polls:
@@ -1009,7 +1003,7 @@ mod tests {
     fn stale_confirm_token_rejects() {
         let env = env(probe(90.0, vec![]), false);
         let file = media_file(&env, "v.mp4");
-        let r = call(&env, serde_json::json!({"source": file, "confirm": "nope"}));
+        let r = confirm(&env, file, "nope");
         assert!(text_of(&r).contains("stale"), "{}", text_of(&r));
     }
 
@@ -1061,18 +1055,12 @@ mod tests {
         let tokens = offered_tokens(&offer);
         let (analysis_token, keep_token) = (&tokens[0], &tokens[1]);
 
-        let analysis = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": analysis_token}),
-        ));
+        let analysis = body_of(&confirm(&env, url, analysis_token));
         assert_eq!(analysis["status"], "pending", "{analysis}");
 
         // The keep confirm must start its own job — not observe the running
         // analysis download and hand its caller someone else's response.
-        let keep = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": keep_token}),
-        ));
+        let keep = body_of(&confirm(&env, url, keep_token));
         assert_eq!(keep["status"], "pending", "{keep}");
         assert_eq!(
             *env.fetcher.downloads.lock().expect("downloads"),
@@ -1106,11 +1094,7 @@ mod tests {
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
         let token = offered_tokens(&offer).remove(0);
-        let pending = body_of(&call_with_notify(
-            &env,
-            serde_json::json!({"source": url, "confirm": token}),
-            &notifier,
-        ));
+        let pending = body_of(&confirm_with_notify(&env, url, &token, &notifier));
         assert_eq!(pending["status"], "pending", "{pending}");
         let at_pending = count.load(std::sync::atomic::Ordering::SeqCst);
 
@@ -1141,10 +1125,7 @@ mod tests {
         let offer = body_of(&call(&env, serde_json::json!({"source": url})));
         assert_eq!(offer["status"], "confirm_required", "{offer}");
         let token = offered_tokens(&offer).remove(0);
-        let pending = body_of(&call(
-            &env,
-            serde_json::json!({"source": url, "confirm": token}),
-        ));
+        let pending = body_of(&confirm(&env, url, &token));
         assert_eq!(pending["status"], "pending", "{pending}");
 
         // The fake reported 1024/4096 before blocking on the gate; the

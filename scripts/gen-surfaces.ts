@@ -22,12 +22,29 @@ interface SchemaProp {
 	anyOf?: readonly unknown[]
 }
 
-const { description: VIDEO_TOOL_DESCRIPTION, inputSchema: VIDEO_INPUT_SCHEMA } = require(
-	'../surfaces/video.schema.json'
-) as {
+interface ToolSchema {
+	name: string
 	description: string
 	inputSchema: { properties: Record<string, SchemaProp>; required: readonly string[] }
 }
+
+const {
+	description: VIDEO_TOOL_DESCRIPTION,
+	inputSchema: VIDEO_INPUT_SCHEMA,
+	tools: TOOLS,
+} = require('../surfaces/video.schema.json') as {
+	description: string
+	inputSchema: { properties: Record<string, SchemaProp>; required: readonly string[] }
+	tools: readonly ToolSchema[]
+}
+
+const toolByName = (name: string): ToolSchema => {
+	const t = TOOLS.find((t) => t.name === name)
+	if (t === undefined) throw new Error(`tool ${name} disappeared from the schema`)
+	return t
+}
+
+const CONFIRM_TOOL = toolByName('video_confirm')
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const REPO_URL = 'https://github.com/durvia/agent-video'
@@ -80,7 +97,8 @@ Protocol — the response always tells you what to do next:
 2. \`"status": "plan"\` — probe summary plus \`recommended_calls\`; copy one
    argument object verbatim into the next call.
 3. \`"status": "confirm_required"\` — the action needs explicit consent.
-   ${desc('confirm')}
+   Call \`video_confirm\` with the same \`source\` and one \`token\` copied
+   from the response.
 4. \`"status": "pending"\` — a background download is running; repeat the
    same call to poll.
 5. \`"status": "failed"\` — \`error\` is model-presentable prose, \`kind\` the
@@ -96,8 +114,8 @@ Refining parameters:
 - \`until\` — ${desc('until')}
 - \`look\` — ${desc('look')}
 - \`strategy\` — ${desc('strategy')}
+- \`want\` — ${desc('want')}
 - \`raw\` — ${desc('raw')}
-- \`transcribe\` — ${desc('transcribe')}
 
 ## Bash path (no MCP client)
 
@@ -155,13 +173,16 @@ function typeboxOf(p: SchemaProp): string {
 	return `Type.String(${opts})`
 }
 
-const required: readonly string[] = VIDEO_INPUT_SCHEMA.required
-const paramLines = Object.entries(props)
-	.map(([key, p]) => {
-		const t = typeboxOf(p)
-		return `\t\t${key}: ${required.includes(key) ? t : `Type.Optional(${t})`},`
-	})
-	.join('\n')
+const paramsOf = (schema: ToolSchema['inputSchema']): string =>
+	Object.entries(schema.properties)
+		.map(([key, p]) => {
+			const t = typeboxOf(p)
+			return `\t\t${key}: ${schema.required.includes(key) ? t : `Type.Optional(${t})`},`
+		})
+		.join('\n')
+
+const paramLines = paramsOf(VIDEO_INPUT_SCHEMA)
+const confirmParamLines = paramsOf(CONFIRM_TOOL.inputSchema)
 
 const piSchemaTs = `/**
  * Schema data for the pi \`video\` tool, derived from the Rust tool schema.
@@ -178,6 +199,15 @@ export const PROMPT_SNIPPET = 'Watch a video (local path or URL) as timestamped 
 export const PARAMETERS = Type.Object(
 	{
 ${paramLines}
+	},
+	{ additionalProperties: false }
+)
+
+export const CONFIRM_TOOL_DESCRIPTION = ${JSON.stringify(CONFIRM_TOOL.description)}
+
+export const CONFIRM_PARAMETERS = Type.Object(
+	{
+${confirmParamLines}
 	},
 	{ additionalProperties: false }
 )

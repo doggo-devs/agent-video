@@ -74,9 +74,8 @@ The grid-count ladder that gates the decision engine (`crate::plan`).
 
 | Key | Type | Default | Validation | Controls |
 |-----|------|---------|-----------|----------|
-| `auto_run` | integer | `2` | must be > 0 | Predicted grid count at or below which a bare call runs immediately instead of answering with a plan. |
-| `max` | integer | `8` | must be > 0 | Predicted grid count above which the plan degrades (chunks stretched to fit) or, if even the stretch is too thin, requires explicit consent. |
-| `max_stretch_seconds` | integer | `600` | must be > 0 | Degradation floor: the most seconds one stretched grid may cover. Past it the plan is likely too thin to be useful, so running it requires explicit consent. |
+| `max` | integer | `8` | must be > 0 | Chunk-count ceiling. Above it the run's chunks are widened to fit or, if even the widened chunks are too thin, it requires explicit consent. A bound on grids, never a prediction: dedup decides the real count after decode. |
+| `max_stretch_seconds` | integer | `600` | must be > 0 | Degradation floor: the most seconds one widened chunk may cover. Past it the plan is likely too thin to be useful, so running it requires explicit consent. |
 
 ### `[network]`
 
@@ -139,7 +138,6 @@ analysis_max_height = 480
 sync_wait_seconds = 90
 
 [budget]
-auto_run = 2
 max = 8
 max_stretch_seconds = 600
 

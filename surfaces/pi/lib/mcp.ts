@@ -93,12 +93,12 @@ export function parseCallResult(value: unknown): McpCallResult {
 /** Narrow tool parameters at the host boundary. pi hands them over shaped
  * by the schema, but this module never assumes the host validated; deeper
  * argument checking stays the server's job (single source of truth). */
-export function parseArgs(params: unknown): Record<string, unknown> {
+export function parseArgs(tool: string, params: unknown): Record<string, unknown> {
 	if (!isRecord(params)) {
-		throw new Error(`video: tool parameters must be an object, got ${render(params)}`);
+		throw new Error(`${tool}: tool parameters must be an object, got ${render(params)}`);
 	}
 	if (typeof params["source"] !== "string") {
-		throw new Error(`video: "source" must be a string, got ${render(params["source"])}`);
+		throw new Error(`${tool}: "source" must be a string, got ${render(params["source"])}`);
 	}
 	return params;
 }
@@ -191,8 +191,10 @@ export class VideoServer {
 
 	constructor(private readonly spawnServer: () => McpChild) {}
 
-	/** Call the `video` tool; progress notifications stream to `onProgress`. */
+	/** Call one of the server's tools by name; progress notifications stream
+	 * to `onProgress`. */
 	async call(
+		tool: string,
 		args: Record<string, unknown>,
 		onProgress: ((message: string) => void) | undefined,
 		signal: AbortSignal | undefined,
@@ -212,7 +214,7 @@ export class VideoServer {
 				jsonrpc: "2.0",
 				id,
 				method: "tools/call",
-				params: { name: "video", arguments: args, _meta: { progressToken: id } },
+				params: { name: tool, arguments: args, _meta: { progressToken: id } },
 			});
 		});
 		// No await separates the post-handshake check from this attachment, so
@@ -371,21 +373,22 @@ export class VideoServer {
 	}
 }
 
-/** One video call, unwrapped the way pi's tool contract expects: content
+/** One tool call, unwrapped the way pi's tool contract expects: content
  * blocks on success, a thrown Error on failure — with the Failed body's
  * fault kind riding in the message so retriability reaches the model. */
 export async function runVideoCall(
 	server: VideoServer,
+	tool: string,
 	params: unknown,
 	onProgress: ((message: string) => void) | undefined,
 	signal: AbortSignal | undefined,
 ): Promise<Block[]> {
-	const result = await server.call(parseArgs(params), onProgress, signal);
+	const result = await server.call(tool, parseArgs(tool, params), onProgress, signal);
 	const content = toBlocks(result.content);
 	if (result.isError === true) {
 		// pi marks failure by throw; unwrap the Failed body so the model
 		// sees the message and the fault kind, not an envelope.
-		const text = content.find((b): b is Text => b.type === "text")?.text ?? "video call failed";
+		const text = content.find((b): b is Text => b.type === "text")?.text ?? `${tool} call failed`;
 		throw new Error(failureMessage(text));
 	}
 	return content;

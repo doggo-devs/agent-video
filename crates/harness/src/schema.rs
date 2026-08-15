@@ -10,6 +10,32 @@ use serde_json::{Value, json};
 
 use super::time::ArgError;
 
+/// Which view of the source a call asks for. The discriminant of the
+/// argument sum type: `from`/`until` window every view, `look`/`strategy`
+/// belong to [`Want::Grids`] alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Want {
+    /// Frame grids over the window.
+    #[default]
+    Grids,
+    /// The spoken text over the window, as `MM:SS text` cue lines.
+    Transcript,
+    /// Probe metadata and follow-up calls; decodes nothing.
+    Plan,
+}
+
+impl Want {
+    /// Variant count, witnessed by an exhaustive match; same drift guard as
+    /// [`Look::COUNT`].
+    const COUNT: usize = match Want::Grids {
+        Want::Grids | Want::Transcript | Want::Plan => 3,
+    };
+
+    /// Every view, in the order the schema advertises them.
+    pub const ALL: [Want; Self::COUNT] = [Want::Grids, Want::Transcript, Want::Plan];
+}
+
 /// Intent-level presets; mapped to core parameters in `look.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,15 +147,12 @@ pub struct VideoArgs {
     /// Which moments to sample; omit = lenient adaptive default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<Strategy>,
+    /// Which view to return; omit = grids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub want: Option<Want>,
     /// Expert escape hatch: verbatim core CLI arguments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
-    /// Echo of a consent token issued by a previous response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confirm: Option<String>,
-    /// `true` = generate (or reuse) a whisper transcript for the source.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transcribe: Option<bool>,
 }
 
 impl VideoArgs {
@@ -141,97 +164,93 @@ impl VideoArgs {
             until: None,
             look: None,
             strategy: None,
+            want: None,
             raw: None,
-            confirm: None,
-            transcribe: None,
         }
     }
 
-    /// Refine the loose wire struct into its one valid reading. This is the
-    /// single place the exclusivity rules of `docs/protocol.md` are
-    /// enforced (`confirm` alone, `transcribe` alone, `raw` without grid
-    /// intent); every consumer matches on the result instead of
-    /// re-checking. `transcribe: false` reads as absent. The error message
-    /// goes to the model verbatim.
+    /// Refine the loose wire struct into its one valid reading.
+    ///
+    /// `want` names the view; the window rides every view, so only `raw` —
+    /// which owns core's whole argument tail — still excludes anything. The
+    /// error message goes to the model verbatim.
     pub fn intent(&self) -> Result<Intent<'_>, ArgError> {
-        let grid = GridSpec {
+        let window = WindowSpec {
             from: self.from.as_ref(),
             until: self.until.as_ref(),
-            look: self.look,
-            strategy: self.strategy,
         };
-        let transcribe = self.transcribe == Some(true);
-        if let Some(token) = &self.confirm {
-            if self.raw.is_some() || transcribe || !grid.is_bare() {
-                return Err(ArgError(CONFIRM_ALONE.to_string()));
-            }
-            return Ok(Intent::Confirm(token));
-        }
-        if transcribe {
-            if self.raw.is_some() || !grid.is_bare() {
-                return Err(ArgError(TRANSCRIBE_ALONE.to_string()));
-            }
-            return Ok(Intent::Transcribe);
-        }
         if let Some(raw) = &self.raw {
-            if !grid.is_bare() {
+            if self.want.is_some()
+                || self.look.is_some()
+                || self.strategy.is_some()
+                || !window.is_bare()
+            {
                 return Err(ArgError(RAW_EXCLUSIVE.to_string()));
             }
             return Ok(Intent::Raw(raw));
         }
-        Ok(Intent::Grid(grid))
+        Ok(match self.want.unwrap_or_default() {
+            Want::Transcript => Intent::Transcript(window),
+            Want::Plan => Intent::Plan,
+            Want::Grids => Intent::Grid(GridSpec {
+                window,
+                look: self.look,
+                strategy: self.strategy,
+            }),
+        })
     }
 }
 
-/// Rejection for `confirm` combined with anything else; also the story
-/// [`crate::plan`] tells when a confirm reaches it out of band.
-pub const CONFIRM_ALONE: &str = "confirm must be passed alone (with source): it authorizes \
-                                 exactly the pending plan, nothing else";
+/// Rejection for `raw` combined with any other argument.
+pub const RAW_EXCLUSIVE: &str = "raw is mutually exclusive with want/from/until/look/strategy: \
+                                 raw callers own core's arguments entirely";
 
-/// Rejection for `transcribe` combined with `raw` or grid intent.
-pub const TRANSCRIBE_ALONE: &str = "transcribe must be passed alone (with source); once the transcript exists it rides along \
-     with every grid call automatically";
-
-/// Rejection for `raw` combined with grid intent.
-pub const RAW_EXCLUSIVE: &str = "raw is mutually exclusive with from/until/look/strategy: raw \
-                                 callers own the strategy entirely";
-
-/// The four mutually exclusive modes of a `video` call, refined from
-/// [`VideoArgs`] by [`VideoArgs::intent`] — a combination that mixes modes
-/// is not constructible here.
+/// The one valid reading of a `video` call, refined from [`VideoArgs`] by
+/// [`VideoArgs::intent`] — a combination that mixes views is not
+/// constructible here.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Intent<'a> {
-    /// `confirm` alone: redeem a pending consent token.
-    Confirm(&'a str),
-    /// `transcribe: true` alone: generate (or reuse) a whisper transcript.
-    Transcribe,
-    /// `raw` alone: verbatim core CLI passthrough.
-    Raw(&'a str),
-    /// The grid path; every field optional, a bare source when all are.
+    /// Frame grids over the window.
     Grid(GridSpec<'a>),
+    /// The spoken text over the window.
+    Transcript(WindowSpec<'a>),
+    /// Probe metadata only; decodes nothing.
+    Plan,
+    /// Verbatim core CLI passthrough.
+    Raw(&'a str),
 }
 
-/// The grid-path arguments of one call; all optional.
+/// The window every view shares; absent bounds mean the whole source.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct GridSpec<'a> {
+pub struct WindowSpec<'a> {
     pub from: Option<&'a TimeValue>,
     pub until: Option<&'a TimeValue>,
+}
+
+impl WindowSpec<'_> {
+    /// Whether the window is the whole source.
+    pub fn is_bare(&self) -> bool {
+        self.from.is_none() && self.until.is_none()
+    }
+}
+
+/// The grid view's arguments; all optional.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GridSpec<'a> {
+    pub window: WindowSpec<'a>,
     pub look: Option<Look>,
     pub strategy: Option<Strategy>,
 }
 
 impl GridSpec<'_> {
-    /// Whether no field carries model intent — a bare source.
+    /// Whether no field carries model intent.
     pub fn is_bare(&self) -> bool {
-        self.from.is_none()
-            && self.until.is_none()
-            && self.look.is_none()
-            && self.strategy.is_none()
+        self.window.is_bare() && self.look.is_none() && self.strategy.is_none()
     }
 }
 
 /// Single-line tool description shown in the tool list.
-pub const VIDEO_TOOL_DESCRIPTION: &str = "Watch a video (local path or URL) as VLM-readable frame grids with timestamps and subtitles, or transcribe its audio with `transcribe: true`. Call with just `source` first: short videos run immediately, everything else answers with metadata and copyable next calls.";
+pub const VIDEO_TOOL_DESCRIPTION: &str = "Watch a video (local path or URL): `want` picks the view \u{2014} grids of timestamped frames (default), the spoken transcript, or probe metadata alone. `from`/`until` window any of them. Local files render on the spot; a URL answers with download options to confirm first.";
 
 /// JSON Schema for MCP `tools/list`, kept in sync with [`VideoArgs`].
 pub fn video_input_schema() -> Value {
@@ -260,20 +279,44 @@ pub fn video_input_schema() -> Value {
                 "enum": Strategy::ALL,
                 "description": "Which moments become frames: adaptive (default: keyframes plus fill in sparse stretches, right for most footage), keyframes (cheapest scan, frames land on cuts — triage for edited footage, blind to changes inside static shots), uniform (evenly spaced in time — use when keyframes mislead: screen recordings, slides, long static takes). Orthogonal to look, which sets frame size/density."
             },
+            "want": {
+                "type": "string",
+                "enum": Want::ALL,
+                "description": "Which view to return over the window: grids (default \u{2014} frame grids you read directly), transcript (the spoken text as \"MM:SS text\" lines; whisper runs once and the result then rides along with every grid), plan (probe metadata and follow-up calls, decoding nothing). For a long video, transcript first is the cheapest way to find what is worth looking at."
+            },
             "raw": {
                 "type": "string",
-                "description": "Expert escape hatch: verbatim agent-video core CLI arguments starting with the subcommand, e.g. \"process --strategy keyframes --base-fps 0.2\". Mutually exclusive with from/until/look/strategy. Input/output plumbing is injected by the server."
-            },
-            "confirm": {
-                "type": "string",
-                "description": "Echo a consent token issued by a previous response to authorize the pending action. Tokens stay valid until a newer plan for the same source replaces them; pass confirm alone with source."
-            },
-            "transcribe": {
-                "type": "boolean",
-                "description": "Set true (alone with source) to transcribe the audio with whisper: the reply carries the transcript as timestamped lines, and it is cached to ride along with every grid afterwards. Needs local media: for a URL, download it first (bare call, then confirm), then repeat with transcribe."
+                "description": "Expert escape hatch: verbatim agent-video core CLI arguments starting with the subcommand, e.g. \"process --strategy keyframes --base-fps 0.2\". Mutually exclusive with every other argument. Input/output plumbing is injected by the server."
             }
         },
         "required": ["source"],
+        "additionalProperties": false
+    })
+}
+
+/// Single-line description of the consent tool.
+pub const CONFIRM_TOOL_DESCRIPTION: &str = "Authorize one pending action a `video` response asked for. Pass the source it concerned and one token copied from that response's `tokens`.";
+
+/// JSON Schema for the `video_confirm` tool.
+///
+/// Consent is its own tool because redeeming a token is a different act
+/// from asking for a view: the tool name carries the discriminant, so the
+/// host's tool dispatch enforces what prose in a shared argument bag only
+/// ever asked for.
+pub fn confirm_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "source": {
+                "type": "string",
+                "description": "The exact source the pending action concerned."
+            },
+            "token": {
+                "type": "string",
+                "description": "One token copied verbatim from a `confirm_required` response. Tokens stay valid until a newer plan for the same source replaces them."
+            }
+        },
+        "required": ["source", "token"],
         "additionalProperties": false
     })
 }
@@ -397,64 +440,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_confirm_combined_with_grid_intent() {
-        let args = VideoArgs {
-            confirm: Some("t".into()),
-            look: Some(Look::Overview),
-            ..VideoArgs::bare("v")
-        };
-        expect_rejection(
-            &args,
-            "confirm must be passed alone (with source): it authorizes exactly the pending \
-             plan, nothing else",
-        );
-    }
-
-    #[test]
-    fn rejects_confirm_combined_with_raw() {
-        let args = VideoArgs {
-            confirm: Some("t".into()),
-            raw: Some("process".into()),
-            ..VideoArgs::bare("v")
-        };
-        expect_rejection(&args, CONFIRM_ALONE);
-    }
-
-    #[test]
-    fn rejects_confirm_combined_with_transcribe() {
-        let args = VideoArgs {
-            confirm: Some("t".into()),
-            transcribe: Some(true),
-            ..VideoArgs::bare("v")
-        };
-        expect_rejection(&args, CONFIRM_ALONE);
-    }
-
-    #[test]
-    fn rejects_transcribe_combined_with_grid_intent() {
-        let args = VideoArgs {
-            transcribe: Some(true),
-            from: Some(TimeValue::Number(3.0)),
-            ..VideoArgs::bare("v")
-        };
-        expect_rejection(
-            &args,
-            "transcribe must be passed alone (with source); once the transcript exists it \
-             rides along with every grid call automatically",
-        );
-    }
-
-    #[test]
-    fn rejects_transcribe_combined_with_raw() {
-        let args = VideoArgs {
-            transcribe: Some(true),
-            raw: Some("process".into()),
-            ..VideoArgs::bare("v")
-        };
-        expect_rejection(&args, TRANSCRIBE_ALONE);
-    }
-
-    #[test]
     fn rejects_raw_combined_with_grid_intent() {
         let args = VideoArgs {
             raw: Some("process".into()),
@@ -463,41 +448,55 @@ mod tests {
         };
         expect_rejection(
             &args,
-            "raw is mutually exclusive with from/until/look/strategy: raw callers own the \
-             strategy entirely",
+            "raw is mutually exclusive with want/from/until/look/strategy: raw callers own \
+             core's arguments entirely",
         );
     }
 
     #[test]
-    fn refines_each_lone_mode_to_its_intent() {
-        let confirm = VideoArgs {
-            confirm: Some("tok".into()),
+    fn want_picks_the_view() {
+        let args = |want| VideoArgs {
+            want: Some(want),
             ..VideoArgs::bare("v")
         };
-        assert_eq!(confirm.intent(), Ok(Intent::Confirm("tok")));
-        let transcribe = VideoArgs {
-            transcribe: Some(true),
+        assert_eq!(args(Want::Plan).intent(), Ok(Intent::Plan));
+        assert!(matches!(
+            args(Want::Transcript).intent(),
+            Ok(Intent::Transcript(_))
+        ));
+        assert!(matches!(args(Want::Grids).intent(), Ok(Intent::Grid(_))));
+    }
+
+    #[test]
+    fn omitted_want_reads_as_grids() {
+        assert!(matches!(
+            VideoArgs::bare("v").intent(),
+            Ok(Intent::Grid(g)) if g.is_bare()
+        ));
+    }
+
+    #[test]
+    fn transcript_carries_the_window() {
+        let args = VideoArgs {
+            want: Some(Want::Transcript),
+            from: Some(TimeValue::Text("1:00".into())),
+            until: Some(TimeValue::Number(120.0)),
             ..VideoArgs::bare("v")
         };
-        assert_eq!(transcribe.intent(), Ok(Intent::Transcribe));
+        let Ok(Intent::Transcript(window)) = args.intent() else {
+            panic!("expected a transcript view, got {:?}", args.intent());
+        };
+        assert_eq!(window.from, Some(&TimeValue::Text("1:00".into())));
+        assert_eq!(window.until, Some(&TimeValue::Number(120.0)));
+    }
+
+    #[test]
+    fn raw_refines_to_a_passthrough() {
         let raw = VideoArgs {
             raw: Some("extract --range 1-2".into()),
             ..VideoArgs::bare("v")
         };
         assert_eq!(raw.intent(), Ok(Intent::Raw("extract --range 1-2")));
-    }
-
-    #[test]
-    fn reads_transcribe_false_as_absent() {
-        let args = VideoArgs {
-            transcribe: Some(false),
-            look: Some(Look::Overview),
-            ..VideoArgs::bare("v")
-        };
-        assert!(
-            matches!(args.intent(), Ok(Intent::Grid(g)) if !g.is_bare()),
-            "transcribe: false must not claim the call"
-        );
     }
 
     #[test]
@@ -550,9 +549,23 @@ mod tests {
     fn pinned_surface_schema_is_current() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../surfaces/video.schema.json");
+        // The golden copy is the whole tool set: a second tool that no
+        // surface knows about is the drift this test exists to catch.
         let expected = json!({
             "description": VIDEO_TOOL_DESCRIPTION,
             "inputSchema": video_input_schema(),
+            "tools": [
+                {
+                    "name": "video",
+                    "description": VIDEO_TOOL_DESCRIPTION,
+                    "inputSchema": video_input_schema(),
+                },
+                {
+                    "name": "video_confirm",
+                    "description": CONFIRM_TOOL_DESCRIPTION,
+                    "inputSchema": confirm_input_schema(),
+                },
+            ],
         });
         if std::env::var_os("UPDATE_SURFACES").is_some() {
             let doc = serde_json::to_string_pretty(&expected).expect("serializable");

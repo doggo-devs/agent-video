@@ -1,7 +1,7 @@
 {
   "name": "@agent-video/pi",
   "version": "0.1.0",
-  "description": "Watch a video (local path or URL) as VLM-readable frame grids with timestamps and subtitles, or transcribe its audio with `transcribe: true`. Call with just `source` first: short videos run immediately, everything else answers with metadata and copyable next calls.",
+  "description": "Watch a video (local path or URL): `want` picks the view — grids of timestamped frames (default), the spoken transcript, or probe metadata alone. `from`/`until` window any of them. Local files render on the spot; a URL answers with download options to confirm first.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

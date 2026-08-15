@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 use rmcp::model::CallToolResult;
 
 use super::deps::{Notifier, ServerDeps};
-use super::handler::offer_transcription;
+use super::handler::offer_transcription_plan;
 use super::probe_cache::cached_probe;
 use super::tracker::{Admission, Poll, Settlement};
 use super::wire::{failed, json_result, pending_result};
@@ -589,7 +589,7 @@ fn analysis_response(
         size_label(probe.size_bytes),
         next.guidance
     );
-    offer_transcription(source, &mut next, deps);
+    offer_transcription_plan(source, &mut next, deps);
     json_result(&VideoBody::Plan {
         probe: next.probe,
         guidance: next.guidance,

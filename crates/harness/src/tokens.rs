@@ -275,7 +275,6 @@ mod tests {
                 window: None,
             },
             subtitle: None,
-            predicted_grids: tag,
         })
     }
 

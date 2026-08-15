@@ -379,6 +379,26 @@ pub(crate) fn call(env: &TestEnv, args: serde_json::Value) -> CallToolResult {
     call_with_notify(env, args, &null_notifier())
 }
 
+/// Redeem a consent token through the `video_confirm` tool.
+pub(crate) fn confirm(env: &TestEnv, source: impl AsRef<Path>, token: &str) -> CallToolResult {
+    confirm_with_notify(env, source, token, &null_notifier())
+}
+
+pub(crate) fn confirm_with_notify(
+    env: &TestEnv,
+    source: impl AsRef<Path>,
+    token: &str,
+    notify: &super::deps::Notifier,
+) -> CallToolResult {
+    let serde_json::Value::Object(map) = serde_json::json!({
+        "source": source.as_ref().to_string_lossy(),
+        "token": token,
+    }) else {
+        unreachable!("json! of an object literal is an object");
+    };
+    super::handler::handle_confirm_call(&map, &env.deps, notify)
+}
+
 /// Drive one call with a caller-owned notifier, for tests pinning who may
 /// send progress notifications (and when).
 pub(crate) fn call_with_notify(

@@ -12,7 +12,7 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use super::download::Pace;
 use crate::fault::Fault;
 use crate::plan::format_bytes;
-use crate::schema::{Look, Strategy, TimeValue, VideoArgs, VideoBody, wire_names};
+use crate::schema::{Look, Strategy, TimeValue, VideoArgs, VideoBody, Want, wire_names};
 use agent_video_core::types::{GridImage, format_ts};
 use agent_video_core::wire::Coverage;
 
@@ -28,20 +28,23 @@ pub(super) use agent_video_core::wire::Metadata as CoreMetadata;
 fn valid_arg_names() -> &'static [String] {
     use std::sync::OnceLock;
     static NAMES: OnceLock<Vec<String>> = OnceLock::new();
-    NAMES.get_or_init(|| {
-        crate::schema::video_input_schema()["properties"]
-            .as_object()
-            .expect("video_input_schema properties is an object by construction")
-            .keys()
-            .cloned()
-            .collect()
-    })
+    NAMES.get_or_init(|| property_names(&crate::schema::video_input_schema()))
 }
 
-pub(super) fn coerce_args(
+fn property_names(schema: &serde_json::Value) -> Vec<String> {
+    schema["properties"]
+        .as_object()
+        .expect("input schemas carry an object of properties by construction")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// Reject any key the published schema does not advertise.
+fn reject_unknown(
     raw: &serde_json::Map<String, serde_json::Value>,
-) -> Result<VideoArgs, Fault> {
-    let valid = valid_arg_names();
+    valid: &[String],
+) -> Result<(), Fault> {
     for key in raw.keys() {
         if !valid.iter().any(|name| name == key) {
             return Err(Fault::bad_input(format!(
@@ -50,14 +53,40 @@ pub(super) fn coerce_args(
             )));
         }
     }
-    let source = match raw.get("source") {
-        Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
-        _ => {
-            return Err(Fault::bad_input(
-                r#"source must be a non-empty string, e.g. {"source": "/videos/talk.mp4"}"#,
-            ));
-        }
-    };
+    Ok(())
+}
+
+/// A non-empty string argument, or a `bad_input` naming the example form.
+fn required_string(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    example: &str,
+) -> Result<String, Fault> {
+    match raw.get(key) {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(s.clone()),
+        _ => Err(Fault::bad_input(format!(
+            "{key} must be a non-empty string, e.g. {example}"
+        ))),
+    }
+}
+
+/// Coerce `video_confirm` arguments into the source and token it names.
+pub(super) fn coerce_confirm_args(
+    raw: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(String, String), Fault> {
+    let valid = property_names(&crate::schema::confirm_input_schema());
+    reject_unknown(raw, &valid)?;
+    let source = required_string(raw, "source", r#"{"source": "/videos/talk.mp4"}"#)?;
+    let token = required_string(raw, "token", r#"{"token": "t1"}"#)?;
+    Ok((source, token))
+}
+
+pub(super) fn coerce_args(
+    raw: &serde_json::Map<String, serde_json::Value>,
+) -> Result<VideoArgs, Fault> {
+    let valid = valid_arg_names();
+    reject_unknown(raw, valid)?;
+    let source = required_string(raw, "source", r#"{"source": "/videos/talk.mp4"}"#)?;
     let time = |key: &str, example: &str| -> Result<Option<TimeValue>, Fault> {
         match raw.get(key) {
             None => Ok(None),
@@ -98,32 +127,27 @@ pub(super) fn coerce_args(
             Some(_) => Err(Fault::bad_input(message)),
         }
     };
+    let want = match raw.get("want") {
+        None => None,
+        Some(v) => Some(serde_json::from_value::<Want>(v.clone()).map_err(|_| {
+            Fault::bad_input(format!(
+                r#"want must be one of {}, e.g. {{"want": "transcript"}}"#,
+                wire_names(&Want::ALL).join(", ")
+            ))
+        })?),
+    };
     let raw_arg = string(
         "raw",
         r#"raw must be a string of core CLI arguments, e.g. {"raw": "process --strategy keyframes"}"#,
     )?;
-    let confirm = string(
-        "confirm",
-        "confirm must be a string token echoed from a previous response",
-    )?;
-    let transcribe = match raw.get("transcribe") {
-        None => None,
-        Some(serde_json::Value::Bool(b)) => Some(*b),
-        Some(_) => {
-            return Err(Fault::bad_input(
-                r#"transcribe must be a boolean, e.g. {"transcribe": true}"#,
-            ));
-        }
-    };
     Ok(VideoArgs {
         source,
         from,
         until,
         look,
         strategy,
+        want,
         raw: raw_arg,
-        confirm,
-        transcribe,
     })
 }
 

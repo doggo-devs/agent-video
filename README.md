@@ -8,7 +8,7 @@ Instead of feeding a model one frame at a time, agent-video samples frames,
 drops blurry and near-duplicate ones, scores the rest, and packs them into grid
 images sized to a single pixel budget — key frames get larger cells so
 important moments keep their detail. The harness adds a policy layer: a budget
-ladder that plans before it decodes, consent tokens for expensive actions, URL
+ladder that bounds what a render emits, consent tokens for expensive actions, URL
 sources (direct links and yt-dlp), a shared disk cache, and whisper
 transcription that rides along with every grid.
 

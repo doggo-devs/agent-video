@@ -18,10 +18,12 @@ use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler};
 
 use super::deps::{Notifier, ServerDeps, null_notifier};
-use super::handler::handle_video_call;
+use super::handler::{handle_confirm_call, handle_video_call};
 use super::wire::failed;
 use crate::config::{BaseDirs, load_config};
-use crate::schema::{VIDEO_TOOL_DESCRIPTION, video_input_schema};
+use crate::schema::{
+    CONFIRM_TOOL_DESCRIPTION, VIDEO_TOOL_DESCRIPTION, confirm_input_schema, video_input_schema,
+};
 
 /// The MCP server: one `video` tool over injected deps.
 pub struct VideoServer {
@@ -51,14 +53,14 @@ impl ServerHandler for VideoServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let serde_json::Value::Object(schema) = video_input_schema() else {
-            unreachable!("video_input_schema is an object by construction");
-        };
-        Ok(ListToolsResult::with_all_items(vec![Tool::new(
-            "video",
-            VIDEO_TOOL_DESCRIPTION,
-            schema,
-        )]))
+        Ok(ListToolsResult::with_all_items(vec![
+            tool("video", VIDEO_TOOL_DESCRIPTION, video_input_schema()),
+            tool(
+                "video_confirm",
+                CONFIRM_TOOL_DESCRIPTION,
+                confirm_input_schema(),
+            ),
+        ]))
     }
 
     async fn call_tool(
@@ -66,12 +68,16 @@ impl ServerHandler for VideoServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        if request.name.as_ref() != "video" {
-            return Ok(failed(&crate::fault::Fault::bad_input(format!(
-                "unknown tool \"{}\"; only \"video\" exists",
-                request.name
-            ))));
-        }
+        let handler: Handler = match request.name.as_ref() {
+            "video" => handle_video_call,
+            "video_confirm" => handle_confirm_call,
+            other => {
+                return Ok(failed(&crate::fault::Fault::bad_input(format!(
+                    "unknown tool \"{other}\"; this server exposes \"video\" and \
+                     \"video_confirm\""
+                ))));
+            }
+        };
         let args = request.arguments.unwrap_or_default();
 
         // Progress is best-effort; a dead transport must not kill the call.
@@ -99,10 +105,23 @@ impl ServerHandler for VideoServer {
         };
 
         let deps = Arc::clone(&self.deps);
-        tokio::task::spawn_blocking(move || handle_video_call(&args, &deps, &notify))
+        tokio::task::spawn_blocking(move || handler(&args, &deps, &notify))
             .await
             .map_err(|e| McpError::internal_error(format!("handler task failed: {e}"), None))
     }
+}
+
+/// One tool's entry point. Both tools share the shape, so dispatch picks a
+/// function rather than branching through the call path twice.
+type Handler =
+    fn(&serde_json::Map<String, serde_json::Value>, &Arc<ServerDeps>, &Notifier) -> CallToolResult;
+
+/// Build one advertised tool from its published schema.
+fn tool(name: &'static str, description: &'static str, schema: serde_json::Value) -> Tool {
+    let serde_json::Value::Object(schema) = schema else {
+        unreachable!("input schemas are objects by construction");
+    };
+    Tool::new(name, description, schema)
 }
 
 /// Boot the stdio MCP server with production deps; blocks until the client

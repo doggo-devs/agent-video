@@ -1,12 +1,8 @@
 {
-  "description": "Watch a video (local path or URL) as VLM-readable frame grids with timestamps and subtitles, or transcribe its audio with `transcribe: true`. Call with just `source` first: short videos run immediately, everything else answers with metadata and copyable next calls.",
+  "description": "Watch a video (local path or URL): `want` picks the view — grids of timestamped frames (default), the spoken transcript, or probe metadata alone. `from`/`until` window any of them. Local files render on the spot; a URL answers with download options to confirm first.",
   "inputSchema": {
     "additionalProperties": false,
     "properties": {
-      "confirm": {
-        "description": "Echo a consent token issued by a previous response to authorize the pending action. Tokens stay valid until a newer plan for the same source replaces them; pass confirm alone with source.",
-        "type": "string"
-      },
       "from": {
         "anyOf": [
           {
@@ -29,7 +25,7 @@
         "type": "string"
       },
       "raw": {
-        "description": "Expert escape hatch: verbatim agent-video core CLI arguments starting with the subcommand, e.g. \"process --strategy keyframes --base-fps 0.2\". Mutually exclusive with from/until/look/strategy. Input/output plumbing is injected by the server.",
+        "description": "Expert escape hatch: verbatim agent-video core CLI arguments starting with the subcommand, e.g. \"process --strategy keyframes --base-fps 0.2\". Mutually exclusive with every other argument. Input/output plumbing is injected by the server.",
         "type": "string"
       },
       "source": {
@@ -45,10 +41,6 @@
         ],
         "type": "string"
       },
-      "transcribe": {
-        "description": "Set true (alone with source) to transcribe the audio with whisper: the reply carries the transcript as timestamped lines, and it is cached to ride along with every grid afterwards. Needs local media: for a URL, download it first (bare call, then confirm), then repeat with transcribe.",
-        "type": "boolean"
-      },
       "until": {
         "anyOf": [
           {
@@ -59,11 +51,115 @@
           }
         ],
         "description": "Window end, same formats. Omit to go to the end of the video."
+      },
+      "want": {
+        "description": "Which view to return over the window: grids (default — frame grids you read directly), transcript (the spoken text as \"MM:SS text\" lines; whisper runs once and the result then rides along with every grid), plan (probe metadata and follow-up calls, decoding nothing). For a long video, transcript first is the cheapest way to find what is worth looking at.",
+        "enum": [
+          "grids",
+          "transcript",
+          "plan"
+        ],
+        "type": "string"
       }
     },
     "required": [
       "source"
     ],
     "type": "object"
-  }
+  },
+  "tools": [
+    {
+      "description": "Watch a video (local path or URL): `want` picks the view — grids of timestamped frames (default), the spoken transcript, or probe metadata alone. `from`/`until` window any of them. Local files render on the spot; a URL answers with download options to confirm first.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "description": "Window start: seconds (83) or timestamp (\"1:23\", \"1:02:03\"). Omit to start from the beginning."
+          },
+          "look": {
+            "description": "How to look: overview (fast triage), detailed (miss nothing), read_text (few large frames to read on-screen text/UI), track_motion (dense small frames for fast action). Subtitle text always rides along in metadata regardless; this only affects frame size/density. Omit for a balanced default.",
+            "enum": [
+              "overview",
+              "detailed",
+              "read_text",
+              "track_motion"
+            ],
+            "type": "string"
+          },
+          "raw": {
+            "description": "Expert escape hatch: verbatim agent-video core CLI arguments starting with the subcommand, e.g. \"process --strategy keyframes --base-fps 0.2\". Mutually exclusive with every other argument. Input/output plumbing is injected by the server.",
+            "type": "string"
+          },
+          "source": {
+            "description": "Local video file path or URL. Call with only `source` first; the response tells you what to do next.",
+            "type": "string"
+          },
+          "strategy": {
+            "description": "Which moments become frames: adaptive (default: keyframes plus fill in sparse stretches, right for most footage), keyframes (cheapest scan, frames land on cuts — triage for edited footage, blind to changes inside static shots), uniform (evenly spaced in time — use when keyframes mislead: screen recordings, slides, long static takes). Orthogonal to look, which sets frame size/density.",
+            "enum": [
+              "adaptive",
+              "keyframes",
+              "uniform"
+            ],
+            "type": "string"
+          },
+          "until": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "description": "Window end, same formats. Omit to go to the end of the video."
+          },
+          "want": {
+            "description": "Which view to return over the window: grids (default — frame grids you read directly), transcript (the spoken text as \"MM:SS text\" lines; whisper runs once and the result then rides along with every grid), plan (probe metadata and follow-up calls, decoding nothing). For a long video, transcript first is the cheapest way to find what is worth looking at.",
+            "enum": [
+              "grids",
+              "transcript",
+              "plan"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "type": "object"
+      },
+      "name": "video"
+    },
+    {
+      "description": "Authorize one pending action a `video` response asked for. Pass the source it concerned and one token copied from that response's `tokens`.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "description": "The exact source the pending action concerned.",
+            "type": "string"
+          },
+          "token": {
+            "description": "One token copied verbatim from a `confirm_required` response. Tokens stay valid until a newer plan for the same source replaces them.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "token"
+        ],
+        "type": "object"
+      },
+      "name": "video_confirm"
+    }
+  ]
 }
