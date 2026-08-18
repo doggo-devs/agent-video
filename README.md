@@ -130,6 +130,13 @@ provisions SenseVoice (~240 MB) and recognition runs locally on the CPU:
 no GPU, no network, no key. It is the cheap tier, not the equal one — it
 covers zh/en/ja/ko/yue only, and trails the endpoint slightly on accuracy.
 
+**The fully-static builds have no local tier** — that is every `-static`
+release tarball and the Linux npm packages, which have no `install-asr` and
+transcribe through the API only. The recognizer links a prebuilt
+onnxruntime that crashes under musl, and a self-contained single file is
+what those builds are for. Use a dynamic build if you want local
+recognition.
+
 For login-gated sources, manage cookies with `agent-video cookie import`,
 `cookie status`, and `cookie clear`.
 

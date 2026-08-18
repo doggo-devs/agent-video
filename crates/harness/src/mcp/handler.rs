@@ -209,14 +209,19 @@ pub(super) fn offer_transcription_plan(source: &str, plan: &mut PlanDecision, de
                 .to_string(),
         });
     } else {
-        plan.guidance.push_str(INSTALL_WHISPER_HINT);
+        plan.guidance.push_str(&install_hint());
     }
 }
 
-/// Told when a source has no subtitles and this installation cannot make any.
-const INSTALL_WHISPER_HINT: &str = " No subtitles found and no transcription available — set \
-     WHISPER_API_KEY for API transcription, or run `agent-video install-asr` for local \
-     recognition.";
+/// Told when a source has no subtitles and this installation cannot make
+/// any. The remedy comes from `transcribe`, which knows which tiers this
+/// build carries.
+fn install_hint() -> String {
+    format!(
+        " No subtitles found and no transcription available — {}.",
+        crate::transcribe::unavailable_hint()
+    )
+}
 
 /// First contact with a URL that has no cached rip: offer downloads.
 fn url_first_contact(
@@ -502,7 +507,13 @@ mod tests {
         let summary = probe(3600.0, vec![]);
         let mut plan = crate::plan::plan_response("/v.mp4", &summary, &env.deps.config);
         offer_transcription_plan("/v.mp4", &mut plan, &env.deps);
-        assert!(plan.guidance.contains("install-asr"), "{plan:?}");
+        // The remedy is whatever this build can honour, quoted from the
+        // one place that knows.
+        assert!(
+            plan.guidance
+                .contains(crate::transcribe::unavailable_hint()),
+            "{plan:?}"
+        );
     }
 
     #[test]
@@ -601,7 +612,7 @@ mod tests {
             body["error"]
                 .as_str()
                 .expect("error")
-                .contains("install-asr"),
+                .contains(crate::transcribe::unavailable_hint()),
             "{body}"
         );
     }

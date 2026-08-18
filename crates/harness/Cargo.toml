@@ -10,6 +10,18 @@ readme = "../README.md"
 [lints]
 workspace = true
 
+[features]
+default = ["local-asr"]
+# Local CPU recognition via sherpa-onnx. On by default; a build without it
+# transcribes only through the API route.
+#
+# It exists because the prebuilt onnxruntime this links is incompatible with
+# musl: a static musl binary segfaults inside musl's allocator while loading
+# any model, in a plain C program with no Rust involved. That is upstream's
+# constraint, not ours, so the fully-static variant drops the local tier
+# rather than pretending to carry it.
+local-asr = ["dep:sherpa-onnx"]
+
 [dependencies]
 agent-video-core = { path = "../core" }
 serde = { workspace = true }
@@ -22,7 +34,7 @@ ureq = "3"
 # Statically linked by default: the build script fetches a prebuilt
 # `-static-lib` archive, so no onnxruntime is required on the host and the
 # binary carries no new dynamic dependency.
-sherpa-onnx = "1.13.4"
+sherpa-onnx = { version = "1.13.5", optional = true }
 rmcp = { version = "2", default-features = false, features = [
     "server",
     "transport-io",

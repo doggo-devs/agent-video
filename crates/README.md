@@ -50,6 +50,16 @@ The static binary has **no hardware acceleration** — FFmpeg is configured with
 runtime). This is the right trade-off for a portable binary; use the dynamic
 build if you need the host's hardware decoders.
 
+The static binary also has **no local recognizer**: `build-static.sh` passes
+`--no-default-features`, dropping `local-asr`, so there is no `install-asr`
+subcommand and transcription needs `WHISPER_API_KEY`. The recognizer links a
+prebuilt onnxruntime built against glibc, and under musl it segfaults inside
+musl's allocator while loading a model — reproducible in a plain C program
+with no Rust involved, so the constraint is upstream's. Fixing it means
+building onnxruntime itself against musl. Dynamic builds carry the local
+tier; `cargo build --no-default-features` reproduces the API-only shape
+anywhere.
+
 `.cargo/config.toml` targets `x86-64-v3` (AVX2, ~all x86-64 CPUs since 2015).
 When distributing to older hardware, override with
 `RUSTFLAGS="-C target-cpu=x86-64"` and set `FFMPEG_TARGET_CPU=x86-64` so the

@@ -16,6 +16,9 @@ pub mod fault;
 pub mod fetch;
 pub mod gate;
 pub mod identity;
+/// Weight provisioning: only a build that can run local recognition has
+/// anything to provision.
+#[cfg(feature = "local-asr")]
 pub mod install;
 pub mod look;
 pub mod mcp;

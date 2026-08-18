@@ -213,6 +213,7 @@ enum Command {
     /// Download the local recognizer's weights (SenseVoice + tokens +
     /// Silero VAD) into the models directory, sha256-verified. Never runs
     /// implicitly.
+    #[cfg(feature = "local-asr")]
     InstallAsr,
     /// Manage the cookie jar used for login-gated sites (yt-dlp sources).
     Cookie {
@@ -444,6 +445,7 @@ fn exit_code_of(e: &anyhow::Error) -> u8 {
     if let Some(err) = e.downcast_ref::<harness::config::ConfigError>() {
         return err.exit_code();
     }
+    #[cfg(feature = "local-asr")]
     if let Some(err) = e.downcast_ref::<harness::install::InstallError>() {
         return err.exit_code();
     }
@@ -588,6 +590,7 @@ fn run() -> anyhow::Result<()> {
         } => run_transcript(&source, from, until),
         Command::Probe { source } => run_probe(&source),
         Command::Mcp => harness::mcp::server::serve_stdio(),
+        #[cfg(feature = "local-asr")]
         Command::InstallAsr => {
             let dirs = harness::config::BaseDirs::detect();
             let cfg = harness::config::load_config(&dirs)?;
@@ -742,8 +745,8 @@ fn run_transcript(source: &str, from: Option<String>, until: Option<String>) -> 
 
     if !harness::transcribe::available(&cfg) {
         anyhow::bail!(
-            "no transcription available — set WHISPER_API_KEY for API transcription, \
-             or run `agent-video install-asr` for local recognition"
+            "no transcription available — {}",
+            harness::transcribe::unavailable_hint()
         );
     }
     let cache = harness::cache::Cache::new(&cfg.paths.cache, cfg.cache.max_bytes);

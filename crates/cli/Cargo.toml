@@ -17,11 +17,13 @@ path = "src/main.rs"
 [features]
 # Pass-throughs so one `-p agent-video --features …` invocation configures
 # the whole binary; the member crates own the actual wiring.
+default = ["local-asr"]
 static-ffmpeg = ["agent-video-core/static-ffmpeg"]
+local-asr = ["agent-video-harness/local-asr"]
 
 [dependencies]
 agent-video-core = { path = "../core", features = ["clap"] }
-agent-video-harness = { path = "../harness" }
+agent-video-harness = { path = "../harness", default-features = false }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }

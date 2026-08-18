@@ -190,6 +190,30 @@ not what a subtitle track is made of.
   upstream as HF weights and community GGUF, both on the rejected llama.cpp
   path.
 
+## The musl wall
+
+The local tier does not ship in the fully-static builds. sherpa links a
+prebuilt onnxruntime compiled against glibc, and under musl it segfaults
+inside musl's `__libc_free` while creating a recognizer — mallocng handed a
+pointer it never allocated.
+
+What was ruled out, each by measurement rather than reasoning:
+
+- **Not our linking, and not Rust.** A plain C program against the same static
+  libs crashes identically.
+- **Not TLS or PIE.** A non-PIE fully static binary crashes the same way.
+- **Not the thread stack** (musl gives 128 KiB where glibc gives 8 MiB, the
+  usual suspect). `PT_GNU_STACK` was confirmed raised to 8 MiB; no change.
+- **Not sherpa's own code.** Rebuilding sherpa from source against musl works
+  and takes 53 s — onnxruntime stays prebuilt because it references no
+  glibc-only symbol. The crash survives that rebuild.
+- **Not glibc-static.** The same C program, statically linked against glibc,
+  returns a working recognizer.
+
+So the wall is onnxruntime's, and getting through it means building
+onnxruntime itself against musl. Until someone does, `local-asr` is a default
+feature that `build-static.sh` turns off.
+
 ## Supply chain note
 
 `sherpa-onnx-sys` downloads prebuilt static libraries from GitHub releases at

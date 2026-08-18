@@ -24,12 +24,16 @@
 mod api;
 mod multipart;
 mod prompt;
+#[cfg(feature = "local-asr")]
 mod sense;
 mod wav;
 
 pub use prompt::{PROMPT_MAX_BYTES, effective_prompt};
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "local-asr")]
+use std::path::PathBuf;
+#[cfg(feature = "local-asr")]
 use std::time::Instant;
 
 use super::config::Config;
@@ -38,6 +42,7 @@ use crate::fault::Fault;
 use crate::identity::ContentId;
 use crate::time::Window;
 use agent_video_core::media::Stop;
+#[cfg(feature = "local-asr")]
 use agent_video_core::media::audio::AudioCeiling;
 use agent_video_core::media::audio::{AudioSamples, WHISPER_SAMPLE_RATE};
 use agent_video_core::source::Source;
@@ -47,50 +52,64 @@ use agent_video_core::types::format_ts;
 // ── local weights ──
 
 /// Pinned filenames under `paths.models`, provisioned by `install-asr`.
-/// The recognizer's date suffix is part of the name: a re-export of the
-/// same architecture is a different model, and must not answer for the
-/// old one's cached transcripts.
-pub const SENSE_MODEL_FILENAME: &str = "sense-voice-2024-07-17.int8.onnx";
-pub const SENSE_TOKENS_FILENAME: &str = "sense-voice-2024-07-17.tokens.txt";
-pub const VAD_FILENAME: &str = "silero_vad.onnx";
+///
+/// Everything in this section is the local tier's, and exists only where
+/// that tier does.
+#[cfg(feature = "local-asr")]
+mod names {
+    use super::{Config, PathBuf};
 
-/// Where the local recognizer's weights, its token table, and the VAD
-/// model must live for the local route to resolve.
-pub fn sense_model_path(cfg: &Config) -> PathBuf {
-    cfg.paths.models.join(SENSE_MODEL_FILENAME)
+    /// Pinned filenames under `paths.models`, provisioned by `install-asr`.
+    /// The recognizer's date suffix is part of the name: a re-export of the
+    /// same architecture is a different model, and must not answer for the
+    /// old one's cached transcripts.
+    pub const SENSE_MODEL_FILENAME: &str = "sense-voice-2024-07-17.int8.onnx";
+    pub const SENSE_TOKENS_FILENAME: &str = "sense-voice-2024-07-17.tokens.txt";
+    pub const VAD_FILENAME: &str = "silero_vad.onnx";
+
+    /// Where the local recognizer's weights, its token table, and the VAD
+    /// model must live for the local route to resolve.
+    pub fn sense_model_path(cfg: &Config) -> PathBuf {
+        cfg.paths.models.join(SENSE_MODEL_FILENAME)
+    }
+
+    pub fn sense_tokens_path(cfg: &Config) -> PathBuf {
+        cfg.paths.models.join(SENSE_TOKENS_FILENAME)
+    }
+
+    pub fn vad_model_path(cfg: &Config) -> PathBuf {
+        cfg.paths.models.join(VAD_FILENAME)
+    }
+
+    /// Cache identity of the local recognizer. A different export of the
+    /// same architecture is a different engine, so the pinned date rides in
+    /// the key.
+    pub const SENSE_CACHE_ID: &str = "sense-voice-2024-07-17";
+
+    /// The install hint shown when local weights are missing.
+    pub fn install_hint(cfg: &Config) -> String {
+        format!(
+            "no local recognizer under {} — run `agent-video install-asr` to provision it",
+            cfg.paths.models.display()
+        )
+    }
 }
 
-pub fn sense_tokens_path(cfg: &Config) -> PathBuf {
-    cfg.paths.models.join(SENSE_TOKENS_FILENAME)
-}
-
-pub fn vad_model_path(cfg: &Config) -> PathBuf {
-    cfg.paths.models.join(VAD_FILENAME)
-}
-
-/// Cache identity of the local recognizer. A different export of the
-/// same architecture is a different engine, so the pinned date rides in
-/// the key.
-const SENSE_CACHE_ID: &str = "sense-voice-2024-07-17";
-
-/// The install hint shown when local weights are missing.
-pub fn install_hint(cfg: &Config) -> String {
-    format!(
-        "no local recognizer under {} — run `agent-video install-asr` to provision it",
-        cfg.paths.models.display()
-    )
-}
+#[cfg(feature = "local-asr")]
+pub use names::*;
 
 // ── route ──
 
 /// A resolved transcription route: which engine will run, carrying
 /// everything its path needs. Resolution happens once, up front —
-/// downstream code never re-derives availability.
+/// downstream code never re-derives availability. In builds without
+/// `local-asr` the local route is unrepresentable.
 #[derive(Debug)]
 pub enum Route {
     /// OpenAI-compatible transcription endpoint.
     Api { key: String, url: String },
     /// In-process SenseVoice on the CPU.
+    #[cfg(feature = "local-asr")]
     Sense(sense::Weights),
 }
 
@@ -99,9 +118,8 @@ impl Route {
     ///
     /// A configured key wins: the endpoint is the accurate, wide-language
     /// tier, and an operator who set a key asked for it. Local
-    /// recognition is what answers without one — provisioned weights, no
-    /// device to probe and no build variant to match, so "installed" is
-    /// the whole condition.
+    /// recognition is what answers without one — provisioned weights and
+    /// no device to probe, so "installed" is the whole condition.
     pub fn resolve(cfg: &Config) -> Result<Route, Fault> {
         if let Some(key) = cfg.whisper.api_key.clone() {
             return Ok(Route::Api {
@@ -109,22 +127,23 @@ impl Route {
                 url: cfg.whisper.api_url.clone(),
             });
         }
-        let weights = sense::Weights {
-            model: sense_model_path(cfg),
-            tokens: sense_tokens_path(cfg),
-            vad: vad_model_path(cfg),
-        };
-        if [&weights.model, &weights.tokens, &weights.vad]
-            .iter()
-            .all(|p| p.is_file())
+        #[cfg(feature = "local-asr")]
         {
-            return Ok(Route::Sense(weights));
+            let weights = sense::Weights {
+                model: sense_model_path(cfg),
+                tokens: sense_tokens_path(cfg),
+                vad: vad_model_path(cfg),
+            };
+            if [&weights.model, &weights.tokens, &weights.vad]
+                .iter()
+                .all(|p| p.is_file())
+            {
+                return Ok(Route::Sense(weights));
+            }
         }
         Err(Fault::environment(format!(
-            "no transcription path available — set WHISPER_API_KEY (or whisper.api_key in \
-             config.toml) for API transcription, or run `agent-video install-asr` for local \
-             recognition ({})",
-            install_hint(cfg)
+            "no transcription path available — {}",
+            unavailable_hint()
         )))
     }
 
@@ -135,6 +154,7 @@ impl Route {
     pub fn cache_id(&self) -> String {
         match self {
             Route::Api { .. } => api_cache_id(),
+            #[cfg(feature = "local-asr")]
             Route::Sense(_) => SENSE_CACHE_ID.to_string(),
         }
     }
@@ -145,6 +165,7 @@ impl Route {
     fn takes_prompt(&self) -> bool {
         match self {
             Route::Api { .. } => true,
+            #[cfg(feature = "local-asr")]
             Route::Sense(_) => false,
         }
     }
@@ -154,6 +175,23 @@ impl Route {
 /// a transcript written before the key was removed stays findable.
 fn api_cache_id() -> String {
     format!("api-{}", api::API_MODEL)
+}
+
+/// What to do about a host that cannot transcribe, worded for the tiers
+/// this build actually carries. Every surface that has to say it reads it
+/// from here: a build with no local recognizer must not send anyone to
+/// `install-asr`.
+pub fn unavailable_hint() -> &'static str {
+    #[cfg(feature = "local-asr")]
+    {
+        "set WHISPER_API_KEY (or whisper.api_key in config.toml) for API transcription, or run \
+         `agent-video install-asr` for local recognition"
+    }
+    #[cfg(not(feature = "local-asr"))]
+    {
+        "set WHISPER_API_KEY (or whisper.api_key in config.toml) for API transcription; this \
+         build carries no local recognizer"
+    }
 }
 
 /// Whether any transcription route is available.
@@ -229,6 +267,7 @@ pub fn transcript_id(cfg: &Config, prompt: &str) -> String {
 /// lives here; the 24-hour hard cap lives in core's [`AudioCeiling`]
 /// constructor. A track past this ceiling fails as too-long input rather
 /// than transcribing a silent prefix as if it were the whole file.
+#[cfg(feature = "local-asr")]
 const MAX_LOCAL_AUDIO_SECONDS: u32 = 4 * 3600;
 
 // ── cue type ──
@@ -283,6 +322,7 @@ pub fn transcribe(
     };
 
     let (cues, sample_count) = match route {
+        #[cfg(feature = "local-asr")]
         Route::Sense(weights) => {
             // The local route decodes whole (VAD wants random access),
             // bounded by the harness's materialization ceiling.
@@ -446,10 +486,12 @@ mod tests {
                 assert_eq!(key, "sk-test");
                 assert_eq!(url, cfg.whisper.api_url);
             }
+            #[cfg(feature = "local-asr")]
             other => panic!("expected the API route, got {other:?}"),
         }
     }
 
+    #[cfg(feature = "local-asr")]
     #[test]
     fn local_weights_answer_without_a_key() {
         let dir = crate::tempdir::TempDir::new("route-sense");
@@ -465,6 +507,7 @@ mod tests {
         assert_eq!(transcript_id(&cfg, ""), SENSE_CACHE_ID);
     }
 
+    #[cfg(feature = "local-asr")]
     #[test]
     fn a_configured_key_outranks_installed_weights() {
         let dir = crate::tempdir::TempDir::new("route-both");
@@ -480,6 +523,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "local-asr")]
     #[test]
     fn a_partial_install_is_not_a_route() {
         let dir = crate::tempdir::TempDir::new("route-partial");
@@ -490,6 +534,7 @@ mod tests {
         assert!(err.message.contains("install-asr"), "{err}");
     }
 
+    #[cfg(feature = "local-asr")]
     #[test]
     fn the_local_route_is_not_keyed_by_the_prompt() {
         // SenseVoice takes no conditioning text, so two prompts must not
@@ -511,6 +556,26 @@ mod tests {
         let err = Route::resolve(&cfg()).expect_err("nothing is provisioned");
         assert_eq!(err.kind, crate::fault::FaultKind::Environment);
         assert!(err.message.contains("WHISPER_API_KEY"), "{err}");
+    }
+
+    #[cfg(not(feature = "local-asr"))]
+    #[test]
+    fn a_build_without_the_local_tier_says_so() {
+        // Staged weights must not change the answer: this build cannot
+        // load them, and pointing at `install-asr` would be a lie.
+        let dir = crate::tempdir::TempDir::new("route-none");
+        let mut cfg = cfg();
+        cfg.paths.models = dir.to_path_buf();
+        for name in [
+            "sense-voice-2024-07-17.int8.onnx",
+            "sense-voice-2024-07-17.tokens.txt",
+            "silero_vad.onnx",
+        ] {
+            std::fs::write(dir.join(name), b"weights").expect("stage a weight file");
+        }
+        let err = Route::resolve(&cfg).expect_err("no key, no local tier");
+        assert!(err.message.contains("no local recognizer"), "{err}");
+        assert!(!err.message.contains("install-asr"), "{err}");
     }
 
     #[test]

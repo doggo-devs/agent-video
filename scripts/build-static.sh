@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # Build a fully static, zero-dependency agent-video.
 #
+# Built without `local-asr`, so transcription here is the API route only.
+# The prebuilt onnxruntime the local recognizer links is glibc-built and
+# incompatible with musl: a static musl binary segfaults inside musl's
+# allocator while loading any model — reproduced in a plain C program with no
+# Rust involved, so it is upstream's constraint rather than this build's.
+# Zero dynamic dependencies is the point of this variant; carrying a
+# recognizer that crashes is not a trade worth making.
+#
 # FFmpeg is compiled and linked statically. One capability needs a lib it does
 # not bundle: software AV1 (libdav1d). This builds it as a static lib, exposes
 # it via pkg-config, then builds with `static-ffmpeg` so FFmpeg's configure
@@ -107,5 +115,7 @@ fi
 # --- 5. Build ----------------------------------------------------------------
 target_args=()
 [ -n "$TARGET" ] && target_args=(--target "$TARGET")
-echo ">> cargo build --release -p agent-video --features static-ffmpeg ${target_args[*]}"
-exec cargo build --release -p agent-video --features static-ffmpeg "${target_args[@]}" "$@"
+features="--no-default-features --features static-ffmpeg"
+echo ">> cargo build --release -p agent-video $features ${target_args[*]}"
+# shellcheck disable=SC2086 # $features is two flag pairs, not one word.
+exec cargo build --release -p agent-video $features "${target_args[@]}" "$@"
