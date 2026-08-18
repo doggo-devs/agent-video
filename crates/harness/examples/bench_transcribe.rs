@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Manual benchmark: does whisper conditioning (prompt / language hint)
-//! improve transcription quality on real media? Never runs in CI —
-//! examples build on demand and this one needs a provisioned route
-//! (local GPU model or API key) plus ground-truth media.
+//! Manual benchmark: does conditioning (prompt / language hint) improve
+//! transcription quality on real media? Never runs in CI — examples build
+//! on demand and this one needs a provisioned route (installed weights or
+//! an API key) plus ground-truth media.
 //!
 //! ```text
-//! cargo run -p agent-video-harness --example bench_transcribe \
-//!     [--features whisper-vulkan] --release -- \
+//! cargo run -p agent-video-harness --example bench_transcribe --release -- \
 //!     <media> <reference.srt> [--prompt "..."] [--language zh]
 //! ```
 //!
@@ -25,14 +24,6 @@ use agent_video_harness::transcribe::{Route, effective_prompt, transcribe};
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-
-    // The local-route GPU probe re-spawns `current_exe()` as
-    // `probe-gpu <backend>`; in an example that binary is us, so answer
-    // the probe the same way the CLI does.
-    if args.first().map(String::as_str) == Some("probe-gpu") {
-        let backend = args.get(1).map(String::as_str).unwrap_or("");
-        std::process::exit(agent_video_harness::gpu::probe_child(backend));
-    }
 
     let cli = match Cli::parse(&args) {
         Ok(cli) => cli,

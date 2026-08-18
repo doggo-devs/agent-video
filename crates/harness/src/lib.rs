@@ -3,8 +3,8 @@
 //! `process`/`extract` run.
 //!
 //! One module per responsibility: argument schema, timestamp policy, budget
-//! ladder, consent tokens, URL sources, disk cache, whisper transcription
-//! and weight provisioning. The [`mcp`] module owns the protocol face (stdio
+//! ladder, consent tokens, URL sources, disk cache, transcription and weight
+//! provisioning. The [`mcp`] module owns the protocol face (stdio
 //! server, download tracker, core self-spawn) and the process's only tokio
 //! runtime; everything else is synchronous and server-free.
 
@@ -15,7 +15,6 @@ pub mod core_run;
 pub mod fault;
 pub mod fetch;
 pub mod gate;
-pub mod gpu;
 pub mod identity;
 pub mod install;
 pub mod look;

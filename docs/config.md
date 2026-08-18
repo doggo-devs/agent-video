@@ -3,7 +3,7 @@
 The harness reads one optional TOML file. Every key overrides a built-in
 default; an absent file (or an empty document) yields the defaults verbatim.
 Validation runs at load time and is strict: an unknown key, a zero where a
-positive integer is required, an empty path, an uncompiled whisper backend, or
+positive integer is required, an empty path, or
 an unknown browser all fail the load, and a misconfigured server refuses to
 start rather than run on a half-valid config.
 
@@ -40,7 +40,7 @@ platform-derived.
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|
 | `cache` | path | `<cache_dir>/agent-video` | Evictable analysis artifacts: download rips (`downloads/`), probe documents (`probe/`), whisper transcripts (`transcripts/`). Subject to the `[cache]` LRU budget and age sweeps. |
-| `models` | path | `<data_dir>/agent-video/models` | Whisper weights (model + Silero VAD) provisioned by `install-whisper`. Persistent and LRU-exempt — never evicted. |
+| `models` | path | `<data_dir>/agent-video/models` | Local ASR weights (SenseVoice + tokens + Silero VAD) provisioned by `install-asr`. Persistent and LRU-exempt — never evicted. |
 | `keep` | path | `<download_dir>` | Landing directory for keep downloads. Files here belong to the user; the harness never evicts or rewrites them. |
 
 ### `[cache]`
@@ -53,8 +53,6 @@ platform-derived.
 
 | Key | Type | Default | Validation | Controls |
 |-----|------|---------|-----------|----------|
-| `model` | string | `large-v3-turbo` | known name or path-shaped | Model identity for transcription and for keying transcripts in the cache. One of the pinned names `medium`, `large-v3`, `large-v3-turbo` (provisioned by `install-whisper`), or a path to a self-supplied ggml file (tilde-expanded) — recognized by its shape: it contains a path separator or starts with `~` or `.`. Any other value (a typo like `large-v3-trubo`) fails the load. A transcript is keyed by content × model, so changing this never serves another model's output. |
-| `backend` | string | unset (auto-detect) | one of `metal`, `coreml`, `cuda`, `vulkan`, and must be compiled into this build | Pins the GPU inference backend. Unset auto-detects from compiled features. Pinning commits to local inference: a missing weight then errors instead of silently falling back to the API. CPU-only inference is not supported; a build with no `whisper-*` feature offers no local transcription at all. |
 | `api_key` | string | unset | — | API key for remote transcription (Groq / OpenAI-compatible endpoint). The `WHISPER_API_KEY` environment variable overrides this at load time; past load, nothing reads the environment again. |
 | `api_url` | string | `https://api.groq.com/openai/v1/audio/transcriptions` | — | Remote transcription endpoint. |
 | `prompt` | string | unset (derived) | non-empty | Conditioning text for whisper (its *initial prompt*). A continuation bias, not an instruction channel: write text that reads like preceding transcript — domain vocabulary, proper nouns, the desired script (简体 vs 繁体) — never directives, which the model does not obey. Budget is ~224 tokens; the harness truncates at 800 bytes. When unset, URL downloads derive a prompt from the media title reported by the site; local files get none. Part of the transcript cache key (hashed), so changing it produces a fresh transcript rather than serving a differently-conditioned one. |
@@ -116,7 +114,7 @@ and used automatically when the file exists and `from_browser` is unset.
 ## Complete example
 
 Every key set to its default value. Keys that default to *unset* (whisper
-`backend` and `api_key`, cookies `from_browser`) are shown commented out —
+`api_key`, cookies `from_browser`) are shown commented out —
 their default is absence. Path values use the Linux/XDG spelling; on other
 platforms the same roles resolve to that platform's base directories.
 
@@ -130,9 +128,6 @@ keep = "~/Downloads"
 max_bytes = 10737418240  # 10 GiB
 
 [whisper]
-model = "large-v3-turbo"
-# backend unset by default: auto-detect from compiled features.
-# backend = "vulkan"
 # api_key unset by default; WHISPER_API_KEY overrides it at load time.
 # api_key = "gsk_..."
 api_url = "https://api.groq.com/openai/v1/audio/transcriptions"

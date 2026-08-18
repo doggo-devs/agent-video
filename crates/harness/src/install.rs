@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `install-whisper`: explicit provisioning of whisper weights.
+//! `install-asr`: explicit provisioning of the local recognizer's weights.
 //!
-//! Fetches the pinned HuggingFace ggml model for the configured (or
-//! overridden) model name plus the Silero VAD model into `paths.models`,
+//! Fetches the pinned SenseVoice model, its token table, and the Silero
+//! VAD model into `paths.models`,
 //! sha256-verified, staged-then-renamed. Weights are runtime data, not
 //! dependencies: nothing is ever auto-downloaded mid-run, and this command
 //! is the only writer of the models directory — though several instances
@@ -16,9 +16,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-use super::config::{Config, WhisperModel};
+use super::config::Config;
 use super::plan::format_bytes;
-use super::transcribe::{VAD_FILENAME, model_filename};
+use super::transcribe::{SENSE_MODEL_FILENAME, SENSE_TOKENS_FILENAME, VAD_FILENAME};
 
 /// A pinned artifact: URL, sha256, and size for progress display.
 struct Pin {
@@ -28,33 +28,31 @@ struct Pin {
     bytes: u64,
 }
 
-const MEDIUM: Pin = Pin {
-    filename: "ggml-medium.bin",
-    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
-    sha256: "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208",
-    bytes: 1_533_763_059,
-};
-
-const LARGE_V3: Pin = Pin {
-    filename: "ggml-large-v3.bin",
-    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
-    sha256: "64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2",
-    bytes: 3_095_033_483,
-};
-
-const LARGE_V3_TURBO: Pin = Pin {
-    filename: "ggml-large-v3-turbo.bin",
-    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
-    sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
-    bytes: 1_624_555_275,
-};
-
-const SILERO_VAD: Pin = Pin {
-    filename: VAD_FILENAME,
-    url: "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin",
-    sha256: "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf",
-    bytes: 885_098,
-};
+/// Everything the local route needs, in one list. There is no model
+/// selection: the local tier is one recognizer, so `install-asr` takes no
+/// arguments and cannot provision a set the engine would refuse to load.
+const PINS: [Pin; 3] = [
+    Pin {
+        filename: SENSE_MODEL_FILENAME,
+        url: "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/\
+              resolve/main/model.int8.onnx",
+        sha256: "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51",
+        bytes: 239_233_841,
+    },
+    Pin {
+        filename: SENSE_TOKENS_FILENAME,
+        url: "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/\
+              resolve/main/tokens.txt",
+        sha256: "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc",
+        bytes: 315_894,
+    },
+    Pin {
+        filename: VAD_FILENAME,
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+        sha256: "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6",
+        bytes: 643_854,
+    },
+];
 
 /// Installation failed; the message names the artifact and cause.
 #[derive(Debug)]
@@ -77,40 +75,13 @@ impl std::fmt::Display for InstallError {
 
 impl std::error::Error for InstallError {}
 
-/// Run `install-whisper`: provision the model named by `override_model`
-/// (falling back to the config) plus the VAD model into `paths.models`.
-/// Present artifacts are verified and skipped; progress goes to stderr.
-pub fn install_whisper(cfg: &Config, override_model: Option<&str>) -> Result<(), InstallError> {
-    let model = match override_model {
-        Some("medium") => WhisperModel::Medium,
-        Some("large-v3") => WhisperModel::LargeV3,
-        Some("large-v3-turbo") => WhisperModel::LargeV3Turbo,
-        Some(other) => {
-            return Err(InstallError(format!(
-                "unknown model '{other}': install-whisper provisions the pinned models \
-                 (medium, large-v3, large-v3-turbo); a self-supplied ggml file needs no \
-                 installation — point whisper.model at it"
-            )));
-        }
-        None => cfg.whisper.model.clone(),
-    };
-    let pin = match &model {
-        WhisperModel::Medium => MEDIUM,
-        WhisperModel::LargeV3 => LARGE_V3,
-        WhisperModel::LargeV3Turbo => LARGE_V3_TURBO,
-        WhisperModel::File(p) => {
-            return Err(InstallError(format!(
-                "whisper.model points at a self-supplied file ({}); nothing to install — pass \
-                 --model medium|large-v3|large-v3-turbo to provision a pinned model instead",
-                p.display()
-            )));
-        }
-    };
-    debug_assert_eq!(Some(pin.filename), model_filename(&model));
-
+/// Run `install-asr`: provision the local recognizer's weights, tokens,
+/// and the VAD model into `paths.models`. Present artifacts are verified
+/// and skipped; progress goes to stderr.
+pub fn install_asr(cfg: &Config) -> Result<(), InstallError> {
     sweep_stale_parts(&cfg.paths.models);
-    for pin in [pin, SILERO_VAD] {
-        provision(&cfg.paths.models, &pin)?;
+    for pin in &PINS {
+        provision(&cfg.paths.models, pin)?;
     }
     Ok(())
 }
@@ -271,12 +242,6 @@ fn file_sha256(path: &Path) -> Result<String, InstallError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{default_config, test_dirs};
-    use std::path::PathBuf;
-
-    fn cfg() -> Config {
-        default_config(&test_dirs(Path::new("/home/u")))
-    }
 
     #[test]
     fn hashes_file_contents() {
@@ -373,19 +338,5 @@ mod tests {
     fn sweep_tolerates_missing_directory() {
         // First-ever install: the models dir does not exist yet.
         sweep_stale_parts(Path::new("/nonexistent/av-models-xyz"));
-    }
-
-    #[test]
-    fn rejects_unknown_model_override() {
-        let err = install_whisper(&cfg(), Some("base")).expect_err("not a pinned model");
-        assert!(err.0.contains("medium, large-v3, large-v3-turbo"), "{err}");
-    }
-
-    #[test]
-    fn rejects_install_for_self_supplied_file() {
-        let mut cfg = cfg();
-        cfg.whisper.model = WhisperModel::File(PathBuf::from("/opt/m.bin"));
-        let err = install_whisper(&cfg, None).expect_err("nothing to install");
-        assert!(err.0.contains("self-supplied"), "{err}");
     }
 }

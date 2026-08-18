@@ -3,8 +3,8 @@
 //!
 //! Six subcommands: `process` (smart frame selection + grid composition),
 //! `extract` (high-density sampling of a time range), `mcp` (the stdio MCP
-//! server exposing the `video` tool), `install-whisper` (provision
-//! transcription weights), `cookie` (manage the jar for login-gated
+//! server exposing the `video` tool), `install-asr` (provision local
+//! recognition weights), `cookie` (manage the jar for login-gated
 //! sites), and `config` (manage config.toml). `process`/`extract` accept a
 //! local file path or any URL the linked FFmpeg can open.
 
@@ -210,14 +210,10 @@ enum Command {
     },
     /// Serve the MCP `video` tool over stdio.
     Mcp,
-    /// Download whisper weights (model + Silero VAD) into the models
-    /// directory, sha256-verified. Never runs implicitly.
-    InstallWhisper {
-        /// Pinned model to provision (medium, large-v3); defaults to
-        /// `whisper.model` from config.toml.
-        #[arg(long)]
-        model: Option<String>,
-    },
+    /// Download the local recognizer's weights (SenseVoice + tokens +
+    /// Silero VAD) into the models directory, sha256-verified. Never runs
+    /// implicitly.
+    InstallAsr,
     /// Manage the cookie jar used for login-gated sites (yt-dlp sources).
     Cookie {
         #[command(subcommand)]
@@ -228,12 +224,6 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Hidden child side of the crash-isolated GPU probe: enumerate the
-    /// named backend's devices and answer via the exit status (0 = a
-    /// usable device exists). Runs in a disposable process because ggml's
-    /// failure paths can abort; the parent reads only the exit code.
-    #[command(hide = true)]
-    ProbeGpu { backend: String },
 }
 
 /// The `look` presets, in the wire spelling the tool advertises. Mirrored
@@ -598,19 +588,14 @@ fn run() -> anyhow::Result<()> {
         } => run_transcript(&source, from, until),
         Command::Probe { source } => run_probe(&source),
         Command::Mcp => harness::mcp::server::serve_stdio(),
-        Command::InstallWhisper { model } => {
+        Command::InstallAsr => {
             let dirs = harness::config::BaseDirs::detect();
             let cfg = harness::config::load_config(&dirs)?;
-            harness::install::install_whisper(&cfg, model.as_deref())?;
+            harness::install::install_asr(&cfg)?;
             Ok(())
         }
         Command::Cookie { action } => run_cookie(&action),
         Command::Config { action } => run_config(&action),
-        Command::ProbeGpu { backend } => {
-            // The parent reads only the exit status; bypass the error
-            // plumbing and its exit-code conventions entirely.
-            std::process::exit(harness::gpu::probe_child(&backend));
-        }
     }
 }
 
@@ -757,9 +742,8 @@ fn run_transcript(source: &str, from: Option<String>, until: Option<String>) -> 
 
     if !harness::transcribe::available(&cfg) {
         anyhow::bail!(
-            "no whisper transcription available — set WHISPER_API_KEY for API \
-             transcription, or compile with a GPU feature and run `agent-video \
-             install-whisper` for local inference"
+            "no transcription available — set WHISPER_API_KEY for API transcription, \
+             or run `agent-video install-asr` for local recognition"
         );
     }
     let cache = harness::cache::Cache::new(&cfg.paths.cache, cfg.cache.max_bytes);

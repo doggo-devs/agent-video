@@ -146,11 +146,6 @@ pub fn serve_stdio() -> anyhow::Result<()> {
     let deps = Arc::new(ServerDeps::production(config));
     // Eviction sweep on boot; never blocks or fails startup.
     let _ = deps.cache.evict(SystemTime::now());
-    // Route whisper.cpp/ggml logs into `log` (silent without a logger)
-    // instead of stderr, keeping transcription quiet on the transport.
-    #[cfg(feature = "whisper-local")]
-    whisper_rs::install_logging_hooks();
-
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let service =

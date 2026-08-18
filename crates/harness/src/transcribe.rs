@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Whisper transcription behind a resolved [`Route`]: local GPU inference
-//! when compiled and provisioned, an OpenAI-compatible API otherwise.
+//! Transcription behind a resolved [`Route`]: an OpenAI-compatible API
+//! when a key is configured, local CPU recognition otherwise.
 //!
-//! **Local** (`local`, `whisper-local` feature + GPU backend):
-//! in-process whisper.cpp; Silero VAD trims silence and music before
-//! recognition. Weights are provisioned by `install-whisper` and never
-//! fetched here.
+//! **Local** (`sense`): SenseVoice over Silero VAD spans, in-process on
+//! the CPU. Weights are provisioned by `install-asr` and never fetched
+//! here. No GPU, no conditioning — the tier exists to be cheap and
+//! offline, not to match the API's accuracy or its language coverage.
 //!
 //! **API** (`api`): audio is decoded, encoded as 16-bit WAV, and POSTed
 //! one bounded chunk at a time (~13 min each) — no VAD pre-filtering; the
@@ -22,71 +22,62 @@
 //! generic codecs with no transcription knowledge.
 
 mod api;
-#[cfg(feature = "whisper-local")]
-mod local;
 mod multipart;
 mod prompt;
+mod sense;
 mod wav;
 
 pub use prompt::{PROMPT_MAX_BYTES, effective_prompt};
 
 use std::path::{Path, PathBuf};
-#[cfg(feature = "whisper-local")]
 use std::time::Instant;
 
-#[cfg(feature = "whisper-local")]
-use super::config::Backend;
-use super::config::{Config, WhisperModel};
+use super::config::Config;
 use crate::cache::Cache;
 use crate::fault::Fault;
 use crate::identity::ContentId;
 use crate::time::Window;
 use agent_video_core::media::Stop;
-#[cfg(feature = "whisper-local")]
 use agent_video_core::media::audio::AudioCeiling;
 use agent_video_core::media::audio::{AudioSamples, WHISPER_SAMPLE_RATE};
 use agent_video_core::source::Source;
 use agent_video_core::subtitle as core_subtitle;
 use agent_video_core::types::format_ts;
 
-// ── model / path helpers ──
+// ── local weights ──
 
-/// Pinned ggml filename for a named model under `paths.models`.
-pub fn model_filename(model: &WhisperModel) -> Option<&'static str> {
-    match model {
-        WhisperModel::Medium => Some("ggml-medium.bin"),
-        WhisperModel::LargeV3 => Some("ggml-large-v3.bin"),
-        WhisperModel::LargeV3Turbo => Some("ggml-large-v3-turbo.bin"),
-        WhisperModel::File(_) => None,
-    }
+/// Pinned filenames under `paths.models`, provisioned by `install-asr`.
+/// The recognizer's date suffix is part of the name: a re-export of the
+/// same architecture is a different model, and must not answer for the
+/// old one's cached transcripts.
+pub const SENSE_MODEL_FILENAME: &str = "sense-voice-2024-07-17.int8.onnx";
+pub const SENSE_TOKENS_FILENAME: &str = "sense-voice-2024-07-17.tokens.txt";
+pub const VAD_FILENAME: &str = "silero_vad.onnx";
+
+/// Where the local recognizer's weights, its token table, and the VAD
+/// model must live for the local route to resolve.
+pub fn sense_model_path(cfg: &Config) -> PathBuf {
+    cfg.paths.models.join(SENSE_MODEL_FILENAME)
 }
 
-/// Pinned Silero VAD model filename under `paths.models`.
-pub const VAD_FILENAME: &str = "ggml-silero-v5.1.2.bin";
-
-/// Where the configured whisper model must live: the models path for named
-/// models, the configured path itself for the self-supplied escape hatch.
-pub fn model_path(cfg: &Config) -> PathBuf {
-    match &cfg.whisper.model {
-        WhisperModel::File(p) => p.clone(),
-        named => cfg
-            .paths
-            .models
-            .join(model_filename(named).expect("named model has a pinned filename")),
-    }
+pub fn sense_tokens_path(cfg: &Config) -> PathBuf {
+    cfg.paths.models.join(SENSE_TOKENS_FILENAME)
 }
 
-/// The VAD model's expected location.
 pub fn vad_model_path(cfg: &Config) -> PathBuf {
     cfg.paths.models.join(VAD_FILENAME)
 }
 
+/// Cache identity of the local recognizer. A different export of the
+/// same architecture is a different engine, so the pinned date rides in
+/// the key.
+const SENSE_CACHE_ID: &str = "sense-voice-2024-07-17";
+
 /// The install hint shown when local weights are missing.
 pub fn install_hint(cfg: &Config) -> String {
     format!(
-        "no whisper model at {} — run `agent-video install-whisper` to provision it, or point \
-         whisper.model at a ggml file",
-        model_path(cfg).display()
+        "no local recognizer under {} — run `agent-video install-asr` to provision it",
+        cfg.paths.models.display()
     )
 }
 
@@ -94,101 +85,75 @@ pub fn install_hint(cfg: &Config) -> String {
 
 /// A resolved transcription route: which engine will run, carrying
 /// everything its path needs. Resolution happens once, up front —
-/// downstream code never re-derives availability. In builds without
-/// `whisper-local` the local route is unrepresentable.
+/// downstream code never re-derives availability.
 #[derive(Debug)]
 pub enum Route {
-    /// In-process whisper.cpp on a compiled-in GPU backend.
-    #[cfg(feature = "whisper-local")]
-    Local {
-        backend: Backend,
-        model: PathBuf,
-        /// Cache identity of the model ([`WhisperModel::cache_id`]).
-        model_id: String,
-    },
     /// OpenAI-compatible transcription endpoint.
     Api { key: String, url: String },
+    /// In-process SenseVoice on the CPU.
+    Sense(sense::Weights),
 }
 
 impl Route {
     /// Resolve the route from config.
     ///
-    /// Local inference wins when fully provisioned: compiled backend, a
-    /// device that passes the runtime probe ([`crate::gpu`]), and the
-    /// model on disk. An *explicit* `whisper.backend` pins the local
-    /// route: a missing model or a failed probe is then an error, never a
-    /// silent fallback to the API — that would swap the engine and the
-    /// model behind the operator's back. Otherwise the API route needs a
-    /// key.
+    /// A configured key wins: the endpoint is the accurate, wide-language
+    /// tier, and an operator who set a key asked for it. Local
+    /// recognition is what answers without one — provisioned weights, no
+    /// device to probe and no build variant to match, so "installed" is
+    /// the whole condition.
     pub fn resolve(cfg: &Config) -> Result<Route, Fault> {
-        #[cfg(feature = "whisper-local")]
-        {
-            if let Some(backend) = local_backend(cfg, crate::gpu::device_available)? {
-                let model = model_path(cfg);
-                if model.is_file() {
-                    return Ok(Route::Local {
-                        backend,
-                        model,
-                        model_id: cfg.whisper.model.cache_id(),
-                    });
-                }
-                if cfg.whisper.backend.is_some() {
-                    return Err(Fault::environment(install_hint(cfg)));
-                }
-            }
-        }
-        match cfg.whisper.api_key.clone() {
-            Some(key) => Ok(Route::Api {
+        if let Some(key) = cfg.whisper.api_key.clone() {
+            return Ok(Route::Api {
                 key,
                 url: cfg.whisper.api_url.clone(),
-            }),
-            None => Err(Fault::environment(
-                "no transcription path available — set WHISPER_API_KEY (or whisper.api_key in \
-                 config.toml) for API transcription, or build with a GPU feature and run \
-                 `agent-video install-whisper` for local inference",
-            )),
+            });
         }
+        let weights = sense::Weights {
+            model: sense_model_path(cfg),
+            tokens: sense_tokens_path(cfg),
+            vad: vad_model_path(cfg),
+        };
+        if [&weights.model, &weights.tokens, &weights.vad]
+            .iter()
+            .all(|p| p.is_file())
+        {
+            return Ok(Route::Sense(weights));
+        }
+        Err(Fault::environment(format!(
+            "no transcription path available — set WHISPER_API_KEY (or whisper.api_key in \
+             config.toml) for API transcription, or run `agent-video install-asr` for local \
+             recognition ({})",
+            install_hint(cfg)
+        )))
     }
 
     /// Transcript cache identity: cues from one engine × model must never
     /// answer for another's (the [`crate::cache::Cache::transcript_path`]
-    /// contract), so the API route keys by the endpoint model, not the
-    /// locally configured one.
+    /// contract), so the API route keys by the endpoint model, not by
+    /// anything configured locally.
     pub fn cache_id(&self) -> String {
         match self {
-            #[cfg(feature = "whisper-local")]
-            Route::Local { model_id, .. } => model_id.clone(),
-            Route::Api { .. } => format!("api-{}", api::API_MODEL),
+            Route::Api { .. } => api_cache_id(),
+            Route::Sense(_) => SENSE_CACHE_ID.to_string(),
+        }
+    }
+
+    /// Whether this engine's output is shaped by the effective prompt.
+    /// SenseVoice takes no conditioning text, so keying its transcripts
+    /// by one would split the cache into entries that hold identical cues.
+    fn takes_prompt(&self) -> bool {
+        match self {
+            Route::Api { .. } => true,
+            Route::Sense(_) => false,
         }
     }
 }
 
-/// The local backend this host can actually run, or `None` to yield to
-/// the API route. Probe-before-decide: device presence is settled here,
-/// up front, never discovered mid-transcription inside ggml (whose
-/// failure paths abort). The pin contract holds throughout: an explicit
-/// `whisper.backend` that fails its probe is a hard error, never a silent
-/// engine swap.
-#[cfg(feature = "whisper-local")]
-fn local_backend(
-    cfg: &Config,
-    device_available: impl Fn(Backend) -> bool,
-) -> Result<Option<Backend>, Fault> {
-    if let Some(pinned) = cfg.whisper.backend {
-        if !device_available(pinned) {
-            return Err(Fault::environment(format!(
-                "whisper.backend is pinned to '{name}' but no usable {name} device was found \
-                 on this host — fix the driver/loader, or remove the pin to allow API \
-                 transcription",
-                name = pinned.name()
-            )));
-        }
-        return Ok(Some(pinned));
-    }
-    Ok(Backend::compiled()
-        .iter()
-        .copied()
-        .find(|&b| device_available(b)))
+/// The API route's cache identity, derivable without a resolved route so
+/// a transcript written before the key was removed stays findable.
+fn api_cache_id() -> String {
+    format!("api-{}", api::API_MODEL)
 }
 
 /// Whether any transcription route is available.
@@ -217,13 +182,13 @@ pub fn render_transcript(srt: &str, window: Window) -> String {
 ///
 /// Lives here rather than beside either surface because both must derive
 /// it identically — a CLI run and a tool call that disagreed would miss
-/// each other's cached transcripts and pay whisper twice for one video.
+/// each other's cached transcripts and pay for one video twice.
 pub fn effective_prompt_for(cache: &Cache, cfg: &Config, fingerprint: &ContentId) -> String {
     effective_prompt(cfg, cache.get_title(fingerprint).as_deref())
 }
 
-/// The transcript cache identity this content would get today: whisper
-/// route × language × effective prompt ([`transcript_id`]).
+/// The transcript cache identity this content would get today: route ×
+/// language × effective prompt ([`transcript_id`]).
 pub fn transcript_id_for(cache: &Cache, cfg: &Config, fingerprint: &ContentId) -> String {
     transcript_id(cfg, &effective_prompt_for(cache, cfg, fingerprint))
 }
@@ -231,14 +196,21 @@ pub fn transcript_id_for(cache: &Cache, cfg: &Config, fingerprint: &ContentId) -
 /// Cache identity of the transcript the active route would produce for
 /// this conditioning. Everything that shapes the cues is in the key:
 /// engine × model ([`Route::cache_id`]), the language hint, and a short
-/// hash of the effective `prompt`. Unconditioned runs keep the bare model
-/// identity, so transcripts from before these knobs existed stay hits.
-/// Falls back to the local model identity when no route resolves, so a
+/// hash of the effective `prompt` — the latter only for engines the
+/// prompt reaches ([`Route::takes_prompt`]). Unconditioned runs keep the
+/// bare model identity, so transcripts from before these knobs existed
+/// stay hits. Falls back to [`api_cache_id`] when no route resolves, so a
 /// transcript generated before a key was removed still rides along.
 pub fn transcript_id(cfg: &Config, prompt: &str) -> String {
-    let base = Route::resolve(cfg)
-        .map(|r| r.cache_id())
-        .unwrap_or_else(|_| cfg.whisper.model.cache_id());
+    let route = Route::resolve(cfg);
+    let base = route
+        .as_ref()
+        .map(Route::cache_id)
+        .unwrap_or_else(|_| api_cache_id());
+    let prompt = match route.as_ref().map(Route::takes_prompt) {
+        Ok(false) => "",
+        _ => prompt,
+    };
     if cfg.whisper.language.is_none() && prompt.is_empty() {
         return base;
     }
@@ -257,7 +229,6 @@ pub fn transcript_id(cfg: &Config, prompt: &str) -> String {
 /// lives here; the 24-hour hard cap lives in core's [`AudioCeiling`]
 /// constructor. A track past this ceiling fails as too-long input rather
 /// than transcribing a silent prefix as if it were the whole file.
-#[cfg(feature = "whisper-local")]
 const MAX_LOCAL_AUDIO_SECONDS: u32 = 4 * 3600;
 
 // ── cue type ──
@@ -312,8 +283,7 @@ pub fn transcribe(
     };
 
     let (cues, sample_count) = match route {
-        #[cfg(feature = "whisper-local")]
-        Route::Local { backend, model, .. } => {
+        Route::Sense(weights) => {
             // The local route decodes whole (VAD wants random access),
             // bounded by the harness's materialization ceiling.
             let cap = AudioCeiling::from_seconds(MAX_LOCAL_AUDIO_SECONDS)
@@ -330,10 +300,9 @@ pub fn transcribe(
                 return Err(zero_samples_fault(file));
             }
             let count = samples.len();
-            (
-                local::recognize(cfg, backend, &model, &samples, prompt, on_step)?,
-                count,
-            )
+            let cues =
+                sense::recognize(&weights, &samples, cfg.whisper.language.as_deref(), on_step)?;
+            (cues, count)
         }
         Route::Api { key, url } => {
             // The API route streams: decode, encode, and upload one bounded
@@ -469,21 +438,6 @@ mod tests {
     }
 
     #[test]
-    fn named_models_resolve_under_models_path() {
-        assert_eq!(
-            model_path(&cfg()),
-            Path::new("/home/u/data-base/agent-video/models/ggml-large-v3-turbo.bin")
-        );
-    }
-
-    #[test]
-    fn file_model_is_the_escape_hatch() {
-        let mut cfg = cfg();
-        cfg.whisper.model = WhisperModel::File(PathBuf::from("/opt/ggml-tiny.bin"));
-        assert_eq!(model_path(&cfg), Path::new("/opt/ggml-tiny.bin"));
-    }
-
-    #[test]
     fn resolves_api_route_when_key_configured() {
         let mut cfg = cfg();
         cfg.whisper.api_key = Some("sk-test".to_string());
@@ -492,37 +446,85 @@ mod tests {
                 assert_eq!(key, "sk-test");
                 assert_eq!(url, cfg.whisper.api_url);
             }
-            #[cfg(feature = "whisper-local")]
             other => panic!("expected the API route, got {other:?}"),
         }
     }
 
     #[test]
-    fn reports_no_route_without_key_or_local_model() {
+    fn local_weights_answer_without_a_key() {
+        let dir = crate::tempdir::TempDir::new("route-sense");
+        let mut cfg = cfg();
+        cfg.paths.models = dir.to_path_buf();
+        for name in [SENSE_MODEL_FILENAME, SENSE_TOKENS_FILENAME, VAD_FILENAME] {
+            std::fs::write(dir.join(name), b"weights").expect("stage a weight file");
+        }
+        match Route::resolve(&cfg).expect("installed weights resolve") {
+            Route::Sense(w) => assert_eq!(w.model, sense_model_path(&cfg)),
+            other => panic!("expected the local route, got {other:?}"),
+        }
+        assert_eq!(transcript_id(&cfg, ""), SENSE_CACHE_ID);
+    }
+
+    #[test]
+    fn a_configured_key_outranks_installed_weights() {
+        let dir = crate::tempdir::TempDir::new("route-both");
+        let mut cfg = cfg();
+        cfg.paths.models = dir.to_path_buf();
+        cfg.whisper.api_key = Some("sk-test".to_string());
+        for name in [SENSE_MODEL_FILENAME, SENSE_TOKENS_FILENAME, VAD_FILENAME] {
+            std::fs::write(dir.join(name), b"weights").expect("stage a weight file");
+        }
+        assert!(matches!(
+            Route::resolve(&cfg).expect("a key resolves"),
+            Route::Api { .. }
+        ));
+    }
+
+    #[test]
+    fn a_partial_install_is_not_a_route() {
+        let dir = crate::tempdir::TempDir::new("route-partial");
+        let mut cfg = cfg();
+        cfg.paths.models = dir.to_path_buf();
+        std::fs::write(dir.join(SENSE_MODEL_FILENAME), b"weights").expect("stage");
+        let err = Route::resolve(&cfg).expect_err("tokens and VAD are missing");
+        assert!(err.message.contains("install-asr"), "{err}");
+    }
+
+    #[test]
+    fn the_local_route_is_not_keyed_by_the_prompt() {
+        // SenseVoice takes no conditioning text, so two prompts must not
+        // split one recognition into two cache entries.
+        let dir = crate::tempdir::TempDir::new("route-prompt");
+        let mut cfg = cfg();
+        cfg.paths.models = dir.to_path_buf();
+        for name in [SENSE_MODEL_FILENAME, SENSE_TOKENS_FILENAME, VAD_FILENAME] {
+            std::fs::write(dir.join(name), b"weights").expect("stage a weight file");
+        }
+        assert_eq!(
+            transcript_id(&cfg, "Rust Ownership."),
+            transcript_id(&cfg, "Kubernetes, etcd.")
+        );
+    }
+
+    #[test]
+    fn reports_no_route_without_a_key() {
         let err = Route::resolve(&cfg()).expect_err("nothing is provisioned");
         assert_eq!(err.kind, crate::fault::FaultKind::Environment);
         assert!(err.message.contains("WHISPER_API_KEY"), "{err}");
-        assert!(err.message.contains("install-whisper"), "{err}");
     }
 
     #[test]
     fn api_transcripts_key_by_endpoint_model() {
         let mut cfg = cfg();
         cfg.whisper.api_key = Some("sk-test".to_string());
-        let id = transcript_id(&cfg, "");
-        assert_eq!(id, format!("api-{}", api::API_MODEL));
-        assert_ne!(
-            id,
-            cfg.whisper.model.cache_id(),
-            "an API transcript must never answer for a local model's"
-        );
+        assert_eq!(transcript_id(&cfg, ""), format!("api-{}", api::API_MODEL));
     }
 
     #[test]
-    fn transcript_lookup_falls_back_to_local_model_id() {
-        // No route resolves, but a transcript generated before a key was
-        // removed should still be findable under the local identity.
-        assert_eq!(transcript_id(&cfg(), ""), cfg().whisper.model.cache_id());
+    fn transcript_lookup_survives_a_removed_key() {
+        // No route resolves, but a transcript generated before the key was
+        // removed should still be findable under the endpoint identity.
+        assert_eq!(transcript_id(&cfg(), ""), format!("api-{}", api::API_MODEL));
     }
 
     #[test]
@@ -578,40 +580,6 @@ mod tests {
         )
         .expect_err("no route is provisioned");
         assert_eq!(err.kind, crate::fault::FaultKind::Environment);
-    }
-
-    #[cfg(feature = "whisper-local")]
-    #[test]
-    fn pinned_backend_failing_probe_is_a_hard_error() {
-        let mut cfg = cfg();
-        cfg.whisper.backend = Some(Backend::Vulkan);
-        cfg.whisper.api_key = Some("sk-test".to_string());
-        let err = local_backend(&cfg, |_| false).expect_err("pin commits to local");
-        assert_eq!(err.kind, crate::fault::FaultKind::Environment);
-        assert!(err.message.contains("vulkan"), "names the backend: {err}");
-    }
-
-    #[cfg(feature = "whisper-local")]
-    #[test]
-    fn pinned_backend_passing_probe_is_selected() {
-        let mut cfg = cfg();
-        cfg.whisper.backend = Some(Backend::Vulkan);
-        let backend = local_backend(&cfg, |_| true).expect("probe passes");
-        assert_eq!(backend, Some(Backend::Vulkan));
-    }
-
-    #[cfg(feature = "whisper-local")]
-    #[test]
-    fn auto_detection_yields_to_api_when_no_device_probes() {
-        let backend = local_backend(&cfg(), |_| false).expect("auto never errors");
-        assert_eq!(backend, None, "no usable device ⇒ the API route decides");
-    }
-
-    #[cfg(feature = "whisper-local")]
-    #[test]
-    fn auto_detection_picks_the_first_usable_compiled_backend() {
-        let backend = local_backend(&cfg(), |_| true).expect("auto never errors");
-        assert_eq!(backend, Backend::compiled().first().copied());
     }
 
     #[test]

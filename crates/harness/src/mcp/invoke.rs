@@ -101,9 +101,8 @@ pub(super) fn transcribe_flow(
     };
     if !deps.whisper.available(&deps.config) {
         return failed(&Fault::environment(
-            "no whisper transcription available — set WHISPER_API_KEY for API transcription, \
-             or compile with a GPU feature and run `agent-video install-whisper` for local \
-             inference",
+            "no transcription available — set WHISPER_API_KEY for API transcription, or run \
+             `agent-video install-asr` for local recognition",
         ));
     }
     let fingerprint = match fingerprint_file(&media) {

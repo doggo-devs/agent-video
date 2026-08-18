@@ -19,7 +19,7 @@ transcription that rides along with every grid.
   tokens, URL sources, disk cache, whisper transcription; `mcp` module owns
   the stdio server.
 - `crates/cli` — the `agent-video` binary. Harness-backed: `watch`, `probe`,
-  `mcp`. Raw core: `process`, `extract`. Plus `install-whisper`, `cookie`.
+  `mcp`. Raw core: `process`, `extract`. Plus `install-asr`, `cookie`.
   See [crates/README.md](crates/README.md).
 - `packages/harness` — npm distribution shell (`@agent-video/cli`): resolves
   the platform binary and passes through; no logic of its own.
@@ -57,7 +57,7 @@ and expect a matching system FFmpeg.
 
 Requires Rust (edition 2024) and FFmpeg shared libraries + headers. See
 [crates/README.md](crates/README.md) for the full build matrix (dynamic,
-static, musl, GPU features).
+static, musl).
 
 ```bash
 cargo build --release
@@ -120,10 +120,15 @@ If you installed via npm, use the npm shim as the command instead:
 
 Call `video` with just a `source` first: short videos run immediately, longer
 ones answer with a plan and copyable follow-up calls. Set `transcribe: true`
-(alone) to get a whisper transcript back as timestamped lines; it is cached
-and rides along with every grid afterwards.
-Transcription needs weights (`agent-video install-whisper`, GPU build) or a
-`WHISPER_API_KEY` for the API route.
+(alone) to get a transcript back as timestamped lines; it is cached and
+rides along with every grid afterwards.
+
+Transcription takes one of two routes. `WHISPER_API_KEY` sends audio to an
+OpenAI-compatible endpoint (Groq's `whisper-large-v3-turbo` by default) —
+the accurate, wide-language tier. Without a key, `agent-video install-asr`
+provisions SenseVoice (~240 MB) and recognition runs locally on the CPU:
+no GPU, no network, no key. It is the cheap tier, not the equal one — it
+covers zh/en/ja/ko/yue only, and trails the endpoint slightly on accuracy.
 
 For login-gated sources, manage cookies with `agent-video cookie import`,
 `cookie status`, and `cookie clear`.

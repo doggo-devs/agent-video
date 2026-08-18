@@ -80,12 +80,6 @@ pub struct CacheCfg {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhisperCfg {
-    pub model: WhisperModel,
-    /// Explicit backend pin; `None` auto-detects from compiled features.
-    /// Pinning a backend commits to local inference: a missing model is
-    /// then an error, never a silent fallback to the API (see
-    /// [`crate::transcribe::Route::resolve`]).
-    pub backend: Option<Backend>,
     /// API key for remote transcription (Groq / OpenAI-compatible).
     /// [`load_config`] lets `WHISPER_API_KEY` override the file value, so
     /// past load time this field is the resolved answer — nothing reads
@@ -221,137 +215,6 @@ pub struct BudgetCfg {
     pub max_response_bytes: NonZeroU64,
 }
 
-/// Whisper model selection: a pinned name provisioned by `install-whisper`,
-/// or a self-supplied ggml file (the escape hatch — spelled as a path:
-/// `"./models/ggml-tiny.bin"`, `"~/models/ggml-tiny.bin"`, or any value
-/// containing a path separator).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WhisperModel {
-    Medium,
-    LargeV3,
-    LargeV3Turbo,
-    File(PathBuf),
-}
-
-impl WhisperModel {
-    /// Parse a `whisper.model` value. Known names parse to their variant;
-    /// a path-shaped value (contains a separator, or starts with `~` or
-    /// `.`) is the self-supplied-file escape hatch. Anything else — a typo
-    /// like `"large-v3-trubo"` — fails the load naming the valid options,
-    /// instead of masquerading as a model file that will never exist.
-    fn parse(s: &str) -> Result<Self, ConfigError> {
-        match s {
-            "medium" => Ok(WhisperModel::Medium),
-            "large-v3" => Ok(WhisperModel::LargeV3),
-            "large-v3-turbo" => Ok(WhisperModel::LargeV3Turbo),
-            path if path.contains(['/', std::path::MAIN_SEPARATOR])
-                || path.starts_with('~')
-                || path.starts_with('.') =>
-            {
-                Ok(WhisperModel::File(PathBuf::from(path)))
-            }
-            other => Err(ConfigError(format!(
-                "whisper.model must be one of medium, large-v3, large-v3-turbo, or a path \
-                 to a self-supplied ggml file — got '{other}'"
-            ))),
-        }
-    }
-
-    /// Stable, filename-safe identity for cache keying: transcripts from
-    /// different models must never answer for each other, so the model is
-    /// part of the transcript's cache key.
-    ///
-    /// A self-supplied ggml is identified by its (hashed) path; swapping the
-    /// bytes behind the same path is the operator's own cache-poisoning.
-    pub fn cache_id(&self) -> String {
-        use sha2::{Digest, Sha256};
-        match self {
-            WhisperModel::Medium => "medium".to_string(),
-            WhisperModel::LargeV3 => "large-v3".to_string(),
-            WhisperModel::LargeV3Turbo => "large-v3-turbo".to_string(),
-            WhisperModel::File(p) => {
-                let digest = Sha256::digest(p.as_os_str().as_encoded_bytes());
-                format!("file-{}", crate::identity::hex(&digest[..8]))
-            }
-        }
-    }
-}
-
-/// Whisper hardware-accelerated backend. CPU-only inference is not
-/// supported — transcription requires a compiled-in GPU backend.
-/// Builds without any `whisper-*` feature simply do not offer
-/// transcription.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Backend {
-    Metal,
-    Coreml,
-    Cuda,
-    Vulkan,
-}
-
-impl Backend {
-    fn parse(s: &str) -> Result<Self, ConfigError> {
-        let Some(backend) = Backend::from_name(s) else {
-            return Err(ConfigError(format!(
-                "whisper.backend must be one of metal, coreml, cuda, vulkan — got '{s}'"
-            )));
-        };
-        if !Self::compiled().contains(&backend) {
-            let available: Vec<&str> = Self::compiled().iter().map(|b| b.name()).collect();
-            return Err(ConfigError(format!(
-                "whisper.backend '{s}' is not compiled into this build; available: {}",
-                available.join(", ")
-            )));
-        }
-        Ok(backend)
-    }
-
-    /// Canonical lowercase name, as accepted by `whisper.backend` and the
-    /// hidden `probe-gpu` subcommand.
-    pub fn name(self) -> &'static str {
-        match self {
-            Backend::Metal => "metal",
-            Backend::Coreml => "coreml",
-            Backend::Cuda => "cuda",
-            Backend::Vulkan => "vulkan",
-        }
-    }
-
-    /// Parse a canonical name, without the compiled-in check.
-    pub fn from_name(s: &str) -> Option<Self> {
-        [
-            Backend::Metal,
-            Backend::Coreml,
-            Backend::Cuda,
-            Backend::Vulkan,
-        ]
-        .into_iter()
-        .find(|b| b.name() == s)
-    }
-
-    /// Whether device presence must be probed at runtime
-    /// ([`crate::gpu::device_available`]). Metal/CoreML are ambient on
-    /// Apple hardware; CUDA/Vulkan depend on loaders, drivers, and devices
-    /// that may be absent on the machine running this build.
-    pub fn needs_probe(self) -> bool {
-        matches!(self, Backend::Cuda | Backend::Vulkan)
-    }
-
-    /// All backends compiled into this build, in preference order.
-    pub fn compiled() -> &'static [Backend] {
-        &[
-            #[cfg(feature = "whisper-metal")]
-            Backend::Metal,
-            #[cfg(feature = "whisper-coreml")]
-            Backend::Coreml,
-            #[cfg(feature = "whisper-cuda")]
-            Backend::Cuda,
-            #[cfg(feature = "whisper-vulkan")]
-            Backend::Vulkan,
-        ]
-    }
-}
-
 // ── file shape ──
 
 #[derive(Debug, Default, Deserialize)]
@@ -392,8 +255,6 @@ struct FileCache {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileWhisper {
-    model: Option<String>,
-    backend: Option<String>,
     api_key: Option<String>,
     api_url: Option<String>,
     prompt: Option<String>,
@@ -483,8 +344,6 @@ pub fn default_config(dirs: &BaseDirs) -> Config {
             max_bytes: nz64(10 * GIB),
         },
         whisper: WhisperCfg {
-            model: WhisperModel::LargeV3Turbo,
-            backend: None,
             api_key: None,
             api_url: WhisperCfg::DEFAULT_API_URL.to_string(),
             prompt: None,
@@ -610,21 +469,6 @@ pub fn parse_config(text: &str, dirs: &BaseDirs) -> Result<Config, ConfigError> 
         cfg.subtitles.preferred_langs = langs;
     }
 
-    if let Some(m) = file.whisper.model {
-        if m.is_empty() {
-            return Err(ConfigError("whisper.model must be non-empty".into()));
-        }
-        cfg.whisper.model = match WhisperModel::parse(&m)? {
-            WhisperModel::File(p) => WhisperModel::File(expand_tilde(
-                p.to_str().expect("came from a &str"),
-                &dirs.home,
-            )),
-            named => named,
-        };
-    }
-    if let Some(b) = file.whisper.backend {
-        cfg.whisper.backend = Some(Backend::parse(&b)?);
-    }
     if let Some(k) = file.whisper.api_key {
         cfg.whisper.api_key = Some(k);
     }
@@ -698,8 +542,6 @@ pub fn render_template(cfg: &Config) -> String {
         max_bytes: cache_max_bytes,
     } = cache;
     let WhisperCfg {
-        model,
-        backend,
         api_key,
         api_url,
         prompt,
@@ -721,12 +563,6 @@ pub fn render_template(cfg: &Config) -> String {
     let CookiesCfg { from_browser, jar } = cookies;
     let SubtitlesCfg { preferred_langs } = subtitles;
 
-    let model_value = match model {
-        WhisperModel::Medium => t("medium"),
-        WhisperModel::LargeV3 => t("large-v3"),
-        WhisperModel::LargeV3Turbo => t("large-v3-turbo"),
-        WhisperModel::File(p) => tp(p),
-    };
     let langs_value = toml::Value::Array(
         preferred_langs
             .iter()
@@ -788,7 +624,7 @@ pub fn render_template(cfg: &Config) -> String {
     line(&mut out, &format!("#cache = {}", tp(cache_path)));
     line(
         &mut out,
-        "# Whisper weights (model + Silero VAD): persistent, never evicted.",
+        "# ASR weights (recognizer + Silero VAD): persistent, never evicted.",
     );
     line(&mut out, &format!("#models = {}", tp(models)));
     line(
@@ -805,30 +641,6 @@ pub fn render_template(cfg: &Config) -> String {
     line(&mut out, &format!("#max_bytes = {cache_max_bytes}"));
     line(&mut out, "");
     line(&mut out, "[whisper]");
-    line(
-        &mut out,
-        "# Transcription model: medium, large-v3, large-v3-turbo (provisioned",
-    );
-    line(
-        &mut out,
-        "# by `agent-video install-whisper`), or a path to a self-supplied",
-    );
-    line(&mut out, "# ggml file.");
-    line(&mut out, &format!("#model = {model_value}"));
-    line(
-        &mut out,
-        "# GPU backend pin: metal, coreml, cuda, vulkan; must be compiled into",
-    );
-    line(
-        &mut out,
-        "# this build. Unset: auto-detect from compiled features.",
-    );
-    opt(
-        &mut out,
-        "backend",
-        backend.map(|b| t(b.name())),
-        "\"vulkan\"",
-    );
     line(
         &mut out,
         "# API key for remote transcription (Groq / OpenAI-compatible);",
@@ -1030,8 +842,6 @@ mod tests {
         assert_eq!(cfg.budget.max_stretch_seconds.get(), 600);
         assert_eq!(cfg.download.max_bytes.get(), 2 * GIB);
         assert_eq!(cfg.download.analysis_max_height.get(), 480);
-        assert_eq!(cfg.whisper.model, WhisperModel::LargeV3Turbo);
-        assert_eq!(cfg.whisper.backend, None);
         assert!(
             !cfg.network.allow_private_hosts,
             "private destinations are blocked by default"
@@ -1054,8 +864,6 @@ mod tests {
             keep = "/tmp/k"
             [cache]
             max_bytes = 1
-            [whisper]
-            model = "large-v3"
             [download]
             max_bytes = 2
             analysis_max_height = 3
@@ -1073,7 +881,6 @@ mod tests {
         assert_eq!(cfg.paths.models, Path::new("/tmp/m"));
         assert_eq!(cfg.paths.keep, Path::new("/tmp/k"));
         assert_eq!(cfg.cache.max_bytes.get(), 1);
-        assert_eq!(cfg.whisper.model, WhisperModel::LargeV3);
         assert_eq!(cfg.download.max_bytes.get(), 2);
         assert_eq!(cfg.download.analysis_max_height.get(), 3);
         assert_eq!(cfg.download.sync_wait_seconds.get(), 4);
@@ -1098,44 +905,6 @@ mod tests {
     fn expands_tilde_in_paths() {
         let cfg = parse_config("[paths]\nkeep = \"~/Videos\"\n", &dirs()).expect("valid");
         assert_eq!(cfg.paths.keep, Path::new("/home/u/Videos"));
-    }
-
-    #[test]
-    fn model_path_escape_hatch() {
-        let cfg = parse_config("[whisper]\nmodel = \"~/models/ggml-tiny.bin\"\n", &dirs())
-            .expect("valid");
-        assert_eq!(
-            cfg.whisper.model,
-            WhisperModel::File(PathBuf::from("/home/u/models/ggml-tiny.bin"))
-        );
-    }
-
-    #[test]
-    fn rejects_typoed_model_name_at_load() {
-        let err = parse_config("[whisper]\nmodel = \"large-v3-trubo\"\n", &dirs())
-            .expect_err("a typo must not become a self-supplied model file");
-        assert!(err.0.contains("large-v3-trubo"), "names the value: {err}");
-        assert!(err.0.contains("large-v3-turbo"), "lists the options: {err}");
-    }
-
-    #[test]
-    fn model_cache_ids_are_distinct_and_filename_safe() {
-        let ids = [
-            WhisperModel::Medium.cache_id(),
-            WhisperModel::LargeV3.cache_id(),
-            WhisperModel::LargeV3Turbo.cache_id(),
-            WhisperModel::File(PathBuf::from("/a/ggml.bin")).cache_id(),
-            WhisperModel::File(PathBuf::from("/b/ggml.bin")).cache_id(),
-        ];
-        for (i, id) in ids.iter().enumerate() {
-            assert!(
-                id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
-                "cache id {id:?} must be filename-safe"
-            );
-            for other in &ids[i + 1..] {
-                assert_ne!(id, other, "distinct models must key distinct entries");
-            }
-        }
     }
 
     #[test]
@@ -1215,19 +984,6 @@ mod tests {
         assert!(err.0.contains("whisper.prompt"), "names the key: {err}");
     }
 
-    #[test]
-    fn rejects_uncompiled_backend() {
-        let err = parse_config("[whisper]\nbackend = \"cuda\"\n", &dirs())
-            .expect_err("cuda is not compiled into test builds");
-        assert!(err.0.contains("not compiled"), "explains why: {err}");
-    }
-
-    #[test]
-    fn rejects_unknown_backend() {
-        let err = parse_config("[whisper]\nbackend = \"tpu\"\n", &dirs()).expect_err("unknown");
-        assert!(err.0.contains("tpu"), "names the value: {err}");
-    }
-
     /// Strip the leading `#` from every disabled-key line (`#key = value`,
     /// no space after `#`), leaving prose comments (`# text`) alone — the
     /// mechanical inverse of the template's comment convention.
@@ -1277,14 +1033,12 @@ mod tests {
     fn template_renders_set_optionals_as_disabled_keys() {
         let d = dirs();
         let mut cfg = default_config(&d);
-        cfg.whisper.backend = Some(Backend::Cuda);
         cfg.whisper.api_key = Some("gsk_live".to_string());
         cfg.whisper.prompt = Some("Rust 所有权与生命周期。".to_string());
         cfg.whisper.language = Some("zh".to_string());
         cfg.cookies.from_browser = Some("chrome:Profile 1".to_string());
         let text = render_template(&cfg);
         for needle in [
-            "#backend = \"cuda\"",
             "#api_key = \"gsk_live\"",
             "#prompt = \"Rust 所有权与生命周期。\"",
             "#language = \"zh\"",

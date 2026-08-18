@@ -4,28 +4,19 @@
 # Unlike the public installer (which pulls a prebuilt binary from npm /
 # GitHub releases), this script builds agent-video from THIS checkout with
 # `cargo` and installs the result — the binary is our own local artifact.
-# Building from source is also what lets us pick the whisper GPU backend:
-# backends are compile-time features, and CPU-only local inference does not
-# exist — a build without a GPU feature transcribes via the API route
-# (WHISPER_API_KEY). Even a GPU build probes the device at runtime and
-# falls back to the API when none is usable.
 #
 # Runs interactively by default (prompts for each choice); pass --yes or set
 # the matching env vars for a fully non-interactive run (CI, re-installs).
 #
 # Choices:
-#   * whisper weights   — off by default (a 1.5G/3G download); which model.
-#                         Only useful alongside a GPU backend: an API-only
-#                         binary never loads local weights.
-#   * hardware accel    — auto-detected, confirmed before use; selects the
-#                         cargo feature. Deliberately not pinned in config:
-#                         the runtime probe decides local vs API per host.
+#   * local ASR weights — off by default (a ~240 MB download). Recognition
+#                         runs on the CPU, so there is no backend to pick
+#                         and no GPU for the build to match.
 #   * yt-dlp            — the site-URL source adapter; checked on PATH, offered.
 #
 # Env overrides (each also has a flag; flag wins):
-#   AV_WHISPER=yes|no          AV_MODEL=medium|large-v3|large-v3-turbo
-#   AV_HW_ACCEL=auto|cpu|metal|coreml|cuda|vulkan
-#   AV_YTDLP=yes|no            AV_BIN_DIR=<dir>
+#   AV_ASR=yes|no              AV_BIN_DIR=<dir>
+#   AV_YTDLP=yes|no
 #   AV_BUILD=dynamic|static    AV_ASSUME_YES=1
 #   AV_INTEGRATE=yes|no        (copy skill + register the video MCP server,
 #                               pointing every entry at the LOCAL binary)
@@ -38,35 +29,30 @@ ARCH="$(uname -m)"
 # ── defaults (env → flag can override) ───────────────────────────────────────
 ASSUME_YES="${AV_ASSUME_YES:-0}"          # 1 = never prompt, take resolved values
 NONINTERACTIVE=0                           # 1 = --non-interactive: prompt-free, no tty
-INSTALL_WHISPER="${AV_WHISPER:-}"          # yes|no|"" (ask)
-WHISPER_MODEL="${AV_MODEL:-large-v3-turbo}"  # medium|large-v3|large-v3-turbo
-HW_ACCEL="${AV_HW_ACCEL:-auto}"            # auto|cpu|metal|coreml|cuda|vulkan
+INSTALL_ASR="${AV_ASR:-}"                  # yes|no|"" (ask)
 INSTALL_YTDLP="${AV_YTDLP:-}"             # yes|no|"" (ask)
 BIN_DIR="${AV_BIN_DIR:-$HOME/.local/bin}"
 BUILD_MODE="${AV_BUILD:-dynamic}"          # dynamic|static
 REUSE_BINARY=""                            # --binary <path>: skip build
 DO_BUILD=1                                 # --no-build: reuse target/release
-FORCE_CONFIG=0                             # --force: overwrite config.toml
 DO_INTEGRATE="${AV_INTEGRATE:-}"           # yes|no|"" (ask): skill + MCP wiring
 
 usage() {
-  sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # The header block, however long it grows: every line up to the first
+  # non-comment. A line range would silently spill into code the next time
+  # the header is edited.
+  sed -n '2,/^[^#]/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
   cat <<'EOF'
 
 Usage: scripts/install-local.sh [options]
   -y, --yes                 Non-interactive; accept resolved defaults.
       --non-interactive     Like --yes but also refuse to read from a tty.
-      --whisper[=yes|no]    Install whisper weights (default: ask / no).
-      --model <name>        Whisper model: medium | large-v3 | large-v3-turbo.
-      --hw-accel[=MODE]     auto (detect+confirm) | cpu (no local whisper,
-                            API route) | metal | coreml | cuda | vulkan.
+      --asr[=yes|no]        Install local ASR weights (default: ask / no).
       --yt-dlp[=yes|no]     Install/verify yt-dlp for site URLs.
       --bin-dir <dir>       Install directory (default: ~/.local/bin).
       --static | --dynamic  FFmpeg linkage (default: dynamic).
       --no-build            Reuse an existing target/release/agent-video.
-      --binary <path>       Install this prebuilt local binary (no build,
-                            no accel feature selection).
-      --force               Overwrite an existing config.toml.
+      --binary <path>       Install this prebuilt local binary (no build).
       --integrate[=yes|no]  Copy the skill + register the `video` MCP server
                             into detected agents (pi/Claude/Codex/Cursor),
                             each pointed at the local binary.
@@ -82,12 +68,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -y|--yes) ASSUME_YES=1 ;;
     --non-interactive) ASSUME_YES=1; NONINTERACTIVE=1 ;;
-    --whisper|--whisper=*) INSTALL_WHISPER="$(optval "$1")"; INSTALL_WHISPER="${INSTALL_WHISPER:-yes}" ;;
-    --no-whisper) INSTALL_WHISPER=no ;;
-    --model) WHISPER_MODEL="$2"; shift ;;
-    --model=*) WHISPER_MODEL="$(optval "$1")" ;;
-    --hw-accel|--hw-accel=*) HW_ACCEL="$(optval "$1")"; HW_ACCEL="${HW_ACCEL:-auto}" ;;
-    --no-hw-accel) HW_ACCEL=cpu ;;
+    --asr|--asr=*) INSTALL_ASR="$(optval "$1")"; INSTALL_ASR="${INSTALL_ASR:-yes}" ;;
+    --no-asr) INSTALL_ASR=no ;;
     --yt-dlp|--yt-dlp=*) INSTALL_YTDLP="$(optval "$1")"; INSTALL_YTDLP="${INSTALL_YTDLP:-yes}" ;;
     --no-yt-dlp) INSTALL_YTDLP=no ;;
     --bin-dir) BIN_DIR="$2"; shift ;;
@@ -97,7 +79,6 @@ while [ $# -gt 0 ]; do
     --no-build) DO_BUILD=0 ;;
     --binary) REUSE_BINARY="$2"; DO_BUILD=0; shift ;;
     --binary=*) REUSE_BINARY="$(optval "$1")"; DO_BUILD=0 ;;
-    --force) FORCE_CONFIG=1 ;;
     --integrate|--integrate=*) DO_INTEGRATE="$(optval "$1")"; DO_INTEGRATE="${DO_INTEGRATE:-yes}" ;;
     --no-integrate) DO_INTEGRATE=no ;;
     -h|--help) usage; exit 0 ;;
@@ -127,78 +108,6 @@ ask() {
   case "$reply" in [Yy]*) return 0 ;; *) return 1 ;; esac
 }
 
-# ── hardware acceleration detection ──────────────────────────────────────────
-# List every backend whose *device* is present, best first, one per line, with
-# a terminal `cpu`. A device only means the build MIGHT link that backend; the
-# resolver still checks each candidate is buildable (accel_buildable) and warns
-# before skipping to the next. Returning all candidates — not just the first —
-# is what lets a host with an unbuildable CUDA still land on a buildable Vulkan
-# instead of silently collapsing to the API route.
-detect_accel() {
-  case "$OS" in
-    Darwin) echo metal; echo cpu; return ;;  # Apple frameworks are always present.
-  esac
-  if command -v nvidia-smi >/dev/null 2>&1 || ls /dev/nvidia0 >/dev/null 2>&1; then
-    echo cuda
-  fi
-  if command -v vulkaninfo >/dev/null 2>&1 \
-     || { command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q libvulkan; }; then
-    echo vulkan
-  fi
-  echo cpu
-}
-
-# Map a backend to its cargo feature ("" for cpu).
-accel_feature() {
-  case "$1" in
-    metal)  echo whisper-metal ;;
-    coreml) echo whisper-coreml ;;
-    cuda)   echo whisper-cuda ;;
-    vulkan) echo whisper-vulkan ;;
-    *)      echo "" ;;
-  esac
-}
-
-# Whether the host can actually COMPILE a backend. whisper.cpp builds via cmake
-# and needs the backend's build toolchain (nvcc, glslc), not merely a runtime
-# device — nvidia-smi/vulkaninfo prove a GPU exists, not that the SDK is here.
-# Getting this wrong is the cmake panic we are guarding against.
-accel_buildable() { # <backend> → 0 if buildable from source on this host
-  [ "$1" = cpu ] && return 0
-  # cmake drives every GPU backend's whisper.cpp build; without it the cmake
-  # crate panics before any SDK check matters, so gate all of them on it first.
-  command -v cmake >/dev/null 2>&1 || return 1
-  case "$1" in
-    metal|coreml)
-      [ "$OS" = Darwin ] && command -v xcrun >/dev/null 2>&1 ;;
-    cuda)
-      command -v nvcc >/dev/null 2>&1 \
-        || [ -x "${CUDA_PATH:-/usr/local/cuda}/bin/nvcc" ] ;;
-    vulkan)
-      # glslc compiles the shaders; the loader/headers must be present too.
-      command -v glslc >/dev/null 2>&1 \
-        && { [ -n "${VULKAN_SDK:-}" ] || [ -e /usr/include/vulkan/vulkan.h ]; } ;;
-    *) return 1 ;;
-  esac
-}
-
-# Toolchain each backend needs, for the fall-back hint. cmake is required by
-# every GPU backend, so it is named first whenever it is the missing piece.
-accel_toolchain_hint() {
-  local sdk
-  case "$1" in
-    cuda)   sdk="the CUDA toolkit (nvcc)" ;;
-    vulkan) sdk="the Vulkan SDK (glslc + headers)" ;;
-    metal|coreml) sdk="Xcode command-line tools (xcrun)" ;;
-    *)      sdk="its build toolchain" ;;
-  esac
-  if command -v cmake >/dev/null 2>&1; then
-    echo "$sdk"
-  else
-    echo "cmake and $sdk"
-  fi
-}
-
 # ── config file location (mirrors the `dirs` crate the binary uses) ──────────
 config_file() {
   if [ -n "${AGENT_VIDEO_CONFIG:-}" ]; then
@@ -214,78 +123,16 @@ config_file() {
 bold "agent-video local installer  (${OS}/${ARCH}, build: ${BUILD_MODE})"
 echo
 
-# 1. whisper
-if [ -z "$INSTALL_WHISPER" ]; then
-  if ask "Install whisper transcription weights? (large download)" no; then
-    INSTALL_WHISPER=yes
+# 1. local ASR weights
+if [ -z "$INSTALL_ASR" ]; then
+  if ask "Install local ASR weights? (~240 MB, CPU recognition without an API key)" no; then
+    INSTALL_ASR=yes
   else
-    INSTALL_WHISPER=no
-  fi
-fi
-if [ "$INSTALL_WHISPER" = yes ]; then
-  case "$WHISPER_MODEL" in
-    medium|large-v3|large-v3-turbo) ;;
-    *) die "unknown model '$WHISPER_MODEL' (choose medium, large-v3, or large-v3-turbo)" ;;
-  esac
-  if [ "$ASSUME_YES" != 1 ] && [ "$NONINTERACTIVE" != 1 ] && [ -t 0 ]; then
-    read -r -p "Whisper model [medium/large-v3/large-v3-turbo] (default $WHISPER_MODEL): " m || m=""
-    WHISPER_MODEL="${m:-$WHISPER_MODEL}"
-    case "$WHISPER_MODEL" in
-      medium|large-v3|large-v3-turbo) ;;
-      *) die "unknown model '$WHISPER_MODEL'" ;;
-    esac
+    INSTALL_ASR=no
   fi
 fi
 
-# 2. hardware acceleration
-# `building` gates the toolchain check: it only matters when we compile from
-# source (a reused/prebuilt binary already carries — or lacks — the backend).
-building=1
-{ [ -n "$REUSE_BINARY" ] || [ "$DO_BUILD" = 0 ]; } && building=0
-
-if [ "$HW_ACCEL" = auto ]; then
-  mapfile -t accel_candidates < <(detect_accel)
-  HW_ACCEL=cpu
-  for cand in "${accel_candidates[@]}"; do
-    [ "$cand" = cpu ] && break   # exhausted every GPU candidate
-    # Device present but its build toolchain is missing: linking it would only
-    # hit the cmake failure. This is a capability downgrade, so warn loudly
-    # (not a quiet info) and cascade to the next candidate rather than the API.
-    if [ "$building" = 1 ] && ! accel_buildable "$cand"; then
-      warn "'$cand' device found, but $(accel_toolchain_hint "$cand") is missing — skipping it (would fail in cmake). Install it and re-run with --hw-accel=$cand to use this GPU."
-      continue
-    fi
-    if ask "Detected '${cand}' acceleration. Enable it for whisper?" yes; then
-      HW_ACCEL="$cand"
-    fi
-    break   # first buildable candidate decides; declining means API route
-  done
-  [ "$HW_ACCEL" = cpu ] \
-    && info "No usable GPU backend — no local whisper; transcription uses the API route (WHISPER_API_KEY)."
-fi
-
-# Explicit --hw-accel=<gpu> (or env) against a host that cannot build it: same
-# guard, but a deliberate request earns a loud warning rather than silence.
-if [ "$HW_ACCEL" != cpu ] && [ "$building" = 1 ] && ! accel_buildable "$HW_ACCEL"; then
-  warn "'$HW_ACCEL' was requested but $(accel_toolchain_hint "$HW_ACCEL") is not installed; \
-the whisper.cpp build would fail in cmake. Falling back to an API-only build — install the \
-toolchain and re-run to enable it."
-  HW_ACCEL=cpu
-fi
-ACCEL_FEATURE="$(accel_feature "$HW_ACCEL")"
-if [ -n "$ACCEL_FEATURE" ] && [ -n "$REUSE_BINARY" ]; then
-  warn "--binary skips building, so the '$HW_ACCEL' feature cannot be linked; \
-the installed binary must already carry it or local transcription stays unavailable."
-fi
-
-# Local weights are dead weight without a local backend: CPU inference does
-# not exist, and an API-only binary never loads them.
-if [ "$building" = 1 ] && [ "$HW_ACCEL" = cpu ] && [ "$INSTALL_WHISPER" = yes ]; then
-  warn "no GPU backend — skipping whisper weights (an API-only build never loads them)"
-  INSTALL_WHISPER=no
-fi
-
-# 3. yt-dlp
+# 2. yt-dlp
 if [ -z "$INSTALL_YTDLP" ]; then
   if command -v yt-dlp >/dev/null 2>&1; then
     INSTALL_YTDLP=no  # already present; nothing to do
@@ -311,12 +158,7 @@ bold "Plan"
 info "binary       : build from source (${BUILD_MODE})${REUSE_BINARY:+  [reuse: $REUSE_BINARY]}${DO_BUILD:+}"
 [ "$DO_BUILD" = 0 ] && [ -z "$REUSE_BINARY" ] && info "binary       : reuse target/release/agent-video (--no-build)"
 info "install to   : $BIN_DIR/agent-video"
-info "whisper      : $INSTALL_WHISPER${INSTALL_WHISPER:+ ($WHISPER_MODEL)}"
-if [ -n "$ACCEL_FEATURE" ]; then
-  info "hw accel     : $HW_ACCEL  (feature: $ACCEL_FEATURE)"
-else
-  info "hw accel     : none — transcription via the API route"
-fi
+info "local ASR    : $INSTALL_ASR"
 info "yt-dlp       : $([ "$INSTALL_YTDLP" = yes ] && echo 'install' || (command -v yt-dlp >/dev/null 2>&1 && echo 'present' || echo 'skip'))"
 info "integrations : $DO_INTEGRATE  (skill + MCP → local binary)"
 info "config       : $(config_file)"
@@ -333,18 +175,11 @@ elif [ "$DO_BUILD" = 0 ]; then
   [ -x "$BIN_SRC" ] || die "no prebuilt binary at $BIN_SRC — drop --no-build to build it"
 else
   command -v cargo >/dev/null 2>&1 || die "cargo not found — install the Rust toolchain (https://rustup.rs)"
-  features=()
-  [ -n "$ACCEL_FEATURE" ] && features+=("$ACCEL_FEATURE")
-  feat_args=()
-  [ ${#features[@]} -gt 0 ] && feat_args=(--features "$(IFS=,; echo "${features[*]}")")
-
   bold "Building agent-video (${BUILD_MODE})..."
   if [ "$BUILD_MODE" = static ]; then
-    # build-static.sh already passes `--features static-ffmpeg`; cargo unions
-    # any extra `--features` we append, so accel rides along.
-    ( cd "$ROOT" && ./scripts/build-static.sh "${feat_args[@]}" )
+    ( cd "$ROOT" && ./scripts/build-static.sh )
   else
-    ( cd "$ROOT" && cargo build --release -p agent-video "${feat_args[@]}" )
+    ( cd "$ROOT" && cargo build --release -p agent-video )
   fi
   BIN_SRC="$ROOT/target/release/agent-video"
   [ -x "$BIN_SRC" ] || die "build reported success but $BIN_SRC is missing"
@@ -361,25 +196,10 @@ case ":$PATH:" in
 esac
 
 # ── config.toml ──────────────────────────────────────────────────────────────
-# Write a minimal config only when it carries a decision the defaults miss:
-# the chosen weights model. The backend is deliberately NOT pinned: the
-# compiled feature auto-detects and the runtime device probe decides local
-# vs API per host; a pin would turn that graceful fallback into a hard
-# error — an operator's choice to make in config.toml, not an installer
-# default. Never silently clobber an existing file.
-CFG="$(config_file)"
-if [ "$INSTALL_WHISPER" = yes ]; then
-  snippet="[whisper]
-model = \"$WHISPER_MODEL\""
-  if [ -f "$CFG" ] && [ "$FORCE_CONFIG" != 1 ]; then
-    warn "config exists: $CFG (left untouched). Recommended [whisper] section:"
-    printf '\n%s\n\n' "$snippet"
-  else
-    mkdir -p "$(dirname "$CFG")"
-    printf '# agent-video — generated by scripts/install-local.sh\n%s\n' "$snippet" > "$CFG"
-    bold "Wrote $CFG"
-  fi
-fi
+# Nothing to write. Which engine runs is discovered, not configured: a key
+# in the environment selects the API, installed weights select local
+# recognition, and neither is a decision this installer has to persist.
+# The file stays the operator's to write.
 
 # ── yt-dlp ───────────────────────────────────────────────────────────────────
 # Prefer an isolated-tool manager over pip: uv and pipx sidestep PEP 668
@@ -410,9 +230,9 @@ if [ "$INSTALL_YTDLP" = yes ]; then
 fi
 
 # ── whisper weights ──────────────────────────────────────────────────────────
-if [ "$INSTALL_WHISPER" = yes ]; then
-  bold "Downloading whisper weights ($WHISPER_MODEL)..."
-  "$BIN" install-whisper --model "$WHISPER_MODEL"
+if [ "$INSTALL_ASR" = yes ]; then
+  bold "Downloading local ASR weights..."
+  "$BIN" install-asr
 fi
 
 # ── platform integrations (skill + MCP + pi extension) ───────────────────────
@@ -551,8 +371,8 @@ fi
 echo
 bold "Done."
 info "Try:  $BIN process <video> -o out/"
-if [ "$INSTALL_WHISPER" = yes ]; then
-  info "Local transcription ready (model: $WHISPER_MODEL, backend: $HW_ACCEL; API fallback needs WHISPER_API_KEY)."
+if [ "$INSTALL_ASR" = yes ]; then
+  info "Local transcription ready (SenseVoice on the CPU). Set WHISPER_API_KEY to prefer the API instead."
 else
-  info "Transcription: API route — set WHISPER_API_KEY (Groq-compatible endpoint by default)."
+  info "Transcription: API route — set WHISPER_API_KEY (Groq-compatible endpoint by default), or run 'agent-video install-asr' for local recognition."
 fi

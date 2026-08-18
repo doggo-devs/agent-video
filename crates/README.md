@@ -121,7 +121,7 @@ scoring weights, timing, subtitles).
 
 ## Benchmarking transcription
 
-A manual benchmark (never run in CI) measures whether whisper conditioning —
+A manual benchmark (never run in CI) measures whether conditioning —
 the `--prompt` continuation text and the `--language` hint — improves
 transcription quality on real media. It transcribes the same file under a
 2×2 conditioning matrix and reports CER (character error rate, Levenshtein
@@ -129,15 +129,15 @@ over cue text with whitespace/punctuation stripped) against a human
 reference SRT:
 
 ```bash
-cargo run -p agent-video-harness --example bench_transcribe \
-    --features whisper-vulkan --release -- \
+cargo run -p agent-video-harness --example bench_transcribe --release -- \
     <media> <reference.srt> [--prompt "..."] [--language zh]
 ```
 
 With no arguments it uses `test2.mp4` / `test2.zh.srt` at the repo root
 (Chinese speech, hence the `zh` default). It needs a provisioned route:
-a local model (`agent-video install-whisper` + a GPU feature) or
-`WHISPER_API_KEY`. Each row writes to a throwaway temp directory — the
+local weights (`agent-video install-asr`) or `WHISPER_API_KEY`. The
+prompt rows only move the API route — SenseVoice takes no conditioning
+text, so locally they measure the same recognition twice. Each row writes to a throwaway temp directory — the
 real transcript cache is never touched.
 
 **Leakage caveat:** never feed text from the reference SRT into `--prompt`.

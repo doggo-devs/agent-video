@@ -18,11 +18,6 @@ path = "src/main.rs"
 # Pass-throughs so one `-p agent-video --features …` invocation configures
 # the whole binary; the member crates own the actual wiring.
 static-ffmpeg = ["agent-video-core/static-ffmpeg"]
-whisper-local = ["agent-video-harness/whisper-local"]
-whisper-metal = ["agent-video-harness/whisper-metal"]
-whisper-coreml = ["agent-video-harness/whisper-coreml"]
-whisper-cuda = ["agent-video-harness/whisper-cuda"]
-whisper-vulkan = ["agent-video-harness/whisper-vulkan"]
 
 [dependencies]
 agent-video-core = { path = "../core", features = ["clap"] }
