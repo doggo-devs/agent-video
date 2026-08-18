@@ -84,15 +84,33 @@ export PKG_CONFIG_ALL_STATIC=1
 # the compiler line wins, so a thin CC wrapper that appends the desired baseline
 # neutralizes it without patching the crate. The wrapper also carries any
 # musl-gcc CC set above.
+#
+# Both names have to move. The `cc` crate resolves the compiler from
+# `CC_<triple>` first and only falls back to `CC`, so a cross build that
+# exported the triple-specific name above would keep using it and never see
+# the wrapper: the baseline would be announced here and absent from the
+# object files.
+#
+# The wrapper keeps the real compiler's filename, in a directory of its own.
+# FFmpeg's configure splits a compiler name into cross-prefix and tool and
+# re-joins them as `${prefix}gcc`, so a wrapper named anything else is looked
+# up under a name that does not exist: `ffmpeg-cc-wrapper` becomes
+# `ffmpeg-cc-gcc`, and configure fails outright. `musl-gcc` survives that
+# round trip because its own name already has the shape.
 if [ -n "${FFMPEG_TARGET_CPU:-}" ]; then
-  wrapper="$ROOT/target/ffmpeg-cc-wrapper"
-  real_cc="${CC:-cc}"
+  real_cc="$(command -v "${CC:-cc}")" \
+    || { echo "error: no C compiler on PATH (${CC:-cc})" >&2; exit 1; }
+  shim_dir="$ROOT/target/ffmpeg-cc-shim"
+  mkdir -p "$shim_dir"
+  wrapper="$shim_dir/$(basename "$real_cc")"
   cat > "$wrapper" <<EOF
 #!/bin/sh
 exec $real_cc "\$@" -march=$FFMPEG_TARGET_CPU -mtune=generic
 EOF
   chmod +x "$wrapper"
+  export PATH="$shim_dir:$PATH"
   export CC="$wrapper"
+  [ -n "$TARGET" ] && export "CC_${TARGET//-/_}=$wrapper"
   echo ">> pinning FFmpeg C baseline to -march=$FFMPEG_TARGET_CPU (via $real_cc)"
 fi
 
