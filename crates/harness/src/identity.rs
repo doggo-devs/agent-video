@@ -101,16 +101,8 @@ fn snapshot(path: &Path) -> std::io::Result<Snapshot> {
 
 /// Read up to `len` bytes (short only at EOF).
 fn read_exactish(file: &mut File, len: usize) -> std::io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    let mut filled = 0;
-    while filled < len {
-        let n = file.read(&mut buf[filled..])?;
-        if n == 0 {
-            break;
-        }
-        filled += n;
-    }
-    buf.truncate(filled);
+    let mut buf = Vec::with_capacity(len);
+    file.take(len as u64).read_to_end(&mut buf)?;
     Ok(buf)
 }
 

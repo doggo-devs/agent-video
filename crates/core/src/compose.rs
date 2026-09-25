@@ -129,10 +129,11 @@ fn draw_border(img: &mut RgbImage, rect: Rect, color: Rgb<u8>, thickness: u32) {
 fn draw_timestamp(img: &mut RgbImage, font: &FontRef, x: u32, y: u32, ts: f32) {
     let label = crate::types::format_ts(ts);
     let scale = PxScale::from(20.0);
+    let (text_w, text_h) = drawing::text_size(scale, font, &label);
 
     // get_pixel_mut darkens in place — one bounds check per pixel instead of two.
-    let strip_w = (label.len() as u32 * 12 + 8).min(img.width().saturating_sub(x));
-    let strip_h = 24.min(img.height().saturating_sub(y));
+    let strip_w = (text_w + 8).min(img.width().saturating_sub(x));
+    let strip_h = (text_h + 4).min(img.height().saturating_sub(y));
     for py in y..(y + strip_h) {
         for px in x..(x + strip_w) {
             let p = img.get_pixel_mut(px, py);

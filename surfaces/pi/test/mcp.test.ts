@@ -46,7 +46,7 @@ interface Call {
 /** Speaks the server side of the wire: answers initialize, records
  * tools/call requests, and replies with whatever the script returns.
  * `chunkBytes` splits every outgoing message into chunks of that many
- * bytes, as a pipe may. */
+ * bytes, as a pipe may. A reply promise can hold a call in flight. */
 class FakeServer {
 	readonly child = new FakeChild();
 	readonly calls: Call[] = [];
@@ -63,7 +63,7 @@ class FakeServer {
 			while (newline !== -1) {
 				const line = buffer.slice(0, newline);
 				buffer = buffer.slice(newline + 1);
-				if (line.trim() !== "") this.handle(JSON.parse(line));
+				if (line.trim() !== "") void this.handle(JSON.parse(line));
 				newline = buffer.indexOf("\n");
 			}
 		});
@@ -81,7 +81,7 @@ class FakeServer {
 		}
 	}
 
-	private handle(message: {
+	private async handle(message: {
 		id?: number;
 		method?: string;
 		params?: {
@@ -89,7 +89,7 @@ class FakeServer {
 			arguments?: Record<string, unknown>;
 			_meta?: { progressToken?: number };
 		};
-	}): void {
+	}): Promise<void> {
 		if (message.method === "initialize") {
 			this.send({ jsonrpc: "2.0", id: message.id, result: {} });
 		} else if (message.method === "tools/call") {
@@ -102,7 +102,7 @@ class FakeServer {
 					method: "notifications/progress",
 					params: { progressToken: token, message: text },
 				});
-			const reply = this.reply(call, progress);
+			const reply = await this.reply(call, progress);
 			if (reply instanceof RpcError) {
 				this.send({
 					jsonrpc: "2.0",
@@ -301,9 +301,71 @@ describe("call mechanics", () => {
 	});
 
 	test("decodes_text_split_mid_character_across_chunks", async () => {
-		const fake = new FakeServer(() => textResult("中文 transcript"), 1);
+		const fake = new FakeServer(() => textResult("中文😀 transcript"), 1);
 		const blocks = await run(fake, { source: "v.mp4" });
-		expect(blocks).toEqual([{ type: "text", text: "中文 transcript" }]);
+		expect(blocks).toEqual([{ type: "text", text: "中文😀 transcript" }]);
+	});
+
+	test("receives_a_large_image_response_across_chunks", async () => {
+		const data = "A".repeat(2 * 1024 * 1024);
+		const fake = new FakeServer(() => ({ content: [{ type: "image", data }] }), 4096);
+
+		expect(await run(fake, { source: "v.mp4" })).toEqual([
+			{ type: "image", data, mimeType: "image/jpeg" },
+		]);
+	});
+
+	test("cancels_one_waiter_without_closing_the_shared_reader", async () => {
+		const started = Promise.withResolvers<void>();
+		const reply = Promise.withResolvers<unknown>();
+		const fake = new FakeServer(({ args }) => {
+			if (args["source"] === "slow.mp4") {
+				started.resolve();
+				return reply.promise;
+			}
+			return textResult("done");
+		});
+		const server = new VideoServer(fake.spawn);
+		const controller = new AbortController();
+		const first = server.call("video", { source: "slow.mp4" }, undefined, controller.signal);
+		await started.promise;
+		const second = server.call("video", { source: "other.mp4" }, undefined, undefined);
+
+		controller.abort();
+		expect((await first).content[0]?.text).toContain("cancelled");
+		expect(await second).toEqual(textResult("done"));
+		reply.resolve(textResult("late reply"));
+		expect(await server.call("video", { source: "next.mp4" }, undefined, undefined)).toEqual(
+			textResult("done"),
+		);
+		expect(fake.spawns).toBe(1);
+	});
+
+	test.each(["exit", "error"] as const)("rejects_pending_calls_and_restarts_after_%s", async (event) => {
+		const started = Promise.withResolvers<void>();
+		const reply = Promise.withResolvers<unknown>();
+		const first = new FakeServer(() => {
+			started.resolve();
+			return reply.promise;
+		});
+		const next = new FakeServer(() => textResult("restarted"));
+		let spawns = 0;
+		const server = new VideoServer(() => (spawns++ === 0 ? first.spawn() : next.spawn()));
+		const pending = server.call("video", { source: "v.mp4" }, undefined, undefined).catch(
+			(error: unknown) => error,
+		);
+		await started.promise;
+
+		if (event === "exit") first.child.kill();
+		else first.child.emit("error", new Error("spawn failed"));
+		expect(await pending).toMatchObject({
+			message: expect.stringContaining(event === "exit" ? "exited" : "failed"),
+		});
+		reply.resolve(textResult("late reply"));
+		expect(await server.call("video", { source: "v.mp4" }, undefined, undefined)).toEqual(
+			textResult("restarted"),
+		);
+		expect(spawns).toBe(2);
 	});
 
 	test("rejects_with_rpc_error_message", async () => {

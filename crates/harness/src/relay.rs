@@ -26,7 +26,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::gate::Semaphore;
-use crate::netguard::{self, ScreenRefusal};
+use crate::netguard::{self, BlockedRange, ScreenRefusal};
 
 /// Cap on the request head read before the request line is understood: a
 /// legitimate proxy request head is well under this. A client that sends
@@ -348,7 +348,7 @@ fn dial_screened(host: &str, port: u16, allow_private: bool) -> Result<TcpStream
 /// failure. Shapes the status the client sees.
 enum DialRefusal {
     /// The address policy banned the target; carries the range name.
-    Forbidden { range: &'static str },
+    Forbidden { range: BlockedRange },
     /// Resolution or connection failed.
     Unreachable(String),
 }
@@ -594,16 +594,13 @@ fn is_connection_header(name: &str) -> bool {
 }
 
 /// Split a `host:port` authority, handling a bracketed IPv6 literal
-/// (`[::1]:443`). The port must be present and numeric.
+/// (`[::1]:443`). Host and port are required; userinfo is not allowed in CONNECT.
 fn split_authority(authority: &str) -> Option<(String, u16)> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (host, after) = rest.split_once(']')?;
-        let port = after.strip_prefix(':')?;
-        Some((format!("[{host}]"), port.parse().ok()?))
-    } else {
-        let (host, port) = authority.rsplit_once(':')?;
-        Some((host.to_string(), port.parse().ok()?))
+    let authority: ureq::http::uri::Authority = authority.parse().ok()?;
+    if authority.host().is_empty() || authority.as_str().contains('@') {
+        return None;
     }
+    Some((authority.host().to_owned(), authority.port_u16()?))
 }
 
 /// Write a minimal error response and close: status line, a plain-text
@@ -656,6 +653,33 @@ mod tests {
         let mut response = Vec::new();
         client.read_to_end(&mut response).expect("read response");
         response
+    }
+
+    #[test]
+    fn accepts_only_connect_targets_with_host_and_port() {
+        for (target, host, port) in [
+            ("example.com:443", "example.com", 443),
+            ("127.0.0.1:80", "127.0.0.1", 80),
+            ("[::1]:443", "[::1]", 443),
+        ] {
+            assert_eq!(
+                split_authority(target),
+                Some((host.to_owned(), port)),
+                "{target}"
+            );
+        }
+        for target in [
+            "example.com",
+            ":443",
+            "example.com:",
+            "example.com:65536",
+            "::1:443",
+            "[::1",
+            "user@example.com:443",
+            "http://example.com:443",
+        ] {
+            assert_eq!(split_authority(target), None, "{target}");
+        }
     }
 
     #[test]

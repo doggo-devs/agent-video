@@ -47,6 +47,54 @@ impl fmt::Display for VettedUrl {
     }
 }
 
+/// An address range blocked by the egress policy, including embedded IPv4 ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedRange {
+    /// IPv4 or IPv6 loopback.
+    Loopback,
+    /// RFC 1918 private IPv4 space.
+    Private,
+    /// IPv4 or IPv6 link-local space.
+    LinkLocal,
+    /// IPv4 0.0.0.0/8.
+    ThisNetwork,
+    /// Shared IPv4 space for carrier-grade NAT.
+    CarrierGradeNat,
+    /// IPv4 192.0.0.0/24.
+    ProtocolAssignments,
+    /// Addresses reserved for documentation.
+    Documentation,
+    /// IPv4 198.18.0.0/15.
+    Benchmarking,
+    /// IPv4 or IPv6 multicast.
+    Multicast,
+    /// IPv4 240.0.0.0/4, including broadcast.
+    Reserved,
+    /// The IPv6 unspecified address.
+    Unspecified,
+    /// IPv6 unique-local space.
+    UniqueLocal,
+}
+
+impl fmt::Display for BlockedRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Loopback => "the loopback range",
+            Self::Private => "a private (RFC 1918) range",
+            Self::LinkLocal => "the link-local range",
+            Self::ThisNetwork => "the 'this network' range",
+            Self::CarrierGradeNat => "the carrier-grade NAT range",
+            Self::ProtocolAssignments => "the IETF protocol assignments range",
+            Self::Documentation => "a documentation range",
+            Self::Benchmarking => "the benchmarking range",
+            Self::Multicast => "a multicast range",
+            Self::Reserved => "a reserved range",
+            Self::Unspecified => "the unspecified address",
+            Self::UniqueLocal => "the unique-local range",
+        })
+    }
+}
+
 /// Why a URL was refused; every message is model-presentable and names the
 /// way out (fix the URL, flip the config knob, or download manually).
 #[derive(Debug)]
@@ -57,7 +105,7 @@ pub enum UrlRejection {
     ForbiddenAddress {
         host: String,
         ip: IpAddr,
-        range: &'static str,
+        range: BlockedRange,
     },
     /// The host did not resolve at all.
     DnsFailure { host: String, detail: String },
@@ -111,7 +159,7 @@ impl From<UrlRejection> for crate::fault::Fault {
 #[derive(Debug)]
 pub(crate) enum ScreenRefusal {
     /// An address in the set is non-global; `range` names the banning range.
-    Forbidden { ip: IpAddr, range: &'static str },
+    Forbidden { ip: IpAddr, range: BlockedRange },
     /// The host did not resolve to any address.
     Dns { detail: String },
 }
@@ -192,46 +240,46 @@ pub fn vet(source: &str, cfg: &Config) -> Result<VettedUrl, UrlRejection> {
 
 // ── address classification ──
 
-/// The range name that bans `ip`, or `None` for global unicast.
-fn forbidden(ip: IpAddr) -> Option<&'static str> {
+/// The range that bans `ip`, or `None` if the address passes the policy.
+fn forbidden(ip: IpAddr) -> Option<BlockedRange> {
     match ip {
         IpAddr::V4(v4) => forbidden_v4(v4),
         IpAddr::V6(v6) => forbidden_v6(v6),
     }
 }
 
-fn forbidden_v4(ip: Ipv4Addr) -> Option<&'static str> {
+fn forbidden_v4(ip: Ipv4Addr) -> Option<BlockedRange> {
     let o = ip.octets();
     if ip.is_loopback() {
-        return Some("the loopback range");
+        return Some(BlockedRange::Loopback);
     }
     if ip.is_private() {
-        return Some("a private (RFC 1918) range");
+        return Some(BlockedRange::Private);
     }
     if ip.is_link_local() {
-        return Some("the link-local range (cloud metadata lives here)");
+        return Some(BlockedRange::LinkLocal);
     }
     if o[0] == 0 {
-        return Some("the 'this network' range");
+        return Some(BlockedRange::ThisNetwork);
     }
     if o[0] == 100 && (o[1] & 0xc0) == 64 {
-        return Some("the carrier-grade NAT range");
+        return Some(BlockedRange::CarrierGradeNat);
     }
     if o[0] == 192 && o[1] == 0 && o[2] == 0 {
-        return Some("the IETF protocol assignments range");
+        return Some(BlockedRange::ProtocolAssignments);
     }
     if ip.is_documentation() {
-        return Some("a documentation range");
+        return Some(BlockedRange::Documentation);
     }
     if o[0] == 198 && (o[1] & 0xfe) == 18 {
-        return Some("the benchmarking range");
+        return Some(BlockedRange::Benchmarking);
     }
     if ip.is_multicast() {
-        return Some("a multicast range");
+        return Some(BlockedRange::Multicast);
     }
     if o[0] >= 240 {
         // 240.0.0.0/4 including the broadcast address.
-        return Some("a reserved range");
+        return Some(BlockedRange::Reserved);
     }
     None
 }
@@ -246,14 +294,14 @@ fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
     )
 }
 
-fn forbidden_v6(ip: Ipv6Addr) -> Option<&'static str> {
+fn forbidden_v6(ip: Ipv6Addr) -> Option<BlockedRange> {
     // Honest reasons for the two addresses `to_ipv4` would misfile
     // (`::` → 0.0.0.0, `::1` → 0.0.0.1).
     if ip.is_loopback() {
-        return Some("the loopback range");
+        return Some(BlockedRange::Loopback);
     }
     if ip.is_unspecified() {
-        return Some("the unspecified address");
+        return Some(BlockedRange::Unspecified);
     }
     // Embedded-IPv4 forms answer for the embedded address:
     // `::ffff:127.0.0.1` is loopback wearing a coat.
@@ -277,17 +325,17 @@ fn forbidden_v6(ip: Ipv6Addr) -> Option<&'static str> {
         return forbidden_v4(embedded_v4(s[2], s[3]))
             .or_else(|| forbidden_v4(embedded_v4(!s[6], !s[7])));
     }
-    if (s[0] & 0xfe00) == 0xfc00 {
-        return Some("the unique-local range");
+    if ip.is_unique_local() {
+        return Some(BlockedRange::UniqueLocal);
     }
-    if (s[0] & 0xffc0) == 0xfe80 {
-        return Some("the link-local range");
+    if ip.is_unicast_link_local() {
+        return Some(BlockedRange::LinkLocal);
     }
     if s[0] == 0x2001 && s[1] == 0xdb8 {
-        return Some("a documentation range");
+        return Some(BlockedRange::Documentation);
     }
-    if (s[0] & 0xff00) == 0xff00 {
-        return Some("a multicast range");
+    if ip.is_multicast() {
+        return Some(BlockedRange::Multicast);
     }
     None
 }
@@ -372,7 +420,7 @@ mod tests {
         let fault = crate::fault::Fault::from(UrlRejection::ForbiddenAddress {
             host: "internal".to_string(),
             ip: "10.0.0.1".parse().expect("literal"),
-            range: "a private (RFC 1918) range",
+            range: BlockedRange::Private,
         });
         assert_eq!(fault.kind, crate::fault::FaultKind::BadInput);
     }
@@ -466,17 +514,20 @@ mod tests {
     #[test]
     fn classifies_special_v4_ranges() {
         let banned = [
-            "0.0.0.0",
-            "100.64.0.1",  // carrier-grade NAT
-            "192.0.0.170", // IETF protocol assignments
-            "192.0.2.1",   // documentation
-            "198.18.0.1",  // benchmarking
-            "224.0.0.251", // multicast
-            "255.255.255.255",
+            ("127.0.0.1", BlockedRange::Loopback),
+            ("192.168.1.5", BlockedRange::Private),
+            ("169.254.169.254", BlockedRange::LinkLocal),
+            ("0.0.0.0", BlockedRange::ThisNetwork),
+            ("100.64.0.1", BlockedRange::CarrierGradeNat),
+            ("192.0.0.170", BlockedRange::ProtocolAssignments),
+            ("192.0.2.1", BlockedRange::Documentation),
+            ("198.18.0.1", BlockedRange::Benchmarking),
+            ("224.0.0.251", BlockedRange::Multicast),
+            ("255.255.255.255", BlockedRange::Reserved),
         ];
-        for ip in banned {
+        for (ip, range) in banned {
             let ip: Ipv4Addr = ip.parse().expect("literal");
-            assert!(forbidden_v4(ip).is_some(), "{ip} must be forbidden");
+            assert_eq!(forbidden_v4(ip), Some(range), "{ip}");
         }
         for ip in ["8.8.8.8", "93.184.216.34"] {
             let ip: Ipv4Addr = ip.parse().expect("literal");
@@ -488,7 +539,7 @@ mod tests {
     fn rejects_6to4_embedded_private_v4() {
         // 2002:c0a8:0105:: embeds 192.168.1.5.
         let ip: Ipv6Addr = "2002:c0a8:105::1".parse().expect("literal");
-        assert_eq!(forbidden_v6(ip), Some("a private (RFC 1918) range"));
+        assert_eq!(forbidden_v6(ip), Some(BlockedRange::Private));
     }
 
     #[test]
@@ -503,14 +554,14 @@ mod tests {
         // Client 192.168.1.5 = c0a8:0105, bit-inverted → 3f57:fefa;
         // server is public 8.8.8.8.
         let ip: Ipv6Addr = "2001:0:808:808::3f57:fefa".parse().expect("literal");
-        assert_eq!(forbidden_v6(ip), Some("a private (RFC 1918) range"));
+        assert_eq!(forbidden_v6(ip), Some(BlockedRange::Private));
     }
 
     #[test]
     fn rejects_teredo_embedding_private_server_v4() {
         // Server 10.0.0.1 = 0a00:0001; inverted client is public 8.8.4.4.
         let ip: Ipv6Addr = "2001:0:a00:1::f7f7:fbfb".parse().expect("literal");
-        assert_eq!(forbidden_v6(ip), Some("a private (RFC 1918) range"));
+        assert_eq!(forbidden_v6(ip), Some(BlockedRange::Private));
     }
 
     #[test]
@@ -522,10 +573,18 @@ mod tests {
 
     #[test]
     fn classifies_special_v6_ranges() {
-        let banned = ["::", "fe80::1", "ff02::1", "2001:db8::1", "64:ff9b::7f00:1"];
-        for ip in banned {
+        let banned = [
+            ("::", BlockedRange::Unspecified),
+            ("::1", BlockedRange::Loopback),
+            ("fd12:3456::1", BlockedRange::UniqueLocal),
+            ("fe80::1", BlockedRange::LinkLocal),
+            ("ff02::1", BlockedRange::Multicast),
+            ("2001:db8::1", BlockedRange::Documentation),
+            ("64:ff9b::7f00:1", BlockedRange::Loopback),
+        ];
+        for (ip, range) in banned {
             let ip: Ipv6Addr = ip.parse().expect("literal");
-            assert!(forbidden_v6(ip).is_some(), "{ip} must be forbidden");
+            assert_eq!(forbidden_v6(ip), Some(range), "{ip}");
         }
         let global: Ipv6Addr = "2606:4700:4700::1111".parse().expect("literal");
         assert!(forbidden_v6(global).is_none());

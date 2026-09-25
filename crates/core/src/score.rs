@@ -146,54 +146,20 @@ fn for_each_border(w: usize, h: usize, mut f: impl FnMut(usize, usize)) {
 }
 
 /// Laplacian variance: a focus/sharpness measure. Higher is sharper.
-///
-/// Convolves with `[[0,1,0],[1,-4,1],[0,1,0]]` (edges clamped) and returns the
-/// response variance. The interior uses plain slice indexing so LLVM can
-/// vectorize it; the one-pixel border falls back to clamped reads, keeping the
-/// result identical to a naive clamped convolution.
+/// Uses the edge-clamped, four-neighbor Laplacian from `imageproc`.
 pub fn clarity(gray: &GrayImage) -> f32 {
-    let (w, h) = gray.dimensions();
-    if w == 0 || h == 0 {
+    if gray.width() == 0 || gray.height() == 0 {
         return 0.0;
     }
-    let (wu, hu) = (w as usize, h as usize);
-    let buf = gray.as_raw();
-    let n = (w as f64) * (h as f64);
+    let response = imageproc::filter::laplacian_filter(gray);
     let mut sum = 0.0_f64;
     let mut sum_sq = 0.0_f64;
-
-    let mut accumulate = |lap: f32| {
-        sum += lap as f64;
-        sum_sq += (lap as f64) * (lap as f64);
-    };
-
-    // Interior: all neighbours in bounds — plain indexing.
-    if wu >= 3 && hu >= 3 {
-        for y in 1..hu - 1 {
-            let row = y * wu;
-            let up = row - wu;
-            let down = row + wu;
-            for x in 1..wu - 1 {
-                let c = buf[row + x] as f32;
-                let lap = buf[up + x] as f32
-                    + buf[row + x - 1] as f32
-                    + buf[row + x + 1] as f32
-                    + buf[down + x] as f32
-                    - 4.0 * c;
-                accumulate(lap);
-            }
-        }
+    for &value in response.as_raw() {
+        let value = f64::from(value);
+        sum += value;
+        sum_sq += value * value;
     }
-
-    // Border: clamped reads.
-    let at = |x: i64, y: i64| at_clamped(buf, wu, hu, x, y);
-    for_each_border(wu, hu, |x, y| {
-        let (xi, yi) = (x as i64, y as i64);
-        let lap =
-            at(xi, yi - 1) + at(xi - 1, yi) + at(xi + 1, yi) + at(xi, yi + 1) - 4.0 * at(xi, yi);
-        accumulate(lap);
-    });
-
+    let n = response.as_raw().len() as f64;
     let mean = sum / n;
     (sum_sq / n - mean * mean) as f32
 }
@@ -201,7 +167,7 @@ pub fn clarity(gray: &GrayImage) -> f32 {
 /// Sobel energy mean: a content-richness measure.
 ///
 /// Applies horizontal and vertical Sobel kernels, takes `sqrt(gx² + gy²)` per
-/// pixel, and returns the mean. Same interior/border split as [`clarity`].
+/// pixel, and returns the mean. Interior reads are direct; border reads clamp.
 pub fn edge_density(gray: &GrayImage) -> f32 {
     let (w, h) = gray.dimensions();
     if w == 0 || h == 0 {
@@ -614,8 +580,7 @@ mod tests {
         assert_eq!(frame_diff(&black, &white), 255.0);
     }
 
-    /// Naive fully-clamped Laplacian variance — the reference the optimized
-    /// interior/border split must match exactly.
+    /// Independent reference for the clamped Laplacian variance.
     fn clarity_naive(g: &GrayImage) -> f32 {
         let (w, h) = g.dimensions();
         let at = |x: i64, y: i64| {
@@ -638,16 +603,13 @@ mod tests {
     }
 
     #[test]
-    fn fast_clarity_matches_naive_clamped() {
-        // A varied gradient+checker pattern exercises interior and border alike.
-        let mut g = GrayImage::new(13, 9);
-        for y in 0..9u32 {
-            for x in 0..13u32 {
-                let v = ((x * 17 + y * 31 + (x ^ y) * 5) % 256) as u8;
-                g.put_pixel(x, y, Luma([v]));
-            }
+    fn matches_clamped_laplacian_variance() {
+        for (w, h) in [(1, 1), (1, 9), (9, 1), (2, 7), (7, 2), (13, 9)] {
+            let g = GrayImage::from_fn(w, h, |x, y| {
+                Luma([((x * 17 + y * 31 + (x ^ y) * 5) % 256) as u8])
+            });
+            assert_eq!(clarity(&g), clarity_naive(&g), "{w}x{h}");
         }
-        assert_eq!(clarity(&g), clarity_naive(&g), "interior path must match");
     }
 
     #[test]

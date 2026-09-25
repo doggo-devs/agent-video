@@ -11,6 +11,8 @@
  * hop into the host.
  */
 
+import { createInterface } from "node:readline";
+
 /** Bound on the initialize handshake. Generous — startup is local process
  * spawn plus one JSON round-trip — so it only fires on a binary that wedges
  * before speaking MCP, which would otherwise block every video call forever
@@ -314,28 +316,15 @@ export class VideoServer {
 	}
 
 	private wireStdout(child: McpChild): void {
-		// Incremental line splitting: `scanned` marks the newline-free prefix
-		// already searched, so a response arriving as one multi-megabyte line
-		// (grids ride base64-inline) is scanned once, not re-scanned from the
-		// start on every chunk.
-		// One streaming decoder for the pipe: a multi-byte character split
-		// across chunks must be joined, not decoded per chunk into U+FFFD.
-		const decoder = new TextDecoder();
-		let buffer = "";
-		let scanned = 0;
-		child.stdout?.on("data", (chunk: Buffer) => {
-			buffer += decoder.decode(chunk, { stream: true });
-			let start = 0;
-			let newline = buffer.indexOf("\n", scanned);
-			while (newline !== -1) {
-				const line = buffer.slice(start, newline);
-				if (line.trim() !== "") this.dispatch(line);
-				start = newline + 1;
-				newline = buffer.indexOf("\n", start);
-			}
-			if (start > 0) buffer = buffer.slice(start);
-			scanned = buffer.length;
+		if (child.stdout === null) return;
+		const lines = createInterface({ input: child.stdout, terminal: false, crlfDelay: Infinity });
+		lines.on("line", (line) => {
+			if (this.child === child && line.trim() !== "") this.dispatch(line);
 		});
+		const close = () => lines.close();
+		lines.on("error", close);
+		child.once("exit", close);
+		child.once("error", close);
 	}
 
 	private dispatch(line: string): void {
