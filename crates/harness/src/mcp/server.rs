@@ -164,12 +164,9 @@ pub fn serve_stdio() -> anyhow::Result<()> {
 /// CLI runs (`process`, `extract`) are untouched: there the user's proxy
 /// environment is their own business.
 ///
-/// Must run while the process is still single-threaded. That is a call-site
-/// obligation the type system cannot state; the argument for it is
-/// positional — first statement of [`serve_stdio`], before anything that
-/// spawns threads — and debug builds on Linux additionally check it with a
-/// live thread count. Where the platform exposes no cheap count the check
-/// is vacuous and the position carries the obligation alone.
+/// Must run while the process is still single-threaded: it is the first
+/// statement of [`serve_stdio`], and debug builds on Linux check the live
+/// thread count.
 fn scrub_no_proxy_env() {
     debug_assert!(
         live_thread_count().is_none_or(|threads| threads == 1),

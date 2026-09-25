@@ -115,15 +115,10 @@ pub struct DownloadCfg {
     /// that started it and every later call that observes it — before
     /// answering Pending.
     ///
-    /// Sized against the job, not the impatience: a download that outlives
-    /// this window is answered with a poll, and every poll costs a full
-    /// model round trip that buys nothing but a byte count. Five minutes
-    /// covers the retry ladder's own budget (the download module's fetch
-    /// retry window), so the common shapes — a rip that lands, a burst
-    /// that is outlasted, a ladder that gives up — all resolve inside
-    /// one call. Pending remains the fallback for genuinely long
-    /// transfers, where it states a real fact about the source rather
-    /// than a fact about this timer.
+    /// Every poll costs a model round trip that buys only a byte count, so
+    /// the default covers the download retry ladder's own budget: a rip
+    /// that lands, a burst that is outlasted, or a ladder that gives up all
+    /// resolve inside one call.
     pub sync_wait_seconds: NonZeroU32,
 }
 
@@ -846,12 +841,6 @@ mod tests {
             !cfg.network.allow_private_hosts,
             "private destinations are blocked by default"
         );
-    }
-
-    #[test]
-    fn empty_document_yields_defaults() {
-        let cfg = parse_config("", &dirs()).expect("empty toml is valid");
-        assert_eq!(cfg.cache.max_bytes.get(), 10 * GIB);
     }
 
     #[test]

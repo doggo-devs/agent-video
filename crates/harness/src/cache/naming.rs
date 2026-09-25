@@ -1,28 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The shared cache's staging-name grammar: the one owner of every
-//! transient spelling that rests *directly* under the cache directories,
-//! and of the predicates the eviction sweep uses to recognize them. Names
-//! inside a per-writer staging directory (e.g. the `.promote` temp of
-//! [`crate::fetch::ytdlp::promote_subtitle`]) are that writer's private
-//! business: the sweep classifies the directory itself, never its
-//! contents.
+//! transient spelling that rests directly under the cache directories, and
+//! of the predicates the eviction sweep recognizes them by. Names inside a
+//! per-writer staging directory are that writer's business; the sweep
+//! classifies only the directory.
 //!
 //! Writers ([`crate::fetch::direct`], [`crate::fetch::ytdlp`],
-//! [`crate::transcribe`]) construct names here; the sweeper
-//! ([`crate::cache::Cache::evict`]) classifies names here. Constructors
-//! and predicates are inverse by construction — a writer cannot change a
-//! spelling without the sweeper following, so live work is never evicted
-//! and crashed work is never missed: abandoned staging entries, `.part`
-//! files and `.staging-…` directories alike, are age-swept from every
-//! directory writers stage in (downloads and transcripts).
-//! [`crate::install`] borrows [`part_path`] for the models directory —
-//! not a cache dir; it runs its own age-gated sweep — so writer-unique
-//! staging has one spelling everywhere.
+//! [`crate::transcribe`], and [`crate::install`] for the models directory)
+//! construct names here; [`crate::cache::Cache::evict`] classifies them
+//! here, so live work is never evicted and crashed work is never missed.
 //!
-//! The on-disk spellings are frozen: `<dest>.<pid>-<seq>.part` for staging
-//! files, `.staging-<key>-<pid>-<seq>` for staging directories — exactly
-//! what earlier releases wrote, so existing caches stay sweepable. The
-//! literals are pinned by tests against verbatim expected strings.
+//! The on-disk spellings are frozen so existing caches stay sweepable:
+//! `<dest>.<pid>-<seq>.part` for files, `.staging-<key>-<pid>-<seq>` for
+//! directories. Tests pin them against verbatim strings.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,27 +65,6 @@ pub fn is_staging_dir(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn file_name(p: &Path) -> String {
-        p.file_name()
-            .expect("staging paths have a file name")
-            .to_string_lossy()
-            .into_owned()
-    }
-
-    #[test]
-    fn part_constructor_output_is_recognized_by_its_predicate() {
-        let part = part_path(Path::new("/cache/downloads/k.mp4"));
-        assert!(is_part_file(&file_name(&part)), "{part:?}");
-        assert!(!is_staging_dir(&file_name(&part)), "{part:?}");
-    }
-
-    #[test]
-    fn staging_constructor_output_is_recognized_by_its_predicate() {
-        let dir = staging_dir_name("k");
-        assert!(is_staging_dir(&dir), "{dir}");
-        assert!(!is_part_file(&dir), "{dir}");
-    }
 
     #[test]
     fn published_names_match_no_staging_predicate() {

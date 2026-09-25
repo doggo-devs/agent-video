@@ -316,6 +316,112 @@ pub fn corrupt_pts(tag: &str, duration: f32, expr: &str) -> Option<Fixture> {
     })
 }
 
+/// Red/green/blue/white quadrants, with counterclockwise display rotation
+/// followed by optional flips. Identity has no display matrix.
+pub fn display_oriented(rotation: i32, hflip: bool, vflip: bool) -> Option<Fixture> {
+    require_ffmpeg()?;
+    let encode = strings(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "color=white:size=160x96:rate=1:duration=1,\
+         drawbox=x=0:y=0:w=80:h=48:color=red:t=fill,\
+         drawbox=x=80:y=0:w=80:h=48:color=lime:t=fill,\
+         drawbox=x=0:y=48:w=80:h=48:color=blue:t=fill",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "0",
+        "corners.mp4",
+    ]);
+    let base = cached(
+        "orientation-corners",
+        &encode,
+        &["corners.mp4"],
+        |scratch| {
+            run_ffmpeg(scratch, &encode);
+        },
+    );
+    let mut fixture = Fixture {
+        media: base.join("corners.mp4"),
+        sidecar: None,
+        duration: 1.0,
+    };
+    if rotation == 0 && !hflip && !vflip {
+        return Some(fixture);
+    }
+    let mut args = strings(&["-display_rotation", &rotation.to_string()]);
+    if hflip {
+        args.push("-display_hflip".into());
+    }
+    if vflip {
+        args.push("-display_vflip".into());
+    }
+    args.extend(strings(&[
+        "-i",
+        fixture.media.to_str().expect("fixture path is utf-8"),
+        "-c",
+        "copy",
+        "oriented.mp4",
+    ]));
+    let dir = cached("display-oriented", &args, &["oriented.mp4"], |scratch| {
+        run_ffmpeg(scratch, &args);
+    });
+    fixture.media = dir.join("oriented.mp4");
+    Some(fixture)
+}
+
+/// [`h264_talk`] with an embedded SubRip track of `cues` one-kilobyte
+/// cues, one every 10ms: enough decoded subtitle data per pass that a
+/// per-cue leak shows in process memory.
+pub fn embedded_subtitle_track(duration: f32, cues: u32) -> Option<Fixture> {
+    let base = h264_talk(duration)?;
+    let text = "x".repeat(1000);
+    let mut srt = String::new();
+    for i in 0..cues {
+        let (start, end) = (i * 10, i * 10 + 5);
+        srt.push_str(&format!(
+            "{}\n00:00:{:02},{:03} --> 00:00:{:02},{:03}\n{text}\n\n",
+            i + 1,
+            start / 1000,
+            start % 1000,
+            end / 1000,
+            end % 1000,
+        ));
+    }
+    let args = strings(&[
+        "-i",
+        base.media.to_str().expect("fixture path is utf-8"),
+        "-i",
+        "track.srt",
+        "-map",
+        "0",
+        "-map",
+        "1",
+        "-c",
+        "copy",
+        "-c:s",
+        "srt",
+        "subs.mkv",
+    ]);
+    let key: Vec<String> = args.iter().cloned().chain([srt.clone()]).collect();
+    let dir = cached("embedded-subtitle", &key, &["subs.mkv"], |scratch| {
+        fs::write(scratch.join("track.srt"), &srt).expect("writing subtitle track");
+        run_ffmpeg(scratch, &args);
+    });
+    Some(Fixture {
+        media: dir.join("subs.mkv"),
+        sidecar: None,
+        duration,
+    })
+}
+
+fn strings(args: &[&str]) -> Vec<String> {
+    args.iter().map(|s| s.to_string()).collect()
+}
+
 /// `Some(())` when the ffmpeg CLI is on PATH (detected once per process).
 /// Absent + `AV_REQUIRE_MEDIA_TESTS` set panics; absent otherwise returns
 /// `None` so the caller can skip.

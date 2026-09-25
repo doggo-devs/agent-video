@@ -7,15 +7,12 @@
 //! here. No GPU, no conditioning — the tier exists to be cheap and
 //! offline, not to match the API's accuracy or its language coverage.
 //!
-//! **API** (`api`): audio is decoded, encoded as 16-bit WAV, and POSTed
-//! one bounded chunk at a time (~13 min each) — no VAD pre-filtering; the
-//! endpoint owns hallucination suppression. Only the chunk in flight is
-//! resident, so peak memory is one chunk, never the track. Chunks split
-//! at hard byte boundaries, so a cue spanning a cut may lose or repeat a
-//! word: accepted for the simplicity of stateless uploads. Each chunk
-//! after the first is conditioned on the tail of the previous chunk's
-//! transcript (`prompt`), so vocabulary, casing, and script choice
-//! carry across the cut instead of lurching.
+//! **API** (`api`): audio is encoded as 16-bit WAV and POSTed one bounded
+//! chunk (~13 min) at a time, with no VAD; only the chunk in flight is
+//! resident. Chunks split at hard sample boundaries, so a cue spanning a
+//! cut may lose or repeat a word, accepted for stateless uploads. Each
+//! chunk after the first is conditioned on the previous chunk's transcript
+//! tail (`prompt`) so vocabulary and script carry across the cut.
 //!
 //! This module owns the policy seams — route resolution, cache identity,
 //! the entry point, SRT publication; `wav` and `multipart` are
@@ -235,9 +232,9 @@ pub fn transcript_id_for(cache: &Cache, cfg: &Config, fingerprint: &ContentId) -
 /// this conditioning. Everything that shapes the cues is in the key:
 /// engine × model ([`Route::cache_id`]), the language hint, and a short
 /// hash of the effective `prompt` — the latter only for engines the
-/// prompt reaches ([`Route::takes_prompt`]). Unconditioned runs keep the
+/// prompt reaches (`Route::takes_prompt`). Unconditioned runs keep the
 /// bare model identity, so transcripts from before these knobs existed
-/// stay hits. Falls back to [`api_cache_id`] when no route resolves, so a
+/// stay hits. Falls back to the API identity when no route resolves, so a
 /// transcript generated before a key was removed still rides along.
 pub fn transcript_id(cfg: &Config, prompt: &str) -> String {
     let route = Route::resolve(cfg);

@@ -200,7 +200,7 @@ fn downscale_to_gray(img: &RgbImage, nw: u32, nh: u32) -> GrayImage {
         let mut sum = 0u64;
         for y in y0..y1 {
             let row = (y * w as usize + x0) * 3;
-            for px in src[row..row + (x1 - x0) * 3].chunks_exact(3) {
+            for px in src[row..row + (x1 - x0) * 3].as_chunks::<3>().0 {
                 sum += SRGB_LUMA[0] * px[0] as u64
                     + SRGB_LUMA[1] * px[1] as u64
                     + SRGB_LUMA[2] * px[2] as u64;

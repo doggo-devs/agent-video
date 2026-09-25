@@ -23,23 +23,13 @@ const STAGING_DIR: &str = ".staging.tmp";
 
 /// One run's output-directory lifecycle, with a staged commit.
 ///
-/// Run-level contract: destruction of the previous run's artifacts happens
-/// only inside [`OutputSession::commit`], after every byte of the new run is
-/// already durable in the staging directory. Grids and statics are written
-/// incrementally — into staging — as they finish; `commit` then writes
-/// `subtitles.txt` and `metadata.json` into staging, sweeps stale artifacts,
-/// and promotes the staged files into place with `metadata.json` renamed
-/// last. So at every instant the directory is one of exactly two states: the
-/// previous completed run (any abort before the sweep), or the new run
-/// mid-promotion — already past the point where all its files exist locally
-/// — with `metadata.json` still marking completion. Once the sweep begins,
-/// staging is the only complete copy of the new run, so from that point on
-/// no failure path deletes it: a promotion that dies half-way leaves every
-/// remaining file in staging for recovery. A leftover staging directory
-/// (crash mid-run, or a failed promotion) is removed on drop — unless it is
-/// that sole copy — and, belt and suspenders, at the next `open`, where the
-/// rerun rebuilds everything anyway. Files this tool never writes are left
-/// untouched. In JSON mode the session touches no files at all.
+/// Grids and statics are written into staging as they finish; the previous
+/// run's artifacts are destroyed only inside [`OutputSession::commit`], once
+/// the new run is complete in staging. At every instant the directory holds
+/// either the previous completed run or the new one mid-promotion. Leftover
+/// staging is removed on drop (unless it is the new run's only copy) and
+/// at the next `open`. Files this tool never writes are left untouched; in
+/// JSON mode the session touches no files at all.
 pub struct OutputSession<'a> {
     sink: Sink<'a>,
     /// Set at the commit's point of no return, just before the sweep: from

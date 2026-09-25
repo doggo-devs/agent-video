@@ -114,15 +114,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_finite_bounds() {
-        // NaN compares false against everything, so it must be rejected
-        // before the ordering check — not panic past it.
-        assert!(parse_range("NaN-1").is_err());
-        assert!(parse_range("0-inf").is_err());
-        assert!(parse_range("0-infinity").is_err());
-    }
-
-    #[test]
     fn rejects_negative_clock_components() {
         assert!(parse_range("0:-30-1:00").is_err());
     }
@@ -145,7 +136,7 @@ mod tests {
     fn maps_every_parse_failure_to_invalid_range_code() {
         // main() picks the exit code from the typed Error; the signature
         // guarantees a code, this pins that it is the right one.
-        for s in ["abc-5", "1:2:3:4-9", "NaN-1", "01:35-01:23", "5"] {
+        for s in ["abc-5", "1:2:3:4-9", "NaN-1", "0-inf", "01:35-01:23", "5"] {
             let err = parse_range(s).expect_err("malformed range must fail");
             assert_eq!(
                 err.code,

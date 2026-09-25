@@ -378,9 +378,8 @@ mod tests {
 
     #[test]
     fn completes_on_a_single_thread_pool() {
-        // Regression: the orchestrator once ran inside the pool and blocked its
-        // only thread on rx.recv(), deadlocking the queued chunk jobs. On a
-        // regression this test hangs rather than fails.
+        // The orchestrator must not occupy the pool's only thread waiting
+        // on chunk jobs queued behind it; a regression hangs this test.
         let cfg = small_grid_config();
         let frames: Vec<_> = (0..4).flat_map(full_chunk).collect();
 

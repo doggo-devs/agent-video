@@ -1,45 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 //! In-process frame decoding: a dedicated decode thread feeding a bounded
-//! channel of small RGB frames.
-//!
-//! The decode thread and `sync_channel` pipeline decoding against scoring:
-//! the channel's capacity bounds buffered frames and provides backpressure,
+//! channel of small RGB frames. The channel's capacity is the backpressure,
 //! and a dropped receiver stops the producer.
 //!
-//! Timestamps come from the decoded frames themselves (`best-effort pts ×
-//! time_base`, rebased to the stream start), produced by the same decoder
-//! that produced the pixels. Container clocks are allowed to jump — MPEG-TS
-//! PCR discontinuities, 33-bit pts wrap-arounds, and spliced clock domains
-//! are all legal — and no local evidence can distinguish a legal jump from
-//! a corrupt one, so this module never tries. Instead, every decoded frame
-//! passes the `Segmenter`, which cuts the container clock into monotone
-//! *segments* and projects them onto one continuous logical clock;
-//! everything downstream (sampler ticks, range end, chunk placement, wire
-//! time ranges) consumes only the logical clock. A single-segment stream —
-//! every normal file — projects identically: logical time equals container
-//! time to the last bit.
+//! Timestamps come from the decoded frames (`best-effort pts × time_base`,
+//! rebased to the stream start). Container clocks may legally jump (MPEG-TS
+//! discontinuities, pts wrap-arounds, splices) and nothing local tells a
+//! legal jump from a corrupt one, so every frame passes the `Segmenter`,
+//! which cuts the clock into monotone segments and projects them onto one
+//! continuous logical clock. Everything downstream consumes only that
+//! clock; a single-segment stream projects identically.
 //!
-//! The contract this buys: every decodable frame is either sampled onto the
-//! logical timeline or dropped with a signal (the first drop emits
-//! [`Event::UnplaceableTimestamp`], the pass total
-//! [`Event::TimestampsDropped`]); every committed clock seam is announced
-//! as [`Event::TimelineDiscontinuity`]; and timestamps alone never fail a
-//! run — a wrong segmentation threshold mislabels a seam, it cannot lose
-//! content wholesale. Decode and I/O failures keep their own coded errors.
+//! Every decodable frame is either placed on the logical timeline or
+//! dropped with a signal ([`Event::UnplaceableTimestamp`] for the first,
+//! [`Event::TimestampsDropped`] for the total); every seam is announced as
+//! [`Event::TimelineDiscontinuity`]. Timestamps alone never fail a run.
 //!
-//! Segment state is owned by the decode thread alone; only released frames
-//! and signals cross the channel. Fast seeking speaks the container clock
-//! and is therefore exact only within the stream's first segment: a later
-//! segment's container offset is unknowable before its frames are decoded,
-//! so a windowed decode of a multi-segment stream finds its window where
-//! the container clock says it is, while labels follow the logical clock.
-//! A seek the demuxer reports as successful can still land beyond every
-//! decodable frame (a poisoned head packet drags the container's index
-//! arbitrarily); that landing is detected at demuxer EOF with zero decoded
-//! frames, announced as [`Event::SeekFallback`], and retried once
-//! sequentially from the stream head — on a remote source the retry rereads
-//! the stream, the bounded price of never letting an index alone turn
-//! content into an empty run.
+//! Seeking speaks the container clock, so a windowed decode is exact only
+//! within the first segment. A seek that lands past every decodable frame
+//! (a poisoned index) is detected at EOF with zero frames, announced as
+//! [`Event::SeekFallback`], and retried once from the stream head.
 
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -55,6 +35,7 @@ use crate::event::{Event, EventSink};
 use crate::source::Source;
 use crate::types::{TimeRange, Ts};
 
+use super::orientation;
 use super::scale::Rescaler;
 use super::{
     ErrorBudget, Recv, Stop, VideoStream, best_video_stream, classify_receive, decode_error,
@@ -185,22 +166,20 @@ pub struct FrameSource<'e> {
 impl<'e> FrameSource<'e> {
     /// Open `input` and start decoding per `spec`.
     ///
-    /// Frames are pre-scaled so their shorter edge is `min_edge` pixels.
-    /// `threads` caps the decoder's thread count (`None` = auto). Container,
-    /// stream, decoder, and seek failures surface here, synchronously, with
-    /// precise error codes; mid-stream failures surface from `next_frame`.
-    /// `events` receives a [`Event::SeekFallback`] when a seek to a window
-    /// start fails — or reports success but lands beyond every decodable
-    /// frame (see the module docs) — and decoding degrades to a sequential
-    /// read, then rides along for the stream's lifetime to report timeline
-    /// signals (see [`FrameSource::next_frame`]).
+    /// Frames are pre-scaled so their shorter edge is `min_edge` pixels, and
+    /// turned upright per the stream's display matrix. Only right-angle
+    /// rotations and reflections with uniform scale are supported; other
+    /// display transforms fail with [`ErrorCode::DecodeFailed`]. `threads` caps the
+    /// decoder's thread count (`None` = auto). Container, stream, decoder,
+    /// and seek failures surface here with precise error codes; mid-stream
+    /// failures surface from `next_frame`. `events` receives
+    /// [`Event::SeekFallback`] when a window seek fails or lands past every
+    /// decodable frame, and the timeline signals of
+    /// [`FrameSource::next_frame`].
     ///
-    /// The [`Stop`] guarding this open is self-minted, not taken from the
-    /// caller: [`Drop`] needs the exclusive right to trip it (a shared
-    /// token tripped elsewhere would kill an unrelated decode mid-stream).
-    /// A pipeline-level stop token (e.g. `ProcessOpts.stop`) therefore
-    /// covers the probe/subtitle paths but not this decode thread; future
-    /// ctrl-C wiring must bridge the two tokens explicitly.
+    /// The [`Stop`] guarding this open is self-minted: [`Drop`] needs the
+    /// exclusive right to trip it. A pipeline-level token such as
+    /// `ProcessOpts.stop` therefore does not reach this decode thread.
     pub fn open(
         input: &Source,
         spec: SampleSpec,
@@ -242,6 +221,8 @@ impl<'e> FrameSource<'e> {
         let stream = ictx
             .stream(video.index)
             .expect("best stream index is valid");
+        let orientation =
+            orientation::of_stream(&stream).map_err(|e| e.with_input(input.as_path()))?;
         let mut codec_ctx = CodecContext::from_parameters(stream.parameters())
             .map_err(|e| decode_error("reading codec parameters", e).with_input(input.as_path()))?;
 
@@ -271,7 +252,7 @@ impl<'e> FrameSource<'e> {
                     decoder,
                     gate: PacketGate::new(&spec),
                     path: FramePath::new(spec, duration),
-                    rescaler: Rescaler::new(min_edge),
+                    rescaler: Rescaler::new(min_edge, orientation),
                     tx,
                     stop: stop_flag,
                     frames_sent: 0,
@@ -415,19 +396,10 @@ impl Drop for FrameSource<'_> {
 /// target (keyframe preroll) fall before the first tick and are discarded
 /// here.
 ///
-/// Tick instants are indexed, never accumulated: the next instant is
-/// `start + idx * step`, and advancing past a frame computes the new index
-/// directly. Two failure shapes of the accumulating form (`next += step`)
-/// are unrepresentable here: a corrupt far-future pts (finite by [`Ts`],
-/// but arbitrary) has no loop to spin — the old advance never terminated
-/// once `step` fell below the accumulator's ULP — and hours of ticks have
-/// no error to accumulate, each instant being one multiplication away from
-/// `start`.
-///
-/// The grid state is a ratchet: once advanced it never rewinds, so the
-/// caller must feed non-decreasing timestamps. [`Segmenter`] enforces
-/// that upstream; the saturation in [`Tick::wants`] is a float-rounding
-/// guard, not a corruption policy.
+/// Tick instants are indexed as `start + idx * step`, never accumulated, so
+/// a far-future pts cannot spin the advance and hours of ticks accrue no
+/// rounding error. The index never rewinds: timestamps must be
+/// non-decreasing, which [`Segmenter`] guarantees upstream.
 struct Tick {
     start: f64,
     step: f64,
@@ -579,12 +551,10 @@ impl PacketGate {
 const SEGMENT_CONFIRM_FRAMES: usize = 3;
 
 /// Extent-fence slack over the declared duration: `fence = duration ×
-/// FACTOR + SLACK` — the previous paradigm's plausible-extent slack,
-/// repurposed from a corruption verdict into a label prior. The slack
-/// covers header imprecision (rounded durations, files that grew after
-/// the header was written); on containers whose declared duration derives
-/// from pts extremes (MPEG-TS) corruption can widen the fence upward,
-/// never inward, so legal cadences always fit.
+/// FACTOR + SLACK`. The slack covers header imprecision (rounded durations,
+/// files that grew after the header was written); where the declared
+/// duration derives from pts extremes (MPEG-TS), corruption can only widen
+/// the fence, so legal cadences always fit.
 const EXTENT_FENCE_FACTOR: f64 = 2.0;
 const EXTENT_FENCE_SLACK: f64 = 300.0;
 
@@ -702,54 +672,31 @@ fn drop_run(buf: Buffered, step: &mut SegStep) {
 }
 
 /// Cuts the container clock into monotone segments and projects them onto
-/// one continuous logical clock.
+/// one continuous logical clock. Frames are content, timestamps are labels:
+/// a wrong threshold mislabels a seam, it never loses content.
 ///
-/// The paradigm: there is no ground truth separating a broken clock from a
-/// legal discontinuity (MPEG-TS PCR jumps, 26.5-hour pts wrap-arounds, and
-/// spliced clock domains are all legal), so nothing here passes verdicts
-/// on the input. Frames are content; timestamps are labels; a wrong
-/// threshold mislabels a seam instead of losing content.
+/// - Admission: a frame continues the committed run only when its gap from
+///   the last released frame is within tolerance — backward within the
+///   jitter bound (twice the nominal gap; such a frame is dropped with a
+///   signal), forward within twice the largest released gap. Any other
+///   frame buffers as a challenger that must gather
+///   [`SEGMENT_CONFIRM_FRAMES`] frames; unvouched frames never move the
+///   cursor or teach the gap statistics. Runs without precedent fence
+///   against the declared extent ([`EXTENT_FENCE_FACTOR`],
+///   [`EXTENT_FENCE_SLACK`]).
+/// - Confirmation: a challenger that continues forward within the fence is
+///   sparse pacing and extends the segment unchanged; one that jumps
+///   backward or past the fence commits a seam, and the logical clock
+///   resumes one nominal gap after the sealed segment ([`Discontinuity`]).
+/// - Rejection: a challenger contradicted first is dropped whole, so a
+///   rejection costs fewer than [`SEGMENT_CONFIRM_FRAMES`] frames, and
+///   alternating poisoned timestamps cannot shred the legal stream.
+/// - Anchoring: the first segment projects identically when it opens within
+///   [`PREROLL_ALLOWANCE`]; below that (a poisoned head dragged the declared
+///   start) it re-anchors at the stream's first container timestamp.
 ///
-/// Admission has exactly one door. A frame continues the committed run
-/// only when its gap from the last released frame sits inside the learned
-/// pacing tolerance: backward within the jitter bound (twice the nominal
-/// frame gap — the depth B-frame reordering can jitter presentation
-/// order; a backward step inside it is decoder noise and drops that frame
-/// with a signal), forward within twice the largest released gap. Every
-/// other frame, forward or backward, buffers as a challenger and must
-/// gather [`SEGMENT_CONFIRM_FRAMES`] frames — no unvouched frame ever
-/// advances the committed cursor or teaches the gap statistics. Runs
-/// without released precedent — the stream head and every challenger —
-/// fence against the declared extent
-/// ([`EXTENT_FENCE_FACTOR`]`/`[`EXTENT_FENCE_SLACK`]), so a keyframe-only
-/// decode teaches itself minute-scale cadence at the head while a
-/// far-future poisoned timestamp still cannot join any run.
-///
-/// Confirmation decides the label, and the declared extent is the label
-/// prior. A confirmed challenger that continues forward within the extent
-/// fence is sparse pacing (timelapse splices, keyframe cadence): it
-/// extends the same segment identically — no seam, no relabel — and its
-/// released gaps become precedent, so the next equal gap passes the door
-/// directly. One that jumps backward or beyond the extent commits a seam:
-/// the current segment seals at its last released instant and the logical
-/// clock continues one nominal gap later (a [`Discontinuity`]). A
-/// challenger contradicted first is dropped whole, with signals — a
-/// rejected challenger costs at most its own frames, fewer than
-/// [`SEGMENT_CONFIRM_FRAMES`]. That bound is what keeps alternating
-/// poisoned timestamps from shredding the stream: the poisoned half dies
-/// challenger by challenger while the legal half streams on
-/// uninterrupted.
-///
-/// The first confirmed segment projects identically (`shift == 0`) when it
-/// opens within [`PREROLL_ALLOWANCE`]; below that — a poisoned head packet
-/// dragged the container's declared start, so legal content rebased far
-/// negative — it re-anchors at the first container timestamp the stream
-/// produced, giving content sane labels without any global verdict on
-/// which clock was "right".
-///
-/// Owned by the decode thread alone; only released frames and signals
-/// cross the channel. Infallible by design: timestamps relabel or drop
-/// frames with signals, they never construct an error.
+/// Owned by the decode thread; only released frames and signals cross the
+/// channel. Infallible: timestamps relabel or drop frames, never error.
 struct Segmenter {
     state: State,
     /// The first container ts the stream produced: the re-anchor point for
@@ -1418,9 +1365,8 @@ mod tests {
 
     #[test]
     fn keeps_tick_instants_on_grid_after_hours_of_ticks() {
-        // Ten hours of single-step advances at a step that is inexact in
-        // binary: the old f32 accumulator drifted by whole seconds here;
-        // indexed instants stay on the grid.
+        // Ten hours of single-step advances at a step inexact in binary:
+        // an accumulator would drift by whole seconds.
         let mut tick = Tick::new(0.0, 0.1);
         for _ in 0..360_000 {
             assert!(tick.wants((tick.next_instant() + 0.01) as f32));

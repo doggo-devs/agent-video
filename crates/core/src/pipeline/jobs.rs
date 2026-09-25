@@ -267,9 +267,8 @@ mod tests {
 
     #[test]
     fn surfaces_a_vanished_job_instead_of_blocking_spawn() {
-        // The job dies and the pool lives on. On the old shape the next
-        // spawn blocked forever on the wedged sequence number; the
-        // completion guard now reports the death and spawn errors out.
+        // The job dies and the pool lives on: the next spawn must report
+        // the death, not block forever on the missing sequence number.
         let pool = panic_swallowing_pool();
         let mut jobs: OrderedJobs<usize> = OrderedJobs::new(limit(1));
 

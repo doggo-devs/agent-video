@@ -60,12 +60,9 @@ fn title_as_continuation(title: &str) -> String {
 /// that can survive [`continuation_prompt`]'s front-truncation are kept,
 /// so the chain's memory never grows with the transcript.
 ///
-/// Cache note: the tail derives from the previous chunk's *output*, which
-/// an endpoint need not reproduce bit-for-bit — and that is fine for the
-/// key. [`super::transcript_id`] over the initial prompt names the recipe,
-/// not one run of it: the whole SRT is produced under that one initial
-/// conditioning and published atomically, so whichever run lands is a
-/// valid value for its key. No cache-key change is needed here.
+/// The tail derives from nondeterministic endpoint output, which is fine
+/// for caching: [`super::transcript_id`] names the recipe (the initial
+/// prompt), and whichever atomically published run lands is a valid value.
 pub(super) struct PromptChain {
     initial: String,
     tail: String,

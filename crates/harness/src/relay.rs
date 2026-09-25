@@ -2,29 +2,21 @@
 //! A loopback forward relay that applies the netguard address policy to
 //! every connection it carries.
 //!
-//! Two egress paths resolve hostnames and follow redirects themselves and
-//! never re-check the policy after [`crate::netguard::vet`]: the yt-dlp
-//! subprocess and the in-process libav demuxer. Pointing both at this relay
-//! (`--proxy` for yt-dlp, the `http_proxy` demuxer option for libav) brings
-//! their traffic — API calls, manifests, fragments, redirect targets,
-//! CONNECT tunnels — under the same per-connection screen the direct-http
-//! client already enforces through [`crate::netguard::GuardedResolver`].
+//! yt-dlp and the libav demuxer resolve hostnames and follow redirects
+//! themselves, never re-checking the policy after [`crate::netguard::vet`].
+//! Routing both through this relay (`--proxy`, the `http_proxy` demuxer
+//! option) puts every API call, manifest, fragment, redirect, and CONNECT
+//! tunnel under the per-connection screen the direct-http client gets from
+//! [`crate::netguard::GuardedResolver`].
 //!
-//! The relay speaks the minimum a forward proxy needs: `CONNECT host:port`
-//! for TLS targets (screen, dial the screened address, splice bytes without
-//! inspecting the tunnel) and absolute-form http requests for plain-http
-//! clients (screen, rewrite to origin-form, forward). It screens through
-//! `crate::netguard::screen`, so the address that passed the check is the
-//! address it dials — the hostname never reaches the OS resolver a second
-//! time, which would reopen the check-then-use window.
+//! The relay speaks `CONNECT host:port` (screen, dial, splice the tunnel
+//! uninspected) and absolute-form http (screen, rewrite to origin-form,
+//! forward). It dials the exact address `crate::netguard::screen` passed,
+//! so the hostname is never resolved twice.
 //!
-//! The listener is loopback-only and unauthenticated, so any local process
-//! may use it. That grants no new authority — the screen applies to every
-//! connection, and a local process could dial out directly anyway — but
-//! traffic through it egresses with this process's identity, worth knowing
-//! on shared machines. Concurrency is bounded: at most `MAX_TUNNELS`
-//! connections are served at once, and anything past the cap is refused
-//! with `503` rather than growing threads without limit.
+//! The listener is loopback-only and unauthenticated: any local process may
+//! use it, and its traffic egresses with this process's identity. At most
+//! `MAX_TUNNELS` connections are served at once; the rest get `503`.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -48,14 +40,11 @@ const MAX_HEAD_BYTES: usize = 16 * 1024;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Idle bound on an established tunnel as a whole: it is reaped only when
-/// NEITHER direction has moved a byte for this long. Per-direction silence
-/// proves nothing — the request side of a CONNECT tunnel carrying one long
-/// response is legitimately silent for hours — but whole-tunnel silence
-/// means the client vanished without FIN/RST (a hard-killed subprocess, a
-/// dropped link) and would otherwise pin its handler threads and both
-/// sockets until process exit. Far above every consumer's own liveness
-/// bound (yt-dlp's watchdog aborts at 480s of no progress, CDNs idle out
-/// well under this), so it only reaps tunnels nothing is waiting on.
+/// NEITHER direction has moved a byte for this long. One direction alone is
+/// legitimately silent for hours (the request side of a long download);
+/// whole-tunnel silence means the client vanished without FIN/RST. Far
+/// above every consumer's own liveness bound, so it only reaps tunnels
+/// nothing waits on.
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Granularity of the tunnel pumps' socket waits. A blocked read or write
@@ -74,15 +63,12 @@ const TUNNEL_LIFETIME_CEILING: Duration = Duration::from_secs(4 * 60 * 60);
 /// Connection-establishment bound when dialing a screened upstream.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Hard cap on concurrent proxied connections. yt-dlp is invoked without
-/// `--concurrent-fragments`, so fragments serialize within one download,
-/// but a single download still holds several sockets at once (API calls,
-/// manifests, separate video and audio streams) and multiple downloads can
-/// run concurrently; 64 is an order of magnitude above that legitimate
-/// peak. Past the cap the relay refuses with `503` — the listener is
-/// unauthenticated and tunnels can idle for [`TUNNEL_IDLE_TIMEOUT`], so
-/// without a bound a connection burst grows two threads per tunnel until
-/// the process dies.
+/// Hard cap on concurrent proxied connections, an order of magnitude above
+/// the legitimate peak (a download holds a few sockets at once: API calls,
+/// manifests, separate video and audio). Past it the relay answers `503`:
+/// the listener is unauthenticated and tunnels may idle for
+/// [`TUNNEL_IDLE_TIMEOUT`], so an unbounded burst would grow two threads
+/// per tunnel until the process dies.
 const MAX_TUNNELS: usize = 64;
 
 /// A loopback forward relay applying the netguard address policy to every
@@ -269,16 +255,10 @@ fn handle_connect(client: TcpStream, authority: &str, tunneling: Tunneling) -> s
 /// per RFC 7230 §6.1), force `Connection: close`, then splice both
 /// directions until EOF.
 ///
-/// The §6.1 strip is request-direction only, deliberately. The response
-/// path is a raw byte splice the relay never parses; stripping there
-/// would cost a response-head parser interleaved with the still-flowing
-/// request body, and buy nothing: the forced `Connection: close` makes
-/// the origin close after one response, the splice propagates that EOF,
-/// so whatever hop-by-hop headers the origin names, the transport
-/// behavior the client observes is exactly one response then close. A
-/// stale `Keep-Alive` reaching libav or yt-dlp — the relay's only
-/// clients — at worst makes them reconnect for the next request, which
-/// is this relay's per-connection model anyway.
+/// The response is spliced unparsed, so its hop-by-hop headers pass
+/// through: the forced `Connection: close` already makes the client see one
+/// response then EOF, and a stale `Keep-Alive` at worst makes it reconnect,
+/// which is the relay's per-connection model anyway.
 fn handle_absolute(
     client: TcpStream,
     method: &str,

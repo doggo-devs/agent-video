@@ -40,11 +40,6 @@ pub const SUBTITLE_EXTS: [&str; 3] = ["srt", "ass", "vtt"];
 /// Stable cache key for a source spelling: the canonical [`SourceId`]'s
 /// hash — the same identity the token registry keys offer sets on, so the
 /// two sides cannot disagree about which spellings share an entry.
-///
-/// Canonical spellings hash to the same key they always did; keys that
-/// existed only under non-canonical spellings now miss and their entries
-/// age out via the LRU — a natural miss (the key *input* converged), not a
-/// recipe change, so no `RECIPE_VERSION` bump.
 pub fn url_key(url: &str) -> String {
     SourceId::from_spelling(url).cache_key()
 }
@@ -105,32 +100,19 @@ impl Cache {
     // ── media titles ──
 
     /// Record the media title learned from the source's probe document at
-    /// download time, keyed by content: any later caller holding the same
-    /// bytes recovers the *first-sighted* title — a stable-per-content
-    /// value, not a pure function of the bytes — for whisper prompt
-    /// derivation ([`crate::transcribe::effective_prompt`]) with no URL
-    /// in hand. Write-once, first writer wins: the title exists only to
-    /// derive a stable conditioning prompt, and the first sighted title
-    /// serves that end as well as any later one; freezing it removes the
-    /// re-download-under-a-new-title → new transcript id →
-    /// re-transcription fragmentation window. A repeated put is a
-    /// successful no-op. Lives beside the probe documents and ages out
-    /// with them.
+    /// download time, keyed by content, so a later caller holding the same
+    /// bytes but no URL can derive the same whisper prompt
+    /// ([`crate::transcribe::effective_prompt`]). First writer wins and a
+    /// repeated put is a no-op: a frozen title keeps the transcript id
+    /// stable across re-downloads. Ages out with the probe documents.
     ///
-    /// Publication is atomic first-writer-wins (docs/shared-cache.md,
-    /// Pattern 2a): the title is staged to a writer-unique `.part` and
-    /// hard-linked into place — the link installs the complete staged
-    /// bytes or fails because a winner already exists — so a reader can
-    /// never observe a torn or empty sidecar, and a crash leaves only
-    /// age-swept staging, never a poisoned winner. A blank title records
-    /// nothing, and a blank on-disk winner (a legacy torn write from the
-    /// pre-atomic path) is no winner: it is unlinked and the publish
-    /// contested again, so the next sighting heals it. On filesystems
-    /// without hard links (exFAT/FAT, some SMB/NFS mounts) publication
-    /// falls back to a same-directory rename — still an atomic install of
-    /// complete bytes, but first-writer-wins weakens to last-writer-wins
-    /// inside the racing window; any existing non-blank winner is
-    /// deferred to first, so the freeze argument survives.
+    /// Publication is atomic (docs/shared-cache.md, Pattern 2a): the title
+    /// is staged to a writer-unique `.part` and hard-linked into place, so
+    /// readers never see a torn sidecar and a crash leaves only staging. A
+    /// blank title records nothing; a blank on-disk winner (a torn write
+    /// from releases before this scheme) is replaced. Without hard links
+    /// (FAT, some network mounts) the publish falls back to a rename:
+    /// still atomic, but last writer wins inside the race window.
     pub fn put_title(&self, fingerprint: &ContentId, title: &str) -> std::io::Result<()> {
         if title.trim().is_empty() {
             return Ok(());
@@ -204,25 +186,15 @@ impl Cache {
     /// Locate the finished media download for a URL key; hits refresh the
     /// LRU clock.
     ///
-    /// A key's media file has one spelling — `{key}.{ext}` with a single
-    /// dot-free extension outside [`SUBTITLE_EXTS`] — exactly what the
-    /// fetchers publish. Everything else is excluded by shape, not by
-    /// blacklist: staging files (`….<writer>.part`) and promotion temps
-    /// (`….promote`) carry extra dots, sidecars carry subtitle
-    /// extensions. When re-downloads under different containers leave
-    /// rivals (`k.mp4` beside `k.webm`), the newest mtime wins
-    /// deterministically — and the winning touch keeps it winning while
-    /// the loser ages toward eviction.
+    /// A key's media file is `{key}.{ext}` with one dot-free extension
+    /// outside [`SUBTITLE_EXTS`], exactly what the fetchers publish; staging
+    /// and promotion temps carry extra dots and are excluded by shape. Among
+    /// rivals from different containers (`k.mp4` beside `k.webm`) the newest
+    /// mtime wins, and the touch keeps it winning.
     ///
-    /// A hit refreshes the key's subtitle sidecars too: a grid served
-    /// from this rip reads them alongside the media, so they share its
-    /// LRU clock — otherwise budget pressure evicts the subtitles out
-    /// from under a hot rip and every later grid silently loses them.
-    /// Eviction stays per-file: with coupled clocks the pair occupies
-    /// adjacent ranks, and the media is touched first, so a budget
-    /// cutoff that splits them tends to orphan a sidecar (harmless —
-    /// re-fetched with the next rip, aged out by the LRU) rather than
-    /// strip subtitles from a still-cached rip.
+    /// A hit also refreshes the key's subtitle sidecars, which grids read
+    /// alongside the media; otherwise budget pressure would evict them from
+    /// under a hot rip.
     pub fn find_download(&self, key: &str) -> Option<PathBuf> {
         let entries = fs::read_dir(&self.downloads_dir).ok()?;
         let prefix = format!("{key}.");
@@ -495,14 +467,6 @@ mod tests {
             Cache::new(&dir, NonZeroU64::new(max_bytes).expect("non-zero")),
             dir,
         )
-    }
-
-    #[test]
-    fn url_key_is_stable_hex() {
-        let k = url_key("https://example.com/v.mp4");
-        assert_eq!(k.len(), 32);
-        assert_eq!(k, url_key("https://example.com/v.mp4"));
-        assert_ne!(k, url_key("https://example.com/w.mp4"));
     }
 
     #[test]

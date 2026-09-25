@@ -5,13 +5,10 @@
 //! same path production uses — packet pump, segmenter, range end, sampler,
 //! EOF flush, and the signal plumbing back to the event sink.
 //!
-//! Each test pins one adversarial shape from the five-generation attack
-//! history under the segment paradigm's contract: every decodable frame is
-//! either sampled onto a monotone logical timeline or dropped with a
-//! signal; committed clock seams are announced; timestamps alone never
-//! fail a run; and a normal file passes with zero timeline events. Errors
-//! are label errors — a wrong seam mislabels, it cannot lose content
-//! wholesale.
+//! Each test pins one adversarial shape against the segmenter's contract:
+//! every decodable frame is sampled onto a monotone logical timeline or
+//! dropped with a signal; committed seams are announced; timestamps alone
+//! never fail a run; a normal file passes with zero timeline events.
 
 #[allow(dead_code)]
 mod support;
@@ -140,11 +137,9 @@ fn process(media: &Path, dir: &Path, events: &Recorder) -> Result<(), Error> {
 }
 
 /// The poisoned-head fixture: only packet 0's pts is shifted +24h, which
-/// drags the container's declared `start_time` (observed: 86400.0) — so
-/// every legal frame rebases to about -86398s. Under the old paradigm this
-/// killed the whole intact video as INPUT_CORRUPT and needed a re-decode
-/// retry; the segmenter re-anchors the first confirmed segment at the
-/// stream head in one pass.
+/// drags the container's declared `start_time` (observed: 86400.0), so
+/// every legal frame rebases to about -86398s. The segmenter must re-anchor
+/// the first confirmed segment at the stream head.
 fn poisoned_head() -> Option<support::fixtures::Fixture> {
     support::fixtures::corrupt_pts(
         "ts-origin-poisoned-head",
@@ -223,10 +218,9 @@ fn survives_a_double_frame_poisoned_head() {
 }
 
 /// 65 poisoned frames over a 300-frame base: enough to confirm as the
-/// stream's first segment (the gen-5 election lost here). The paradigm's
-/// answer is a label error with zero content loss: the poisoned run keeps
-/// its 65 frames at the head of the logical clock, a seam is committed,
-/// and the 235 legal frames follow — nothing is dropped, nothing fails.
+/// stream's first segment. The answer is a label error with zero content
+/// loss: the poisoned run keeps its 65 frames at the head of the logical
+/// clock, a seam is committed, and the 235 legal frames follow.
 #[test]
 fn survives_a_sixty_five_frame_poisoned_head() {
     let fx = require_fixture!(support::fixtures::corrupt_pts(
@@ -255,10 +249,9 @@ fn survives_a_sixty_five_frame_poisoned_head() {
     );
 }
 
-/// Three mutually inconsistent clock domains (the majority-corrupt shape
-/// that stayed INPUT_CORRUPT after its one rebase under the old paradigm).
-/// Now: each domain is a segment, content is preserved across two seams,
-/// and the run succeeds — the paradigm flip made explicit.
+/// Three mutually inconsistent clock domains, the corrupt majority
+/// included: each domain is a segment, content survives both seams, and
+/// the run succeeds.
 #[test]
 fn survives_three_clock_domains() {
     let fx = require_fixture!(support::fixtures::corrupt_pts(
@@ -496,13 +489,10 @@ fn extracts_a_range_across_a_poisoned_head() {
     );
 }
 
-/// S1: a single forward blip below the old 10-second fence floor (+9.5s
-/// on a 30 fps stream). The two-door design admitted it unconfirmed — it
-/// advanced the committed cursor, inflated the learned gap statistics,
-/// and pushed the next ~49 legal frames into the backward-jitter drop
-/// path: one poisoned frame cost 49 legal ones, with no seam signal.
-/// Single-door: it buffers as a challenger, the next legal frame kills
-/// it, and the stream survives whole.
+/// S1: a single +9.5s forward blip on a 30 fps stream. Admitted
+/// unconfirmed, it would advance the cursor and push the next ~49 legal
+/// frames into the backward-jitter drop path; as a challenger, the next
+/// legal frame kills it and the stream survives whole.
 #[test]
 fn quarantines_a_sub_ten_second_forward_blip() {
     let fx = require_fixture!(support::fixtures::corrupt_pts(
@@ -532,8 +522,8 @@ fn quarantines_a_sub_ten_second_forward_blip() {
 /// whose keyframes run 0,2,..,10 then jump to 25 and 39.9. The tail
 /// keyframes are content at a plausible position inside the declared
 /// 40s extent with nothing left to contradict them; dropping them at EOF
-/// as an unconfirmed challenger loses the last 30 seconds of a healthy
-/// file — the exact content loss this paradigm's contract forbids.
+/// as an unconfirmed challenger would lose the last 30 seconds of a
+/// healthy file.
 #[test]
 fn keyframe_decode_surfaces_a_legal_sparse_tail() {
     let fx = require_fixture!(support::fixtures::sparse_tail_keyframes(40.0));
@@ -559,12 +549,10 @@ fn keyframe_decode_surfaces_a_legal_sparse_tail() {
 }
 
 /// S3: a window seek on the poisoned-head stream speaks the dragged
-/// container clock (logical 1.0 → ~86401s absolute), reports success,
-/// and decodes nothing — under the old assembly the run died as
-/// NoFramesExtracted with zero events, timestamps alone failing a run.
-/// The decode pass now detects the empty landing at demuxer EOF, rewinds
-/// to the stream head, announces the fallback, and serves the window
-/// sequentially from content.
+/// container clock (logical 1.0 → ~86401s absolute), reports success, and
+/// decodes nothing. The decode pass must detect the empty landing at EOF,
+/// rewind to the stream head, announce the fallback, and serve the window
+/// sequentially.
 #[test]
 fn recovers_a_window_seek_dragged_by_a_poisoned_head() {
     let fx = require_fixture!(poisoned_head());
@@ -616,8 +604,8 @@ fn extracts_a_mid_range_across_a_poisoned_head() {
     assert!(events.saw("SeekFallback"), "the degraded seek is announced");
 }
 
-/// The regression pinned since the first design: an edit-list cut mp4 has
-/// legitimate negative packet pts (pre-roll) against a zero header origin.
+/// An edit-list cut mp4 has legitimate negative packet pts (pre-roll)
+/// against a zero header origin.
 /// It is a normal file: one identity segment, zero timeline events, and
 /// the duration tracks the cut.
 #[test]

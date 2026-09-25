@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Core invocation and transcription execution: build the core child's
 //! argument vector, run it (JSON captured, exit class recovered from the
-//! published exit-code contract), and the `transcribe: true` flow that
+//! published exit-code contract), and the `want: "transcript"` flow that
 //! resolves local media, reuses or runs whisper (single-flight per
 //! transcript key), and answers with the transcript itself.
 
@@ -85,7 +85,7 @@ fn transcript_gate_key(fingerprint: &ContentId, transcript_id: &str) -> String {
 
 // ── transcription execution ──
 
-/// The `transcribe: true` flow: resolve local media, reuse a cached
+/// The `want: "transcript"` flow: resolve local media, reuse a cached
 /// transcript, else run whisper; answer with the transcript text. The
 /// handler routes here on [`crate::schema::Intent::Transcribe`], so
 /// exclusivity with `raw`/`confirm`/grid intent is already proven.

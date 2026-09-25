@@ -2,35 +2,25 @@
 //! The canonical cookie jar and its concurrency protocol.
 //!
 //! One Netscape-format jar under the config dir holds cookies for every
-//! site; the format is domain-keyed, so isolation between sites is a
-//! property of the format, not of this module. yt-dlp both consumes the
-//! jar (`--cookies`) and rotates cookies back into it on exit — but it
-//! takes no locks, so several MCP instances sharing the canonical file
-//! would corrupt it. The protocol here gives every mutable copy exactly
-//! one owner:
+//! site. yt-dlp reads it and rotates cookies back on exit but takes no
+//! locks, so every mutable copy gets exactly one owner:
 //!
-//! 1. [`JarLease::checkout`] copies the canonical jar (under an exclusive
-//!    lock) into a private staging dir: a pristine *snapshot* plus a
+//! 1. [`JarLease::checkout`] copies the canonical jar under an exclusive
+//!    lock into a private staging dir: a pristine *snapshot* plus a
 //!    *staged* copy handed to yt-dlp.
 //! 2. yt-dlp reads and rewrites only the staged copy.
-//! 3. [`JarLease::commit`] computes the delta staged − snapshot — exactly
-//!    the cookies this run touched — and applies it to the canonical jar
-//!    under the lock. Concurrent runs' rotations on other cookies survive.
+//! 3. [`JarLease::commit`] applies the delta staged − snapshot to the
+//!    canonical jar under the lock, so concurrent runs' rotations of other
+//!    cookies survive.
 //!
-//! Deletions never propagate: a cookie present in the snapshot but absent
-//! from the staged file is kept in the canonical jar. Expiry-driven
-//! deletions are harmless to resurrect (consumers check the timestamp),
-//! and this makes a killed child — whose staged file may be missing or
-//! truncated — an empty or additive delta instead of a destructive one.
+//! Deletions never propagate: a killed child's missing or truncated staged
+//! file is an empty or additive delta, never a destructive one. A user's
+//! [`clear`] does propagate: it is logged, and a lease checked out before
+//! it drops the cleared scope from its delta.
 //!
-//! Absent is never conflated with unreadable: a canonical jar that does
-//! not exist is genuinely empty, but one that exists and fails to read
-//! (EIO, permissions) aborts the operation before any rewrite — treating
-//! it as empty would replace every other site's cookies with this run's
-//! delta.
-//!
-//! Only the yt-dlp source consumes cookies; direct media links
-//! ([`crate::fetch::direct`]) authenticate via signed URLs, not cookies.
+//! A canonical jar that does not exist is empty; one that exists but
+//! fails to read aborts the operation before any rewrite. Only the yt-dlp
+//! source consumes cookies.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -117,6 +107,9 @@ impl CookieHandle {
 pub struct JarLease {
     staging: PathBuf,
     canonical: PathBuf,
+    /// The last [`clear`] recorded at checkout; later clears bind the
+    /// commit.
+    epoch: u64,
 }
 
 /// Writer-unique `pid-seq` token for lease staging dirs, mirroring the
@@ -140,9 +133,10 @@ impl JarLease {
             .ok_or_else(|| io::Error::other("cookie jar path has no parent directory"))?;
         let staging = parent.join(format!(".cookie-lease-{}", writer_id()));
         fs::create_dir_all(&staging)?;
-        let lease = JarLease {
+        let mut lease = JarLease {
             staging,
             canonical: canonical.to_path_buf(),
+            epoch: 0,
         };
         {
             let _lock = JarLock::exclusive(canonical)?;
@@ -151,6 +145,7 @@ impl JarLease {
             // 0600 instead — no world-readable window.
             copy_private(canonical, &lease.staged())?;
             copy_private(canonical, &lease.snapshot())?;
+            lease.epoch = ClearLog::read(canonical)?.epoch();
         }
         Ok(lease)
     }
@@ -167,7 +162,8 @@ impl JarLease {
     /// Apply this run's delta (staged − snapshot) to the canonical jar
     /// under the lock. Cookies untouched by this run — including ones a
     /// concurrent instance rotated meanwhile — are left as the canonical
-    /// jar has them.
+    /// jar has them. Cookies in a scope [`clear`]ed after checkout are
+    /// dropped: the run's copy predates the user's revocation.
     pub fn commit(self) -> io::Result<()> {
         // A killed child may have left the staged file unwritten; the
         // snapshot then equals it and the delta is empty.
@@ -182,6 +178,14 @@ impl JarLease {
             return Ok(());
         }
         let _lock = JarLock::exclusive(&self.canonical)?;
+        let clears = ClearLog::read(&self.canonical)?;
+        let delta: Vec<(EntryKey, String)> = delta
+            .into_iter()
+            .filter(|((domain, _, _), _)| !clears.revokes_since(self.epoch, domain))
+            .collect();
+        if delta.is_empty() {
+            return Ok(());
+        }
         let mut canonical = read_jar_if_present(&self.canonical)?;
         canonical.extend(delta);
         write_jar(&self.canonical, &canonical)
@@ -192,6 +196,74 @@ impl Drop for JarLease {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.staging);
     }
+}
+
+/// Every [`clear`] still able to bind a lease: `(epoch, scope)` in epoch
+/// order, where scope `None` is the whole jar. Kept in a sibling file
+/// because a clear-all removes the jar itself. A clear-all subsumes every
+/// earlier record, so the log compacts to it.
+struct ClearLog(Vec<(u64, Option<String>)>);
+
+impl ClearLog {
+    fn path(canonical: &Path) -> PathBuf {
+        canonical.with_extension("cleared")
+    }
+
+    /// Read the log; a missing one is empty. Callers hold the lock.
+    fn read(canonical: &Path) -> io::Result<ClearLog> {
+        let text = match fs::read_to_string(Self::path(canonical)) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ClearLog(Vec::new())),
+            Err(e) => return Err(e),
+        };
+        let records = text
+            .lines()
+            .map(|line| {
+                let (epoch, scope) = line.split_once('\t').unwrap_or((line, ""));
+                let epoch = epoch.parse().map_err(|_| {
+                    io::Error::other(format!("malformed cookie clear log: {line:?}"))
+                })?;
+                Ok((epoch, (!scope.is_empty()).then(|| scope.to_string())))
+            })
+            .collect::<io::Result<_>>()?;
+        Ok(ClearLog(records))
+    }
+
+    fn epoch(&self) -> u64 {
+        self.0.last().map_or(0, |&(epoch, _)| epoch)
+    }
+
+    /// Whether a clear after `epoch` covers cookies of `domain`.
+    fn revokes_since(&self, epoch: u64, domain: &str) -> bool {
+        self.0
+            .iter()
+            .any(|(e, scope)| *e > epoch && scope.as_deref().is_none_or(|s| covers(s, domain)))
+    }
+
+    /// Append a clear of `scope` and persist the log. Callers hold the lock.
+    fn record(mut self, canonical: &Path, scope: Option<&str>) -> io::Result<()> {
+        let epoch = self.epoch() + 1;
+        if scope.is_none() {
+            self.0.clear();
+        }
+        self.0.push((epoch, scope.map(str::to_string)));
+        let text: String = self
+            .0
+            .iter()
+            .map(|(e, s)| format!("{e}\t{}\n", s.as_deref().unwrap_or("")))
+            .collect();
+        let path = Self::path(canonical);
+        let tmp = path.with_extension(format!("cleared-tmp-{}", std::process::id()));
+        fs::write(&tmp, text)?;
+        fs::rename(&tmp, &path)
+    }
+}
+
+/// Whether clearing `scope` removes a cookie of `domain`: the domain
+/// itself and its subdomains, leading dot ignored.
+fn covers(scope: &str, domain: &str) -> bool {
+    let d = domain.trim_start_matches('.');
+    d == scope || d.ends_with(&format!(".{scope}"))
 }
 
 // ── jar format ──
@@ -420,25 +492,26 @@ pub fn status(cfg: &CookiesCfg) -> Result<Vec<(String, usize)>, CookieError> {
 }
 
 /// Remove all cookies, or only one domain's (matching the domain and its
-/// subdomains); returns how many entries were removed.
+/// subdomains); returns how many entries were removed. Leases checked out
+/// before the clear cannot write the cleared scope back.
 pub fn clear(cfg: &CookiesCfg, domain: Option<&str>) -> Result<usize, CookieError> {
     if !cfg.jar.is_file() {
-        // Nothing to clear; also keeps the lock from creating the config
-        // dir as a side effect.
+        // Nothing to clear, and no lease can be outstanding: checkout
+        // needs the jar. Also keeps the lock from creating the config dir.
         return Ok(0);
     }
     let _lock = JarLock::exclusive(&cfg.jar)?;
     let mut entries = read_jar_if_present(&cfg.jar)?;
+    let clears = ClearLog::read(&cfg.jar)?;
     let Some(domain) = domain else {
+        clears.record(&cfg.jar, None)?;
         fs::remove_file(&cfg.jar)?;
         return Ok(entries.len());
     };
     let before = entries.len();
-    entries.retain(|(entry_domain, _, _), _| {
-        let d = entry_domain.trim_start_matches('.');
-        !(d == domain || d.ends_with(&format!(".{domain}")))
-    });
+    entries.retain(|(entry_domain, _, _), _| !covers(domain, entry_domain));
     let removed = before - entries.len();
+    clears.record(&cfg.jar, Some(domain))?;
     if removed > 0 {
         write_jar(&cfg.jar, &entries)?;
     }
@@ -599,30 +672,85 @@ mod tests {
     }
 
     #[test]
-    fn commit_treats_missing_canonical_jar_as_empty() {
-        // A concurrent `clear` may remove the jar mid-lease: NotFound is
-        // genuinely empty, so the commit recreates the jar with the delta.
+    fn commit_after_clear_all_leaves_the_jar_cleared() {
         let (cfg, _dir) = temp_cfg("gone");
         fs::write(&cfg.jar, format!("{}\n", line(".a.com", "n", "v"))).expect("write");
-
         let lease = JarLease::checkout(&cfg.jar).expect("checkout");
-        fs::write(lease.staged(), format!("{}\n", line(".a.com", "n", "new")))
-            .expect("write staged");
-        fs::remove_file(&cfg.jar).expect("remove");
+        fs::write(
+            lease.staged(),
+            format!("{}\n", line(".a.com", "n", "rotated")),
+        )
+        .expect("write staged");
+
+        clear(&cfg, None).expect("clear");
+        lease.commit().expect("commit");
+
+        assert!(
+            !cfg.jar.exists(),
+            "a pre-clear lease must not revive the jar"
+        );
+        assert_eq!(mode(&cfg), CookieMode::Anonymous);
+    }
+
+    #[test]
+    fn commit_after_domain_clear_drops_only_that_domain() {
+        let (cfg, _dir) = temp_cfg("gone-domain");
+        fs::write(
+            &cfg.jar,
+            format!(
+                "{}\n{}\n",
+                line(".a.com", "n", "v"),
+                line(".b.org", "m", "w")
+            ),
+        )
+        .expect("write");
+        let lease = JarLease::checkout(&cfg.jar).expect("checkout");
+        fs::write(
+            lease.staged(),
+            format!(
+                "{}\n{}\n",
+                line("sub.a.com", "n", "rotated"),
+                line(".b.org", "m", "rotated")
+            ),
+        )
+        .expect("write staged");
+
+        clear(&cfg, Some("a.com")).expect("clear");
+        lease.commit().expect("commit");
+
+        let jar = fs::read_to_string(&cfg.jar).expect("read");
+        assert!(
+            !jar.contains("a.com"),
+            "cleared domain stays cleared: {jar}"
+        );
+        assert!(jar.contains(&line(".b.org", "m", "rotated")), "{jar}");
+    }
+
+    #[test]
+    fn a_lease_after_a_clear_commits_normally() {
+        let (cfg, _dir) = temp_cfg("post-clear");
+        fs::write(&cfg.jar, format!("{}\n", line(".a.com", "n", "v"))).expect("write");
+        clear(&cfg, Some("a.com")).expect("clear");
+        let lease = JarLease::checkout(&cfg.jar).expect("checkout");
+        fs::write(
+            lease.staged(),
+            format!("{}\n", line(".a.com", "n", "fresh")),
+        )
+        .expect("write staged");
 
         lease.commit().expect("commit");
 
         let jar = fs::read_to_string(&cfg.jar).expect("read");
-        assert!(jar.contains("new"), "delta lands in the recreated jar");
+        assert!(
+            jar.contains("fresh"),
+            "only earlier leases are bound: {jar}"
+        );
     }
 
     #[test]
     fn concurrent_leases_never_share_a_staging_dir() {
-        // Checkouts within one clock quantum used to collide on a
-        // pid+timestamp name (both `create_dir_all` calls succeed, both
-        // children rewrite one jar.txt, and the first Drop deletes the
-        // dir under the other's live child); pid+seq is collision-free
-        // by construction.
+        // A shared dir would let the first lease's Drop delete it under
+        // the other's live child.
         let (cfg, _dir) = temp_cfg("unique");
         fs::write(&cfg.jar, line(".a.com", "n", "v")).expect("write");
 

@@ -3,8 +3,8 @@
  * through an in-memory fake of the spawned server: real newline-delimited
  * JSON-RPC over streams, no child process. Covers the process-boundary
  * contract — parameter narrowing, consent-token flow riding one child,
- * failure unwrapping with fault-kind fidelity, and malformed responses
- * failing diagnosably.
+ * failure unwrapping with fault-kind fidelity, byte-level framing, and
+ * malformed responses failing diagnosably.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -34,18 +34,28 @@ class RpcError {
 }
 
 type Reply = (
-	args: Record<string, unknown>,
+	call: Call,
 	progress: (message: string) => void,
 ) => unknown | RpcError;
 
+interface Call {
+	tool: string;
+	args: Record<string, unknown>;
+}
+
 /** Speaks the server side of the wire: answers initialize, records
- * tools/call arguments, and replies with whatever the script returns. */
+ * tools/call requests, and replies with whatever the script returns.
+ * `chunkBytes` splits every outgoing message into chunks of that many
+ * bytes, as a pipe may. */
 class FakeServer {
 	readonly child = new FakeChild();
-	readonly calls: Record<string, unknown>[] = [];
+	readonly calls: Call[] = [];
 	spawns = 0;
 
-	constructor(private readonly reply: Reply) {
+	constructor(
+		private readonly reply: Reply,
+		private readonly chunkBytes = Infinity,
+	) {
 		let buffer = "";
 		this.child.stdin.on("data", (chunk: Buffer) => {
 			buffer += chunk.toString("utf8");
@@ -65,19 +75,26 @@ class FakeServer {
 	};
 
 	private send(message: unknown): void {
-		this.child.stdout.write(`${JSON.stringify(message)}\n`);
+		const bytes = Buffer.from(`${JSON.stringify(message)}\n`, "utf8");
+		for (let at = 0; at < bytes.length; at += this.chunkBytes) {
+			this.child.stdout.write(bytes.subarray(at, at + this.chunkBytes));
+		}
 	}
 
 	private handle(message: {
 		id?: number;
 		method?: string;
-		params?: { arguments?: Record<string, unknown>; _meta?: { progressToken?: number } };
+		params?: {
+			name?: string;
+			arguments?: Record<string, unknown>;
+			_meta?: { progressToken?: number };
+		};
 	}): void {
 		if (message.method === "initialize") {
 			this.send({ jsonrpc: "2.0", id: message.id, result: {} });
 		} else if (message.method === "tools/call") {
-			const args = message.params?.arguments ?? {};
-			this.calls.push(args);
+			const call = { tool: message.params?.name ?? "", args: message.params?.arguments ?? {} };
+			this.calls.push(call);
 			const token = message.params?._meta?.progressToken;
 			const progress = (text: string) =>
 				this.send({
@@ -85,7 +102,7 @@ class FakeServer {
 					method: "notifications/progress",
 					params: { progressToken: token, message: text },
 				});
-			const reply = this.reply(args, progress);
+			const reply = this.reply(call, progress);
 			if (reply instanceof RpcError) {
 				this.send({
 					jsonrpc: "2.0",
@@ -108,7 +125,7 @@ function failed(error: string, kind: string): unknown {
 }
 
 function run(fake: FakeServer, params: unknown): Promise<unknown> {
-	return runVideoCall(new VideoServer(fake.spawn), params, undefined, undefined);
+	return runVideoCall(new VideoServer(fake.spawn), "video", params, undefined, undefined);
 }
 
 describe("failure unwrapping", () => {
@@ -197,8 +214,8 @@ describe("boundary validation", () => {
 
 describe("consent token flow", () => {
 	test("reuses_one_server_so_consent_tokens_stay_valid", async () => {
-		const fake = new FakeServer((args) =>
-			typeof args["confirm"] === "string"
+		const fake = new FakeServer(({ tool }) =>
+			tool === "video_confirm"
 				? textResult("download started")
 				: textResult(
 						JSON.stringify({
@@ -210,19 +227,29 @@ describe("consent token flow", () => {
 		);
 		const server = new VideoServer(fake.spawn);
 
-		const offer = await runVideoCall(server, { source: "http://v" }, undefined, undefined);
+		const offer = await runVideoCall(
+			server,
+			"video",
+			{ source: "http://v" },
+			undefined,
+			undefined,
+		);
 		expect(offer[0]?.type).toBe("text");
 		expect(offer[0]?.type === "text" ? offer[0].text : "").toContain("tok-1");
 
 		const confirmed = await runVideoCall(
 			server,
-			{ source: "http://v", confirm: "tok-1" },
+			"video_confirm",
+			{ source: "http://v", token: "tok-1" },
 			undefined,
 			undefined,
 		);
 		expect(confirmed).toEqual([{ type: "text", text: "download started" }]);
 		expect(fake.spawns).toBe(1); // same child: in-process tokens survive the hop
-		expect(fake.calls[1]?.["confirm"]).toBe("tok-1");
+		expect(fake.calls[1]).toEqual({
+			tool: "video_confirm",
+			args: { source: "http://v", token: "tok-1" },
+		});
 	});
 });
 
@@ -249,6 +276,7 @@ describe("call mechanics", () => {
 		const seen: string[] = [];
 		const blocks = await runVideoCall(
 			new VideoServer(fake.spawn),
+			"video",
 			{ source: "http://v" },
 			(message) => seen.push(message),
 			undefined,
@@ -262,6 +290,7 @@ describe("call mechanics", () => {
 		const aborted = AbortSignal.abort();
 		const blocks = await runVideoCall(
 			new VideoServer(fake.spawn),
+			"video",
 			{ source: "v.mp4" },
 			undefined,
 			aborted,
@@ -269,6 +298,12 @@ describe("call mechanics", () => {
 		expect(blocks[0]?.type === "text" ? blocks[0].text : "").toContain("cancelled");
 		expect(fake.spawns).toBe(0);
 		expect(fake.calls).toHaveLength(0);
+	});
+
+	test("decodes_text_split_mid_character_across_chunks", async () => {
+		const fake = new FakeServer(() => textResult("中文 transcript"), 1);
+		const blocks = await run(fake, { source: "v.mp4" });
+		expect(blocks).toEqual([{ type: "text", text: "中文 transcript" }]);
 	});
 
 	test("rejects_with_rpc_error_message", async () => {

@@ -7,29 +7,15 @@
 //! to loopback, private (RFC 1918), link-local (cloud metadata), or any
 //! other non-global address, unless `network.allow_private_hosts` is set.
 //!
-//! The policy is one function — `screen` resolves a host and rejects the
-//! whole set if any address is non-global — enforced up front and again per
-//! connection everywhere a connection is made:
-//! - [`vet`] runs `screen` once, up front, so a refusal reaches the model
-//!   with a clear reason before any packet leaves.
-//! - [`GuardedResolver`] re-runs the same classification on every address
-//!   the direct-http client is about to connect to — redirect targets and
-//!   DNS answers that changed since [`vet`] included — closing the
-//!   check-then-use window on that path.
-//! - [`crate::relay::PolicyRelay`] runs `screen` on every connection the
-//!   yt-dlp subprocess and the libav demuxer make, then connects to the
-//!   already-screened address. Those two paths resolve hostnames
-//!   themselves and never re-check after [`vet`], so their traffic is
-//!   routed through the relay (`--proxy` for yt-dlp, the `http_proxy`
-//!   demuxer option for libav) to bring them under the same per-connection
-//!   check. An attacker who rebinds a passing name to an internal address
-//!   between [`vet`] and the connection is refused at the relay, not
-//!   trusted from the earlier resolution.
+//! One function, `screen`, resolves a host and rejects the whole address
+//! set if any address is non-global. [`vet`] runs it up front so a refusal
+//! reaches the model before any packet leaves; [`GuardedResolver`] (the
+//! direct-http client) and [`crate::relay::PolicyRelay`] (yt-dlp and libav)
+//! re-run it on the address each connection actually dials, so a name
+//! rebound after [`vet`] is still refused.
 //!
-//! `no_proxy` would punch a hole in the relay routing — libav consults the
-//! env var at connect time even when a proxy is explicitly configured — so
-//! the MCP server scrubs it from its own environment at boot and blanks it
-//! in every yt-dlp child's environment.
+//! `no_proxy` would let libav and yt-dlp bypass the relay, so the MCP
+//! server scrubs it at boot and blanks it in every yt-dlp child.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};

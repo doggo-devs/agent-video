@@ -6,15 +6,13 @@
 //! tuning-profile table in [`config`], because the harness predicts grid
 //! budgets through the same table the pipeline resolves against — splitting
 //! them would let prediction and execution drift. The CLI argument surface
-//! is opt-in via the `clap` feature; without it core is a plain library.
-//! The public surface is what the CLI and
-//! the harness crate consume: [`pipeline`] to run, [`config`] to configure,
+//! is opt-in via the `clap` feature.
+//!
+//! Public surface: [`pipeline`] to run, [`config`] to configure,
 //! [`media`]/[`probe`] to inspect, [`wire`] as the output contract,
-//! [`subtitle`] as the SRT contract (one parser, one serializer — every
-//! SRT the workspace writes must parse back here),
-//! [`event`] as the observability contract, and
-//! [`source`]/[`types`]/[`error`] as shared vocabulary. Everything else is
-//! implementation detail.
+//! [`subtitle`] as the SRT contract (every SRT the workspace writes must
+//! parse back here), [`event`] for observability, and
+//! [`source`]/[`types`]/[`error`] as shared vocabulary.
 
 pub mod config;
 pub mod error;

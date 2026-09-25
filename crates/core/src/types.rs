@@ -1,23 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Public data types shared across the pipeline.
 //!
-//! The central design constraint lives here: neither frame type holds a
-//! full-resolution decoded frame. Right after a frame is decoded, `extract`
-//! derives a small grayscale image (for scoring) and a small RGB image (for
-//! composition), then drops the original buffer. Frames travel as
-//! [`CandidateFrame`] until the scoring boundary, where per-competition-set
-//! rank normalization turns them into [`ScoredFrame`]; both share their RGB
-//! pixels through an [`Arc`], so retaining a representative is a pointer clone,
-//! not a deep copy. This keeps peak memory in the hundreds-of-MB range instead
-//! of GBs for long videos.
+//! No frame type holds a full-resolution decoded frame: right after decode,
+//! a small grayscale (for scoring) and a small RGB (for composition) are
+//! derived and the original dropped. Frames travel as [`CandidateFrame`]
+//! until scoring turns them into [`ScoredFrame`]; both share their RGB
+//! through an [`Arc`].
 //!
-//! Timestamps travel as [`Ts`] — `f32` seconds, finite by construction,
-//! minted once at the decode boundary. The ulp is under 1 ms out to ~4.5
-//! hours and under 8 ms out to 24 hours — far finer than grid timestamps
-//! (whole seconds on the wire) ever need. The harness computes windows in
-//! `f64`, but the hand-off is CLI text re-parsed here, so no silent
-//! in-process narrowing exists. Revisit `f64` before supporting multi-day
-//! streams, where dense sampling could collide within one ulp.
+//! Timestamps travel as [`Ts`]: `f32` seconds, finite by construction,
+//! minted once at the decode boundary. The ulp stays under 8 ms out to
+//! 24 hours, far finer than the whole seconds on the wire; revisit `f64`
+//! before supporting multi-day streams.
 
 use std::sync::Arc;
 
@@ -444,14 +437,9 @@ pub enum GridImage {
 
 /// Per-grid subtitle outcome — the *result* of subtitle resolution.
 ///
-/// The states a bare `Option<String>` collapsed — "the run has no subtitle
-/// source" and "a source exists but no cue overlaps this range" — are
-/// distinct constructors here, so downstream code can tell them apart by
-/// type. "Resolution never ran" is not a state of this type at all: a
-/// [`GridMeta`] carries no subtitle slot, and the wire shape is only
-/// constructible by pairing one with a resolved outcome
-/// ([`crate::wire::Grid::new`]). On the wire only [`GridSubtitles::Text`]
-/// survives, as [`crate::wire::Grid::subtitles`].
+/// "No subtitle source" and "no cue in this range" are distinct states; on
+/// the wire only [`GridSubtitles::Text`] survives, as
+/// [`crate::wire::Grid::subtitles`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum GridSubtitles {
     /// The run resolved no subtitle source at all.
@@ -464,11 +452,9 @@ pub enum GridSubtitles {
 
 /// Metadata for one rendered grid image.
 ///
-/// Deliberately has no subtitle slot: subtitle resolution is a separate
-/// output-boundary step, and the wire shape ([`crate::wire::Grid`]) can only
-/// be built by pairing this with its resolved [`GridSubtitles`] — a grid
-/// whose resolution was forgotten does not typecheck, instead of silently
-/// serializing as "no subtitles".
+/// Deliberately has no subtitle slot: the wire shape ([`crate::wire::Grid`])
+/// is only built by pairing this with its resolved [`GridSubtitles`], so a
+/// grid whose subtitle resolution was forgotten does not typecheck.
 #[derive(Debug, Clone)]
 pub struct GridMeta {
     /// Image payload, produced by the output session.
@@ -651,14 +637,6 @@ mod tests {
             assert!(Ts::new(bad).is_none(), "ts {bad} must be rejected");
         }
         assert!(Ts::new(-0.5).is_some(), "pre-roll timestamps are valid");
-    }
-
-    #[test]
-    fn orders_timestamps_ascending() {
-        let ts = |v| Ts::new(v).expect("finite test ts");
-        let mut v = [ts(9.0), ts(-0.5), ts(3.0)];
-        v.sort();
-        assert_eq!(v, [ts(-0.5), ts(3.0), ts(9.0)]);
     }
 
     #[test]

@@ -310,20 +310,13 @@ fn perform_download(
     match plan.dest {
         Dest::Cache => analysis_response(source, &path, warning.as_deref(), deps).into(),
         Dest::Keep => {
-            // The receipt makes future echoes of this token replays instead
-            // of duplicate rips — keep is the one non-idempotent action, so
-            // its idempotency is manufactured here. Truncation warnings
-            // still fulfill: the file landed and belongs to the user. The
-            // receipt rides the settlement as its owned effect, so a job
-            // whose slot was abandoned can never write it — the tracker
-            // drops a disowned settlement whole, and a zombie cannot
-            // overwrite the receipt a retry just recorded. The disowned
-            // compensation is the receipt's mirror: a file published by a
-            // job that then lost its slot (cancellation can land between
-            // the fetcher's last cancel check and its rename) would orphan
-            // under a name no receipt points to and no retry can take, so
-            // an unadopted settlement removes it — the file exists iff its
-            // settlement was adopted, up to a process crash in between.
+            // The receipt makes later echoes of this token replays instead
+            // of duplicate rips; truncation warnings still fulfill, since
+            // the file belongs to the user. It rides the settlement as an
+            // owned effect, so a disowned job can never write it. The
+            // disowned compensation mirrors it: a file published by a job
+            // that then lost its slot is removed, so the file exists iff
+            // its settlement was adopted (up to a process crash).
             let response = keep_response(&path, warning.as_deref(), deps);
             let unadopted = path.clone();
             let receipt = {
@@ -404,14 +397,11 @@ enum Setback {
 /// Fetch until the rip is complete, the budget runs out, or the failure is
 /// one no fresh extraction can heal.
 ///
-/// The loop lives at this layer — above both downloaders, below the
-/// protocol — because only a whole new invocation re-runs extraction, and
-/// re-extraction is the only thing that changes the signed URL a flaky CDN
-/// backend pinned the rip to. yt-dlp's own retries resume that same URL
-/// and cannot help. And it lives here rather than in the model's hands
-/// because a retry from up there costs a consent round-trip apiece: the
-/// job is already detached behind the tracker, so spending the time here
-/// costs the caller nothing but a pending poll.
+/// The loop sits above both downloaders because only a new invocation
+/// re-extracts, and only re-extraction changes the signed URL a flaky CDN
+/// backend pinned the rip to. It sits below the protocol because the job is
+/// already detached behind the tracker: retrying here costs the caller a
+/// pending poll, not a consent round-trip per attempt.
 ///
 /// A short rip that nonetheless landed is kept as the fallback: retries
 /// adopt over the same cache names, so a failed retry still leaves the

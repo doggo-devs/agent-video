@@ -40,13 +40,10 @@ impl Cue {
     /// bounds yield `None`: NaN or infinity here is corrupt input, not a
     /// clampable time.
     ///
-    /// Embedded streams legitimately carry cues placed before the video's
-    /// first frame: edit-list pre-roll (MP4 `elst` negative offsets),
-    /// `-itsoffset`-shifted tracks, and broadcast priming cues. The domain
-    /// rule is a single intersection: a cue ending at or before 0 is not
-    /// content and yields `None`; one straddling 0 is clamped to start at 0,
-    /// which honors the container's intent that its text be on screen when
-    /// the first frame presents. Empty text also yields `None`.
+    /// Embedded streams legitimately place cues before the first frame
+    /// (edit-list pre-roll, shifted tracks, priming cues): a cue ending at
+    /// or before 0 yields `None`, one straddling 0 is clamped to start at 0.
+    /// Empty text also yields `None`.
     pub fn visible(start: f64, end: f64, text: String) -> Option<Cue> {
         // Narrow first, so an f64 that overflows f32 becomes inf here and
         // fails the finiteness check with the other non-finite inputs; the
@@ -184,12 +181,9 @@ impl Subtitles {
     /// run had no source".
     ///
     /// Totality is the contract: grid spans cover picked frames, not the
-    /// timeline, so per-grid overlap slicing silently dropped every cue in
-    /// the unsampled head/tail and in the gaps between grids — worst on
-    /// short videos, whose sparse frames leave proportionally wide gaps.
-    /// Nearest-span assignment has no gaps to drop into, and handles
-    /// overlapping spans (static stretches straddle their neighbors) with
-    /// the same rule instead of duplicating boundary cues into both grids.
+    /// timeline, so overlap slicing would drop every cue in the gaps between
+    /// grids. Nearest-span assignment has no gaps, and overlapping spans
+    /// (static stretches straddle their neighbors) never duplicate a cue.
     ///
     /// Each entry renders as `MM:SS text` lines (cue start times), so the
     /// text stays addressable for follow-up `--from/--until` calls.
@@ -321,16 +315,10 @@ pub const SIDECAR_SUBTITLE_EXTS: &[&str] = &["srt"];
 /// Find all sidecar subtitle files alongside the video: `video.<ext>` and
 /// `video.*.<ext>` for every extension in [`SIDECAR_SUBTITLE_EXTS`].
 ///
-/// Best-effort by design: this runs on every local auto-detect invocation,
-/// including ones that need no subtitles, so a directory that cannot be
-/// listed (permissions, sandbox) degrades to a warning and whatever the
-/// exact-name check already found — mirroring the missing-track downgrade
-/// in `auto_detect`. A sidecar that is *found* but unreadable still fails,
-/// in `read_sidecar`.
-///
-/// Library consumers that only want the list stay silent: this discards the
-/// scan diagnostics. The pipeline's auto path uses `find_sidecars_inner` to
-/// route them into its event sink instead.
+/// Best-effort: it runs on every auto-detect, so an unlistable directory
+/// degrades to whatever the exact-name check found; a sidecar that is found
+/// but unreadable still fails in `read_sidecar`. Scan diagnostics are
+/// discarded here; the pipeline uses `find_sidecars_inner` to keep them.
 pub fn find_sidecars(input: &Path) -> Vec<std::path::PathBuf> {
     find_sidecars_inner(input, &Discard)
 }

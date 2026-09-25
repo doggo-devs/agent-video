@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Real-decode integration tests over synthesized media (see
-//! [`support::fixtures`]). Every assertion is invariant-level — durations,
-//! coverage, ordering, container magic — never pixel content, so the suite
-//! survives encoder and ffmpeg-version drift.
+//! [`support::fixtures`]). Assertions cover timing, coverage, and decoded
+//! geometry; color checks allow codec rounding instead of requiring exact pixels.
 
 // The support module is shared with timeline_segments.rs; each test
 // binary uses its own subset, so unused items are expected here.
@@ -15,6 +14,7 @@ use agent_video_core::media::Stop;
 use agent_video_core::media::audio::{
     AudioCeiling, AudioSamples, WHISPER_SAMPLE_RATE, decode_audio_16k_mono,
 };
+use agent_video_core::media::decode::{FrameSource, SampleSpec};
 use agent_video_core::pipeline::{self, OutputSink, SubtitleSource, Window};
 use agent_video_core::probe;
 use agent_video_core::source::Source;
@@ -407,5 +407,79 @@ fn collects_whole_track_under_a_generous_ceiling() {
     assert_eq!(
         streamed, whole,
         "streamed fills and the whole decode are the same samples"
+    );
+}
+
+#[test]
+fn displays_rotated_and_mirrored_corners_in_their_declared_positions() {
+    let red = [255u8, 0, 0];
+    let green = [0, 255, 0];
+    let blue = [0, 0, 255];
+    let white = [255, 255, 255];
+    // Each row names the displayed top-left, top-right, bottom-left, bottom-right.
+    let cases = [
+        (0, false, false, (80, 48), [red, green, blue, white]),
+        (90, false, false, (48, 80), [green, white, red, blue]),
+        (-90, false, false, (48, 80), [blue, red, white, green]),
+        (180, false, false, (80, 48), [white, blue, green, red]),
+        (0, true, false, (80, 48), [green, red, white, blue]),
+        (0, false, true, (80, 48), [blue, white, red, green]),
+        (90, true, false, (48, 80), [white, green, blue, red]),
+        (90, false, true, (48, 80), [red, blue, green, white]),
+        (0, true, true, (80, 48), [white, blue, green, red]),
+        (180, true, true, (80, 48), [red, green, blue, white]),
+    ];
+    for (rotation, hflip, vflip, dimensions, corners) in cases {
+        let fx = require_fixture!(support::fixtures::display_oriented(rotation, hflip, vflip));
+        let case = format!("rotation={rotation}, hflip={hflip}, vflip={vflip}");
+        let mut frames = FrameSource::open(
+            &source_of(&fx.media),
+            SampleSpec::Keyframes,
+            48,
+            None,
+            &Discard,
+        )
+        .expect("opens");
+        let frame = frames.next_frame().expect("decodes").expect("has a frame");
+        let (w, h) = frame.rgb.dimensions();
+
+        assert_eq!((w, h), dimensions, "{case}");
+        assert_eq!(frames.aspect(), Some(w as f32 / h as f32), "{case}");
+        let positions = [
+            (w / 4, h / 4),
+            (3 * w / 4, h / 4),
+            (w / 4, 3 * h / 4),
+            (3 * w / 4, 3 * h / 4),
+        ];
+        for ((x, y), expected) in positions.into_iter().zip(corners) {
+            let actual = frame.rgb.get_pixel(x, y).0;
+            assert!(
+                actual
+                    .into_iter()
+                    .zip(expected)
+                    .all(|(a, e)| a.abs_diff(e) < 12),
+                "{case}, pixel ({x}, {y}): expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rejects_unsupported_display_rotation_instead_of_returning_sideways_pixels() {
+    let fx = require_fixture!(support::fixtures::display_oriented(45, false, false));
+    let error = FrameSource::open(
+        &source_of(&fx.media),
+        SampleSpec::Keyframes,
+        48,
+        None,
+        &Discard,
+    )
+    .err()
+    .expect("a non-right-angle matrix cannot be represented");
+
+    assert_eq!(error.code, agent_video_core::error::ErrorCode::DecodeFailed);
+    assert_eq!(
+        error.context().and_then(|c| c.input_path.as_deref()),
+        Some(fx.media.as_path())
     );
 }

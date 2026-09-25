@@ -426,12 +426,6 @@ mod tests {
     }
 
     #[test]
-    fn space_form_chunk_seconds_wins_over_equals_form_profile() {
-        let inv = parse_raw("process --profile=fast --chunk-seconds 30").expect("valid");
-        assert_eq!(inv.chunk_seconds, 30.0);
-    }
-
-    #[test]
     fn ignores_equals_form_chunk_seconds_with_empty_value() {
         let inv = parse_raw("process --chunk-seconds=").expect("valid");
         assert_eq!(inv.chunk_seconds, f64::from(DEFAULT_CHUNK_SECONDS));

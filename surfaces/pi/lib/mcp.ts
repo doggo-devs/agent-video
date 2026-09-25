@@ -318,10 +318,13 @@ export class VideoServer {
 		// already searched, so a response arriving as one multi-megabyte line
 		// (grids ride base64-inline) is scanned once, not re-scanned from the
 		// start on every chunk.
+		// One streaming decoder for the pipe: a multi-byte character split
+		// across chunks must be joined, not decoded per chunk into U+FFFD.
+		const decoder = new TextDecoder();
 		let buffer = "";
 		let scanned = 0;
 		child.stdout?.on("data", (chunk: Buffer) => {
-			buffer += chunk.toString("utf8");
+			buffer += decoder.decode(chunk, { stream: true });
 			let start = 0;
 			let newline = buffer.indexOf("\n", scanned);
 			while (newline !== -1) {

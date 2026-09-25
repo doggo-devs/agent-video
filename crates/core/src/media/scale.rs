@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Frame rescaling via libswscale: decoded native-format frames to small RGB
-//! images sized for grid composition.
+//! images sized for grid composition, turned upright per the stream's
+//! display matrix.
 //!
 //! The conversion runs on the decode thread, immediately after each frame is
 //! received, so the full-resolution frame is dropped before the next one is
@@ -9,7 +10,8 @@
 use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling;
 use ffmpeg_next as ffmpeg;
-use image::RgbImage;
+use image::metadata::Orientation;
+use image::{DynamicImage, RgbImage};
 
 use crate::error::{Error, ErrorCode, Result};
 
@@ -19,6 +21,7 @@ use crate::error::{Error, ErrorCode, Result};
 /// resolution switches are rare but legal).
 pub struct Rescaler {
     min_edge: u32,
+    orientation: Orientation,
     ctx: Option<scaling::Context>,
     src_key: Option<(Pixel, u32, u32)>,
     dst: (u32, u32),
@@ -29,9 +32,11 @@ pub struct Rescaler {
 }
 
 impl Rescaler {
-    pub fn new(min_edge: u32) -> Self {
+    /// A rescaler whose output is turned by `orientation`.
+    pub fn new(min_edge: u32, orientation: Orientation) -> Self {
         Self {
             min_edge: min_edge.max(1),
+            orientation,
             ctx: None,
             src_key: None,
             dst: (0, 0),
@@ -39,7 +44,7 @@ impl Rescaler {
         }
     }
 
-    /// Convert one decoded frame to a small RGB image.
+    /// Convert one decoded frame to a small, upright RGB image.
     pub fn rgb(&mut self, frame: &ffmpeg::frame::Video) -> Result<RgbImage> {
         let key = (frame.format(), frame.width(), frame.height());
         if self.src_key != Some(key) {
@@ -76,7 +81,9 @@ impl Rescaler {
             .run(frame, &mut self.out)
             .map_err(|e| Error::new(ErrorCode::DecodeFailed, format!("scaling frame: {e}")))?;
 
-        rgb_image_from_frame(&self.out, self.dst)
+        let mut image = DynamicImage::ImageRgb8(rgb_image_from_frame(&self.out, self.dst)?);
+        image.apply_orientation(self.orientation);
+        Ok(image.into_rgb8())
     }
 }
 

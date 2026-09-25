@@ -1,28 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Consent token registry, in-memory for one MCP stdio session.
 //!
-//! The registry is the only token mint: policy emits [`OfferDraft`]s —
-//! which carry no token text — and [`Tokens::commit`] assigns each one a
-//! session-unique token from a monotonic counter, so two distinct plans
-//! can never alias — uniqueness is a registry fact, not a property of any
-//! text policy could construct. [`Token::new`] wraps the text the model
-//! echoes back, and wrapping is not minting: a constructed token is a
-//! lookup claim that redeems nothing unless a commit minted its text.
+//! [`Tokens::commit`] is the only mint: policy emits token-less
+//! [`OfferDraft`]s and commit assigns each a session-unique token from a
+//! monotonic counter. [`Token::new`] only wraps the text the model echoes
+//! back for lookup; it redeems nothing a commit did not mint.
 //!
-//! A token only authorizes the plan and source it was issued for. Redemption
-//! is idempotent: an offer stays redeemable until a newer plan for the same
-//! source replaces it, so a failed or repeated attempt never strands the
-//! model with a stale token. Idempotency has two shapes: naturally idempotent
-//! actions (core runs, cache downloads that serve the existing rip) stay
-//! [`Redemption::Fresh`] forever, while a completed keep download — the one
-//! action whose repetition duplicates a user-owned file — is recorded via
-//! [`Tokens::fulfill`] so later echoes replay the receipt instead.
+//! A token authorizes only the plan and source it was issued for, and stays
+//! redeemable until a newer plan for the same source replaces it. Actions
+//! that are naturally idempotent stay [`Redemption::Fresh`]; a completed
+//! keep download, whose repetition would duplicate a user-owned file, is
+//! recorded via [`Tokens::fulfill`] so later echoes replay the receipt.
 //!
 //! Offer sets are keyed by canonical source identity
-//! ([`crate::cache::source::SourceId`] — the same identity the disk cache
-//! keys on), not by the model's spelling, and the registry is bounded: past
+//! ([`crate::cache::source::SourceId`], as the disk cache is). Past
 //! `MAX_OFFER_SETS` live sources the stalest set is evicted, its tokens
-//! answering as stale — a state the model is already told how to leave.
+//! answering as stale.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -146,18 +139,14 @@ struct OfferSet {
 /// behind the one lock that guards them; guards never escape this type.
 /// One live offer set per source, at most `MAX_OFFER_SETS` sources.
 ///
-/// The contract — one live offer set per *source* — is about the source,
-/// not the model's spelling of it: `/v.mp4`, `/./v.mp4`, a trailing-space
-/// echo, or a re-cased URL host must be one conversation, or a superseded
-/// plan would stay redeemable under an alias. The registry derives the
-/// [`SourceId`] itself — the same type whose hash keys the disk cache —
-/// so no caller can mis-key it and the two sides cannot diverge.
+/// Spellings of one source (`/v.mp4`, `/./v.mp4`, a re-cased URL host)
+/// share one offer set, or a superseded plan would stay redeemable under an
+/// alias; the registry derives the [`SourceId`] itself so no caller can
+/// mis-key it.
 ///
-/// A cheaply-cloneable shared handle: clones share one registry (and one
-/// mint counter). Owning a `Tokens` pins nothing but the registry itself —
-/// deliberately, so an effect queued into the download tracker (the keep
-/// receipt) can capture a clone without owning the deps graph that owns
-/// the tracker, which would close a strong reference cycle and leak both.
+/// Clones share one registry and mint counter, and pin nothing else, so a
+/// keep receipt queued into the download tracker can hold a clone without
+/// closing a reference cycle through the deps graph.
 #[derive(Debug, Clone, Default)]
 pub struct Tokens(Arc<Mutex<Registry>>);
 

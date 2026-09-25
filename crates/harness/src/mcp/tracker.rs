@@ -229,13 +229,9 @@ impl JobSlot {
 /// execution: adoption ordering (defuse, then effect) was already settled
 /// under the lock, only the running happens here.
 ///
-/// Execution stays in `Drop` rather than an explicit consuming method: one
-/// mechanism covers every exit path, and a `run(self)` would either leave
-/// `Drop` as a second execution path or make "dropped without running" a
-/// reachable state. The classic cost — an effect panicking inside a drop
-/// during an unwind is a double panic — buys nothing here: the workspace
-/// builds with `panic = "abort"`, so the first panic already ends the
-/// process before any unwind reaches this drop.
+/// Execution lives in `Drop` so every exit path runs it and "dropped
+/// without running" is unreachable; the double-panic risk of effects in a
+/// drop does not arise under the workspace's `panic = "abort"`.
 #[derive(Default)]
 struct Aftermath {
     /// Owned effects of settlements adopted in this critical section.

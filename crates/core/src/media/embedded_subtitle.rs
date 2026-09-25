@@ -120,10 +120,11 @@ pub fn extract_track(input: &Source, track: usize, what: &str, stop: &Stop) -> R
             continue;
         }
 
-        let mut sub = AvSubtitle::new();
-        let Ok(true) = decoder.decode(&packet, &mut sub) else {
+        let mut sub = DecodedSubtitle(AvSubtitle::new());
+        let Ok(true) = decoder.decode(&packet, &mut sub.0) else {
             continue;
         };
+        let sub = &sub.0;
 
         let Some(pts) = packet.pts().or(packet.dts()) else {
             continue;
@@ -163,6 +164,22 @@ pub fn extract_track(input: &Source, track: usize, what: &str, stop: &Stop) -> R
     }
 
     Ok(cues.into_cues())
+}
+
+/// An `AVSubtitle` that frees what the decoder attached to it. ffmpeg-next's
+/// `Subtitle` has no `Drop`, so without this every decoded packet leaks its
+/// rects and their text.
+struct DecodedSubtitle(AvSubtitle);
+
+impl Drop for DecodedSubtitle {
+    fn drop(&mut self) {
+        // SAFETY: the struct is either zeroed (`Subtitle::new`, or a decode
+        // that produced nothing) or filled by `avcodec_decode_subtitle2`,
+        // which allocates with av_malloc exactly what `avsubtitle_free`
+        // releases. `avsubtitle_free` re-zeroes the struct, and nothing
+        // else frees it, so no double free is possible.
+        unsafe { ffmpeg::ffi::avsubtitle_free(self.0.as_mut_ptr()) }
+    }
 }
 
 /// Cue-count budget for one extracted track. Feature-length movies run

@@ -570,12 +570,9 @@ const PROGRESS_PREFIX: &str = "AVDL ";
 const PROGRESS_TEMPLATE: &str = "download:AVDL %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s";
 
 /// Sentinel marking the one stdout line that names the media's final path.
-/// stdout carries three kinds of line — progress, this, and yt-dlp's own
-/// chatter — and each is recognised by what it *is*: the open-world
-/// default this replaces ("whatever did not parse as progress is the
-/// filepath") let a `[download] Destination: …` line pass for the media
-/// path, which is why the chatter had to be muted with `--quiet` — taking
-/// yt-dlp's short-transfer diagnostics down with it.
+/// stdout mixes progress, this, and yt-dlp's chatter; each is recognized by
+/// its sentinel, so a line like `[download] Destination: …` can never pass
+/// for the path.
 const FILEPATH_PREFIX: &str = "AVFP ";
 
 /// One classified stdout line. Closed world by construction: adding a
@@ -620,19 +617,13 @@ pub fn parse_progress(line: &str) -> Option<(u64, Option<u64>)> {
     Some((downloaded, total.or(estimate)))
 }
 
-/// A per-writer staging directory inside the shared cache: two jobs
-/// confirming the same URL — whether in one server or two — would
-/// otherwise hand yt-dlp the same output template, and yt-dlp's own
-/// `.part` handling interleaves their writes. The name comes from the
-/// cache's one staging grammar
-/// ([`crate::cache::naming::staging_dir_name`]): writer-unique, not
-/// per-process — a pid alone would let two threads of one server share a
-/// directory. Each job downloads into its own directory and adopts the
-/// results into the cache with per-file renames (same filesystem, atomic
-/// per writer; last-writer-wins is safe because equal keys mean equal
-/// recipes). Removed on drop; a crash leaves it for
-/// [`crate::cache::Cache::evict`]'s stale-staging sweep, which recognizes
-/// it through the same grammar's predicate.
+/// A per-writer staging directory inside the shared cache: two jobs on the
+/// same URL would otherwise share yt-dlp's output template and interleave
+/// writes into one `.part`. Named by the cache's staging grammar
+/// ([`crate::cache::naming::staging_dir_name`]); results are adopted into
+/// the cache by per-file renames, last writer winning (equal keys mean
+/// equal recipes). Removed on drop; a crash leaves it for
+/// [`crate::cache::Cache::evict`]'s stale-staging sweep.
 struct StagingDir {
     path: PathBuf,
 }
@@ -829,7 +820,9 @@ impl Landing {
     fn media_template(&self) -> PathBuf {
         match self {
             Landing::Cache { staging, key, .. } => staging.path.join(format!("{key}.%(ext)s")),
-            Landing::Keep { dir } => dir.join("%(title)s [%(id)s].%(ext)s"),
+            // The format id keeps renditions apart: yt-dlp treats an
+            // existing file of the same name as already downloaded.
+            Landing::Keep { dir } => dir.join("%(title)s [%(id)s] [%(format_id)s].%(ext)s"),
         }
     }
 
@@ -901,19 +894,14 @@ fn download_args(
     relay: &PolicyRelay,
     cookies: &CookieHandle,
 ) -> Vec<String> {
-    // `--no-quiet` is load-bearing, and not a default: `--print` turns
-    // quiet on by itself. Quiet suppresses yt-dlp's screen channel, and
-    // that channel carries the diagnostic that tells a short transfer from
-    // a dead host — `Got error: Downloaded N bytes, expected M bytes`,
-    // reported per pending retry and never repeated on stderr, which only
-    // ever shows the terminal `Did not get any data blocks`. The chatter
-    // this lets through is safe because stdout lines are typed by sentinel
-    // ([`classify`]) rather than by falling through a default.
+    // `--no-quiet` is load-bearing: `--print` turns quiet on, and quiet
+    // mutes the screen channel, the only place yt-dlp reports a pending
+    // retry's short transfer ([`short_transfer`]). stdout lines are typed
+    // by sentinel ([`classify`]), so the extra chatter is safe.
     //
-    // No `--retries` either: yt-dlp already defaults to 10, and every one
-    // of them resumes the *same* signed URL — the one pinned to the backend
-    // that served short. Only a fresh invocation re-runs extraction, which
-    // is why the retry loop lives above this process, in `mcp::download`.
+    // No `--retries`: yt-dlp's own retries resume the same signed URL; only
+    // a fresh invocation re-extracts, so the retry loop lives in
+    // `mcp::download`.
     let mut args: Vec<String> = [
         "--no-playlist",
         "--no-simulate",
@@ -1200,10 +1188,7 @@ mod tests {
 
     #[test]
     fn chatter_never_becomes_the_media_path() {
-        // Regression: with stdout typed by "anything that is not progress
-        // is the filepath", this line published a log message as the media
-        // path — which is why the chatter had to be muted, taking the
-        // short-transfer diagnostics with it.
+        // A log line naming a path must never pass for the media path.
         assert_eq!(
             classify("[download] Destination: /tmp/rip.f30032.mp4"),
             Line::Chatter("[download] Destination: /tmp/rip.f30032.mp4")
@@ -1335,6 +1320,28 @@ mod tests {
         assert_eq!(parse_progress("AVDL 1536.0 NA NA"), Some((1536, None)));
         assert_eq!(parse_progress("/some/file/path.mp4"), None);
         assert_eq!(parse_progress("AVDL NA NA NA"), None);
+    }
+
+    #[test]
+    fn keep_template_names_the_rendition() {
+        // yt-dlp skips a download whose output name already exists, so a
+        // name shared across tiers would serve an earlier 360p rip for a
+        // later 1080p request.
+        let landing = Landing::prepare(
+            DownloadIo::Keep {
+                dir: Path::new("/keep"),
+            },
+            false,
+        )
+        .expect("keep landing");
+
+        let template = landing.media_template();
+
+        assert!(
+            template.to_string_lossy().contains("%(format_id)s"),
+            "{}",
+            template.display()
+        );
     }
 
     fn temp_dir(tag: &str) -> crate::tempdir::TempDir {

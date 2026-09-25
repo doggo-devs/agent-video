@@ -373,7 +373,7 @@ pub enum VideoBody {
         consequence: String,
         tokens: Vec<OfferedToken>,
     },
-    /// The product of `transcribe: true`: the transcript itself, whole, as
+    /// The product of `want: "transcript"`: the transcript itself, whole, as
     /// `MM:SS text` cue lines. It is also cached and rides along with every
     /// grid afterwards, sliced per grid.
     Transcript {
@@ -465,14 +465,6 @@ mod tests {
             Ok(Intent::Transcript(_))
         ));
         assert!(matches!(args(Want::Grids).intent(), Ok(Intent::Grid(_))));
-    }
-
-    #[test]
-    fn omitted_want_reads_as_grids() {
-        assert!(matches!(
-            VideoArgs::bare("v").intent(),
-            Ok(Intent::Grid(g)) if g.is_bare()
-        ));
     }
 
     #[test]

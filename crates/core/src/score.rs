@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Frame scoring, rank normalization, and selection.
 //!
-//! Three raw dimensions are computed per frame in their natural (incomparable)
-//! units, then **rank-normalized within a chunk** to `0..=100` before being
-//! weighted into a final score. Ranking is scale-free: it removes the unit
-//! mismatch between a Laplacian variance, a Sobel energy, and a pixel
-//! difference without any magic normalization constant. The cost is that only
-//! order is preserved, not magnitude — acceptable for what is fundamentally a
-//! ranking task.
+//! Three raw dimensions (Laplacian variance, Sobel energy, pixel difference)
+//! are computed in incomparable units, then **rank-normalized within a
+//! chunk** to `0..=100` and weighted into a final score: scale-free, at the
+//! cost of keeping only order.
 //!
-//! Selection takes the top-k by score with a temporal non-maximum suppression
-//! pass so chosen frames spread across time rather than clustering on one
-//! high-action moment. Hero detection (which drives layout template choice) is
-//! a separate step that deliberately bypasses rank normalization: it tests the
-//! raw `scene_diff` magnitude against an absolute threshold, because ranks are
-//! spread over the full range by construction and carry no evidence that
-//! anything actually stood out.
+//! Selection takes the top-k with temporal non-maximum suppression, so
+//! picks spread across time. Hero detection (which picks the layout)
+//! bypasses ranks and tests raw `scene_diff` against an absolute threshold:
+//! ranks always span the full range and so carry no evidence that anything
+//! stood out.
 
 use std::ops::{Index, IndexMut};
 

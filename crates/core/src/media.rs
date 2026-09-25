@@ -14,6 +14,7 @@
 pub mod audio;
 pub mod decode;
 pub mod embedded_subtitle;
+mod orientation;
 mod scale;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -129,11 +130,9 @@ impl Default for Stop {
 /// representable state (see [`Stop`]). A caller that never intends to trip
 /// passes `&Stop::new()`.
 ///
-/// `options` become an `AVDictionary` handed to `avformat_open_input`, so
-/// each pair is a libav protocol/demuxer option — e.g.
-/// `("http_proxy", "http://127.0.0.1:port")` to route every connection the
-/// demuxer makes through a forward proxy. This module forwards them
-/// verbatim and never interprets their meaning; pass `&[]` for a plain open.
+/// `options` are forwarded verbatim to `avformat_open_input` as libav
+/// protocol/demuxer options, e.g. `("http_proxy", "http://127.0.0.1:port")`;
+/// pass `&[]` for a plain open.
 ///
 /// The returned [`InterruptibleInput`] derefs to the plain input context
 /// and owns its clone of the token — nothing leaks per open.
@@ -172,21 +171,15 @@ fn path_cstring(source: &Source) -> Result<std::ffi::CString> {
 ///
 /// The interrupt callback installed by [`open_input`] polls the
 /// `AtomicBool` inside the token through a raw pointer, so the flag must
-/// outlive every callback invocation. This wrapper is that proof: field
-/// order drops `input` first — `avformat_close_input` runs, after which
-/// libav never calls back — and only then releases the token clone.
-/// Unlike `ffmpeg::util::interrupt`'s boxed-closure API (which leaks the
-/// closure per open, unreclaimable because the context has no teardown
-/// hook for it), nothing here outlives the open — which matters in a
-/// long-lived server probing one URL per call.
+/// outlive every callback invocation. Field order is the proof: `input`
+/// drops first (after `avformat_close_input` libav never calls back), then
+/// the token clone. Unlike `ffmpeg::util::interrupt`'s boxed closure, which
+/// leaks per open, nothing here outlives the open.
 ///
-/// The proof also pins the inner value's identity: it derefs to `&Input`
-/// but deliberately exposes no `&mut Input` (no `DerefMut`, no accessor),
-/// because a `&mut Input` admits `mem::replace` — safe code could extract
-/// the callback-armed context, outlive the wrapper with it, and leave the
-/// callback polling a freed flag. The mutating operations the pipeline
-/// needs are delegated below ([`Self::seek`], [`Self::read_packet`]), so
-/// the context this wrapper opened is the context it closes.
+/// It derefs to `&Input` but never exposes `&mut Input`: `mem::replace`
+/// through one would let safe code extract the callback-armed context and
+/// leave the callback polling a freed flag. The mutating operations are
+/// delegated instead ([`Self::seek`], [`Self::read_packet`]).
 pub struct InterruptibleInput {
     /// Declared (and therefore dropped) first: the context must close
     /// before the flag it polls is released.
@@ -205,10 +198,14 @@ impl InterruptibleInput {
         self.input.seek(ts, range)
     }
 
+    /// Read the next packet into `packet`, releasing what it held before.
     pub fn read_packet(
         &mut self,
         packet: &mut ffmpeg::Packet,
     ) -> std::result::Result<(), ffmpeg::Error> {
+        // av_read_frame overwrites the packet without unreferencing it, so
+        // a reused packet would leak every buffer it ever held.
+        *packet = ffmpeg::Packet::empty();
         packet.read(&mut self.input)
     }
 }

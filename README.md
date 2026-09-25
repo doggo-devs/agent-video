@@ -119,9 +119,9 @@ If you installed via npm, use the npm shim as the command instead:
 ```
 
 Call `video` with just a `source` first: short videos run immediately, longer
-ones answer with a plan and copyable follow-up calls. Set `transcribe: true`
-(alone) to get a transcript back as timestamped lines; it is cached and
-rides along with every grid afterwards.
+ones answer with a plan and copyable follow-up calls. Set `want: "transcript"`
+to get a transcript back as timestamped lines; it is cached and rides along
+with every grid afterwards.
 
 Transcription takes one of two routes. `WHISPER_API_KEY` sends audio to an
 OpenAI-compatible endpoint (Groq's `whisper-large-v3-turbo` by default) —

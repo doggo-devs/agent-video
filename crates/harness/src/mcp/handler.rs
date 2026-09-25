@@ -184,11 +184,13 @@ pub(super) fn offer_transcription(
     }
     match decision {
         Decision::Plan(plan) => offer_transcription_plan(source, plan, deps),
-        Decision::Run { notices, .. } if deps.whisper.available(&deps.config) => notices.push(
-            "no subtitles found for this source — call again with transcribe: true to \
-             generate a whisper transcript; it then rides along with every grid"
-                .to_string(),
-        ),
+        Decision::Run { notices, .. } if deps.whisper.available(&deps.config) => {
+            notices.push(format!(
+                "no subtitles found for this source — call again with {} to generate a \
+                 whisper transcript; it then rides along with every grid",
+                serde_json::to_string(&transcript_call(source)).expect("VideoArgs serializes")
+            ))
+        }
         _ => {}
     }
 }
@@ -200,16 +202,21 @@ pub(super) fn offer_transcription_plan(source: &str, plan: &mut PlanDecision, de
     }
     if deps.whisper.available(&deps.config) {
         plan.recommended_calls.push(RecommendedCall {
-            call: VideoArgs {
-                want: Some(Want::Transcript),
-                ..VideoArgs::bare(source)
-            },
+            call: transcript_call(source),
             note: "no subtitles found — generate a whisper transcript; it then rides \
                    along with every grid"
                 .to_string(),
         });
     } else {
         plan.guidance.push_str(&install_hint());
+    }
+}
+
+/// The call that transcribes `source`; both hint deliveries quote it.
+fn transcript_call(source: &str) -> VideoArgs {
+    VideoArgs {
+        want: Some(Want::Transcript),
+        ..VideoArgs::bare(source)
     }
 }
 
@@ -490,15 +497,22 @@ mod tests {
     }
 
     #[test]
-    fn subtitleless_render_notes_the_transcribe_option() {
+    fn subtitleless_render_hints_a_call_the_server_accepts() {
         let env = env(probe(3600.0, vec![]), true);
         let file = media_file(&env, "long.mp4");
         let text = text_of(&call(&env, serde_json::json!({"source": file})));
-        assert!(
-            text.contains("transcribe: true"),
-            "the hint rides with the frames rather than standing in front of \
-             them: {text}"
-        );
+        let (_, quoted) = text
+            .split_once("call again with ")
+            .unwrap_or_else(|| panic!("the hint rides with the frames: {text}"));
+        let hinted: serde_json::Value = serde_json::Deserializer::from_str(quoted)
+            .into_iter()
+            .next()
+            .expect("the hint quotes a call")
+            .expect("the quoted call is JSON");
+
+        let followed = body_of(&call(&env, hinted));
+
+        assert_eq!(followed["status"], "transcript", "{followed}");
     }
 
     #[test]

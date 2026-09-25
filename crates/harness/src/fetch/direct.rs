@@ -72,25 +72,15 @@ const CANCELLED_NOTE: &str = "download cancelled: its tracker slot was abandoned
 /// redirect targets included — passes the host policy), no proxy, and a
 /// `StallGuard` wrapping every transport.
 ///
-/// This is the single recipe for a screened agent: the [`GuardedResolver`]
-/// and the proxy override are installed together here so the resolver's
-/// contract cannot drift from the connection path. ureq's
-/// `Config::default()` adopts `HTTP_PROXY`/`HTTPS_PROXY` from the
-/// environment; a proxy would be dialed in place of every target, so the
-/// resolver would screen only the proxy's address and redirect targets
-/// would bypass the egress policy entirely — exactly in the corp
-/// environments where an internal-reaching proxy exists. `.proxy(None)`
-/// pins all dialing to the guarded path and must stay.
+/// `.proxy(None)` must stay: ureq otherwise adopts `HTTP_PROXY` from the
+/// environment and dials the proxy in place of every target, so the
+/// resolver would screen only the proxy's address.
 ///
-/// Deadlines are deliberately only `connect` + `global`. ureq 3 has no
-/// idle timeout, and its phase timeouts cannot fill in: `recv_body` is
-/// re-anchored at every socket wait (a bound per read, never per body),
-/// and a configured `recv_response` leaks a stale `headers_end +
-/// recv_response` deadline into the body phase, killing any transfer that
-/// pauses ≥ 1s past that mark (verified against ureq 3.3.0). So the agent
-/// keeps ureq's phase timeouts off and the `StallGuard` owns stall
-/// detection uniformly: no receive wait outlives `IDLE_LIMIT` of peer
-/// silence.
+/// Deadlines are only `connect` + `global`. ureq 3 has no idle timeout, and
+/// its phase timeouts cannot stand in: `recv_body` bounds each read, not the
+/// body, and a configured `recv_response` leaks a stale deadline into the
+/// body phase (verified against ureq 3.3.0). The `StallGuard` owns stall
+/// detection instead: no receive wait outlives `IDLE_LIMIT` of silence.
 fn agent(cfg: &Config, cancel: &CancelSignal) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
@@ -509,29 +499,19 @@ pub fn download_direct(
     result
 }
 
-/// Publish a fully-written staging file at its final name. The staging
-/// name comes from [`crate::cache::naming::part_path`] — writer-unique,
-/// because the cache directory is shared across server processes and
-/// cache keys are deterministic, so a fixed `.part` name would let two
-/// processes interleave writes into one file and rename the corruption
-/// into the cache; last-writer-wins on the rename is safe because equal
-/// keys mean equal recipes. `sync_all` runs before the rename — the
-/// writer's own handle, no reopen — so a crash can never leave the
-/// published name pointing at bytes still in the page cache; the rename
-/// is atomic per writer. A crash between sync and rename leaves only a
-/// `.part` for the staleness sweep. The directory entry itself is not
-/// fsynced, accepted: losing the rename to a power cut is a cache miss,
-/// never a torn published file.
+/// Publish a fully-written staging file at its final name. The staging name
+/// ([`crate::cache::naming::part_path`]) is writer-unique because the cache
+/// is shared across processes; last writer wins on the rename, which is
+/// safe because equal keys mean equal recipes. `sync_all` runs before the
+/// rename, so a crash never publishes bytes still in the page cache; the
+/// directory entry is not fsynced, so a power cut costs a cache miss, never
+/// a torn file.
 ///
-/// A disowned job must not publish: its settlement is void, and for a
-/// keep destination the published file would orphan under a name the
-/// retry can no longer take. The cancel check sits between the sync
-/// (seconds on a large file) and the rename, the narrowest window this
-/// side of the syscall; a cancellation landing inside it publishes anyway
-/// — a rename cannot be checked-and-done atomically against the signal —
-/// and is compensated upstream: the disowned settlement removes the
-/// published file (`crate::mcp::download`), so only a process crash in
-/// that window leaves an orphan.
+/// A disowned job must not publish: for a keep destination the file would
+/// orphan under a name the retry can no longer take. The cancel check sits
+/// between the sync and the rename; a cancellation inside that window still
+/// publishes, and the disowned settlement removes the file
+/// (`crate::mcp::download`).
 fn publish(
     file: std::fs::File,
     part: &Path,

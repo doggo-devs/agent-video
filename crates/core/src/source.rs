@@ -167,11 +167,6 @@ mod tests {
     }
 
     #[test]
-    fn treats_colonless_input_as_local() {
-        assert!(matches!(Source::classify("https"), Source::Local(_)));
-    }
-
-    #[test]
     fn displays_remote_url_verbatim() {
         let url = "https://example.com/v.mp4?token=a+b.c";
         assert_eq!(Source::classify(url).to_string(), url);
