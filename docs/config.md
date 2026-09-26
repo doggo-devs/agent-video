@@ -60,9 +60,10 @@ platform-derived.
 
 ### `[download]`
 
+Download sizes are reported for the agent to assess; they do not impose a download limit.
+
 | Key | Type | Default | Validation | Controls |
 |-----|------|---------|-----------|----------|
-| `max_bytes` | integer | `2147483648` (2 GiB) | must be > 0 | Hard refusal ceiling for any single download. Known-oversize downloads are refused before the first byte; unknown-length streams are cut off mid-flight. |
 | `analysis_max_height` | integer | `480` | must be > 0 | Frame-height ceiling for analysis rips (the grid-quality ceiling). Part of the rip's cache key, so changing it produces a distinct cache entry rather than serving stale bytes. |
 | `sync_wait_seconds` | integer | `90` | must be > 0 | How long a confirmed download may block the `video` call before detaching into the background tracker. Generous by design: for an agent one blocked call is cheaper than a chain of pending polls, each of which costs a full model round trip. |
 
@@ -138,7 +139,6 @@ api_url = "https://api.groq.com/openai/v1/audio/transcriptions"
 # language = "zh"
 
 [download]
-max_bytes = 2147483648  # 2 GiB
 analysis_max_height = 480
 sync_wait_seconds = 90
 

@@ -85,15 +85,8 @@ fn run(
     )?;
 
     let batch_size = extract_batch_frames(fps, cfg.chunk_seconds());
-    // The same judging machinery `process` uses — the two subcommands must
-    // select surviving frames identically for the same input.
-    let mut stream = CandidateStream::new(
-        stream,
-        dedup::Deduper::new(cfg.hash_threshold(), cfg.dedup_window()),
-        batch_size,
-        cfg.score_edge(),
-        None,
-    );
+    let mut stream = CandidateStream::new(stream, batch_size, cfg.score_edge(), None);
+    let mut deduper = dedup::Deduper::new(cfg.hash_threshold(), cfg.dedup_window());
     let weights = cfg.weights();
     let spec = cfg.canvas_spec();
 
@@ -104,14 +97,14 @@ fn run(
     let mut prev_tail: Option<Arc<GrayImage>> = None;
     let mut aspect = Aspect::SQUARE;
 
-    while let Some(judged) = stream.next_batch()? {
+    while let Some(batch) = stream.next_batch()? {
         if let Some(a) = stream.aspect() {
             aspect = a;
         }
         candidate_batch.extend(
-            judged
+            batch
                 .into_iter()
-                .filter_map(|(frame, kept)| kept.then_some(frame)),
+                .filter_map(|sample| deduper.accepts(&sample.hash).then_some(sample.frame)),
         );
 
         if candidate_batch.len() >= batch_size {

@@ -60,7 +60,11 @@ const SUBS_INFIX: &str = "_subs";
 /// goes to a temp name and is renamed into place only once complete, so
 /// adoption can never publish a truncated sidecar. The error is the
 /// caller's to surface — the media itself is unaffected.
-pub fn promote_subtitle(dir: &Path, key: &str, preferred_langs: &[String]) -> std::io::Result<()> {
+pub fn promote_subtitle(
+    dir: &Path,
+    key: &super::RipKey,
+    preferred_langs: &[String],
+) -> std::io::Result<()> {
     use agent_video_core::subtitle::SIDECAR_SUBTITLE_EXTS;
 
     let mut names: Vec<String> = std::fs::read_dir(dir)?
@@ -629,7 +633,7 @@ struct StagingDir {
 }
 
 impl StagingDir {
-    fn create(parent: &Path, key: &str) -> std::io::Result<Self> {
+    fn create(parent: &Path, key: &super::RipKey) -> std::io::Result<Self> {
         let path = parent.join(crate::cache::naming::staging_dir_name(key));
         std::fs::create_dir_all(&path)?;
         Ok(StagingDir { path })
@@ -716,7 +720,7 @@ pub fn download(
 ) -> Result<Attempt, Fault> {
     let landing = Landing::prepare(io, recipe.subs)?;
     let cookies = acquire_cookies(cfg)?;
-    let args = download_args(url, recipe, &landing, cfg, relay, &cookies);
+    let args = download_args(url, recipe, &landing, relay, &cookies);
     let run = run_child(&args, relay, progress)?;
     // Whatever the verdict: a normal exit and a graceful abort both saved
     // the staged jar, a hard-killed child left an empty delta. A failed
@@ -743,8 +747,7 @@ pub fn download(
             short,
             warning,
             Fault::bad_input(format!(
-                "yt-dlp finished without producing a file — the size cap (download.max_bytes) \
-                 may have aborted it: {}",
+                "yt-dlp finished without producing a file: {}",
                 stderr_tail(&run.stderr)
             )),
         );
@@ -788,7 +791,7 @@ enum Landing {
     Cache {
         staging: StagingDir,
         dest_dir: PathBuf,
-        key: String,
+        key: super::RipKey,
         subs: bool,
     },
     /// Straight into the keep directory; yt-dlp names the file and no side
@@ -806,7 +809,7 @@ impl Landing {
                 Ok(Landing::Cache {
                     staging,
                     dest_dir: dir.to_path_buf(),
-                    key: key.to_string(),
+                    key: key.clone(),
                     subs,
                 })
             }
@@ -890,7 +893,6 @@ fn download_args(
     url: &VettedUrl,
     recipe: &YtdlpRecipe,
     landing: &Landing,
-    cfg: &Config,
     relay: &PolicyRelay,
     cookies: &CookieHandle,
 ) -> Vec<String> {
@@ -914,8 +916,6 @@ fn download_args(
         PROGRESS_TEMPLATE,
         "-f",
         &recipe.format,
-        "--max-filesize",
-        &cfg.download.max_bytes.get().to_string(),
         // Every yt-dlp connection (and its ffmpeg children, via the env
         // set at spawn) routes through the policy relay.
         "--proxy",
@@ -1223,7 +1223,7 @@ mod tests {
             subs: false,
         };
 
-        let args = download_args(&url, &recipe, &landing, &cfg, &relay, &cookies);
+        let args = download_args(&url, &recipe, &landing, &relay, &cookies);
 
         let print = args.iter().position(|a| a == "--print").expect("--print");
         assert!(
@@ -1357,7 +1357,12 @@ mod tests {
         let dir = temp_dir("promote");
         std::fs::write(dir.join("k_subs.zh-Hans.srt"), b"zh").expect("write");
         std::fs::write(dir.join("k_subs.en-US.srt"), b"en").expect("write");
-        promote_subtitle(&dir, "k", &langs(&["en", "zh"])).expect("promote");
+        promote_subtitle(
+            &dir,
+            &crate::fetch::RipKey::fixture("k"),
+            &langs(&["en", "zh"]),
+        )
+        .expect("promote");
         assert_eq!(std::fs::read(dir.join("k.srt")).expect("promoted"), b"en");
     }
 
@@ -1366,7 +1371,12 @@ mod tests {
         let dir = temp_dir("promote-zh");
         std::fs::write(dir.join("k_subs.zh-Hans.srt"), b"zh").expect("write");
         std::fs::write(dir.join("k_subs.en-US.srt"), b"en").expect("write");
-        promote_subtitle(&dir, "k", &langs(&["zh", "en"])).expect("promote");
+        promote_subtitle(
+            &dir,
+            &crate::fetch::RipKey::fixture("k"),
+            &langs(&["zh", "en"]),
+        )
+        .expect("promote");
         assert_eq!(std::fs::read(dir.join("k.srt")).expect("promoted"), b"zh");
     }
 
@@ -1374,7 +1384,8 @@ mod tests {
     fn promote_ignores_unrelated_files() {
         let dir = temp_dir("unrelated");
         std::fs::write(dir.join("k.mp4"), b"v").expect("write");
-        promote_subtitle(&dir, "k", &langs(&["en"])).expect("promote");
+        promote_subtitle(&dir, &crate::fetch::RipKey::fixture("k"), &langs(&["en"]))
+            .expect("promote");
         assert!(!dir.join("k.srt").exists());
     }
 
@@ -1384,7 +1395,8 @@ mod tests {
         // become a sidecar core would refuse to parse.
         let dir = temp_dir("vtt");
         std::fs::write(dir.join("k_subs.en.vtt"), b"vtt").expect("write");
-        promote_subtitle(&dir, "k", &langs(&["en"])).expect("promote");
+        promote_subtitle(&dir, &crate::fetch::RipKey::fixture("k"), &langs(&["en"]))
+            .expect("promote");
         assert!(!dir.join("k.vtt").exists());
         assert!(!dir.join("k.srt").exists());
     }
@@ -1397,7 +1409,8 @@ mod tests {
         // URL's whole cache lifetime.
         let dir = temp_dir("torn");
         std::fs::create_dir(dir.join("k_subs.en.srt")).expect("uncopyable candidate");
-        promote_subtitle(&dir, "k", &langs(&["en"])).expect_err("copy must fail");
+        promote_subtitle(&dir, &crate::fetch::RipKey::fixture("k"), &langs(&["en"]))
+            .expect_err("copy must fail");
         assert!(!dir.join("k.srt").exists(), "no publishable sidecar");
         assert!(!dir.join("k.srt.promote").exists(), "no temp leftover");
     }
@@ -1495,7 +1508,7 @@ mod tests {
         let landing = Landing::prepare(
             DownloadIo::Cache {
                 dir: &dir,
-                key: "k",
+                key: &crate::fetch::RipKey::fixture("k"),
             },
             true,
         )
@@ -1505,7 +1518,7 @@ mod tests {
             subs: true,
         };
 
-        let args = download_args(&url, &recipe, &landing, &cfg, &relay, &cookies);
+        let args = download_args(&url, &recipe, &landing, &relay, &cookies);
 
         let o = args.iter().position(|a| a == "-o").expect("-o present");
         assert_eq!(
@@ -1547,7 +1560,7 @@ mod tests {
             subs: true,
         };
 
-        let args = download_args(&url, &recipe, &landing, &cfg, &relay, &cookies);
+        let args = download_args(&url, &recipe, &landing, &relay, &cookies);
 
         assert!(!args.iter().any(|a| a == "--write-subs"), "{args:?}");
         let o = args.iter().position(|a| a == "-o").expect("-o present");
@@ -1565,7 +1578,7 @@ mod tests {
         let landing = Landing::prepare(
             DownloadIo::Cache {
                 dir: &dir,
-                key: "k",
+                key: &crate::fetch::RipKey::fixture("k"),
             },
             true,
         )
@@ -1612,7 +1625,8 @@ mod tests {
     #[test]
     fn staging_adoption_publishes_every_file_and_cleans_up() {
         let dir = temp_dir("adopt");
-        let staging = StagingDir::create(&dir, "k").expect("staging");
+        let staging =
+            StagingDir::create(&dir, &crate::fetch::RipKey::fixture("k")).expect("staging");
         let staging_path = staging.path.clone();
         std::fs::write(staging_path.join("k.mp4"), b"v").expect("write");
         std::fs::write(staging_path.join("k.srt"), b"s").expect("write");
@@ -1635,7 +1649,12 @@ mod tests {
         std::fs::write(dir.join("k.mp4"), b"v").expect("write");
         std::fs::write(dir.join("k_subs.en.srt"), b"en").expect("write");
         std::fs::write(dir.join("k_subs.zh.srt"), b"zh").expect("write");
-        promote_subtitle(&dir, "k", &langs(&["en", "zh"])).expect("promote");
+        promote_subtitle(
+            &dir,
+            &crate::fetch::RipKey::fixture("k"),
+            &langs(&["en", "zh"]),
+        )
+        .expect("promote");
 
         let sidecars = agent_video_core::subtitle::find_sidecars(&dir.join("k.mp4"));
         assert_eq!(sidecars, vec![dir.join("k.srt")]);

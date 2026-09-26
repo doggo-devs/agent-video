@@ -56,8 +56,7 @@ const TUNNEL_TICK: Duration = Duration::from_secs(5);
 /// Hard ceiling on a tunnel's total lifetime, active or not: a termination
 /// guarantee against a peer that dribbles forever, not stall detection —
 /// the idle clock handles silence. Mirrors the direct client's whole-call
-/// ceiling and is sized the same way, for `download.max_bytes` on slow
-/// links.
+/// ceiling.
 const TUNNEL_LIFETIME_CEILING: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Connection-establishment bound when dialing a screened upstream.

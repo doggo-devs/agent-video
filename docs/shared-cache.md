@@ -112,10 +112,7 @@ success.
   media title for a content fingerprint, an input to the transcript identity
   (`crate::transcribe::transcript_id`); freezing it closes the
   retitle → new transcript id → re-transcription fragmentation window. A
-  blank title is never published, and a blank on-disk sidecar (a legacy torn
-  write from the pre-atomic path) is no winner: `get_title` answers `None`
-  without refreshing its clock so it ages out, and `put_title` unlinks it and
-  contests the link again, so the next sighting heals it.
+  blank title is never published. An existing sidecar is never replaced.
 
 ## Pattern 3 — Three-way merge protocol
 
@@ -152,7 +149,7 @@ pattern.
 | Whisper transcripts (`cache.rs` keying + `transcribe::write_srt`) | 2 | keyed by fingerprint × `transcript_id`; writer-unique `.part` (via `cache::naming`), `rename`, `.part` removed on failure | Yes — the key rules out cross-recipe answers, but decoding is not byte-deterministic, so safety rests on the staged rename: exactly what pattern 2 provides. |
 | Direct downloads (`fetch/direct.rs`) | 2 | writer-unique `.part` (via `cache::naming`), `sync_all`, atomic `rename` | Yes. |
 | yt-dlp downloads (`fetch/ytdlp.rs`) | 2 | per-writer `.staging-…` dir (via `cache::naming`), fsync + per-file `rename` in `adopt_into` | Yes. |
-| Title sidecars (`cache.rs::put_title`) | 2a | writer-unique `.part` (via `cache::naming`), atomic `hard_link` publish, `.part` removed win or lose | Yes — the link installs the whole title or loses to an existing winner, so first-writer-wins is atomic; blank legacy sidecars are dethroned on put and self-retire on read. |
+| Title sidecars (`cache.rs::put_title`) | 2a | writer-unique `.part` (via `cache::naming`), atomic `hard_link` publish, `.part` removed win or lose | Yes — the link installs the whole title or loses to an existing winner, so first-writer-wins is atomic. |
 | Cookie jar (`cookies.rs`) | 3 | exclusive `.lock`, checkout/commit delta merge, temp + rename publish | Yes. |
 
 Every write path meets or exceeds its declared pattern. The one over-strength

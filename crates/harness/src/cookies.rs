@@ -219,10 +219,10 @@ impl ClearLog {
         let records = text
             .lines()
             .map(|line| {
-                let (epoch, scope) = line.split_once('\t').unwrap_or((line, ""));
-                let epoch = epoch.parse().map_err(|_| {
-                    io::Error::other(format!("malformed cookie clear log: {line:?}"))
-                })?;
+                let malformed =
+                    || io::Error::other(format!("malformed cookie clear log: {line:?}"));
+                let (epoch, scope) = line.split_once('\t').ok_or_else(malformed)?;
+                let epoch = epoch.parse().map_err(|_| malformed())?;
                 Ok((epoch, (!scope.is_empty()).then(|| scope.to_string())))
             })
             .collect::<io::Result<_>>()?;
@@ -495,6 +495,12 @@ pub fn status(cfg: &CookiesCfg) -> Result<Vec<(String, usize)>, CookieError> {
 /// subdomains); returns how many entries were removed. Leases checked out
 /// before the clear cannot write the cleared scope back.
 pub fn clear(cfg: &CookiesCfg, domain: Option<&str>) -> Result<usize, CookieError> {
+    if domain.is_some_and(|domain| domain.trim().is_empty() || domain.chars().any(char::is_control))
+    {
+        return Err(CookieError(
+            "cookie domain must be nonempty and contain no control characters".into(),
+        ));
+    }
     if !cfg.jar.is_file() {
         // Nothing to clear, and no lease can be outstanding: checkout
         // needs the jar. Also keeps the lock from creating the config dir.
@@ -911,6 +917,29 @@ mod tests {
         clear(&cfg, None).expect("clear");
         assert!(!cfg.jar.exists());
         assert_eq!(mode(&cfg), CookieMode::Anonymous, "back to anonymous");
+    }
+
+    #[test]
+    fn rejects_invalid_clear_scopes_without_revoking_leases_or_corrupting_the_log() {
+        let (cfg, _dir) = temp_cfg("invalid-clear");
+        let original = line("a.com", "session", "old");
+        fs::write(&cfg.jar, &original).expect("jar");
+        let lease = JarLease::checkout(&cfg.jar).expect("lease");
+        fs::write(lease.staged(), line("a.com", "session", "new")).expect("rotation");
+        for domain in ["", " ", "a.com\nb.org", "a.com\r", "a.com\t", "a.com\0"] {
+            assert!(clear(&cfg, Some(domain)).is_err(), "{domain:?}");
+        }
+        assert_eq!(
+            fs::read_to_string(&cfg.jar).expect("jar unchanged"),
+            original
+        );
+        assert!(!ClearLog::path(&cfg.jar).exists());
+        lease
+            .commit()
+            .expect("invalid clears did not revoke the lease");
+        assert!(fs::read_to_string(&cfg.jar).expect("jar").contains("new"));
+        assert_eq!(clear(&cfg, Some("a.com")).expect("valid clear"), 1);
+        JarLease::checkout(&cfg.jar).expect("clear log remains readable");
     }
 
     #[cfg(unix)]

@@ -49,7 +49,7 @@ pub(super) fn run_invocation(
         let fp = fingerprint_file(media_path).ok()?;
         let transcript_id = transcript_id_for(&fp.id, deps);
         let key = transcript_gate_key(&fp.id, &transcript_id);
-        match deps.transcriptions.admit_within(&key, deps.transcribe_wait) {
+        match deps.transcriptions.admit_within(key, deps.transcribe_wait) {
             Some(_hold) => deps.cache.find_transcript(&fp.id, &transcript_id),
             None => {
                 transcript_in_flight = true;
@@ -79,8 +79,11 @@ pub(super) fn run_invocation(
 /// The single-flight key for one transcript: content × recipe. One
 /// definition for the transcribe flow (the holder) and the grid flow (the
 /// rendezvous), so the two sides cannot key apart.
-fn transcript_gate_key(fingerprint: &ContentId, transcript_id: &str) -> String {
-    format!("{fingerprint}.{transcript_id}")
+fn transcript_gate_key(
+    fingerprint: &ContentId,
+    transcript_id: &transcribe::TranscriptId,
+) -> (ContentId, transcribe::TranscriptId) {
+    (fingerprint.clone(), transcript_id.clone())
 }
 
 // ── transcription execution ──
@@ -127,7 +130,7 @@ pub(super) fn transcribe_flow(
     // content.
     let prompt = effective_prompt_for(&fingerprint, deps);
     let transcript_id = transcribe::transcript_id(&deps.config, &prompt);
-    let mut decoded_seconds: Option<f64> = None;
+    let mut decoded_end_seconds: Option<f64> = None;
     {
         // Single-flight per transcript (content × recipe): the cache check
         // and the whisper run share one keyed critical section, so a
@@ -141,7 +144,7 @@ pub(super) fn transcribe_flow(
         // a rival that outwaits its own bound answers "in flight" instead
         // of inheriting the winner's whole account.
         let Some(_admitted) = deps.transcriptions.admit_within(
-            &transcript_gate_key(&fingerprint, &transcript_id),
+            transcript_gate_key(&fingerprint, &transcript_id),
             deps.transcribe_wait,
         ) else {
             return failed(&Fault::transient(
@@ -165,7 +168,7 @@ pub(super) fn transcribe_flow(
                         notify(step, None, message.to_string());
                     });
             match result {
-                Ok(outcome) => decoded_seconds = Some(outcome.audio_seconds),
+                Ok(outcome) => decoded_end_seconds = Some(outcome.decoded_end_seconds),
                 Err(e) => return failed(&e),
             }
         }
@@ -214,13 +217,12 @@ pub(super) fn transcribe_flow(
         Err(ArgError(message)) => return failed(&Fault::bad_input(message)),
     };
     let transcript = render_transcript(&srt, window);
-    // Honesty over silence: a transcript that stops mid-video says so.
-    let truncation_note = decoded_seconds
+    // Coverage is measured before VAD; sparse speech is not truncated audio.
+    let truncation_note = decoded_end_seconds
         .filter(|&a| crate::probe::materially_truncated(a, probe.duration))
         .map(|a| {
             format!(
-                "Warning: only {} of audio decoded for a {} video — the transcript stops \
-                 there; the source's audio track is likely truncated or corrupt. ",
+                "Note: decoded audio ends at {} in a {} video. ",
                 format_ts(a as f32),
                 format_ts(probe.duration as f32)
             )
@@ -264,6 +266,35 @@ mod tests {
     use crate::mcp::testutil::{
         body_of, call, confirm, env, media_file, offered_tokens, probe, text_of,
     };
+
+    #[test]
+    fn ignores_transcripts_from_other_recipes_without_redownloading_media() {
+        let env = env(probe(90.0, vec![]), true);
+        let url = "https://example.com/video.mp4";
+        let offer = body_of(&call(&env, serde_json::json!({"source": url})));
+        let token = offered_tokens(&offer).remove(0);
+        confirm(&env, url, &token);
+        let media = super::resolve_media(url, &env.deps).expect("downloaded media");
+        let fp = crate::identity::fingerprint_file(&media)
+            .expect("fingerprint")
+            .id;
+        let stale = env.deps.cache.transcript_path(
+            &fp,
+            &crate::transcribe::TranscriptId::fixture("different-recipe"),
+        );
+        std::fs::create_dir_all(stale.parent().expect("parent")).expect("cache directory");
+        std::fs::write(&stale, "1\n00:00:00,000 --> 00:00:01,000\nstale timing\n")
+            .expect("different cached transcript");
+        for _ in 0..2 {
+            let body = body_of(&call(
+                &env,
+                serde_json::json!({"source": url, "want": "transcript"}),
+            ));
+            assert_eq!(body["transcript"], "00:00 hi");
+        }
+        assert_eq!(*env.whisper.calls.lock().expect("calls"), 1);
+        assert_eq!(*env.fetcher.downloads.lock().expect("downloads"), 1);
+    }
 
     /// Run the URL flow up to a cached analysis rip, then transcribe it.
     fn download_then_transcribe(env: &crate::mcp::testutil::TestEnv, url: &str) {

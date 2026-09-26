@@ -5,12 +5,14 @@
 //! whisper form layout; the WAV and multipart codecs are [`super::wav`]
 //! and [`super::multipart`].
 
+use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use super::prompt::PromptChain;
 use super::{Cue, multipart, wav};
 use crate::fault::Fault;
-use agent_video_core::media::audio::WHISPER_SAMPLE_RATE;
+use agent_video_core::media::audio::{AudioChunk, SamplePos, WHISPER_SAMPLE_RATE};
 
 /// Maximum upload size per chunk (bytes). Groq / OpenAI limit is 25 MB.
 const MAX_UPLOAD_BYTES: usize = 24 * 1024 * 1024; // 24 MiB with margin
@@ -62,21 +64,27 @@ pub(super) fn recognize<F>(
     api_url: &str,
     language: Option<&str>,
     initial_prompt: &str,
-    chunks: &mut Chunker<F>,
+    next: &mut F,
     on_step: &mut dyn FnMut(&str),
 ) -> Result<Vec<Cue>, Fault>
 where
-    F: FnMut(&mut Vec<f32>, usize) -> Result<bool, Fault>,
+    F: FnMut(NonZeroUsize) -> Result<Option<AudioChunk>, Fault>,
 {
     let agent = api_agent(API_CONNECT_TIMEOUT, API_CALL_CEILING);
     let mut chain = PromptChain::new(initial_prompt);
     let mut all_cues = Vec::new();
     let mut n = 0usize;
-    while let Some(chunk) = chunks.next_chunk()? {
+    let mut pending = None;
+    while let Some(mut chunk) = next_upload(next, &mut pending, MAX_CHUNK_SAMPLES)? {
         n += 1;
         on_step(&format!("transcribing via API (chunk {n})"));
+        let span = chunk.start..chunk.end();
+        // Padding makes tiny tails acceptable to ASR endpoints; cues are
+        // still clipped to the source span, excluding this synthetic tail.
+        chunk
+            .samples
+            .resize(chunk.samples.len().max(WHISPER_SAMPLE_RATE as usize), 0.0);
         let wav = wav::encode(&chunk.samples, WHISPER_SAMPLE_RATE);
-        let offset = chunk.offset;
         // The chunk's f32 samples are spent once encoded; only the WAV
         // (half their size) rides through the upload.
         drop(chunk);
@@ -88,7 +96,7 @@ where
             language,
             &chain.prompt(),
             &wav,
-            offset,
+            span,
         )?;
         tracing::info!(
             chunk = n,
@@ -107,69 +115,53 @@ where
 /// header, at [`wav::BYTES_PER_SAMPLE`] each.
 const MAX_CHUNK_SAMPLES: usize = (MAX_UPLOAD_BYTES - wav::HEADER_BYTES) / wav::BYTES_PER_SAMPLE;
 
+/// Short pauses stay in one request; long absent spans cost no upload bytes.
+const MAX_GAP_SAMPLES: usize = 2 * WHISPER_SAMPLE_RATE as usize;
+
+fn next_upload<F>(
+    next: &mut F,
+    pending: &mut Option<AudioChunk>,
+    capacity: usize,
+) -> Result<Option<AudioChunk>, Fault>
+where
+    F: FnMut(NonZeroUsize) -> Result<Option<AudioChunk>, Fault>,
+{
+    let mut output: Option<AudioChunk> = None;
+    loop {
+        let remaining = capacity - output.as_ref().map_or(0, |chunk| chunk.samples.len());
+        let Some(bound) = NonZeroUsize::new(remaining) else {
+            break;
+        };
+        let chunk = match pending.take() {
+            Some(chunk) => Some(chunk),
+            None => next(bound)?,
+        };
+        let Some(mut chunk) = chunk else { break };
+        let out = output.get_or_insert_with(|| AudioChunk {
+            start: chunk.start,
+            samples: Vec::new(),
+        });
+        let gap = chunk.start.samples_since(out.end());
+        if gap > MAX_GAP_SAMPLES || gap >= remaining {
+            *pending = Some(chunk);
+            break;
+        }
+        out.samples.resize(out.samples.len() + gap, 0.0);
+        let take = chunk.samples.len().min(remaining - gap);
+        if take < chunk.samples.len() {
+            *pending = Some(AudioChunk {
+                start: chunk.start.advance(take),
+                samples: chunk.samples.split_off(take),
+            });
+        }
+        out.samples.extend(chunk.samples);
+    }
+    Ok(output)
+}
+
 // The bound and the budget must agree: a full chunk's WAV fits one upload.
 const _: () =
     assert!(wav::HEADER_BYTES + MAX_CHUNK_SAMPLES * wav::BYTES_PER_SAMPLE <= MAX_UPLOAD_BYTES);
-
-/// One bounded run of samples with its absolute position in the track.
-pub(super) struct Chunk {
-    pub(super) samples: Vec<f32>,
-    /// Offset of `samples[0]` from the track start, in samples.
-    pub(super) offset: usize,
-}
-
-/// Pull bounded chunks off a sample stream: only the chunk in flight (plus
-/// the stream's delivery overshoot) is ever resident, which is what keeps
-/// a 3-hour track from materializing. `fill` follows
-/// [`AudioSamples::fill`](agent_video_core::media::audio::AudioSamples::fill)'s
-/// contract: append until the threshold or track end; `false` ("nothing
-/// more will arrive") is final. Cuts land at hard sample boundaries, not
-/// silence — see the module doc of [`super`] for the trade-off.
-pub(super) struct Chunker<F> {
-    fill: F,
-    max_samples: usize,
-    buf: Vec<f32>,
-    consumed: usize,
-}
-
-impl<F: FnMut(&mut Vec<f32>, usize) -> Result<bool, Fault>> Chunker<F> {
-    /// A chunker bounded to the upload budget — the only bound production
-    /// code can construct.
-    pub(super) fn new(fill: F) -> Self {
-        Chunker::with_bound(fill, MAX_CHUNK_SAMPLES)
-    }
-
-    fn with_bound(fill: F, max_samples: usize) -> Self {
-        Chunker {
-            fill,
-            max_samples,
-            buf: Vec::new(),
-            consumed: 0,
-        }
-    }
-
-    /// The next chunk, or `None` once the stream is exhausted.
-    pub(super) fn next_chunk(&mut self) -> Result<Option<Chunk>, Fault> {
-        if self.buf.len() < self.max_samples {
-            (self.fill)(&mut self.buf, self.max_samples)?;
-        }
-        if self.buf.is_empty() {
-            return Ok(None);
-        }
-        let take = self.buf.len().min(self.max_samples);
-        let rest = self.buf.split_off(take);
-        let samples = std::mem::replace(&mut self.buf, rest);
-        let offset = self.consumed;
-        self.consumed += samples.len();
-        Ok(Some(Chunk { samples, offset }))
-    }
-
-    /// Total samples handed out so far; after exhaustion, the track's
-    /// decoded length.
-    pub(super) fn samples_pulled(&self) -> usize {
-        self.consumed
-    }
-}
 
 /// The multipart form for one WAV chunk. The boundary is keyed to the WAV
 /// payload ([`multipart::Form::keyed_to`]), so attacker-influenced text
@@ -202,7 +194,7 @@ fn upload_and_parse(
     language: Option<&str>,
     prompt: &str,
     wav: &[u8],
-    offset_samples: usize,
+    span: Range<SamplePos>,
 ) -> Result<Vec<Cue>, Fault> {
     let form = whisper_form(wav, language, prompt);
 
@@ -220,7 +212,7 @@ fn upload_and_parse(
         .map_err(|e| Fault::transient(format!("reading API response: {e}")))?;
 
     match status {
-        200..=299 => parse_verbose_json(&resp_body, offset_samples),
+        200..=299 => parse_verbose_json(&resp_body, span),
         // Auth failures are the deployment's problem, not the request's:
         // retrying without a key change cannot succeed.
         401 | 403 => Err(Fault::environment(format!(
@@ -238,7 +230,7 @@ fn upload_and_parse(
 }
 
 /// Parse the OpenAI-compatible verbose_json response.
-fn parse_verbose_json(body: &str, offset_samples: usize) -> Result<Vec<Cue>, Fault> {
+fn parse_verbose_json(body: &str, span: Range<SamplePos>) -> Result<Vec<Cue>, Fault> {
     #[derive(serde::Deserialize)]
     struct Response {
         segments: Option<Vec<Segment>>,
@@ -253,19 +245,25 @@ fn parse_verbose_json(body: &str, offset_samples: usize) -> Result<Vec<Cue>, Fau
     let resp: Response = serde_json::from_str(body)
         .map_err(|e| Fault::internal(format!("parsing API response: {e}")))?;
 
-    let offset_s = offset_samples as f64 / WHISPER_SAMPLE_RATE as f64;
+    let offset_s = span.start.seconds();
+    let duration = span.end.seconds() - offset_s;
     let cues = resp
         .segments
         .unwrap_or_default()
         .into_iter()
         .filter_map(|seg| {
             let text = seg.text.trim().to_string();
-            if text.is_empty() {
+            if text.is_empty() || !seg.start.is_finite() || !seg.end.is_finite() {
+                return None;
+            }
+            let start = seg.start.clamp(0.0, duration);
+            let end = seg.end.clamp(0.0, duration);
+            if end <= start {
                 return None;
             }
             Some(Cue {
-                start_cs: ((seg.start + offset_s) * 100.0).round() as i64,
-                end_cs: ((seg.end + offset_s) * 100.0).round() as i64,
+                start_cs: ((start + offset_s) * 100.0).round() as i64,
+                end_cs: ((end + offset_s) * 100.0).round() as i64,
                 text,
             })
         })
@@ -276,6 +274,110 @@ fn parse_verbose_json(body: &str, offset_samples: usize) -> Result<Vec<Cue>, Fau
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounds_uploads_including_gap_padding_and_leaves_long_gaps_absent() {
+        let mut chunks = [
+            AudioChunk {
+                start: SamplePos::from_samples(0),
+                samples: vec![1.0; 10],
+            },
+            AudioChunk {
+                start: SamplePos::from_samples(15),
+                samples: vec![2.0; 10],
+            },
+            AudioChunk {
+                start: SamplePos::from_samples(1_000_000),
+                samples: vec![3.0; 5],
+            },
+        ]
+        .into_iter();
+        let mut next = |_| Ok(chunks.next());
+        let mut pending = None;
+        let first = next_upload(&mut next, &mut pending, 20)
+            .expect("upload")
+            .expect("first");
+        assert_eq!(
+            first.samples,
+            [vec![1.0; 10], vec![0.0; 5], vec![2.0; 5]].concat()
+        );
+        let second = next_upload(&mut next, &mut pending, 20)
+            .expect("upload")
+            .expect("second");
+        assert_eq!(second.start, SamplePos::from_samples(20));
+        assert_eq!(second.samples, vec![2.0; 5]);
+        let third = next_upload(&mut next, &mut pending, 20)
+            .expect("upload")
+            .expect("third");
+        assert_eq!(third.start, SamplePos::from_samples(1_000_000));
+        assert_eq!(third.samples, vec![3.0; 5]);
+        assert!(
+            next_upload(&mut next, &mut pending, 20)
+                .expect("end")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn uploads_many_tiny_runs_once_and_clips_cues_before_tail_padding() {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("API peer");
+        let addr = listener.local_addr().expect("address");
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("one request");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut reader = std::io::BufReader::new(&mut socket);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).expect("header") > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().expect("length");
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).expect("body");
+            let riff = body.windows(4).position(|b| b == b"RIFF").expect("WAV");
+            let bytes = u32::from_le_bytes(body[riff + 40..riff + 44].try_into().expect("size"));
+            assert_eq!(bytes, 32_000, "subsecond audio is padded to one second");
+            let json = r#"{"segments":[{"start":0,"end":1,"text":"speech"},{"start":0.8,"end":1,"text":"padding"}]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                json.len()
+            )
+            .expect("response");
+        });
+        let mut runs = (0..20).map(|i| AudioChunk {
+            start: SamplePos::from_samples(16_000 + i * 176),
+            samples: vec![0.5; 160],
+        });
+        let cues = recognize(
+            "key",
+            &format!("http://{addr}"),
+            None,
+            "",
+            &mut |_| Ok(runs.next()),
+            &mut |_| {},
+        )
+        .expect("one upload");
+        peer.join().expect("WAV expectations");
+        assert_eq!(
+            cues,
+            vec![Cue {
+                start_cs: 100,
+                end_cs: 122,
+                text: "speech".into()
+            }]
+        );
+    }
 
     #[test]
     fn whisper_form_carries_language_and_prompt_when_set() {
@@ -368,55 +470,6 @@ mod tests {
         );
     }
 
-    /// A fake sample stream honoring the fill contract: appends in
-    /// `granule`-sized slabs (the delivery overshoot) until the threshold
-    /// or the source ends; exhaustion is final.
-    fn slab_fill(
-        source: Vec<f32>,
-        granule: usize,
-    ) -> impl FnMut(&mut Vec<f32>, usize) -> Result<bool, Fault> {
-        let mut pos = 0;
-        move |out, min| {
-            while out.len() < min && pos < source.len() {
-                let end = (pos + granule).min(source.len());
-                out.extend_from_slice(&source[pos..end]);
-                pos = end;
-            }
-            Ok(pos < source.len())
-        }
-    }
-
-    #[test]
-    fn chunker_bounds_chunks_and_keeps_offsets_contiguous() {
-        let source: Vec<f32> = (0..1000).map(|i| i as f32).collect();
-        // A granule that divides nothing evenly: overshoot must carry over.
-        let mut chunks = Chunker::with_bound(slab_fill(source.clone(), 7), 100);
-        let mut rebuilt = Vec::new();
-        while let Some(chunk) = chunks.next_chunk().expect("fake stream cannot fail") {
-            assert!(chunk.samples.len() <= 100, "chunk respects the bound");
-            assert_eq!(chunk.offset, rebuilt.len(), "offsets are contiguous");
-            rebuilt.extend(chunk.samples);
-        }
-        assert_eq!(rebuilt, source, "no sample lost or repeated across cuts");
-        assert_eq!(chunks.samples_pulled(), 1000);
-        assert!(
-            chunks.next_chunk().expect("still no failure").is_none(),
-            "exhaustion is final"
-        );
-    }
-
-    #[test]
-    fn chunker_yields_nothing_for_an_empty_stream() {
-        let mut chunks = Chunker::with_bound(slab_fill(Vec::new(), 7), 100);
-        assert!(
-            chunks
-                .next_chunk()
-                .expect("empty is not an error")
-                .is_none()
-        );
-        assert_eq!(chunks.samples_pulled(), 0);
-    }
-
     #[test]
     fn hung_api_endpoint_errors_within_the_call_ceiling() {
         // A server that accepts, swallows the request, and never answers —
@@ -445,7 +498,7 @@ mod tests {
             None,
             "",
             b"RIFF",
-            0,
+            SamplePos::from_samples(0)..SamplePos::from_samples(160_000),
         )
         .expect_err("a silent endpoint must not pin the call");
 
@@ -464,7 +517,11 @@ mod tests {
             {"id":0,"start":0.0,"end":2.5,"text":" Hello world"},
             {"id":1,"start":3.0,"end":5.0,"text":" Goodbye"}
         ]}"#;
-        let cues = parse_verbose_json(body, 0).expect("valid json");
+        let cues = parse_verbose_json(
+            body,
+            SamplePos::from_samples(0)..SamplePos::from_samples(160_000),
+        )
+        .expect("valid json");
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[0].text, "Hello world");
         assert_eq!(cues[0].start_cs, 0);
@@ -474,12 +531,20 @@ mod tests {
 
     #[test]
     fn parses_verbose_json_with_sample_offset() {
-        let body = r#"{"segments":[{"id":0,"start":1.0,"end":2.0,"text":"hi"}]}"#;
+        let body = r#"{"segments":[{"id":0,"start":1.0,"end":22.0,"text":"hi"}]}"#;
         // offset = 160000 samples = 10 seconds
-        let cues = parse_verbose_json(body, 160_000).expect("valid json");
+        let cues = parse_verbose_json(
+            body,
+            SamplePos::from_samples(160_000)..SamplePos::from_samples(192_000),
+        )
+        .expect("valid json");
         assert_eq!(
             cues[0].start_cs, 1100,
             "1.0s + 10.0s offset = 11.0s = 1100cs"
+        );
+        assert_eq!(
+            cues[0].end_cs, 1200,
+            "a cue cannot extend into the following gap"
         );
     }
 }

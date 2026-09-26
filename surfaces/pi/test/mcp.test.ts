@@ -11,10 +11,10 @@ import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import {
-	failureMessage,
 	type McpChild,
 	parseCallResult,
 	runVideoCall,
+	VideoCallError,
 	VideoServer,
 } from "../lib/mcp.ts";
 
@@ -131,27 +131,43 @@ function run(fake: FakeServer, params: unknown): Promise<unknown> {
 describe("failure unwrapping", () => {
 	test("preserves_fault_kind_on_failure", async () => {
 		const fake = new FakeServer(() => failed("[INPUT_CORRUPT] bad moov", "bad_input"));
-		await expect(run(fake, { source: "v.mp4" })).rejects.toThrow(
-			"[INPUT_CORRUPT] bad moov (kind: bad_input — the source or arguments are wrong; " +
+		const error = await run(fake, { source: "v.mp4" }).catch((error: unknown) => error);
+		expect(error).toBeInstanceOf(VideoCallError);
+		expect(error).toMatchObject({
+			kind: "bad_input",
+			remoteKind: "bad_input",
+			message:
+				"[INPUT_CORRUPT] bad moov (kind: bad_input — the source or arguments are wrong; " +
 				"retrying the identical call cannot succeed)",
-		);
+		});
 	});
 
 	test("marks_transient_failure_retriable", async () => {
 		const fake = new FakeServer(() => failed("fetch stalled", "transient"));
-		await expect(run(fake, { source: "http://v" })).rejects.toThrow(
-			"fetch stalled (kind: transient — plausibly a passing condition; " +
+		const error = await run(fake, { source: "http://v" }).catch((error: unknown) => error);
+		expect(error).toMatchObject({
+			kind: "transient",
+			message:
+				"fetch stalled (kind: transient — plausibly a passing condition; " +
 				"retrying the same call may succeed)",
-		);
+		});
 	});
 
 	test("surfaces_unknown_kind_verbatim", () => {
 		const body = JSON.stringify({ status: "failed", error: "boom", kind: "flaky_moon" });
-		expect(failureMessage(body)).toBe("boom (kind: flaky_moon)");
+		expect(VideoCallError.fromText(body)).toMatchObject({
+			kind: undefined,
+			remoteKind: "flaky_moon",
+			message: "boom (kind: flaky_moon)",
+		});
 	});
 
 	test("keeps_error_prose_when_kind_missing", () => {
-		expect(failureMessage(JSON.stringify({ error: "just prose" }))).toBe("just prose");
+		expect(VideoCallError.fromText(JSON.stringify({ error: "just prose" }))).toMatchObject({
+			kind: undefined,
+			remoteKind: undefined,
+			message: "just prose",
+		});
 	});
 
 	test("falls_back_to_raw_text_when_failure_is_not_json", async () => {
@@ -195,6 +211,31 @@ describe("boundary validation", () => {
 		expect(() => parseCallResult({ content: [{ type: "text", text: 42 }] })).toThrow(
 			"content[0].text is not a string",
 		);
+	});
+
+	test("rejects_incomplete_known_content_instead_of_dropping_it", async () => {
+		for (const [block, field] of [
+			[{ type: "image" }, "data"],
+			[{ type: "text", data: "abc" }, "text"],
+			[{ type: "image", data: "abc", mimeType: 42 }, "mimeType"],
+		] as const) {
+			const fake = new FakeServer(() => ({ content: [block] }));
+			await expect(run(fake, { source: "v.mp4" })).rejects.toThrow(
+				`content[0].${field} is not a string`,
+			);
+		}
+	});
+
+	test("ignores_future_content_types_while_delivering_known_blocks", async () => {
+		const fake = new FakeServer(() => ({
+			content: [
+				{ type: "future", payload: {} },
+				{ type: "text", text: "still readable" },
+			],
+		}));
+		expect(await run(fake, { source: "v.mp4" })).toEqual([
+			{ type: "text", text: "still readable" },
+		]);
 	});
 
 	test("diagnoses_non_boolean_is_error", () => {
@@ -332,7 +373,8 @@ describe("call mechanics", () => {
 		const second = server.call("video", { source: "other.mp4" }, undefined, undefined);
 
 		controller.abort();
-		expect((await first).content[0]?.text).toContain("cancelled");
+		const cancelled = (await first).content[0];
+		expect(cancelled?.type === "text" ? cancelled.text : "").toContain("cancelled");
 		expect(await second).toEqual(textResult("done"));
 		reply.resolve(textResult("late reply"));
 		expect(await server.call("video", { source: "next.mp4" }, undefined, undefined)).toEqual(

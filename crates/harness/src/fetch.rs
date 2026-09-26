@@ -34,6 +34,24 @@ use super::tokens::{Dest, DownloadPlan};
 /// the LRU ages out.
 const RECIPE_VERSION: u32 = 1;
 
+/// Disk identity of an analysis rip, derived from its source and download recipe.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RipKey(String);
+
+impl std::fmt::Display for RipKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+impl RipKey {
+    /// A fixed disk spelling for cache and publication fixtures.
+    pub(crate) fn fixture(key: &str) -> Self {
+        Self(key.to_owned())
+    }
+}
+
 /// Cache identity of one analysis rip: the canonical source plus every
 /// config knob that shapes the downloaded bytes. "Every" is enforced by
 /// construction, not by review: [`RipId::derive`] is the only constructor,
@@ -74,9 +92,6 @@ impl RipId {
             whisper: _,
             download:
                 DownloadCfg {
-                    // Refusal ceiling: decides whether a download runs,
-                    // never the bytes of one that does.
-                    max_bytes: _,
                     analysis_max_height,
                     // Response latency, invisible to the fetched bytes.
                     sync_wait_seconds: _,
@@ -118,7 +133,7 @@ impl RipId {
     /// Render the on-disk key. Destructures `self` exhaustively, so an
     /// identity field cannot exist without entering the key; the spelling
     /// keeps the pre-`RipId` format, so existing cache entries stay valid.
-    fn key(&self) -> String {
+    fn key(&self) -> RipKey {
         let RipId {
             source,
             max_height,
@@ -127,10 +142,10 @@ impl RipId {
         } = self;
         let auth = if *authenticated { "-auth" } else { "" };
         let net = if *private_hosts_allowed { "-priv" } else { "" };
-        format!(
+        RipKey(format!(
             "{}-h{max_height}r{RECIPE_VERSION}{auth}{net}",
             source.cache_key()
-        )
+        ))
     }
 }
 
@@ -140,9 +155,9 @@ impl RipId {
 /// same source ⇒ the same entry, by [`SourceId`] construction.
 ///
 /// Not the in-flight job key: the tracker dedupes by
-/// [`crate::cache::url_key`] alone — "a download for this URL is running"
+/// canonical source and destination — "a download for this URL is running"
 /// is source identity, not byte identity.
-pub fn rip_key(url: &str, cfg: &Config) -> String {
+pub fn rip_key(url: &str, cfg: &Config) -> RipKey {
     RipId::derive(SourceId::from_spelling(url), cfg).key()
 }
 
@@ -231,13 +246,13 @@ pub struct Downloaded {
 ///
 /// Deliberately not a [`Fault`]: a short rip is the retry loop's input,
 /// never the caller's verdict.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Shortfall {
     /// The transfer ended before the advertised length.
     Transfer { got: u64, expected: u64 },
     /// The container's tracks stop before its declared extent, named as
     /// [`crate::probe::coverage_shortfall`] phrases it.
-    Coverage(String),
+    Coverage(crate::probe::CoverageShortfall),
 }
 
 impl Shortfall {
@@ -249,7 +264,7 @@ impl Shortfall {
                 format_bytes(*got),
                 format_bytes(*expected)
             ),
-            Shortfall::Coverage(issue) => issue.clone(),
+            Shortfall::Coverage(issue) => issue.to_string(),
         }
     }
 }
@@ -312,7 +327,7 @@ fn combine_kinds(ytdlp: FaultKind, direct: FaultKind) -> FaultKind {
 /// files are free-form.
 #[derive(Debug, Clone, Copy)]
 pub enum DownloadIo<'a> {
-    Cache { dir: &'a Path, key: &'a str },
+    Cache { dir: &'a Path, key: &'a RipKey },
     Keep { dir: &'a Path },
 }
 
@@ -358,7 +373,10 @@ fn verify_coverage(attempt: Attempt) -> Attempt {
 /// without a truncated container on disk. An attempt already known to be
 /// short is never re-judged: the first evidence is the specific one, and a
 /// second opinion could only blur it.
-fn judge_coverage(attempt: Attempt, observe: impl Fn(&Path) -> Option<String>) -> Attempt {
+fn judge_coverage(
+    attempt: Attempt,
+    observe: impl Fn(&Path) -> Option<crate::probe::CoverageShortfall>,
+) -> Attempt {
     let Attempt::Complete(landed) = attempt else {
         return attempt;
     };
@@ -395,7 +413,11 @@ mod tests {
     #[test]
     fn a_rip_whose_tracks_stop_early_is_short_but_still_served() {
         let judged = judge_coverage(complete("v.mp4"), |_| {
-            Some("the audio track covers only 00:31 of the 08:51 timeline".to_string())
+            Some(crate::probe::CoverageShortfall {
+                track: crate::probe::TrackKind::Audio,
+                actual_seconds: 31.0,
+                expected_seconds: 531.0,
+            })
         });
 
         match judged {
@@ -403,7 +425,15 @@ mod tests {
                 evidence: Shortfall::Coverage(issue),
                 landed,
             } => {
-                assert!(issue.contains("00:31"), "{issue}");
+                assert_eq!(issue.track, crate::probe::TrackKind::Audio);
+                assert_eq!(
+                    issue.to_string(),
+                    "the audio track covers only 00:31 of the 08:51 timeline"
+                );
+                assert_eq!(
+                    (issue.actual_seconds, issue.expected_seconds),
+                    (31.0, 531.0)
+                );
                 assert_eq!(
                     landed.expect("a truncated container is still a file").path,
                     PathBuf::from("v.mp4"),
@@ -503,7 +533,7 @@ mod tests {
         let cfg = default_config(&dirs);
         let key = rip_key("https://example.com/v", &cfg);
         assert!(
-            !key.contains("-priv") && !key.contains("-auth"),
+            !key.to_string().contains("-priv") && !key.to_string().contains("-auth"),
             "default-policy keys keep the pre-field spelling, so existing \
              cache entries stay valid: {key}"
         );

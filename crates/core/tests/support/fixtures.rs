@@ -88,6 +88,75 @@ pub fn keyframe_poor(duration: f32) -> Option<Fixture> {
     })
 }
 
+/// Two exact PCM runs at video seconds 1..2 and 3..5; the container starts at 10.
+pub fn sparse_audio(rate: u32) -> Option<Fixture> {
+    require_ffmpeg()?;
+    let args = strings(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=blue:s=64x48:r=1:d=5",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("aevalsrc='if(lt(t,2),0.25,0.75)':s={rate}:d=4"),
+        "-af",
+        &format!(
+            "asetnsamples=n={}:p=0,aselect='lt(t,1)+gte(t,2)',asetpts=PTS+1/TB",
+            rate / 100
+        ),
+        "-c:v",
+        "ffv1",
+        "-c:a",
+        "pcm_f32le",
+        "-output_ts_offset",
+        "10",
+        "audio.mkv",
+    ]);
+    let dir = cached("sparse-audio", &args, &["audio.mkv"], |scratch| {
+        run_ffmpeg(scratch, &args)
+    });
+    Some(Fixture {
+        media: dir.join("audio.mkv"),
+        sidecar: None,
+        duration: 5.0,
+    })
+}
+
+/// Continuous lossy audio exercising decoder skip-samples and resampler delay.
+pub fn primed_audio(codec: &str) -> Option<Fixture> {
+    require_ffmpeg()?;
+    let rate = if codec == "aac" { "44100" } else { "48000" };
+    let filename = if codec == "aac" {
+        "audio.mp4"
+    } else {
+        "audio.mkv"
+    };
+    let args = strings(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=blue:s=64x48:r=1:d=3",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("sine=frequency=440:sample_rate={rate}:duration=3"),
+        "-c:v",
+        "libx264",
+        "-c:a",
+        codec,
+        filename,
+    ]);
+    let dir = cached("primed-audio", &args, &[filename], |scratch| {
+        run_ffmpeg(scratch, &args)
+    });
+    Some(Fixture {
+        media: dir.join(filename),
+        sidecar: None,
+        duration: 3.0,
+    })
+}
+
 /// A legal long-GOP recording with a sparse keyframe tail: keyframes
 /// forced at 0,2,..,10 then 25 and `duration - 0.1`, everything else
 /// suppressed (`-g 9999 -sc_threshold 0`) — the screen-capture/`-g 600`
@@ -190,6 +259,15 @@ pub fn edit_list_cut(duration: f32, cut: f32) -> Option<Fixture> {
 /// the audio parameters change mid-stream while the container demuxes as
 /// one continuous file.
 pub fn audio_param_change(duration: f32) -> Option<Fixture> {
+    spliced_audio(duration, false)
+}
+
+/// Two MPEG-TS segments whose clocks restart at zero at the splice.
+pub fn reset_av_clock(duration: f32) -> Option<Fixture> {
+    spliced_audio(duration, true)
+}
+
+fn spliced_audio(duration: f32, reset: bool) -> Option<Fixture> {
     require_ffmpeg()?;
     let half = duration / 2.0;
     // Each lavfi segment restarts its clock at 0, so with identical filters
@@ -231,7 +309,12 @@ pub fn audio_param_change(duration: f32) -> Option<Fixture> {
         .collect()
     };
     let first = seg(44_100, 0.0, "rotate=t", "seg1.ts");
-    let second = seg(22_050, half, "negate,rotate=0.7+1.3*t", "seg2.ts");
+    let second = seg(
+        if reset { 44_100 } else { 22_050 },
+        if reset { 0.0 } else { half },
+        "negate,rotate=0.7+1.3*t",
+        "seg2.ts",
+    );
     let key: Vec<String> = first.iter().chain(second.iter()).cloned().collect();
     let dir = cached("audio-param-change", &key, &["concat.ts"], |scratch| {
         run_ffmpeg(scratch, &first);
@@ -258,8 +341,17 @@ pub fn audio_param_change(duration: f32) -> Option<Fixture> {
 /// segmenter sees; MPEG-TS is used because its 33-bit pts field round-trips
 /// far-future values that MP4's composition offsets cannot represent.
 pub fn corrupt_pts(tag: &str, duration: f32, expr: &str) -> Option<Fixture> {
+    corrupt_clock(tag, duration, expr, None)
+}
+
+/// Video and audio packet timestamp corruption, with audio starting 0.5s late.
+pub fn corrupt_av_pts(tag: &str, duration: f32, video: &str, audio: &str) -> Option<Fixture> {
+    corrupt_clock(tag, duration, video, Some(audio))
+}
+
+fn corrupt_clock(tag: &str, duration: f32, expr: &str, audio: Option<&str>) -> Option<Fixture> {
     require_ffmpeg()?;
-    let clean: Vec<String> = [
+    let mut clean: Vec<String> = [
         "-f",
         "lavfi",
         "-i",
@@ -285,7 +377,25 @@ pub fn corrupt_pts(tag: &str, duration: f32, expr: &str) -> Option<Fixture> {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    let remux: Vec<String> = [
+    if audio.is_some() {
+        clean.insert(0, "-copyts".into());
+        clean.splice(
+            5..5,
+            [
+                "-f",
+                "lavfi",
+                "-i",
+                &format!(
+                    "sine=frequency=440:sample_rate=48000:duration={},asetpts=PTS+0.5/TB",
+                    duration - 0.5
+                ),
+            ]
+            .map(String::from),
+        );
+        let end = clean.len() - 1;
+        clean.splice(end..end, ["-c:a", "aac"].map(String::from));
+    }
+    let mut remux: Vec<String> = [
         "-i",
         "clean.ts",
         "-c",
@@ -304,6 +414,13 @@ pub fn corrupt_pts(tag: &str, duration: f32, expr: &str) -> Option<Fixture> {
     .iter()
     .map(|s| s.to_string())
     .collect();
+    if let Some(expr) = audio {
+        let end = remux.len() - 1;
+        remux.splice(
+            end..end,
+            ["-bsf:a".to_string(), format!("setts=pts={expr}")],
+        );
+    }
     let key: Vec<String> = clean.iter().chain(remux.iter()).cloned().collect();
     let dir = cached(tag, &key, &["corrupt.ts"], |scratch| {
         run_ffmpeg(scratch, &clean);
@@ -554,4 +671,43 @@ fn run_ffmpeg(dir: &Path, args: &[String]) {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+/// Eighty seconds of A/B transitions followed by a held B. With uniform flashes,
+/// the two scenes deliberately collide under a gradient-only image hash.
+pub fn revisited_static_scene(uniform_flashes: bool) -> Option<Fixture> {
+    require_ffmpeg()?;
+    let luma = if uniform_flashes {
+        "if(lt(N,20),if(mod(N,2),235,16),235)"
+    } else {
+        "if(eq(N,0)+eq(N,2),if(lt(X,W/2),32,224),if(lt(X,W/2),224,32))"
+    };
+    let args: Vec<String> = [
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("nullsrc=size=128x96:rate=1:duration=80,geq=lum='{luma}':cb=128:cr=128"),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "18",
+        "-g",
+        "1",
+        "-pix_fmt",
+        "yuv420p",
+        "scene.mp4",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let dir = cached("revisited-static", &args, &["scene.mp4"], |scratch| {
+        run_ffmpeg(scratch, &args)
+    });
+    Some(Fixture {
+        media: dir.join("scene.mp4"),
+        sidecar: None,
+        duration: 80.0,
+    })
 }

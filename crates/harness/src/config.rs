@@ -107,8 +107,6 @@ impl WhisperCfg {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DownloadCfg {
-    /// Hard refusal ceiling for any single download.
-    pub max_bytes: NonZeroU64,
     /// Analysis rips are capped at this frame height (grid quality ceiling).
     pub analysis_max_height: NonZeroU32,
     /// How long a `video` call may block on a running download — the one
@@ -259,7 +257,6 @@ struct FileWhisper {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileDownload {
-    max_bytes: Option<u64>,
     analysis_max_height: Option<u32>,
     sync_wait_seconds: Option<u32>,
 }
@@ -345,7 +342,6 @@ pub fn default_config(dirs: &BaseDirs) -> Config {
             language: None,
         },
         download: DownloadCfg {
-            max_bytes: nz64(2 * GIB),
             analysis_max_height: nz32(480),
             sync_wait_seconds: nz32(300),
         },
@@ -419,9 +415,6 @@ pub fn parse_config(text: &str, dirs: &BaseDirs) -> Result<Config, ConfigError> 
 
     if let Some(v) = nz64(file.cache.max_bytes, "cache.max_bytes")? {
         cfg.cache.max_bytes = v;
-    }
-    if let Some(v) = nz64(file.download.max_bytes, "download.max_bytes")? {
-        cfg.download.max_bytes = v;
     }
     if let Some(v) = nz32(
         file.download.analysis_max_height,
@@ -543,7 +536,6 @@ pub fn render_template(cfg: &Config) -> String {
         language,
     } = whisper;
     let DownloadCfg {
-        max_bytes: download_max_bytes,
         analysis_max_height,
         sync_wait_seconds,
     } = download;
@@ -673,11 +665,6 @@ pub fn render_template(cfg: &Config) -> String {
     opt(&mut out, "language", language.as_deref().map(t), "\"zh\"");
     line(&mut out, "");
     line(&mut out, "[download]");
-    line(
-        &mut out,
-        "# Hard refusal ceiling for any single download, in bytes (default 2 GiB).",
-    );
-    line(&mut out, &format!("#max_bytes = {download_max_bytes}"));
     line(
         &mut out,
         "# Frame-height ceiling for analysis rips (grid quality ceiling).",
@@ -835,7 +822,6 @@ mod tests {
         assert_eq!(cfg.paths.keep, Path::new("/home/u/downloads-base"));
         assert_eq!(cfg.budget.max.get(), 8);
         assert_eq!(cfg.budget.max_stretch_seconds.get(), 600);
-        assert_eq!(cfg.download.max_bytes.get(), 2 * GIB);
         assert_eq!(cfg.download.analysis_max_height.get(), 480);
         assert!(
             !cfg.network.allow_private_hosts,
@@ -854,7 +840,6 @@ mod tests {
             [cache]
             max_bytes = 1
             [download]
-            max_bytes = 2
             analysis_max_height = 3
             sync_wait_seconds = 4
             [budget]
@@ -870,7 +855,6 @@ mod tests {
         assert_eq!(cfg.paths.models, Path::new("/tmp/m"));
         assert_eq!(cfg.paths.keep, Path::new("/tmp/k"));
         assert_eq!(cfg.cache.max_bytes.get(), 1);
-        assert_eq!(cfg.download.max_bytes.get(), 2);
         assert_eq!(cfg.download.analysis_max_height.get(), 3);
         assert_eq!(cfg.download.sync_wait_seconds.get(), 4);
         assert_eq!(cfg.budget.max.get(), 6);
@@ -880,8 +864,11 @@ mod tests {
 
     #[test]
     fn rejects_unknown_keys() {
-        let err = parse_config("[budget]\nautorun = 3\n", &dirs()).expect_err("unknown key");
-        assert!(err.0.contains("autorun"), "message names the key: {err}");
+        for (section, key) in [("budget", "autorun"), ("download", "max_bytes")] {
+            let err = parse_config(&format!("[{section}]\n{key} = 3\n"), &dirs())
+                .expect_err("unknown key");
+            assert!(err.0.contains(key), "message names the key: {err}");
+        }
     }
 
     #[test]

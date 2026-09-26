@@ -3,8 +3,7 @@
 //!
 //! Probes direct media links in-process (the demuxer reads the container
 //! header over http without downloading the payload) and streams downloads
-//! to `<dest>.part` against a hard cap, so a file at the final path is
-//! always whole.
+//! to a staging file. Only a completed transfer is published at its final path.
 //!
 //! Stall discipline: ureq's per-phase timeouts cannot express "abort when
 //! the peer goes silent" (see `agent`), so every connection is wrapped in
@@ -60,8 +59,7 @@ const CANCEL_TICK: Duration = Duration::from_secs(2);
 
 /// Whole-call ceiling for a download (connect through last body byte). A
 /// termination guarantee against a peer that dribbles forever, not stall
-/// detection — `IDLE_LIMIT` handles silence. Sized for
-/// `download.max_bytes` on slow links.
+/// detection — `IDLE_LIMIT` handles silence.
 const BODY_CEILING: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Error note for a transfer aborted because its job was disowned.
@@ -433,9 +431,8 @@ pub enum Transfer {
     Short(Shortfall),
 }
 
-/// Download `url` to `dest`, refusing to exceed `max_bytes`: known oversize
-/// is refused before the first byte, unknown-length streams are cut off
-/// mid-flight. The `.part` file never survives a failure or a short body.
+/// Download `url` to `dest`, publishing only after the body completes.
+/// The staging file never survives a failure or a short body.
 pub fn download_direct(
     url: &VettedUrl,
     dest: &Path,
@@ -443,7 +440,6 @@ pub fn download_direct(
     cancel: &CancelSignal,
     progress: ProgressFn<'_>,
 ) -> Result<Transfer, Fault> {
-    let max_bytes = cfg.download.max_bytes.get();
     let mut res = agent(cfg, cancel)
         .get(url.as_str())
         .call()
@@ -459,17 +455,6 @@ pub fn download_direct(
             other => Fault::transient(format!("download failed: GET {url} → {other}")),
         })?;
     let total = res.body().content_length().filter(|&len| len > 0);
-    if let Some(total) = total
-        && total > max_bytes
-    {
-        return Err(Fault::bad_input(format!(
-            "the file is {}, past the {} ceiling (download.max_bytes) — download it manually \
-             and pass the local path as source",
-            format_bytes(total),
-            format_bytes(max_bytes)
-        )));
-    }
-
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Fault::environment(format!("cannot create {}: {e}", parent.display())))?;
@@ -478,7 +463,6 @@ pub fn download_direct(
     let result = stream_to_part(
         &mut res.body_mut().as_reader(),
         &part,
-        max_bytes,
         total,
         cancel,
         progress,
@@ -548,7 +532,6 @@ enum Streamed {
 fn stream_to_part(
     reader: &mut dyn Read,
     part: &Path,
-    max_bytes: u64,
     total: Option<u64>,
     cancel: &CancelSignal,
     progress: ProgressFn<'_>,
@@ -585,14 +568,6 @@ fn stream_to_part(
             break;
         }
         bytes += n as u64;
-        if bytes > max_bytes {
-            return Err(Fault::bad_input(format!(
-                "download aborted at {}: the stream exceeded the {} ceiling \
-                 (download.max_bytes) — download it manually",
-                format_bytes(bytes),
-                format_bytes(max_bytes)
-            )));
-        }
         file.write_all(&buf[..n])
             .map_err(|e| Fault::environment(format!("cannot write {}: {e}", part.display())))?;
         if last_report.elapsed() >= PROGRESS_INTERVAL {
@@ -771,7 +746,7 @@ mod tests {
         };
         let part = dir.join("v.mp4.part");
 
-        let err = stream_to_part(&mut reader, &part, u64::MAX, None, &cancel, &mut |_, _| {})
+        let err = stream_to_part(&mut reader, &part, None, &cancel, &mut |_, _| {})
             .expect_err("a cancelled stream must not complete");
 
         assert!(err.message.contains("cancelled"), "{err}");
@@ -891,6 +866,53 @@ mod tests {
     }
 
     #[test]
+    fn completes_known_and_unknown_length_bodies() {
+        let dir = crate::tempdir::TempDir::new("av-direct-unlimited");
+        let cfg = crate::config::parse_config(
+            "[network]\nallow_private_hosts = true\n",
+            &crate::config::test_dirs(&dir),
+        )
+        .expect("local peer allowed");
+        for known_length in [true, false] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let peer = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().expect("accept");
+                for line in std::io::BufRead::lines(std::io::BufReader::new(&mut socket)) {
+                    if line.expect("read request header").is_empty() {
+                        break;
+                    }
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n")
+                    .expect("headers");
+                if known_length {
+                    socket
+                        .write_all(b"Content-Length: 128\r\n")
+                        .expect("length");
+                }
+                socket.write_all(b"\r\n").expect("end headers");
+                socket.write_all(&[42; 128]).expect("body");
+            });
+            let url = crate::netguard::vet(&format!("http://{addr}/v.mp4"), &cfg).expect("vetted");
+            let dest = dir.join(format!("{known_length}.mp4"));
+            let mut reports = Vec::new();
+            let result = download_direct(
+                &url,
+                &dest,
+                &cfg,
+                &CancelSignal::new(),
+                &mut |bytes, total| reports.push((bytes, total)),
+            )
+            .expect("download completes without a size policy");
+            peer.join().expect("peer completed");
+            assert!(matches!(result, Transfer::Complete(128)));
+            assert_eq!(std::fs::read(dest).expect("published file"), [42; 128]);
+            assert_eq!(reports.last(), Some(&(128, Some(128))));
+        }
+    }
+
+    #[test]
     fn a_body_shorter_than_content_length_publishes_nothing() {
         // The direct twin of yt-dlp's short transfer: the server promises
         // 100 bytes and hangs up at 40. Publishing that under the cache
@@ -923,7 +945,7 @@ mod tests {
             &recipe,
             DownloadIo::Cache {
                 dir: &cache,
-                key: "k",
+                key: &crate::fetch::RipKey::fixture("k"),
             },
             &cfg,
             &CancelSignal::new(),

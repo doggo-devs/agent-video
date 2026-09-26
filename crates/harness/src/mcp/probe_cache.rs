@@ -25,7 +25,10 @@ pub(super) fn effective_prompt_for(fingerprint: &ContentId, deps: &ServerDeps) -
 }
 
 /// [`transcribe::transcript_id_for`] against the server's deps.
-pub(super) fn transcript_id_for(fingerprint: &ContentId, deps: &ServerDeps) -> String {
+pub(super) fn transcript_id_for(
+    fingerprint: &ContentId,
+    deps: &ServerDeps,
+) -> transcribe::TranscriptId {
     transcribe::transcript_id_for(&deps.cache, &deps.config, fingerprint)
 }
 

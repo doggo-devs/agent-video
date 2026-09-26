@@ -244,7 +244,7 @@ fn url_first_contact(
         Ok(i) => i,
         Err(e) => return failed(&e),
     };
-    let decision = decide_url(args, &info, &deps.config);
+    let decision = decide_url(args, &info);
     execute_decision(args, decision, None, Vec::new(), deps, notify)
 }
 
@@ -595,9 +595,12 @@ mod tests {
     }
 
     #[test]
-    fn truncated_audio_warns_in_transcribe_guidance() {
+    fn reports_the_decoded_audio_endpoint_in_transcribe_guidance() {
         let env = env(probe(437.0, vec![]), true);
-        *env.whisper.audio_seconds.lock().expect("audio_seconds") = 49.0;
+        *env.whisper
+            .decoded_end_seconds
+            .lock()
+            .expect("decoded_end_seconds") = 49.0;
         let file = media_file(&env, "trunc.mp4");
         let body = body_of(&call(
             &env,
@@ -606,7 +609,7 @@ mod tests {
         assert_eq!(body["status"], "transcript", "{body}");
         let guidance = body["guidance"].as_str().expect("guidance");
         assert!(
-            guidance.starts_with("Warning: only 00:49"),
+            guidance.starts_with("Note: decoded audio ends at 00:49"),
             "truncation leads the guidance: {guidance}"
         );
         assert!(guidance.contains("Transcript cached"), "{guidance}");

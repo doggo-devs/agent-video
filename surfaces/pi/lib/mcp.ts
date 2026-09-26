@@ -7,8 +7,7 @@
  * malformed response becomes a diagnosable Error naming what was wrong,
  * not a TypeError three frames later. The server's Failed body carries a
  * machine-readable fault `kind` (crates/harness/src/schema.rs); this module
- * keeps it attached to the thrown message so retry decisions survive the
- * hop into the host.
+ * retains it on VideoCallError and renders it in the message for the host.
  */
 
 import { createInterface } from "node:readline";
@@ -21,15 +20,12 @@ const INIT_TIMEOUT_MS = 30_000;
 
 // ── wire shapes ──
 
-export interface McpContentBlock {
-	type: string;
-	text?: string;
-	data?: string;
-	mimeType?: string;
-}
+export type Text = { type: "text"; text: string };
+export type Image = { type: "image"; data: string; mimeType: string };
+export type Block = Text | Image;
 
 export interface McpCallResult {
-	content: McpContentBlock[];
+	content: Block[];
 	isError?: boolean;
 }
 
@@ -69,21 +65,33 @@ export function parseCallResult(value: unknown): McpCallResult {
 	if (!Array.isArray(content)) {
 		throw new Error(`malformed MCP result: "content" is not an array in ${render(value)}`);
 	}
-	const blocks: McpContentBlock[] = [];
+	const blocks: Block[] = [];
 	for (const [i, item] of content.entries()) {
 		if (!isRecord(item) || typeof item["type"] !== "string") {
 			throw new Error(`malformed MCP result: content[${i}] lacks a string "type": ${render(item)}`);
 		}
-		const block: McpContentBlock = { type: item["type"] };
-		for (const key of ["text", "data", "mimeType"] as const) {
+		const string = (key: string): string => {
 			const field = item[key];
-			if (field === undefined) continue;
 			if (typeof field !== "string") {
 				throw new Error(`malformed MCP result: content[${i}].${key} is not a string`);
 			}
-			block[key] = field;
+			return field;
+		};
+		switch (item["type"]) {
+			case "text":
+				blocks.push({ type: "text", text: string("text") });
+				break;
+			case "image":
+				blocks.push({
+					type: "image",
+					data: string("data"),
+					mimeType: item["mimeType"] === undefined ? "image/jpeg" : string("mimeType"),
+				});
+				break;
+			default:
+				// Future MCP content types are ignored; known types must be complete.
+				break;
 		}
-		blocks.push(block);
 	}
 	const isError = value["isError"];
 	if (isError !== undefined && typeof isError !== "boolean") {
@@ -110,50 +118,58 @@ export function parseArgs(tool: string, params: unknown): Record<string, unknown
 /** Retry guidance per fault kind, mirroring the contract of
  * `VideoBody::Failed` (crates/harness/src/schema.rs): each kind names who
  * can fix the failure and whether retrying can possibly succeed. */
-const KIND_GUIDANCE: Record<string, string | undefined> = {
+const KIND_GUIDANCE = {
 	bad_input: "the source or arguments are wrong; retrying the identical call cannot succeed",
 	environment: "this installation lacks something — tell the user; retrying cannot help",
 	transient: "plausibly a passing condition; retrying the same call may succeed",
 	internal: "an agent-video bug; retrying cannot help",
-};
+} as const;
 
-/** Unwrap a Failed body into the message pi throws: the prose plus the
- * fault kind and its retry guidance, so the model can tell a retriable
- * transient from a hopeless bad_input. Unknown kinds pass through verbatim
- * (forward compatibility beats a lie); non-JSON text is already prose. */
-export function failureMessage(text: string): string {
-	let body: unknown;
-	try {
-		body = JSON.parse(text);
-	} catch {
-		return text; // not JSON — use the raw text
-	}
-	if (!isRecord(body) || typeof body["error"] !== "string") return text;
-	const kind = body["kind"];
-	if (typeof kind !== "string") return body["error"];
-	const guidance = KIND_GUIDANCE[kind];
-	return guidance === undefined
-		? `${body["error"]} (kind: ${kind})`
-		: `${body["error"]} (kind: ${kind} — ${guidance})`;
+/** Failure categories understood by this client. */
+export type FaultKind = keyof typeof KIND_GUIDANCE;
+
+function isFaultKind(kind: string): kind is FaultKind {
+	return Object.hasOwn(KIND_GUIDANCE, kind);
 }
 
-// ── content mapping ──
+/** A tool failure with a machine-readable category and model-readable guidance.
+ * Unknown remote categories survive in remoteKind without acquiring retry semantics. */
+export class VideoCallError extends Error {
+	readonly kind: FaultKind | undefined;
 
-export type Text = { type: "text"; text: string };
-export type Image = { type: "image"; data: string; mimeType: string };
-export type Block = Text | Image;
-
-/** Map validated MCP content into pi's ToolResultMessage blocks. */
-export function toBlocks(content: McpContentBlock[]): Block[] {
-	const blocks: Block[] = [];
-	for (const c of content) {
-		if (c.type === "text" && c.text !== undefined) {
-			blocks.push({ type: "text", text: c.text });
-		} else if (c.type === "image" && c.data !== undefined) {
-			blocks.push({ type: "image", data: c.data, mimeType: c.mimeType ?? "image/jpeg" });
-		}
+	private constructor(
+		message: string,
+		readonly remoteKind: string | undefined,
+	) {
+		const kind = remoteKind !== undefined && isFaultKind(remoteKind) ? remoteKind : undefined;
+		const guidance = kind === undefined ? undefined : KIND_GUIDANCE[kind];
+		super(
+			remoteKind === undefined
+				? message
+				: guidance === undefined
+					? `${message} (kind: ${remoteKind})`
+					: `${message} (kind: ${remoteKind} — ${guidance})`,
+		);
+		this.name = "VideoCallError";
+		this.kind = kind;
 	}
-	return blocks;
+
+	/** Decode a Failed body, retaining plain prose and unknown categories from other servers. */
+	static fromText(text: string): VideoCallError {
+		let body: unknown;
+		try {
+			body = JSON.parse(text);
+		} catch {
+			return new VideoCallError(text, undefined);
+		}
+		if (!isRecord(body) || typeof body["error"] !== "string") {
+			return new VideoCallError(text, undefined);
+		}
+		return new VideoCallError(
+			body["error"],
+			typeof body["kind"] === "string" ? body["kind"] : undefined,
+		);
+	}
 }
 
 // ── the client ──
@@ -367,7 +383,7 @@ export class VideoServer {
 
 /** One tool call, unwrapped the way pi's tool contract expects: content
  * blocks on success, a thrown Error on failure — with the Failed body's
- * fault kind riding in the message so retriability reaches the model. */
+ * fault kind retained on the error and rendered in its message for the model. */
 export async function runVideoCall(
 	server: VideoServer,
 	tool: string,
@@ -376,12 +392,12 @@ export async function runVideoCall(
 	signal: AbortSignal | undefined,
 ): Promise<Block[]> {
 	const result = await server.call(tool, parseArgs(tool, params), onProgress, signal);
-	const content = toBlocks(result.content);
+	const content = result.content;
 	if (result.isError === true) {
 		// pi marks failure by throw; unwrap the Failed body so the model
 		// sees the message and the fault kind, not an envelope.
 		const text = content.find((b): b is Text => b.type === "text")?.text ?? `${tool} call failed`;
-		throw new Error(failureMessage(text));
+		throw VideoCallError.fromText(text);
 	}
 	return content;
 }

@@ -291,12 +291,7 @@ impl Wire {
         let spent = describe_grids(&meta, &notices).len() + RESPONSE_OVERHEAD;
         let kept = self.fits(&meta.grids, spent);
         if kept < meta.grids.len() {
-            let resumes_at = meta.grids[kept]
-                .time_range
-                .split('-')
-                .next()
-                .unwrap_or_default()
-                .to_string();
+            let resumes_at = format_ts(meta.grids[kept].time_range.start());
             let dropped = meta.grids.len() - kept;
             let total = meta.grids.len();
             let ceiling = crate::plan::format_bytes(self.max_bytes as u64);
@@ -385,7 +380,7 @@ mod tests {
     fn grid(range: &str, bytes: usize) -> Grid {
         Grid {
             image: GridImage::Base64("x".repeat(bytes)),
-            time_range: range.to_string(),
+            time_range: agent_video_core::pipeline::parse_range(range).expect("fixture range"),
             total_frames: 1,
             key_frames: Vec::new(),
             layout: LayoutKind::Uniform,

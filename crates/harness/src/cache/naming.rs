@@ -10,9 +10,9 @@
 //! construct names here; [`crate::cache::Cache::evict`] classifies them
 //! here, so live work is never evicted and crashed work is never missed.
 //!
-//! The on-disk spellings are frozen so existing caches stay sweepable:
+//! Current staging names:
 //! `<dest>.<pid>-<seq>.part` for files, `.staging-<key>-<pid>-<seq>` for
-//! directories. Tests pin them against verbatim strings.
+//! directories.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,7 +45,7 @@ pub fn part_path(dest: &Path) -> PathBuf {
 /// Writer-unique staging directory name for cache key `key`:
 /// `.staging-<key>-<pid>-<seq>` (docs/shared-cache.md, Pattern 2).
 /// Recognized by [`is_staging_dir`].
-pub fn staging_dir_name(key: &str) -> String {
+pub fn staging_dir_name(key: &crate::fetch::RipKey) -> String {
     format!("{STAGING_PREFIX}{key}-{}", writer_id())
 }
 
@@ -77,48 +77,20 @@ mod tests {
     }
 
     #[test]
-    fn pins_the_on_disk_part_spelling() {
-        // The frozen grammar: `<dest>.<pid>-<seq>.part`. A change here
-        // strands `.part` files written by existing installs.
-        let part = part_path(Path::new("/c/k.mp4")).display().to_string();
-        let middle = part
-            .strip_prefix("/c/k.mp4.")
-            .and_then(|rest| rest.strip_suffix(".part"))
-            .expect("spelling is <dest>.<writer>.part: {part}");
-        let (pid, seq) = middle.rsplit_once('-').expect("writer id is pid-seq");
-        assert_eq!(pid, std::process::id().to_string());
-        assert!(seq.chars().all(|c| c.is_ascii_digit()), "{seq}");
-    }
-
-    #[test]
-    fn pins_the_on_disk_staging_spelling() {
-        // The frozen grammar: `.staging-<key>-<pid>-<seq>`.
-        let dir = staging_dir_name("abc123");
-        let middle = dir
-            .strip_prefix(".staging-abc123-")
-            .expect("spelling is .staging-<key>-<writer>: {dir}");
-        let (pid, seq) = middle.rsplit_once('-').expect("writer id is pid-seq");
-        assert_eq!(pid, std::process::id().to_string());
-        assert!(seq.chars().all(|c| c.is_ascii_digit()), "{seq}");
-    }
-
-    #[test]
-    fn recognizes_legacy_on_disk_spellings() {
-        // Verbatim names earlier releases wrote; an existing cache must
-        // stay sweepable across upgrades.
-        assert!(is_part_file("aged.mp4.123-0.part"));
-        assert!(is_part_file("fp.large-v3.srt.4242-7.part"));
-        assert!(is_staging_dir(".staging-k-999-0"));
-    }
-
-    #[test]
     fn part_paths_are_writer_unique() {
         let dest = Path::new("/cache/downloads/k.mp4");
         let a = part_path(dest);
-        assert!(
-            a.to_string_lossy().starts_with("/cache/downloads/k.mp4."),
-            "stays next to its destination: {a:?}"
+        assert_eq!(
+            a.parent(),
+            dest.parent(),
+            "atomic rename stays on one filesystem"
         );
+        assert!(is_part_file(
+            a.file_name()
+                .expect("staging name")
+                .to_str()
+                .expect("UTF-8")
+        ));
         // Two writers (even two threads of one process) must not share a
         // staging file.
         assert_ne!(a, part_path(dest));
@@ -126,6 +98,9 @@ mod tests {
 
     #[test]
     fn staging_dir_names_are_writer_unique() {
-        assert_ne!(staging_dir_name("k"), staging_dir_name("k"));
+        let key = crate::fetch::RipKey::fixture("k");
+        let name = staging_dir_name(&key);
+        assert!(is_staging_dir(&name));
+        assert_ne!(name, staging_dir_name(&key));
     }
 }

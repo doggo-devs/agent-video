@@ -12,6 +12,7 @@
 //! pairing.
 
 pub mod audio;
+mod clock;
 pub mod decode;
 pub mod embedded_subtitle;
 mod orientation;
@@ -575,10 +576,20 @@ pub fn summarize_input(
         })
         .collect();
 
+    let orientation =
+        orientation::of_stream(&stream).map_err(|e| e.with_input(source.as_path()))?;
+    let (width, height) = match orientation {
+        image::metadata::Orientation::Rotate90
+        | image::metadata::Orientation::Rotate270
+        | image::metadata::Orientation::Rotate90FlipH
+        | image::metadata::Orientation::Rotate270FlipH => (video.height(), video.width()),
+        _ => (video.width(), video.height()),
+    };
+
     Ok(MediaSummary {
         duration,
-        width: video.width(),
-        height: video.height(),
+        width,
+        height,
         container: ictx.format().name().to_string(),
         subtitle_tracks,
     })

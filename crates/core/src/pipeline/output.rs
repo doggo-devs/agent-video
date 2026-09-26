@@ -16,9 +16,7 @@ use crate::wire::METADATA_FILENAME;
 
 use super::OutputSink;
 
-/// Name of the staging directory inside the output directory. Starts with a
-/// dot so [`is_own_artifact`]'s tmp-prefix rule never mistakes it for a
-/// final artifact, and lives on the same filesystem so promotion is a rename.
+/// Staging stays inside the output directory so publication uses same-filesystem renames.
 const STAGING_DIR: &str = ".staging.tmp";
 
 /// One run's output-directory lifecycle, with a staged commit.
@@ -215,12 +213,8 @@ impl Drop for OutputSession<'_> {
 }
 
 /// Whether `name` is a file this tool writes into the output directory:
-/// grids, static entries, metadata, subtitles, or their legacy atomic-write
-/// temps (pre-staging versions wrote `.<name>.tmp` files in place).
+/// grids, static entries, metadata or subtitles.
 fn is_own_artifact(name: &str) -> bool {
-    if let Some(tmp) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) {
-        return is_own_artifact(tmp);
-    }
     let numbered_jpg = |prefix: &str| {
         name.strip_prefix(prefix)
             .and_then(|rest| rest.strip_suffix(".jpg"))
@@ -335,8 +329,6 @@ mod tests {
             "grid_extract.jpg",
             "metadata.json",
             "subtitles.txt",
-            ".grid_001.jpg.tmp",
-            ".metadata.json.tmp",
         ] {
             assert!(is_own_artifact(own), "{own} is ours");
         }

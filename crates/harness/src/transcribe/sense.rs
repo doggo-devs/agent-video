@@ -6,10 +6,10 @@
 //! Everything here runs on the CPU through statically linked onnxruntime;
 //! weights come from `install-asr` and are never fetched at run time.
 //!
-//! The module owns two policy numbers ([`MAX_CUE_SECONDS`],
-//! [`CUE_GAP_SECONDS`]) and nothing else: span detection belongs to the
-//! VAD, text to the recognizer, and SRT serialization to the parent.
+//! Recognition consumes bounded continuous windows. VAD state resets at
+//! their boundaries; subtitle positions remain on the source clock.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use sherpa_onnx::{
@@ -19,27 +19,25 @@ use sherpa_onnx::{
 
 use super::Cue;
 use crate::fault::Fault;
-use agent_video_core::media::audio::WHISPER_SAMPLE_RATE;
+use agent_video_core::media::audio::{AudioChunk, SamplePos, WHISPER_SAMPLE_RATE};
 
 /// Samples handed to the VAD at a time. Silero v5 consumes exactly 512
 /// samples (32 ms at 16 kHz) per inference; feeding any other window
 /// makes it pad internally and drift.
 const VAD_WINDOW: usize = 512;
 
-/// Seconds of audio the VAD may buffer before a caller must drain it.
-/// Bounds resident memory independently of track length: spans are popped
-/// as they close, so this only has to outlast the longest single span.
-const VAD_BUFFER_SECONDS: f32 = 60.0;
+/// Maximum continuous input per VAD reset, bounding its growing buffer.
+const MAX_WINDOW_SAMPLES: usize = 60 * WHISPER_SAMPLE_RATE as usize;
 
 /// Longest cue this module will emit. A VAD span averages several
 /// seconds; past this the line stops being a subtitle and becomes a
 /// paragraph a reader cannot align with the picture.
-const MAX_CUE_SECONDS: f32 = 6.0;
+const MAX_CUE_SECONDS: f64 = 6.0;
 
 /// Silence between two recognized tokens that ends a cue. Below the
 /// threshold the pause is phrasing; above it, it is a sentence boundary
 /// the speaker themselves marked.
-const CUE_GAP_SECONDS: f32 = 0.6;
+const CUE_GAP_SECONDS: f64 = 0.6;
 
 /// Weight files the local route needs, checked to exist before the route
 /// resolves so a missing file is an install hint, not a decode failure.
@@ -50,68 +48,89 @@ pub struct Weights {
     pub vad: std::path::PathBuf,
 }
 
-/// Recognize `samples` (16 kHz mono f32) into cues with absolute
+/// Recognize timed 16 kHz mono blocks into cues with absolute
 /// centisecond timestamps.
 ///
 /// `language` is a two-letter hint or `None` for SenseVoice's own
 /// detection; the recognizer accepts only the languages it was trained on
 /// (zh, en, ja, ko, yue) and falls back to detection for anything else.
-pub fn recognize(
+pub fn recognize<F>(
     weights: &Weights,
-    samples: &[f32],
+    next: &mut F,
     language: Option<&str>,
     on_step: &mut dyn FnMut(&str),
-) -> Result<Vec<Cue>, Fault> {
+) -> Result<Vec<Cue>, Fault>
+where
+    F: FnMut(NonZeroUsize) -> Result<Option<AudioChunk>, Fault>,
+{
     on_step("loading recognizer");
     let recognizer = build_recognizer(weights, language)?;
     let vad = build_vad(&weights.vad)?;
 
     on_step("detecting speech");
     let mut cues = Vec::new();
-    let mut chunks = samples.chunks(VAD_WINDOW).peekable();
-    while let Some(chunk) = chunks.next() {
-        // Silero rejects a short tail window; the flush below reclaims
-        // whatever speech it holds.
-        if chunk.len() == VAD_WINDOW {
-            vad.accept_waveform(chunk);
+    let bound = NonZeroUsize::new(MAX_WINDOW_SAMPLES).expect("positive VAD window");
+    while let Some(block) = next(bound)? {
+        for samples in block.samples.chunks(VAD_WINDOW) {
+            if samples.len() == VAD_WINDOW {
+                vad.accept_waveform(samples);
+            } else {
+                let mut tail = [0.0; VAD_WINDOW];
+                tail[..samples.len()].copy_from_slice(samples);
+                vad.accept_waveform(&tail);
+            }
+            drain(
+                &vad,
+                &recognizer,
+                block.start,
+                block.samples.len(),
+                &mut cues,
+            );
         }
-        if chunks.peek().is_none() {
-            vad.flush();
-        }
-        drain(&vad, &recognizer, &mut cues);
+        vad.flush();
+        drain(
+            &vad,
+            &recognizer,
+            block.start,
+            block.samples.len(),
+            &mut cues,
+        );
+        vad.reset();
     }
-    // A track shorter than one window never entered the loop body's flush.
-    vad.flush();
-    drain(&vad, &recognizer, &mut cues);
-
-    tracing::info!(
-        cues = cues.len(),
-        duration_s = samples.len() as f64 / f64::from(WHISPER_SAMPLE_RATE),
-        "local recognition complete",
-    );
+    tracing::info!(cues = cues.len(), "local recognition complete");
     Ok(cues)
 }
 
-/// Pop every closed span and append its cues.
-fn drain(vad: &VoiceActivityDetector, recognizer: &OfflineRecognizer, cues: &mut Vec<Cue>) {
-    while !vad.is_empty() {
-        let Some(segment) = vad.front() else {
-            break;
-        };
+fn drain(
+    vad: &VoiceActivityDetector,
+    recognizer: &OfflineRecognizer,
+    base: SamplePos,
+    sample_count: usize,
+    cues: &mut Vec<Cue>,
+) {
+    while let Some(segment) = vad.front() {
         vad.pop();
-        let offset = segment.start() as f32 / WHISPER_SAMPLE_RATE as f32;
+        let Ok(start) = usize::try_from(segment.start()) else {
+            continue;
+        };
+        let len = segment
+            .samples()
+            .len()
+            .min(sample_count.saturating_sub(start));
+        if len == 0 {
+            continue;
+        }
         let stream = recognizer.create_stream();
-        stream.accept_waveform(WHISPER_SAMPLE_RATE as i32, segment.samples());
+        stream.accept_waveform(WHISPER_SAMPLE_RATE as i32, &segment.samples()[..len]);
         recognizer.decode(&stream);
         let Some(result) = stream.get_result() else {
             continue;
         };
-        let span_end = offset + segment.n() as f32 / WHISPER_SAMPLE_RATE as f32;
         cues.extend(split(
             &result.tokens,
             result.timestamps.as_deref(),
-            offset,
-            span_end,
+            base.advance(start).seconds(),
+            base.advance(start + len).seconds(),
         ));
     }
 }
@@ -120,7 +139,7 @@ fn drain(vad: &VoiceActivityDetector, recognizer: &OfflineRecognizer, cues: &mut
 ///
 /// Without timestamps the span can only answer as a single cue — that is
 /// the honest shape of the information, not a degraded one.
-fn split(tokens: &[String], timestamps: Option<&[f32]>, offset: f32, span_end: f32) -> Vec<Cue> {
+fn split(tokens: &[String], timestamps: Option<&[f32]>, offset: f64, span_end: f64) -> Vec<Cue> {
     let Some(times) = timestamps.filter(|t| t.len() == tokens.len()) else {
         let text = join(tokens.iter().filter(|t| !is_control(t)).map(String::as_str));
         return one_cue(text, offset, span_end).into_iter().collect();
@@ -128,10 +147,14 @@ fn split(tokens: &[String], timestamps: Option<&[f32]>, offset: f32, span_end: f
 
     let mut cues = Vec::new();
     let mut pending: Vec<&str> = Vec::new();
-    let mut start = 0.0f32;
-    let mut previous = 0.0f32;
+    let mut start = 0.0f64;
+    let mut previous = 0.0f64;
 
     for (token, &at) in tokens.iter().zip(times) {
+        if !at.is_finite() {
+            continue;
+        }
+        let at = f64::from(at).clamp(0.0, (span_end - offset).max(0.0));
         if is_control(token) {
             continue;
         }
@@ -161,9 +184,9 @@ fn split(tokens: &[String], timestamps: Option<&[f32]>, offset: f32, span_end: f
 
 /// A cue, unless the text is blank — an empty subtitle line is noise the
 /// reader has to skip, and a cue with no text has nothing to say.
-fn one_cue(text: String, start: f32, end: f32) -> Option<Cue> {
+fn one_cue(text: String, start: f64, end: f64) -> Option<Cue> {
     let text = text.trim().to_string();
-    if text.is_empty() {
+    if text.is_empty() || end <= start {
         return None;
     }
     Some(Cue {
@@ -234,7 +257,11 @@ fn build_vad(model: &Path) -> Result<VoiceActivityDetector, Fault> {
         num_threads: threads(),
         ..VadModelConfig::default()
     };
-    VoiceActivityDetector::create(&config, VAD_BUFFER_SECONDS).ok_or_else(|| {
+    VoiceActivityDetector::create(
+        &config,
+        MAX_WINDOW_SAMPLES as f32 / WHISPER_SAMPLE_RATE as f32,
+    )
+    .ok_or_else(|| {
         Fault::environment(format!(
             "cannot load the VAD model at {} — re-run `agent-video install-asr` to repair it",
             model.display()
@@ -311,7 +338,7 @@ mod tests {
         let cues = split(&words, Some(&times), 0.0, 10.0);
         assert!(cues.len() > 1, "a 10s span cannot be one cue: {cues:?}");
         for cue in &cues {
-            let seconds = (cue.end_cs - cue.start_cs) as f32 / 100.0;
+            let seconds = (cue.end_cs - cue.start_cs) as f64 / 100.0;
             assert!(
                 seconds <= MAX_CUE_SECONDS + 0.5,
                 "{cue:?} exceeds the ceiling"

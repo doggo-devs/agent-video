@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Pipeline orchestration: sample → dedup → chunk → (per-chunk) score → select
 //! → layout → compose, then write grids, `metadata.json`, and subtitles.
+//! Static detection independently observes every sample before dedup filters it.
 //!
 //! Rank normalization and selection are deliberately per-chunk: scores are only
 //! meaningful relative to the frames they compete with. A chunk is at least
@@ -30,7 +31,7 @@ use crate::probe::{KeyframeInfo, SampleStrategy};
 use crate::source::Source;
 use crate::subtitle::Subtitles;
 use crate::types::{GridMeta, TimeRange};
-use crate::{dedup, probe, sample};
+use crate::{probe, sample};
 
 use candidates::CandidateStream;
 use output::OutputSession;
@@ -491,7 +492,6 @@ fn process_stream(
     let cfg = ctx.cfg;
     let mut stream = CandidateStream::new(
         stream,
-        dedup::Deduper::new(cfg.hash_threshold(), cfg.dedup_window()),
         extract_batch_frames(cfg.base_fps(), cfg.chunk_seconds()),
         cfg.score_edge(),
         Some(ctx.pool),
@@ -502,8 +502,8 @@ fn process_stream(
         if let Some(aspect) = stream.aspect() {
             state.set_aspect(aspect);
         }
-        for (frame, kept) in batch {
-            state.push_judged(frame, kept)?;
+        for sample in batch {
+            state.push(sample)?;
         }
     }
     let (duration, grid_metas) = state.finish()?;

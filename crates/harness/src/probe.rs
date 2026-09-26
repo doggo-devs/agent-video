@@ -114,23 +114,58 @@ pub(crate) fn materially_truncated(track_s: f64, container_s: f64) -> bool {
     container_s - track_s > 10.0 && track_s < container_s * 0.9
 }
 
-/// Post-download integrity: name the track that covers materially less of
+/// The media track whose coverage is shorter than the container timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackKind {
+    Audio,
+    Video,
+}
+
+impl std::fmt::Display for TrackKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Audio => "audio",
+            Self::Video => "video",
+        })
+    }
+}
+
+/// Evidence of a track ending materially before its container timeline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoverageShortfall {
+    pub track: TrackKind,
+    pub actual_seconds: f64,
+    pub expected_seconds: f64,
+}
+
+impl std::fmt::Display for CoverageShortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the {} track covers only {} of the {} timeline",
+            self.track,
+            format_ts(self.actual_seconds as f32),
+            format_ts(self.expected_seconds as f32),
+        )
+    }
+}
+
+/// Post-download integrity: identify the track that covers materially less of
 /// the timeline than the container claims, if any. `None` also when the
 /// file cannot be probed — integrity has its own verdicts elsewhere.
-pub fn coverage_shortfall(file: &Path) -> Option<String> {
-    let source = Source::classify(&file.to_string_lossy());
+pub fn coverage_shortfall(file: &Path) -> Option<CoverageShortfall> {
+    let source = Source::Local(file.to_path_buf());
     let coverage = media::stream_coverage(&source, &media::Stop::new()).ok()?;
-    let check = |name: &str, seconds: Option<f64>| -> Option<String> {
+    let check = |track: TrackKind, seconds: Option<f64>| -> Option<CoverageShortfall> {
         let s = seconds?;
-        materially_truncated(s, coverage.container_seconds).then(|| {
-            format!(
-                "the {name} track covers only {} of the {} timeline",
-                format_ts(s as f32),
-                format_ts(coverage.container_seconds as f32)
-            )
+        materially_truncated(s, coverage.container_seconds).then_some(CoverageShortfall {
+            track,
+            actual_seconds: s,
+            expected_seconds: coverage.container_seconds,
         })
     };
-    check("audio", coverage.audio_seconds).or_else(|| check("video", coverage.video_seconds))
+    check(TrackKind::Audio, coverage.audio_seconds)
+        .or_else(|| check(TrackKind::Video, coverage.video_seconds))
 }
 
 /// Probe a direct media URL over http(s): the demuxer reads the container

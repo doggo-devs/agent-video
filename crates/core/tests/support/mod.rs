@@ -63,9 +63,3 @@ pub fn parse_wire_ts(s: &str) -> f32 {
                 .unwrap_or_else(|_| panic!("bad wire timestamp {s:?}"))
     })
 }
-
-/// Parse a wire time range (`"MM:SS-MM:SS"`) into `(start, end)` seconds.
-pub fn parse_wire_range(s: &str) -> (f32, f32) {
-    let (a, b) = s.split_once('-').expect("wire range has a dash");
-    (parse_wire_ts(a), parse_wire_ts(b))
-}

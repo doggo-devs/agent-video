@@ -24,7 +24,16 @@ use std::time::{Duration, Instant};
 
 use rmcp::model::CallToolResult;
 
+use crate::cache::source::SourceId;
 use crate::fetch::CancelSignal;
+use crate::tokens::Dest;
+
+/// One download job: canonical source and destination, independent of disk recipe keys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DownloadKey {
+    pub source: SourceId,
+    pub dest: Dest,
+}
 
 /// What the download thread reports; the thread shares no state.
 enum JobEvent {
@@ -297,7 +306,7 @@ pub enum Admission {
 #[derive(Default)]
 pub struct Tracker {
     /// The only lock; flat, values are plain owned data.
-    jobs: Mutex<HashMap<String, JobSlot>>,
+    jobs: Mutex<HashMap<DownloadKey, JobSlot>>,
 }
 
 impl Tracker {
@@ -307,7 +316,7 @@ impl Tracker {
     /// one critical section, so the loser of a concurrent double confirm
     /// sees `Running` instead of spawning a second download. Adopted
     /// effects and evicted slots execute after the lock, before returning.
-    pub fn admit(&self, key: &str, stall_limit: Duration) -> Admission {
+    pub fn admit(&self, key: &DownloadKey, stall_limit: Duration) -> Admission {
         let mut aftermath = Aftermath::default();
         let admission = self.admit_locked(key, stall_limit, &mut aftermath);
         drop(aftermath); // the lock is gone: effects and teardown run here
@@ -316,7 +325,7 @@ impl Tracker {
 
     fn admit_locked(
         &self,
-        key: &str,
+        key: &DownloadKey,
         stall_limit: Duration,
         aftermath: &mut Aftermath,
     ) -> Admission {
@@ -345,21 +354,26 @@ impl Tracker {
         let cancel = CancelSignal::new();
         aftermath
             .evicted
-            .extend(jobs.insert(key.to_string(), JobSlot::new(rx, cancel.clone())));
+            .extend(jobs.insert(key.clone(), JobSlot::new(rx, cancel.clone())));
         Admission::Started(JobReporter { events: tx, cancel })
     }
 
     /// Resolve one poll: settled beats dead beats stalled beats running,
     /// decided in a single critical section. Adopted effects and evicted
     /// slots execute after the lock, before this returns.
-    pub fn poll(&self, key: &str, stall_limit: Duration) -> Poll {
+    pub fn poll(&self, key: &DownloadKey, stall_limit: Duration) -> Poll {
         let mut aftermath = Aftermath::default();
         let poll = self.poll_locked(key, stall_limit, &mut aftermath);
         drop(aftermath); // the lock is gone: effects and teardown run here
         poll
     }
 
-    fn poll_locked(&self, key: &str, stall_limit: Duration, aftermath: &mut Aftermath) -> Poll {
+    fn poll_locked(
+        &self,
+        key: &DownloadKey,
+        stall_limit: Duration,
+        aftermath: &mut Aftermath,
+    ) -> Poll {
         let mut jobs = self.lock();
         let Some(slot) = jobs.get_mut(key) else {
             return Poll::Vacant;
@@ -390,13 +404,13 @@ impl Tracker {
     /// Rewind a job's progress clock by `by`, as if it had been silent that
     /// long. Test-only: real staleness comes from the wall clock.
     #[cfg(test)]
-    pub fn age(&self, key: &str, by: Duration) {
+    pub fn age(&self, key: &DownloadKey, by: Duration) {
         if let Some(slot) = self.lock().get_mut(key) {
             slot.last_progress = Instant::now().checked_sub(by).expect("clock has history");
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, JobSlot>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<DownloadKey, JobSlot>> {
         self.jobs.lock().expect("tracker poisoned")
     }
 }
@@ -413,12 +427,19 @@ mod tests {
     /// rewind the clock explicitly.
     const LIMIT: Duration = Duration::from_secs(3600);
 
+    fn key(source: &str) -> DownloadKey {
+        DownloadKey {
+            source: SourceId::from_spelling(source),
+            dest: Dest::Cache,
+        }
+    }
+
     fn settled_result() -> CallToolResult {
         CallToolResult::success(vec![ContentBlock::text("done")])
     }
 
     /// Claim a vacant slot; the tests below own the invariant that it is.
-    fn start(tracker: &Tracker, key: &str) -> JobReporter {
+    fn start(tracker: &Tracker, key: &DownloadKey) -> JobReporter {
         match tracker.admit(key, LIMIT) {
             Admission::Started(reporter) => reporter,
             other => panic!("slot must be vacant, got {other:?}"),
@@ -428,15 +449,31 @@ mod tests {
     #[test]
     fn polls_vacant_without_a_job() {
         let tracker = Tracker::default();
-        assert!(matches!(tracker.poll("k", LIMIT), Poll::Vacant));
+        assert!(matches!(tracker.poll(&key("k"), LIMIT), Poll::Vacant));
+    }
+
+    #[test]
+    fn deduplicates_source_aliases_but_separates_destinations() {
+        let tracker = Tracker::default();
+        let _analysis = start(&tracker, &key("https://example.com/v.mp4"));
+        let mut alias = key("HTTPS://Example.COM/v.mp4");
+        assert!(matches!(
+            tracker.admit(&alias, LIMIT),
+            Admission::Running { .. }
+        ));
+        alias.dest = Dest::Keep;
+        assert!(matches!(
+            tracker.admit(&alias, LIMIT),
+            Admission::Started(_)
+        ));
     }
 
     #[test]
     fn polls_running_with_live_progress() {
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
+        let reporter = start(&tracker, &key("k"));
         reporter.progress(512, Some(1024));
-        let Poll::Running { downloaded, total } = tracker.poll("k", LIMIT) else {
+        let Poll::Running { downloaded, total } = tracker.poll(&key("k"), LIMIT) else {
             panic!("job is live");
         };
         assert_eq!((downloaded, total), (512, Some(1024)));
@@ -445,10 +482,10 @@ mod tests {
     #[test]
     fn keeps_known_total_when_a_report_omits_it() {
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
+        let reporter = start(&tracker, &key("k"));
         reporter.progress(512, Some(1024));
         reporter.progress(600, None);
-        let Poll::Running { downloaded, total } = tracker.poll("k", LIMIT) else {
+        let Poll::Running { downloaded, total } = tracker.poll(&key("k"), LIMIT) else {
             panic!("job is live");
         };
         assert_eq!((downloaded, total), (600, Some(1024)));
@@ -457,11 +494,11 @@ mod tests {
     #[test]
     fn hands_out_settled_response_exactly_once() {
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
+        let reporter = start(&tracker, &key("k"));
         reporter.settle(settled_result());
-        assert!(matches!(tracker.poll("k", LIMIT), Poll::Settled(_)));
+        assert!(matches!(tracker.poll(&key("k"), LIMIT), Poll::Settled(_)));
         assert!(
-            matches!(tracker.poll("k", LIMIT), Poll::Vacant),
+            matches!(tracker.poll(&key("k"), LIMIT), Poll::Vacant),
             "cleared after handout"
         );
     }
@@ -469,14 +506,14 @@ mod tests {
     #[test]
     fn abandons_stalled_jobs_and_clears_the_slot() {
         let tracker = Tracker::default();
-        let _reporter = start(&tracker, "k");
-        tracker.age("k", Duration::from_secs(120));
+        let _reporter = start(&tracker, &key("k"));
+        tracker.age(&key("k"), Duration::from_secs(120));
         assert!(matches!(
-            tracker.poll("k", Duration::from_secs(60)),
+            tracker.poll(&key("k"), Duration::from_secs(60)),
             Poll::Abandoned
         ));
         assert!(
-            matches!(tracker.poll("k", LIMIT), Poll::Vacant),
+            matches!(tracker.poll(&key("k"), LIMIT), Poll::Vacant),
             "slot is free for a retry"
         );
     }
@@ -484,11 +521,11 @@ mod tests {
     #[test]
     fn abandons_a_job_whose_reporter_died_unsettled() {
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
+        let reporter = start(&tracker, &key("k"));
         drop(reporter); // the download thread panicked
-        assert!(matches!(tracker.poll("k", LIMIT), Poll::Abandoned));
+        assert!(matches!(tracker.poll(&key("k"), LIMIT), Poll::Abandoned));
         assert!(
-            matches!(tracker.poll("k", LIMIT), Poll::Vacant),
+            matches!(tracker.poll(&key("k"), LIMIT), Poll::Vacant),
             "slot is free for a retry"
         );
     }
@@ -498,11 +535,11 @@ mod tests {
         // Settled result queued against a stalled clock: the finished
         // download wins, clock staleness is irrelevant.
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
-        tracker.age("k", Duration::from_secs(120));
+        let reporter = start(&tracker, &key("k"));
+        tracker.age(&key("k"), Duration::from_secs(120));
         reporter.settle(settled_result());
         assert!(matches!(
-            tracker.poll("k", Duration::from_secs(60)),
+            tracker.poll(&key("k"), Duration::from_secs(60)),
             Poll::Settled(_)
         ));
     }
@@ -511,20 +548,20 @@ mod tests {
     fn settled_beats_a_dead_reporter() {
         // The queued result must win over the disconnect that follows it.
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
+        let reporter = start(&tracker, &key("k"));
         reporter.settle(settled_result());
-        assert!(matches!(tracker.poll("k", LIMIT), Poll::Settled(_)));
+        assert!(matches!(tracker.poll(&key("k"), LIMIT), Poll::Settled(_)));
     }
 
     #[test]
     fn abandonment_trips_the_jobs_cancel_signal() {
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
+        let reporter = start(&tracker, &key("k"));
         let cancel = reporter.cancel_signal();
-        tracker.age("k", Duration::from_secs(120));
+        tracker.age(&key("k"), Duration::from_secs(120));
         assert!(!cancel.is_cancelled(), "live job is not cancelled");
         assert!(matches!(
-            tracker.poll("k", Duration::from_secs(60)),
+            tracker.poll(&key("k"), Duration::from_secs(60)),
             Poll::Abandoned
         ));
         assert!(
@@ -536,11 +573,11 @@ mod tests {
     #[test]
     fn displacing_admission_trips_the_old_jobs_cancel_signal() {
         let tracker = Tracker::default();
-        let stalled = start(&tracker, "k");
+        let stalled = start(&tracker, &key("k"));
         let cancel = stalled.cancel_signal();
-        tracker.age("k", Duration::from_secs(120));
+        tracker.age(&key("k"), Duration::from_secs(120));
         assert!(matches!(
-            tracker.admit("k", Duration::from_secs(60)),
+            tracker.admit(&key("k"), Duration::from_secs(60)),
             Admission::Started(_)
         ));
         assert!(
@@ -556,15 +593,15 @@ mod tests {
         // released. The poll runs on a helper thread so a regression fails
         // the recv timeout instead of hanging the suite.
         let tracker = Arc::new(Tracker::default());
-        let reporter = start(&tracker, "k");
+        let reporter = start(&tracker, &key("k"));
         let inner = Arc::clone(&tracker);
         reporter.settle(Settlement::with_owned_effect(settled_result(), move || {
-            assert!(matches!(inner.poll("other", LIMIT), Poll::Vacant));
+            assert!(matches!(inner.poll(&key("other"), LIMIT), Poll::Vacant));
         }));
         let (tx, rx) = mpsc::channel();
         let polling = Arc::clone(&tracker);
         std::thread::spawn(move || {
-            let _ = tx.send(polling.poll("k", LIMIT));
+            let _ = tx.send(polling.poll(&key("k"), LIMIT));
         });
         let polled = rx
             .recv_timeout(Duration::from_secs(10))
@@ -575,13 +612,13 @@ mod tests {
     #[test]
     fn runs_the_owned_effect_when_a_settlement_is_adopted() {
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
+        let reporter = start(&tracker, &key("k"));
         let ran = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&ran);
         reporter.settle(Settlement::with_owned_effect(settled_result(), move || {
             flag.store(true, Ordering::SeqCst);
         }));
-        assert!(matches!(tracker.poll("k", LIMIT), Poll::Settled(_)));
+        assert!(matches!(tracker.poll(&key("k"), LIMIT), Poll::Settled(_)));
         assert!(
             ran.load(Ordering::SeqCst),
             "an adopted settlement's effect must land with its result"
@@ -591,10 +628,10 @@ mod tests {
     #[test]
     fn drops_a_late_settlements_owned_effect_after_abandonment() {
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
-        tracker.age("k", Duration::from_secs(120));
+        let reporter = start(&tracker, &key("k"));
+        tracker.age(&key("k"), Duration::from_secs(120));
         assert!(matches!(
-            tracker.poll("k", Duration::from_secs(60)),
+            tracker.poll(&key("k"), Duration::from_secs(60)),
             Poll::Abandoned
         ));
         let ran = Arc::new(AtomicBool::new(false));
@@ -603,7 +640,7 @@ mod tests {
             flag.store(true, Ordering::SeqCst);
         }));
         assert!(
-            matches!(tracker.poll("k", LIMIT), Poll::Vacant),
+            matches!(tracker.poll(&key("k"), LIMIT), Poll::Vacant),
             "a disowned settlement must not resurrect the slot"
         );
         assert!(
@@ -615,10 +652,10 @@ mod tests {
     #[test]
     fn fires_the_disowned_compensation_when_no_slot_adopts_the_settlement() {
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
-        tracker.age("k", Duration::from_secs(120));
+        let reporter = start(&tracker, &key("k"));
+        tracker.age(&key("k"), Duration::from_secs(120));
         assert!(matches!(
-            tracker.poll("k", Duration::from_secs(60)),
+            tracker.poll(&key("k"), Duration::from_secs(60)),
             Poll::Abandoned
         ));
         let compensated = Arc::new(AtomicBool::new(false));
@@ -635,13 +672,13 @@ mod tests {
     #[test]
     fn adoption_defuses_the_disowned_compensation() {
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
+        let reporter = start(&tracker, &key("k"));
         let compensated = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&compensated);
         reporter.settle(Settlement::from(settled_result()).or_disowned(move || {
             flag.store(true, Ordering::SeqCst);
         }));
-        assert!(matches!(tracker.poll("k", LIMIT), Poll::Settled(_)));
+        assert!(matches!(tracker.poll(&key("k"), LIMIT), Poll::Settled(_)));
         assert!(
             !compensated.load(Ordering::SeqCst),
             "an adopted settlement's compensation must never fire"
@@ -654,7 +691,7 @@ mod tests {
         // drops the slot, the channel, and the queued event — the
         // compensation must ride that drop.
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
+        let reporter = start(&tracker, &key("k"));
         let compensated = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&compensated);
         reporter.settle(Settlement::from(settled_result()).or_disowned(move || {
@@ -678,7 +715,7 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    tracker.admit("k", LIMIT)
+                    tracker.admit(&key("k"), LIMIT)
                 })
             })
             .into_iter()
@@ -701,9 +738,9 @@ mod tests {
     #[test]
     fn admission_over_a_live_job_reports_running() {
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
+        let reporter = start(&tracker, &key("k"));
         reporter.progress(512, Some(1024));
-        let Admission::Running { downloaded, total } = tracker.admit("k", LIMIT) else {
+        let Admission::Running { downloaded, total } = tracker.admit(&key("k"), LIMIT) else {
             panic!("live job must not be displaced");
         };
         assert_eq!((downloaded, total), (512, Some(1024)));
@@ -712,11 +749,14 @@ mod tests {
     #[test]
     fn admission_hands_out_an_unobserved_settled_response() {
         let tracker = Tracker::default();
-        let reporter = start(&tracker, "k");
+        let reporter = start(&tracker, &key("k"));
         reporter.settle(settled_result());
-        assert!(matches!(tracker.admit("k", LIMIT), Admission::Settled(_)));
+        assert!(matches!(
+            tracker.admit(&key("k"), LIMIT),
+            Admission::Settled(_)
+        ));
         assert!(
-            matches!(tracker.admit("k", LIMIT), Admission::Started(_)),
+            matches!(tracker.admit(&key("k"), LIMIT), Admission::Started(_)),
             "handed out once; the slot is free again"
         );
     }
@@ -724,9 +764,9 @@ mod tests {
     #[test]
     fn admission_displaces_a_dead_job() {
         let tracker = Tracker::default();
-        drop(start(&tracker, "k")); // the download thread panicked
+        drop(start(&tracker, &key("k"))); // the download thread panicked
         assert!(
-            matches!(tracker.admit("k", LIMIT), Admission::Started(_)),
+            matches!(tracker.admit(&key("k"), LIMIT), Admission::Started(_)),
             "a dead job must not block retries"
         );
     }
@@ -734,11 +774,11 @@ mod tests {
     #[test]
     fn admission_displaces_a_stalled_job() {
         let tracker = Tracker::default();
-        let _reporter = start(&tracker, "k");
-        tracker.age("k", Duration::from_secs(120));
+        let _reporter = start(&tracker, &key("k"));
+        tracker.age(&key("k"), Duration::from_secs(120));
         assert!(
             matches!(
-                tracker.admit("k", Duration::from_secs(60)),
+                tracker.admit(&key("k"), Duration::from_secs(60)),
                 Admission::Started(_)
             ),
             "a wedged job must not block retries"

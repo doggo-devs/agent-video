@@ -18,9 +18,9 @@ use rmcp::model::CallToolResult;
 use super::deps::{Notifier, ServerDeps};
 use super::handler::offer_transcription_plan;
 use super::probe_cache::cached_probe;
-use super::tracker::{Admission, Poll, Settlement};
+use super::tracker::{Admission, DownloadKey, Poll, Settlement};
 use super::wire::{failed, json_result, pending_result};
-use crate::cache::url_key;
+use crate::cache::source::SourceId;
 use crate::fault::Fault;
 use crate::fetch::{Attempt, CancelSignal, DownloadIo, Downloaded, ProgressFn, Shortfall, rip_key};
 use crate::plan::{format_bytes, plan_response, size_label};
@@ -92,10 +92,10 @@ const _: () =
 /// different consent tokens — so they must not share a state machine: a
 /// keep confirm during a running analysis download starts (or observes)
 /// the keep job, never the analysis one.
-pub(super) fn slot_key(source: &str, dest: Dest) -> String {
-    match dest {
-        Dest::Cache => format!("cache.{}", url_key(source)),
-        Dest::Keep => format!("keep.{}", url_key(source)),
+pub(super) fn slot_key(source: &str, dest: Dest) -> DownloadKey {
+    DownloadKey {
+        source: SourceId::from_spelling(source),
+        dest,
     }
 }
 
@@ -132,7 +132,7 @@ pub(super) enum Waited {
 
 /// Wait out the grace window on `key`, forwarding progress. Every
 /// observer waits, so a poll costs wall clock instead of being free.
-pub(super) fn wait_out(key: &str, deps: &Arc<ServerDeps>, notify: &Notifier) -> Waited {
+pub(super) fn wait_out(key: &DownloadKey, deps: &Arc<ServerDeps>, notify: &Notifier) -> Waited {
     let window = Duration::from_secs(u64::from(deps.config.download.sync_wait_seconds.get()));
     let started = Instant::now();
     let deadline = started + window;

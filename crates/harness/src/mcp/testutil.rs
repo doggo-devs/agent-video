@@ -106,7 +106,7 @@ pub(crate) struct FakeWhisper {
     pub(crate) prompts: Mutex<Vec<String>>,
     /// Decoded-audio seconds the fake reports; `INFINITY` = "covers
     /// everything", so only truncation tests set a finite value.
-    pub(crate) audio_seconds: Mutex<f64>,
+    pub(crate) decoded_end_seconds: Mutex<f64>,
     /// When present, `transcribe` announces itself on the sender and then
     /// blocks on the receiver until released, so tests can hold one whisper
     /// run open while a concurrent request arrives.
@@ -139,7 +139,10 @@ impl Whisper for FakeWhisper {
         std::fs::create_dir_all(out_srt.parent().expect("parent")).expect("transcripts dir");
         std::fs::write(out_srt, "1\n00:00:00,000 --> 00:00:01,000\nhi\n\n").expect("write srt");
         Ok(crate::transcribe::Transcribed {
-            audio_seconds: *self.audio_seconds.lock().expect("audio_seconds"),
+            decoded_end_seconds: *self
+                .decoded_end_seconds
+                .lock()
+                .expect("decoded_end_seconds"),
         })
     }
 }
@@ -252,7 +255,7 @@ pub(crate) fn core_json() -> String {
         },
         vec![Grid {
             image: GridImage::Base64("QUJD".to_string()),
-            time_range: "00:00-01:30".to_string(),
+            time_range: agent_video_core::types::TimeRange::new(0.0, 90.0).expect("fixture range"),
             total_frames: 12,
             key_frames: vec![KeyFrameMeta {
                 timestamp: "00:10".to_string(),
@@ -316,7 +319,7 @@ pub(crate) fn env_with_fetcher(
         available: whisper_available,
         calls: Mutex::new(0),
         prompts: Mutex::new(Vec::new()),
-        audio_seconds: Mutex::new(f64::INFINITY),
+        decoded_end_seconds: Mutex::new(f64::INFINITY),
         gate: Mutex::new(None),
     });
     let deps = Arc::new(ServerDeps {

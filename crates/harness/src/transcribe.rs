@@ -9,8 +9,8 @@
 //!
 //! **API** (`api`): audio is encoded as 16-bit WAV and POSTed one bounded
 //! chunk (~13 min) at a time, with no VAD; only the chunk in flight is
-//! resident. Chunks split at hard sample boundaries, so a cue spanning a
-//! cut may lose or repeat a word, accepted for stateless uploads. Each
+//! resident. Short gaps are padded; long gaps and the upload bound split chunks.
+//! A cue spanning a capacity cut may lose or repeat a word. Each
 //! chunk after the first is conditioned on the previous chunk's transcript
 //! tail (`prompt`) so vocabulary and script carry across the cut.
 //!
@@ -30,8 +30,6 @@ pub use prompt::{PROMPT_MAX_BYTES, effective_prompt};
 use std::path::Path;
 #[cfg(feature = "local-asr")]
 use std::path::PathBuf;
-#[cfg(feature = "local-asr")]
-use std::time::Instant;
 
 use super::config::Config;
 use crate::cache::Cache;
@@ -39,9 +37,7 @@ use crate::fault::Fault;
 use crate::identity::ContentId;
 use crate::time::Window;
 use agent_video_core::media::Stop;
-#[cfg(feature = "local-asr")]
-use agent_video_core::media::audio::AudioCeiling;
-use agent_video_core::media::audio::{AudioSamples, WHISPER_SAMPLE_RATE};
+use agent_video_core::media::audio::AudioSamples;
 use agent_video_core::source::Source;
 use agent_video_core::subtitle as core_subtitle;
 use agent_video_core::types::format_ts;
@@ -198,6 +194,24 @@ pub fn available(cfg: &Config) -> bool {
 
 // ── cache identity ──
 
+/// Transcript identity: engine, model and conditioning.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TranscriptId(String);
+
+impl std::fmt::Display for TranscriptId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+impl TranscriptId {
+    /// Construct a recipe identity for cache fixtures.
+    pub(crate) fn fixture(id: &str) -> Self {
+        Self(id.to_owned())
+    }
+}
+
 /// Render the cached SRT as `MM:SS text` lines, keeping the cues that
 /// overlap `window`. Timestamps stay absolute to the source, so a slice
 /// lines up with the grids of the same range.
@@ -222,21 +236,16 @@ pub fn effective_prompt_for(cache: &Cache, cfg: &Config, fingerprint: &ContentId
     effective_prompt(cfg, cache.get_title(fingerprint).as_deref())
 }
 
-/// The transcript cache identity this content would get today: route ×
-/// language × effective prompt ([`transcript_id`]).
-pub fn transcript_id_for(cache: &Cache, cfg: &Config, fingerprint: &ContentId) -> String {
+/// The current transcript recipe for this content ([`transcript_id`]).
+pub fn transcript_id_for(cache: &Cache, cfg: &Config, fingerprint: &ContentId) -> TranscriptId {
     transcript_id(cfg, &effective_prompt_for(cache, cfg, fingerprint))
 }
 
 /// Cache identity of the transcript the active route would produce for
-/// this conditioning. Everything that shapes the cues is in the key:
-/// engine × model ([`Route::cache_id`]), the language hint, and a short
-/// hash of the effective `prompt` — the latter only for engines the
-/// prompt reaches (`Route::takes_prompt`). Unconditioned runs keep the
-/// bare model identity, so transcripts from before these knobs existed
-/// stay hits. Falls back to the API identity when no route resolves, so a
-/// transcript generated before a key was removed still rides along.
-pub fn transcript_id(cfg: &Config, prompt: &str) -> String {
+/// this conditioning: engine, model, language and
+/// effective prompt (only for engines that consume it). Falls back to the
+/// API identity when no route resolves, preserving lookup after key removal.
+pub fn transcript_id(cfg: &Config, prompt: &str) -> TranscriptId {
     let route = Route::resolve(cfg);
     let base = route
         .as_ref()
@@ -247,25 +256,16 @@ pub fn transcript_id(cfg: &Config, prompt: &str) -> String {
         _ => prompt,
     };
     if cfg.whisper.language.is_none() && prompt.is_empty() {
-        return base;
+        return TranscriptId(base);
     }
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(prompt.as_bytes());
-    format!(
+    TranscriptId(format!(
         "{base}-{}-{}",
         cfg.whisper.language.as_deref().unwrap_or("auto"),
         crate::identity::hex(&digest[..4])
-    )
+    ))
 }
-
-/// Whole-track decode ceiling for the local route: 4 hours of 16 kHz f32
-/// PCM is 4 × 3600 × 16_000 × 4 B ≈ 921 MB resident — the most this
-/// harness will materialize for VAD's random access. The policy number
-/// lives here; the 24-hour hard cap lives in core's [`AudioCeiling`]
-/// constructor. A track past this ceiling fails as too-long input rather
-/// than transcribing a silent prefix as if it were the whole file.
-#[cfg(feature = "local-asr")]
-const MAX_LOCAL_AUDIO_SECONDS: u32 = 4 * 3600;
 
 // ── cue type ──
 
@@ -282,9 +282,8 @@ pub struct Cue {
 /// Facts about a finished transcription the caller can judge honesty by.
 #[derive(Debug, Clone, Copy)]
 pub struct Transcribed {
-    /// Seconds of audio actually decoded and fed to recognition — less
-    /// than the container duration when the audio track was truncated.
-    pub audio_seconds: f64,
+    /// Source-time end of decoded audio, measured before speech filtering.
+    pub decoded_end_seconds: f64,
 }
 
 /// Transcribe `file` into an SRT at `out_srt` (written atomically via
@@ -318,58 +317,36 @@ pub fn transcribe(
         )));
     };
 
-    let (cues, sample_count) = match route {
+    let mut next = |max| stream.next_chunk(max).map_err(Fault::from);
+    let cues = match route {
         #[cfg(feature = "local-asr")]
-        Route::Sense(weights) => {
-            // The local route decodes whole (VAD wants random access),
-            // bounded by the harness's materialization ceiling.
-            let cap = AudioCeiling::from_seconds(MAX_LOCAL_AUDIO_SECONDS)
-                .expect("4h is under core's 24h hard cap");
-            let t = Instant::now();
-            let samples = stream.collect(cap)?;
-            tracing::info!(
-                elapsed_ms = t.elapsed().as_millis() as u64,
-                samples = samples.len(),
-                duration_s = samples.len() as f64 / f64::from(WHISPER_SAMPLE_RATE),
-                "audio decode complete",
-            );
-            if samples.is_empty() {
-                return Err(zero_samples_fault(file));
-            }
-            let count = samples.len();
-            let cues =
-                sense::recognize(&weights, &samples, cfg.whisper.language.as_deref(), on_step)?;
-            (cues, count)
-        }
-        Route::Api { key, url } => {
-            // The API route streams: decode, encode, and upload one bounded
-            // chunk at a time — the track is never materialized.
-            let mut chunks =
-                api::Chunker::new(|out, min| stream.fill(out, min).map_err(Fault::from));
-            let cues = api::recognize(
-                &key,
-                &url,
-                cfg.whisper.language.as_deref(),
-                prompt,
-                &mut chunks,
-                on_step,
-            )?;
-            let count = chunks.samples_pulled();
-            if count == 0 {
-                return Err(zero_samples_fault(file));
-            }
-            tracing::info!(
-                samples = count,
-                duration_s = count as f64 / f64::from(WHISPER_SAMPLE_RATE),
-                "audio decode complete",
-            );
-            (cues, count)
-        }
+        Route::Sense(weights) => sense::recognize(
+            &weights,
+            &mut next,
+            cfg.whisper.language.as_deref(),
+            on_step,
+        )?,
+        Route::Api { key, url } => api::recognize(
+            &key,
+            &url,
+            cfg.whisper.language.as_deref(),
+            prompt,
+            &mut next,
+            on_step,
+        )?,
     };
-
+    let decoded_end = stream
+        .decoded_end()
+        .ok_or_else(|| zero_samples_fault(file))?;
+    if stream.dropped_frames() > 0 {
+        on_step(&format!(
+            "discarded {} audio frames with unconfirmed timestamps",
+            stream.dropped_frames()
+        ));
+    }
     write_srt(out_srt, &cues)?;
     Ok(Transcribed {
-        audio_seconds: sample_count as f64 / f64::from(WHISPER_SAMPLE_RATE),
+        decoded_end_seconds: decoded_end.seconds(),
     })
 }
 
@@ -501,7 +478,7 @@ mod tests {
             Route::Sense(w) => assert_eq!(w.model, sense_model_path(&cfg)),
             other => panic!("expected the local route, got {other:?}"),
         }
-        assert_eq!(transcript_id(&cfg, ""), SENSE_CACHE_ID);
+        assert_eq!(transcript_id(&cfg, "").to_string(), SENSE_CACHE_ID);
     }
 
     #[cfg(feature = "local-asr")]
@@ -579,14 +556,20 @@ mod tests {
     fn api_transcripts_key_by_endpoint_model() {
         let mut cfg = cfg();
         cfg.whisper.api_key = Some("sk-test".to_string());
-        assert_eq!(transcript_id(&cfg, ""), format!("api-{}", api::API_MODEL));
+        assert_eq!(
+            transcript_id(&cfg, "").to_string(),
+            format!("api-{}", api::API_MODEL)
+        );
     }
 
     #[test]
     fn transcript_lookup_survives_a_removed_key() {
         // No route resolves, but a transcript generated before the key was
         // removed should still be findable under the endpoint identity.
-        assert_eq!(transcript_id(&cfg(), ""), format!("api-{}", api::API_MODEL));
+        assert_eq!(
+            transcript_id(&cfg(), "").to_string(),
+            format!("api-{}", api::API_MODEL)
+        );
     }
 
     #[test]
@@ -625,7 +608,9 @@ mod tests {
         assert_ne!(a, b, "different prompts, different entries");
         for id in [&a, &b] {
             assert!(
-                id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                id.to_string()
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-'),
                 "transcript id {id:?} must stay filename-safe"
             );
         }

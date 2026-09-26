@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 /// start. Non-decreasing order is a stream property, not a value property:
 /// the decode boundary enforces it at the mint point (its segmenter
 /// releases timestamps monotone on one logical clock), and the
-/// chunker asserts it as a precondition of its own pure API.
+/// process orchestrator checks it before either temporal analysis.
 #[derive(Debug, Clone, Copy)]
 pub struct Ts(f32);
 

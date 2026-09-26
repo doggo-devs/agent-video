@@ -450,7 +450,7 @@ fn process_reports_the_real_video_despite_a_poisoned_head() {
         "reported duration {total} tracks the real 2s video, not the corrupt pts"
     );
     for grid in &meta.grids {
-        let (start, end) = support::parse_wire_range(&grid.time_range);
+        let (start, end) = (grid.time_range.start(), grid.time_range.end());
         assert!(
             start >= 0.0 && end < 100.0,
             "grid timestamps are measured from the re-anchored origin: {}",

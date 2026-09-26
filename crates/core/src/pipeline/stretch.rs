@@ -1,198 +1,216 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Static-stretch detection over the dedup verdict stream.
-//!
-//! Dedup collapses an unchanging scene into a long gap between kept frames.
-//! [`StretchDetector`] watches that stream: when a gap spans at least
-//! `min_span` seconds and enough sampled frames were dropped inside it as
-//! duplicates (the evidence that the stretch was watched, not just unsampled),
-//! it reports the gap as a [`Stretch`] whose representative is the last kept
-//! frame before the scene froze.
+//! Continuous static evidence over every sampled frame, independent of dedup.
+//! One fixed anchor bounds both visual drift and retained image memory.
 
 use std::sync::Arc;
 
 use image::RgbImage;
+use image_hasher::ImageHash;
 
-use crate::types::TimeRange;
+use crate::types::{TimeRange, Ts};
 
-/// Minimum number of frames dropped as duplicates inside a kept-frame gap for
-/// the gap to count as a static stretch. One drop could be a flicker; a few
-/// spanning drops are evidence that the scene genuinely held still. Gaps
-/// without drops (sparse keyframe sampling) are left alone.
-const MIN_STATIC_DROPS: usize = 3;
+use super::candidates::HashedFrame;
 
-/// A detected static stretch: the scene held still over `range` and `rgb`
-/// (the kept frame at the range's start) stands in for the whole span.
-/// Carrying a [`TimeRange`] makes `start <= end` a construction fact, not a
-/// consumer-side re-proof.
+const MIN_STATIC_SAMPLES: usize = 4;
+// Gradient hashes discard absolute brightness. Allow small decode variations,
+// but do not join a uniform flash to the preceding scene.
+const MAX_LUMA_DELTA: f32 = 8.0;
+
+/// A continuous sampled run and its first frame, ready for rendering.
 #[derive(Debug)]
 pub struct Stretch {
-    /// The still span on the timeline.
+    /// From the first observation to the last matching observation.
     pub range: TimeRange,
-    /// The representative frame, shared with the pipeline via [`Arc`].
+    /// The fixed representative of this run, including revisited scenes.
     pub rgb: Arc<RgbImage>,
 }
 
-/// The run of frames dropped as duplicates since the last kept frame: how
-/// many, and when the last one was seen.
-struct DropRun {
-    count: usize,
-    last_ts: f32,
+struct Run {
+    hash: ImageHash,
+    mean_luma: f32,
+    start: Ts,
+    last: Ts,
+    samples: usize,
+    rgb: Arc<RgbImage>,
 }
 
-/// Streaming detector for static stretches.
-///
-/// Feed every dedup verdict in timestamp order via [`note_kept`] /
-/// [`note_dropped`], then call [`finish`] to close a stretch that runs to the
-/// end of the stream.
-///
-/// [`note_kept`]: StretchDetector::note_kept
-/// [`note_dropped`]: StretchDetector::note_dropped
-/// [`finish`]: StretchDetector::finish
+impl Run {
+    fn new(sample: &HashedFrame) -> Self {
+        Self {
+            hash: sample.hash.clone(),
+            mean_luma: sample.mean_luma,
+            start: sample.frame.ts,
+            last: sample.frame.ts,
+            samples: 1,
+            rgb: sample.frame.rgb.clone(),
+        }
+    }
+
+    fn finish(self, min_span: f32) -> Option<Stretch> {
+        let range = TimeRange::new(self.start.get().max(0.0), self.last.get())?;
+        (self.samples >= MIN_STATIC_SAMPLES && range.duration() >= min_span).then_some(Stretch {
+            range,
+            rgb: self.rgb,
+        })
+    }
+}
+
+/// A bounded detector: one candidate, one representative, no completed-run list.
+/// Short runs are discarded. A change or sampling hole seals the old candidate
+/// at its last matching sample, then starts afresh with the current observation.
 pub struct StretchDetector {
-    /// Minimum kept-frame gap, in seconds, for a stretch to qualify.
     min_span: f32,
-    /// Timestamp and shared RGB of the most recent kept frame — the candidate
-    /// representative should a static gap follow it. The `Arc` makes retaining
-    /// it a pointer clone rather than a deep copy of the ~1.4 MB image.
-    last_kept: Option<(f32, Arc<RgbImage>)>,
-    drops: Option<DropRun>,
+    hash_threshold: u32,
+    max_sample_gap: f32,
+    run: Option<Run>,
 }
 
 impl StretchDetector {
-    /// A detector requiring kept-frame gaps of at least `min_span` seconds.
-    pub fn new(min_span: f32) -> Self {
+    /// Require both `min_span` seconds and four distinct sample timestamps.
+    /// `max_sample_gap` bounds the unobserved interval admitted as continuous
+    /// evidence, including sparse keyframe sampling; it is not learned from gaps.
+    pub fn new(min_span: f32, hash_threshold: u32, max_sample_gap: f32) -> Self {
         Self {
             min_span,
-            last_kept: None,
-            drops: None,
+            hash_threshold,
+            max_sample_gap,
+            run: None,
         }
     }
 
-    fn drop_count(&self) -> usize {
-        self.drops.as_ref().map_or(0, |d| d.count)
+    /// Observe every sample in timestamp order, including dedup rejections.
+    pub fn observe(&mut self, sample: &HashedFrame) -> Option<Stretch> {
+        if let Some(run) = &mut self.run {
+            let gap = sample.frame.ts.get() - run.last.get();
+            if gap <= self.max_sample_gap
+                && run.hash.dist(&sample.hash) <= self.hash_threshold
+                && (run.mean_luma - sample.mean_luma).abs() <= MAX_LUMA_DELTA
+            {
+                if sample.frame.ts > run.last {
+                    run.samples = (run.samples + 1).min(MIN_STATIC_SAMPLES);
+                    run.last = sample.frame.ts;
+                }
+                return None;
+            }
+        }
+        let previous = self.run.replace(Run::new(sample));
+        previous.and_then(|run| run.finish(self.min_span))
     }
 
-    /// Record a kept frame: returns the closed stretch if the gap since the
-    /// previous kept frame qualifies, then makes this frame the new
-    /// representative candidate.
-    pub fn note_kept(&mut self, ts: f32, rgb: &Arc<RgbImage>) -> Option<Stretch> {
-        let stretch = self.last_kept.as_ref().and_then(|(prev_ts, prev_rgb)| {
-            // The range doubles as the gap proof: timestamps are fed in
-            // order, so `new` only fails on a backwards pair — which is no
-            // stretch — and the span check subsumes the ordering.
-            let range = TimeRange::new(*prev_ts, ts)?;
-            (range.duration() >= self.min_span && self.drop_count() >= MIN_STATIC_DROPS).then(
-                || Stretch {
-                    range,
-                    rgb: prev_rgb.clone(),
-                },
-            )
-        });
-        self.last_kept = Some((ts, rgb.clone()));
-        self.drops = None;
-        stretch
-    }
-
-    /// Record a frame dropped as a duplicate of the last kept frame.
-    pub fn note_dropped(&mut self, ts: f32) {
-        let count = self.drop_count() + 1;
-        self.drops = Some(DropRun { count, last_ts: ts });
-    }
-
-    /// Close out a stretch that runs to the end of the stream, bounded by the
-    /// last dropped duplicate rather than a following kept frame.
+    /// Seal the trailing candidate once, ending at its last observed sample.
     pub fn finish(&mut self) -> Option<Stretch> {
-        let drops = self.drops.take()?;
-        if drops.count < MIN_STATIC_DROPS {
-            return None;
-        }
-        let (prev_ts, rgb) = self.last_kept.take()?;
-        let range = TimeRange::new(prev_ts, drops.last_ts)?;
-        (range.duration() >= self.min_span).then_some(Stretch { range, rgb })
+        self.run.take().and_then(|run| run.finish(self.min_span))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::CandidateFrame;
+    use image::GrayImage;
 
-    fn rgb() -> Arc<RgbImage> {
-        Arc::new(RgbImage::new(1, 1))
-    }
-
-    /// Feed `n` drops at one-second intervals starting after `from`.
-    fn drop_range(det: &mut StretchDetector, from: f32, n: usize) {
-        for i in 1..=n {
-            det.note_dropped(from + i as f32);
+    fn sample(ts: f32, hash: u8, mean_luma: f32) -> HashedFrame {
+        HashedFrame {
+            frame: CandidateFrame {
+                ts: Ts::new(ts).expect("finite timestamp"),
+                gray: Arc::new(GrayImage::new(1, 1)),
+                rgb: Arc::new(RgbImage::new(1, 1)),
+            },
+            hash: ImageHash::from_bytes(&[hash; 8]).expect("64-bit hash"),
+            mean_luma,
         }
     }
 
     #[test]
-    fn closes_stretch_on_qualifying_gap() {
-        let mut det = StretchDetector::new(60.0);
-
-        assert!(det.note_kept(0.0, &rgb()).is_none());
-        drop_range(&mut det, 0.0, 5);
-        let stretch = det.note_kept(75.0, &rgb()).expect("gap qualifies");
-
-        assert_eq!((stretch.range.start(), stretch.range.end()), (0.0, 75.0));
+    fn requires_duration_and_distinct_observations() {
+        let mut detector = StretchDetector::new(3.0, 0, 5.0);
+        for ts in [0.0, 0.0, 1.0, 3.0] {
+            assert!(detector.observe(&sample(ts, 0, 128.0)).is_none());
+        }
+        assert!(
+            detector.finish().is_none(),
+            "three timestamps do not suffice"
+        );
+        for ts in [0.0, 0.5, 1.0, 2.0] {
+            detector.observe(&sample(ts, 0, 128.0));
+        }
+        assert!(
+            detector.finish().is_none(),
+            "samples cannot replace duration"
+        );
+        for ts in [0.0, 1.0, 2.0, 3.0] {
+            detector.observe(&sample(ts, 0, 128.0));
+        }
+        assert_eq!(
+            detector
+                .finish()
+                .expect("both thresholds met")
+                .range
+                .duration(),
+            3.0
+        );
+        assert!(detector.finish().is_none(), "finish does not repeat output");
     }
 
     #[test]
-    fn ignores_gap_with_too_few_drops() {
-        let mut det = StretchDetector::new(60.0);
+    fn compares_to_the_anchor_instead_of_chaining_similarity() {
+        let mut detector = StretchDetector::new(3.0, 8, 5.0);
+        // A~B and B~C, but A!~C. C must begin a separate run.
+        for (ts, hash) in [(0.0, 0), (1.0, 1), (2.0, 3), (3.0, 3), (4.0, 3), (5.0, 3)] {
+            assert!(detector.observe(&sample(ts, hash, 128.0)).is_none());
+        }
+        let stretch = detector.finish().expect("C settles");
+        assert_eq!((stretch.range.start(), stretch.range.end()), (2.0, 5.0));
+    }
 
-        det.note_kept(0.0, &rgb());
-        drop_range(&mut det, 0.0, MIN_STATIC_DROPS - 1);
-
+    #[test]
+    fn closes_before_a_sampling_hole_and_restarts_after_it() {
+        let mut detector = StretchDetector::new(3.0, 0, 5.0);
+        for ts in 0..=3 {
+            detector.observe(&sample(ts as f32, 0, 128.0));
+        }
+        let stretch = detector
+            .observe(&sample(80.0, 0, 128.0))
+            .expect("earlier run qualified");
+        assert_eq!((stretch.range.start(), stretch.range.end()), (0.0, 3.0));
         assert!(
-            det.note_kept(75.0, &rgb()).is_none(),
-            "sparse sampling gap is not static"
+            detector.finish().is_none(),
+            "one sample after a hole is not a run"
+        );
+
+        let mut detector = StretchDetector::new(60.0, 0, 5.0);
+        for ts in [0.0, 1.0, 2.0, 3.0, 80.0] {
+            assert!(detector.observe(&sample(ts, 0, 128.0)).is_none());
+        }
+        assert!(
+            detector.finish().is_none(),
+            "the hole cannot satisfy duration"
         );
     }
 
     #[test]
-    fn ignores_gap_shorter_than_min_span() {
-        let mut det = StretchDetector::new(60.0);
-
-        det.note_kept(0.0, &rgb());
-        drop_range(&mut det, 0.0, 5);
-
-        assert!(det.note_kept(30.0, &rgb()).is_none(), "gap below min span");
-    }
-
-    #[test]
-    fn closes_trailing_stretch_at_last_drop() {
-        let mut det = StretchDetector::new(60.0);
-
-        det.note_kept(1.0, &rgb());
-        drop_range(&mut det, 1.0, 69);
-        let stretch = det.finish().expect("trailing stretch qualifies");
-
-        assert_eq!((stretch.range.start(), stretch.range.end()), (1.0, 70.0));
-    }
-
-    #[test]
-    fn finish_without_drops_yields_nothing() {
-        let mut det = StretchDetector::new(60.0);
-
-        det.note_kept(0.0, &rgb());
-
-        assert!(det.finish().is_none());
-    }
-
-    #[test]
-    fn drops_reset_after_each_kept_frame() {
-        let mut det = StretchDetector::new(60.0);
-
-        det.note_kept(0.0, &rgb());
-        drop_range(&mut det, 0.0, 5);
-        det.note_kept(30.0, &rgb());
-        drop_range(&mut det, 30.0, 2);
-
-        assert!(
-            det.note_kept(95.0, &rgb()).is_none(),
-            "drops before an intervening kept frame do not carry over"
-        );
+    fn rejects_brightness_flicker_and_recovers_without_retaining_old_images() {
+        let mut detector = StretchDetector::new(3.0, 8, 5.0);
+        for ts in 0..10_000 {
+            let observation = sample(ts as f32, 0, if ts % 2 == 0 { 0.0 } else { 255.0 });
+            let weak = Arc::downgrade(&observation.frame.rgb);
+            assert!(detector.observe(&observation).is_none());
+            drop(observation);
+            if ts % 2 == 1 {
+                let next = sample(ts as f32 + 0.5, 0, 128.0);
+                assert!(detector.observe(&next).is_none());
+                assert!(weak.upgrade().is_none(), "replaced anchor was released");
+            }
+        }
+        let first = sample(10_000.0, 0, 128.0);
+        detector.observe(&first);
+        for ts in 10_001..=10_004 {
+            detector.observe(&sample(ts as f32, 0, 128.0));
+        }
+        let stretch = detector
+            .finish()
+            .expect("flicker does not poison future evidence");
+        assert_eq!(stretch.range.end(), 10_004.0);
+        assert!(stretch.range.start() >= 9_999.5);
     }
 }

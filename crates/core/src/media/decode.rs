@@ -35,6 +35,7 @@ use crate::event::{Event, EventSink};
 use crate::source::Source;
 use crate::types::{TimeRange, Ts};
 
+use super::clock::{ContainerTs, Discontinuity, FALLBACK_NOMINAL_GAP, SegStep, Segmenter};
 use super::orientation;
 use super::scale::Rescaler;
 use super::{
@@ -42,38 +43,82 @@ use super::{
     duration_seconds, open_input,
 };
 
-/// Seconds on the container's presentation clock, 0-based at the declared
-/// stream start — the clock decoded frames arrive on. A distinct type from
-/// the logical clock so a container timestamp cannot be handed downstream
-/// unprojected.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-struct ContainerTs(f64);
-
-/// Seconds on the run's logical clock — the monotone timeline everything
-/// downstream (sampler ticks, range end, chunker, wire ranges) consumes.
-///
-/// Only [`Segment::project`] mints values, and the segmenter advances
-/// segment anchors monotonically, so the instants a decode pass releases
-/// are non-decreasing by construction, not by runtime check.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-struct LogicalTs(f64);
-
-impl LogicalTs {
-    /// Narrow to the pipeline's frame timestamp; `None` when the value
-    /// overflows `f32` — unreachable for fenced segments, checked anyway
-    /// because [`Ts`] is the finite-by-construction boundary.
-    fn to_ts(self) -> Option<Ts> {
-        Ts::new(self.0 as f32)
+/// Recover a suspect header origin from the same confirmed video head used
+/// for frame labels. Only the head is decoded; no RGB conversion is needed.
+pub(super) fn head_timeline(
+    source: &Source,
+    stop: &Stop,
+    audio_start: f64,
+) -> Result<super::Timeline> {
+    let mut input = open_input(source, stop, &[])?;
+    let video = best_video_stream(&input, source)?;
+    let stream = input.stream(video.index).expect("video stream");
+    let mut decoder = CodecContext::from_parameters(stream.parameters())
+        .and_then(|ctx| ctx.decoder().video())
+        .map_err(|e| decode_error("opening video clock decoder", e))?;
+    let mut clock = Segmenter::new(duration_seconds(&input, source).ok(), FALLBACK_NOMINAL_GAP);
+    let mut packet = Packet::empty();
+    let mut budget = ErrorBudget::new("recovering video clock origin");
+    let mut flushing = false;
+    loop {
+        let mut frame = ffmpeg::frame::Video::empty();
+        let mut finished = false;
+        let step = match classify_receive(decoder.receive_frame(&mut frame)) {
+            Recv::Frame => {
+                budget.ok();
+                let Some(pts) = frame.timestamp().or(frame.pts()) else {
+                    continue;
+                };
+                clock.admit(
+                    ContainerTs(video.timeline.seconds(pts, video.time_base)),
+                    frame,
+                )
+            }
+            Recv::Broken(e) => {
+                budget.fail(e)?;
+                continue;
+            }
+            Recv::Drained if flushing => {
+                finished = true;
+                clock.finish()
+            }
+            Recv::Drained => {
+                match input.read_packet(&mut packet) {
+                    Ok(()) if packet.stream() == video.index => {
+                        decoder
+                            .send_packet(&packet)
+                            .map_err(|e| decode_error("decoding video clock head", e))?;
+                    }
+                    Ok(()) => {}
+                    Err(ffmpeg::Error::Eof) => {
+                        decoder
+                            .send_eof()
+                            .map_err(|e| decode_error("flushing video clock head", e))?;
+                        flushing = true;
+                    }
+                    Err(e) => budget.fail(e)?,
+                }
+                continue;
+            }
+        };
+        for (logical, frame) in step.released {
+            let pts = frame
+                .timestamp()
+                .or(frame.pts())
+                .expect("admitted timestamp");
+            let timeline = super::Timeline {
+                origin: pts as f64 * video.time_base - logical.0,
+            };
+            // A long poisoned head can itself confirm. Wait for the run
+            // on the audio clock instead of returning that same bad origin.
+            if audio_start - timeline.origin >= super::clock::PREROLL_ALLOWANCE {
+                return Ok(timeline);
+            }
+        }
+        if finished {
+            return Ok(video.timeline);
+        }
     }
-}
-
-/// One committed clock seam: the container clock read `container` where
-/// the logical clock continues at `logical`. Reported downstream as
-/// [`Event::TimelineDiscontinuity`].
-#[derive(Debug, Clone, Copy)]
-struct Discontinuity {
-    container: ContainerTs,
-    logical: LogicalTs,
 }
 
 /// One sampled RGB frame, already downscaled for composition.
@@ -543,496 +588,6 @@ impl PacketGate {
     }
 }
 
-/// Frames a candidate run must accumulate before it becomes (or replaces)
-/// the committed segment. Three defeats the observed one- and two-frame
-/// poisoned stream heads outright, bounds every false candidate's cost to
-/// two signaled frames (under 0.1s at 30 fps), and commits a real
-/// discontinuity within three frames of its seam.
-const SEGMENT_CONFIRM_FRAMES: usize = 3;
-
-/// Extent-fence slack over the declared duration: `fence = duration ×
-/// FACTOR + SLACK`. The slack covers header imprecision (rounded durations,
-/// files that grew after the header was written); where the declared
-/// duration derives from pts extremes (MPEG-TS), corruption can only widen
-/// the fence, so legal cadences always fit.
-const EXTENT_FENCE_FACTOR: f64 = 2.0;
-const EXTENT_FENCE_SLACK: f64 = 300.0;
-
-/// Pre-roll allowance for the stream's first segment, seconds. Legitimate
-/// negative timestamps (edit-list pre-roll, priming frames) stay within
-/// single seconds of zero; a first segment opening below this bound means
-/// the declared origin was dragged (or the pts counter wrapped), and the
-/// segment is re-anchored at the stream head instead of trusted verbatim.
-const PREROLL_ALLOWANCE: f64 = -60.0;
-
-/// Nominal inter-frame gap before any is observed, seconds (25 fps).
-/// Seeds the seam width and the jitter bound for keyframe-paced decodes
-/// until the first released delta replaces it.
-const FALLBACK_NOMINAL_GAP: f64 = 0.04;
-
-/// One committed span of the logical timeline: a run of frames whose
-/// container timestamps advanced plausibly. `logical = container + shift`;
-/// the first segment of a well-anchored stream has `shift == 0.0` exactly,
-/// so a single-segment file — every normal file — reproduces the container
-/// clock bit for bit.
-#[derive(Debug, Clone, Copy)]
-struct Segment {
-    shift: f64,
-    /// Container ts of the last frame this segment released.
-    last: ContainerTs,
-}
-
-impl Segment {
-    /// The segment for a confirmed run starting at `first`, projected so
-    /// its first frame lands on `anchor`. `anchor == first` yields the
-    /// exact identity: IEEE subtraction of equal finite values is `0.0`,
-    /// and adding `0.0` never changes a finite timestamp.
-    fn anchored(anchor: f64, first: ContainerTs) -> Segment {
-        Segment {
-            shift: anchor - first.0,
-            last: first,
-        }
-    }
-
-    /// Project a container timestamp onto the logical clock.
-    fn project(&self, ts: ContainerTs) -> LogicalTs {
-        LogicalTs(ts.0 + self.shift)
-    }
-}
-
-/// A run of frames awaiting confirmation: the head of the stream before
-/// any segment is confirmed, or a challenger opened by a discontinuity
-/// candidate. Non-empty by construction, bounded by
-/// [`SEGMENT_CONFIRM_FRAMES`]; the frames are owned here until they are
-/// released into a segment or dropped wholesale — no third fate exists.
-struct Buffered {
-    frames: Vec<(ContainerTs, ffmpeg::frame::Video)>,
-}
-
-impl Buffered {
-    fn new(ts: ContainerTs, frame: ffmpeg::frame::Video) -> Buffered {
-        Buffered {
-            frames: vec![(ts, frame)],
-        }
-    }
-
-    fn push(&mut self, ts: ContainerTs, frame: ffmpeg::frame::Video) {
-        self.frames.push((ts, frame));
-    }
-
-    fn first(&self) -> ContainerTs {
-        self.frames.first().expect("buffered runs are non-empty").0
-    }
-
-    fn last(&self) -> ContainerTs {
-        self.frames.last().expect("buffered runs are non-empty").0
-    }
-
-    fn len(&self) -> usize {
-        self.frames.len()
-    }
-}
-
-/// The committed side of the segmenter: the stream head still gathering
-/// its first confirmation, or a confirmed segment streaming frames.
-enum Current {
-    Head(Buffered),
-    Confirmed(Segment),
-}
-
-/// Segmenter state. A challenger can only exist alongside a current run:
-/// "challenger with nothing to challenge" is not representable.
-enum State {
-    /// No frame seen yet.
-    Unopened,
-    Open {
-        current: Current,
-        /// A candidate run contradicting `current`, gathering confirmation.
-        challenger: Option<Buffered>,
-    },
-}
-
-/// What one segmenter step yielded. Drops precede releases: a killed
-/// challenger's frames fell off the timeline before the step's releases
-/// continued it.
-#[derive(Default)]
-struct SegStep {
-    /// Frames released onto the logical clock, in order.
-    released: Vec<(LogicalTs, ffmpeg::frame::Video)>,
-    /// Container timestamps of frames dropped off the timeline.
-    dropped: Vec<ContainerTs>,
-    /// A clock seam committed by this step.
-    cut: Option<Discontinuity>,
-}
-
-/// Drop a whole buffered run off the timeline, one signal per frame.
-fn drop_run(buf: Buffered, step: &mut SegStep) {
-    step.dropped
-        .extend(buf.frames.into_iter().map(|(ts, _)| ts));
-}
-
-/// Cuts the container clock into monotone segments and projects them onto
-/// one continuous logical clock. Frames are content, timestamps are labels:
-/// a wrong threshold mislabels a seam, it never loses content.
-///
-/// - Admission: a frame continues the committed run only when its gap from
-///   the last released frame is within tolerance — backward within the
-///   jitter bound (twice the nominal gap; such a frame is dropped with a
-///   signal), forward within twice the largest released gap. Any other
-///   frame buffers as a challenger that must gather
-///   [`SEGMENT_CONFIRM_FRAMES`] frames; unvouched frames never move the
-///   cursor or teach the gap statistics. Runs without precedent fence
-///   against the declared extent ([`EXTENT_FENCE_FACTOR`],
-///   [`EXTENT_FENCE_SLACK`]).
-/// - Confirmation: a challenger that continues forward within the fence is
-///   sparse pacing and extends the segment unchanged; one that jumps
-///   backward or past the fence commits a seam, and the logical clock
-///   resumes one nominal gap after the sealed segment ([`Discontinuity`]).
-/// - Rejection: a challenger contradicted first is dropped whole, so a
-///   rejection costs fewer than [`SEGMENT_CONFIRM_FRAMES`] frames, and
-///   alternating poisoned timestamps cannot shred the legal stream.
-/// - Anchoring: the first segment projects identically when it opens within
-///   [`PREROLL_ALLOWANCE`]; below that (a poisoned head dragged the declared
-///   start) it re-anchors at the stream's first container timestamp.
-///
-/// Owned by the decode thread; only released frames and signals cross the
-/// channel. Infallible: timestamps relabel or drop frames, never error.
-struct Segmenter {
-    state: State,
-    /// The first container ts the stream produced: the re-anchor point for
-    /// a first segment that opens outside the pre-roll allowance.
-    stream_head: Option<ContainerTs>,
-    /// Forward fence for runs without released precedent, from the
-    /// declared extent.
-    extent_fence: f64,
-    /// Last released in-segment gap: the seam width and the jitter scale.
-    /// In a keyframe-only decode this is the keyframe cadence, so the
-    /// jitter bound scales with it — a small backward resync there costs a
-    /// frame or two (signaled) instead of a seam.
-    nominal_gap: f64,
-    /// Largest released in-segment gap: the forward tolerance's precedent.
-    /// Only released — vouched — frames teach it, and learning is capped
-    /// at the extent fence, so neither an unvouched blip nor a confirmed
-    /// run carrying a corrupt gap can widen the tolerance without bound.
-    max_released_gap: f64,
-    /// Highest logical instant released — the monotonicity invariant,
-    /// stated where it is produced.
-    #[cfg(debug_assertions)]
-    watermark: f64,
-}
-
-impl Segmenter {
-    fn new(duration: Option<f32>, nominal_gap: f64) -> Segmenter {
-        let declared = duration
-            .map(f64::from)
-            .filter(|d| d.is_finite() && *d > 0.0)
-            .unwrap_or(0.0);
-        Segmenter {
-            state: State::Unopened,
-            stream_head: None,
-            extent_fence: declared * EXTENT_FENCE_FACTOR + EXTENT_FENCE_SLACK,
-            nominal_gap,
-            max_released_gap: 0.0,
-            #[cfg(debug_assertions)]
-            watermark: f64::NEG_INFINITY,
-        }
-    }
-
-    /// Feed the next decoded frame; get back the frames it released, the
-    /// frames it dropped, and any clock seam it committed.
-    fn admit(&mut self, ts: ContainerTs, frame: ffmpeg::frame::Video) -> SegStep {
-        let mut step = SegStep::default();
-        if self.stream_head.is_none() {
-            self.stream_head = Some(ts);
-        }
-        // Work on the state by value: every arm builds the successor state
-        // whole, so a half-transitioned segmenter cannot be observed.
-        match std::mem::replace(&mut self.state, State::Unopened) {
-            State::Unopened => {
-                self.state = State::Open {
-                    current: Current::Head(Buffered::new(ts, frame)),
-                    challenger: None,
-                };
-            }
-            State::Open {
-                current,
-                challenger,
-            } => {
-                self.state = self.step(current, challenger, ts, frame, &mut step);
-            }
-        }
-        step
-    }
-
-    /// End of stream. A pending challenger has nothing left to contradict
-    /// it — the confirmation quorum exists to protect future frames from
-    /// an unvouched cursor advance, and there are none. A forward tail
-    /// within the extent fence is content at a plausible position and is
-    /// released in place; any other tail still has no committable label
-    /// and is dropped with signals. An unconfirmed head is the whole
-    /// stream (nothing ever contradicted it), so it confirms: a two-frame
-    /// video is content, not a fragment.
-    fn finish(&mut self) -> SegStep {
-        let mut step = SegStep::default();
-        if let State::Open {
-            current,
-            challenger,
-        } = std::mem::replace(&mut self.state, State::Unopened)
-        {
-            match current {
-                Current::Head(buf) => {
-                    // A challenger against an unconfirmed head contradicted
-                    // it backward or beyond the extent, so it cannot extend
-                    // the segment the head is about to become either.
-                    if let Some(ch) = challenger {
-                        drop_run(ch, &mut step);
-                    }
-                    self.confirm_first(buf, &mut step);
-                }
-                Current::Confirmed(mut seg) => {
-                    if let Some(ch) = challenger {
-                        if self.continues_forward(&seg, &ch) {
-                            self.extend(&mut seg, ch, &mut step);
-                        } else {
-                            drop_run(ch, &mut step);
-                        }
-                    }
-                }
-            }
-        }
-        step
-    }
-
-    /// One step of an opened stream: route the frame to the run it
-    /// continues, or make it the new challenger. Returns the successor
-    /// state.
-    fn step(
-        &mut self,
-        current: Current,
-        challenger: Option<Buffered>,
-        ts: ContainerTs,
-        frame: ffmpeg::frame::Video,
-        step: &mut SegStep,
-    ) -> State {
-        if self.fits_current(&current, ts) {
-            // The established run continues: a pending challenger was a
-            // blip (an isolated poisoned run) and dies with a signal.
-            if let Some(ch) = challenger {
-                drop_run(ch, step);
-            }
-            State::Open {
-                current: self.advance(current, ts, frame, step),
-                challenger: None,
-            }
-        } else if challenger.as_ref().is_some_and(|ch| self.fits_run(ch, ts)) {
-            let mut ch = challenger.expect("checked by is_some_and");
-            ch.push(ts, frame);
-            if ch.len() < SEGMENT_CONFIRM_FRAMES {
-                State::Open {
-                    current,
-                    challenger: Some(ch),
-                }
-            } else {
-                State::Open {
-                    current: Current::Confirmed(self.commit(current, ch, step)),
-                    challenger: None,
-                }
-            }
-        } else {
-            // Fits nothing: this frame opens the (replacement) challenger.
-            if let Some(old) = challenger {
-                drop_run(old, step);
-            }
-            State::Open {
-                current,
-                challenger: Some(Buffered::new(ts, frame)),
-            }
-        }
-    }
-
-    /// Whether `ts` continues the committed run through the single
-    /// admission door: inside the learned pacing tolerance. Everything
-    /// else — forward or backward, big or small — must gather quorum as a
-    /// challenger before it can advance the committed cursor.
-    fn fits_current(&self, current: &Current, ts: ContainerTs) -> bool {
-        match current {
-            Current::Head(buf) => self.fits_run(buf, ts),
-            Current::Confirmed(seg) => {
-                let gap = ts.0 - seg.last.0;
-                (-self.jitter()..=self.forward_tolerance()).contains(&gap)
-            }
-        }
-    }
-
-    /// Whether `ts` continues an unconfirmed run: monotone, within the
-    /// extent fence (no released precedent exists to fence with).
-    fn fits_run(&self, buf: &Buffered, ts: ContainerTs) -> bool {
-        let gap = ts.0 - buf.last().0;
-        (0.0..=self.extent_fence).contains(&gap)
-    }
-
-    /// Backward tolerance inside a confirmed segment: ~2 frame durations,
-    /// the depth B-frame reordering can jitter presentation order.
-    fn jitter(&self) -> f64 {
-        2.0 * self.nominal_gap
-    }
-
-    /// Forward tolerance inside a confirmed segment: twice the largest gap
-    /// the segment's released — vouched — frames established. No flat
-    /// floor exists: an unvouched forward jump of any size buffers as a
-    /// challenger, so no single frame can advance the committed cursor or
-    /// rewrite the statistics that admit the next one.
-    fn forward_tolerance(&self) -> f64 {
-        2.0 * self.max_released_gap
-    }
-
-    /// Whether a challenger's first frame continues `seg` forward within
-    /// the extent fence — the label prior deciding identity extension
-    /// against a seam.
-    fn continues_forward(&self, seg: &Segment, ch: &Buffered) -> bool {
-        let gap = ch.first().0 - seg.last.0;
-        gap > 0.0 && gap <= self.extent_fence
-    }
-
-    /// Advance the committed run with a frame that fits it.
-    fn advance(
-        &mut self,
-        current: Current,
-        ts: ContainerTs,
-        frame: ffmpeg::frame::Video,
-        step: &mut SegStep,
-    ) -> Current {
-        match current {
-            Current::Head(mut buf) => {
-                buf.push(ts, frame);
-                if buf.len() < SEGMENT_CONFIRM_FRAMES {
-                    Current::Head(buf)
-                } else {
-                    Current::Confirmed(self.confirm_first(buf, step))
-                }
-            }
-            Current::Confirmed(mut seg) => {
-                if ts < seg.last {
-                    // Backward within the jitter bound: decoder noise, not
-                    // a discontinuity — drop the frame, keep the segment.
-                    step.dropped.push(ts);
-                } else {
-                    self.release(&mut seg, ts, frame, step);
-                }
-                Current::Confirmed(seg)
-            }
-        }
-    }
-
-    /// Confirm the stream's first segment: identity within the pre-roll
-    /// allowance, re-anchored at the stream head otherwise (a dragged
-    /// declared origin — see the type docs).
-    fn confirm_first(&mut self, buf: Buffered, step: &mut SegStep) -> Segment {
-        let first = buf.first();
-        let anchor = if first.0 >= PREROLL_ALLOWANCE {
-            first.0
-        } else {
-            self.stream_head.expect("set on the first admitted frame").0
-        };
-        self.open_segment(Segment::anchored(anchor, first), buf, step)
-    }
-
-    /// Commit a confirmed challenger. Against the stream's unconfirmed
-    /// head it becomes the first segment; against a committed segment the
-    /// extent prior decides: sparse forward pacing extends the segment
-    /// identically, anything else seals it and continues the logical
-    /// clock one nominal gap past its last released instant.
-    fn commit(&mut self, current: Current, ch: Buffered, step: &mut SegStep) -> Segment {
-        match current {
-            // The head never confirmed: its short run is dropped whole
-            // (with signals) and the challenger becomes the stream's first
-            // segment. No seam is announced — there is no committed clock
-            // to seam from.
-            Current::Head(buf) => {
-                drop_run(buf, step);
-                self.confirm_first(ch, step)
-            }
-            Current::Confirmed(mut seg) => {
-                if self.continues_forward(&seg, &ch) {
-                    // The same clock, sparser: successors vouched for the
-                    // jump and the extent prior vouches for the position.
-                    self.extend(&mut seg, ch, step);
-                    seg
-                } else {
-                    let seam = seg.project(seg.last).0 + self.nominal_gap;
-                    let first = ch.first();
-                    step.cut = Some(Discontinuity {
-                        container: first,
-                        logical: LogicalTs(seam),
-                    });
-                    self.open_segment(Segment::anchored(seam, first), ch, step)
-                }
-            }
-        }
-    }
-
-    /// Release a forward run into the segment it continues: identity
-    /// labels, no seam — sparse pacing at a position the extent prior
-    /// vouches for.
-    fn extend(&mut self, seg: &mut Segment, ch: Buffered, step: &mut SegStep) {
-        for (ts, frame) in ch.frames {
-            self.release(seg, ts, frame, step);
-        }
-    }
-
-    /// Release a confirmed run into `seg`, oldest first.
-    fn open_segment(&mut self, mut seg: Segment, buf: Buffered, step: &mut SegStep) -> Segment {
-        let mut frames = buf.frames.into_iter();
-        let (first, frame) = frames.next().expect("buffered runs are non-empty");
-        debug_assert!(first == seg.last, "a segment opens at its first frame");
-        self.emit(&seg, first, frame, step);
-        for (ts, frame) in frames {
-            self.release(&mut seg, ts, frame, step);
-        }
-        seg
-    }
-
-    /// Release one frame into `seg`, learning its gap statistics.
-    fn release(
-        &mut self,
-        seg: &mut Segment,
-        ts: ContainerTs,
-        frame: ffmpeg::frame::Video,
-        step: &mut SegStep,
-    ) {
-        let gap = ts.0 - seg.last.0;
-        debug_assert!(gap >= 0.0, "in-segment releases are monotone");
-        // Precedent learning is capped at the extent fence: a confirmed
-        // challenger may legally carry a large gap, but nothing beyond the
-        // declared extent may widen future tolerances.
-        if gap > 0.0 && gap <= self.extent_fence {
-            self.nominal_gap = gap;
-            self.max_released_gap = self.max_released_gap.max(gap);
-        }
-        seg.last = ts;
-        self.emit(seg, ts, frame, step);
-    }
-
-    fn emit(
-        &mut self,
-        seg: &Segment,
-        ts: ContainerTs,
-        frame: ffmpeg::frame::Video,
-        step: &mut SegStep,
-    ) {
-        let logical = seg.project(ts);
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                logical.0 >= self.watermark,
-                "the logical clock never rewinds"
-            );
-            self.watermark = logical.0;
-        }
-        step.released.push((logical, frame));
-    }
-}
-
 /// One dropped frame's identity, reported downstream as a diagnostic.
 #[derive(Debug, Clone, Copy)]
 struct Unplaced {
@@ -1048,7 +603,7 @@ struct Unplaced {
 /// sending, so the whole admission path (including the EOF flush) is
 /// testable without a decoder.
 struct FramePath {
-    seg: Segmenter,
+    seg: Segmenter<ffmpeg::frame::Video>,
     sampler: Sampler,
     /// Stop decoding once the released logical clock reaches this bound
     /// (range sampling). Released instants are non-decreasing by
@@ -1104,7 +659,7 @@ impl FramePath {
         self.place(seg)
     }
 
-    fn place(&mut self, seg: SegStep) -> Step {
+    fn place(&mut self, seg: SegStep<ffmpeg::frame::Video>) -> Step {
         let mut step = Step {
             cut: seg.cut,
             ..Step::default()
@@ -1379,348 +934,7 @@ mod tests {
         );
     }
 
-    /// A segmenter as a fixed-fps decode at 30 fps would build it, over a
-    /// container declaring `duration` seconds (`None` = undeclared).
-    fn segmenter(duration: Option<f32>) -> Segmenter {
-        Segmenter::new(duration, 1.0 / 30.0)
-    }
-
-    fn admit(seg: &mut Segmenter, v: f64) -> SegStep {
-        seg.admit(ContainerTs(v), ffmpeg::frame::Video::empty())
-    }
-
-    fn released(step: &SegStep) -> Vec<f64> {
-        step.released.iter().map(|(l, _)| l.0).collect()
-    }
-
-    fn dropped(step: &SegStep) -> Vec<f64> {
-        step.dropped.iter().map(|ts| ts.0).collect()
-    }
-
-    /// Feed `values` then finish; collect every released logical instant.
-    fn drain_releases(seg: &mut Segmenter, values: &[f64]) -> Vec<f64> {
-        let mut out = Vec::new();
-        for &v in values {
-            out.extend(released(&admit(seg, v)));
-        }
-        out.extend(released(&seg.finish()));
-        out
-    }
-
-    fn assert_close(actual: &[f64], expected: &[f64]) {
-        assert_eq!(actual.len(), expected.len(), "{actual:?} vs {expected:?}");
-        for (a, e) in actual.iter().zip(expected) {
-            assert!((a - e).abs() < 1e-9, "{actual:?} vs {expected:?}");
-        }
-    }
-
-    #[test]
-    fn projects_a_clean_stream_identically() {
-        let mut seg = segmenter(Some(2.0));
-        let out = drain_releases(&mut seg, &[0.0, 0.1, 0.2, 0.3, 0.4]);
-        // Bit-exact, not approximate: the identity segment adds 0.0.
-        assert_eq!(out, vec![0.0, 0.1, 0.2, 0.3, 0.4]);
-    }
-
-    #[test]
-    fn buffers_the_head_until_confirmation() {
-        let mut seg = segmenter(Some(2.0));
-        assert!(released(&admit(&mut seg, 0.0)).is_empty());
-        assert!(released(&admit(&mut seg, 0.1)).is_empty());
-        assert_eq!(released(&admit(&mut seg, 0.2)), vec![0.0, 0.1, 0.2]);
-        assert_eq!(released(&admit(&mut seg, 0.3)), vec![0.3], "streams on");
-    }
-
-    #[test]
-    fn emits_no_signals_on_a_clean_pass() {
-        let mut seg = segmenter(Some(2.0));
-        for i in 0..60 {
-            let step = admit(&mut seg, f64::from(i) * 0.1);
-            assert!(step.dropped.is_empty(), "clean streams drop nothing");
-            assert!(step.cut.is_none(), "clean streams commit no seams");
-        }
-        let step = seg.finish();
-        assert!(step.dropped.is_empty() && step.cut.is_none());
-    }
-
-    #[test]
-    fn drops_backward_jitter_inside_a_segment() {
-        let mut seg = segmenter(Some(2.0));
-        for v in [0.0, 0.1, 0.2] {
-            admit(&mut seg, v);
-        }
-        // nominal gap is 0.1, jitter bound 0.2: a small backward step is
-        // decoder noise, dropped with a signal, no challenger.
-        let step = admit(&mut seg, 0.15);
-        assert_eq!(dropped(&step), vec![0.15]);
-        assert!(step.cut.is_none());
-        assert_eq!(released(&admit(&mut seg, 0.3)), vec![0.3]);
-    }
-
-    #[test]
-    fn commits_a_seam_on_a_confirmed_backward_jump() {
-        let mut seg = segmenter(Some(100.0));
-        for v in [5.0, 5.1, 5.2] {
-            admit(&mut seg, v);
-        }
-        assert!(released(&admit(&mut seg, 1.0)).is_empty(), "buffered");
-        assert!(released(&admit(&mut seg, 1.1)).is_empty(), "buffered");
-        let step = admit(&mut seg, 1.2);
-        let cut = step.cut.expect("a confirmed backward jump commits a seam");
-        // The new segment continues one nominal gap (0.1) past the seal.
-        assert!((cut.logical.0 - 5.3).abs() < 1e-9);
-        assert!((cut.container.0 - 1.0).abs() < 1e-9);
-        assert_close(&released(&step), &[5.3, 5.4, 5.5]);
-        assert_close(&released(&admit(&mut seg, 1.3)), &[5.6]);
-    }
-
-    #[test]
-    fn kills_an_unconfirmed_challenger_when_the_segment_resumes() {
-        let mut seg = segmenter(Some(2.0));
-        for v in [0.0, 0.1, 0.2] {
-            admit(&mut seg, v);
-        }
-        assert!(released(&admit(&mut seg, 500.0)).is_empty(), "buffered");
-        let step = admit(&mut seg, 0.3);
-        assert_eq!(dropped(&step), vec![500.0], "the blip dies with a signal");
-        assert_eq!(released(&step), vec![0.3], "the segment streams on");
-        assert!(step.cut.is_none(), "no seam was committed");
-    }
-
-    #[test]
-    fn bounds_alternating_poison_to_the_poisoned_half() {
-        // The fragment-storm shape: every other frame jumps +24h. Each
-        // poisoned frame opens a challenger that the next legal frame
-        // kills, so loss is exactly the poisoned half, every drop is
-        // signaled, no seam is committed, and the logical clock stays on
-        // the legal half.
-        let mut seg = segmenter(Some(2.0));
-        let mut kept = Vec::new();
-        let mut lost = 0;
-        for i in 0..60 {
-            let t = f64::from(i) * 0.033;
-            let step = admit(&mut seg, t);
-            kept.extend(released(&step));
-            lost += step.dropped.len();
-            assert!(step.cut.is_none());
-            let step = admit(&mut seg, t + 86_400.0);
-            kept.extend(released(&step));
-            lost += step.dropped.len();
-            assert!(step.cut.is_none());
-        }
-        let tail = seg.finish();
-        lost += tail.dropped.len();
-        kept.extend(released(&tail));
-        assert_eq!(kept.len(), 60, "the legal half survives whole");
-        assert_eq!(lost, 60, "loss is bounded to the poisoned half");
-        assert!(kept.iter().all(|&t| t < 2.1), "duration does not explode");
-        assert!(kept.windows(2).all(|w| w[0] <= w[1]));
-    }
-
-    #[test]
-    fn extends_the_segment_over_a_confirmed_sparse_splice() {
-        // Legal sparse pacing (a timelapse splice): the jump buffers as a
-        // challenger and, once its successors vouch for it, continues the
-        // same segment identically — no seam, no relabel, no drop.
-        let mut seg = segmenter(Some(60.0));
-        for v in [0.0, 0.1, 0.2] {
-            admit(&mut seg, v);
-        }
-        assert!(released(&admit(&mut seg, 5.0)).is_empty(), "buffered");
-        assert!(released(&admit(&mut seg, 5.1)).is_empty(), "buffered");
-        let step = admit(&mut seg, 5.2);
-        assert!(step.cut.is_none(), "sparse pacing is not a seam");
-        assert!(step.dropped.is_empty(), "sparse pacing is not corruption");
-        assert_eq!(released(&step), vec![5.0, 5.1, 5.2]);
-        assert_eq!(
-            released(&admit(&mut seg, 9.8)),
-            vec![9.8],
-            "the released splice gap is precedent for the next one"
-        );
-    }
-
-    #[test]
-    fn quarantines_an_unvouched_forward_blip() {
-        // One frame jumps +9.5s — below the old 10s fence floor that let
-        // it walk into the segment unconfirmed, drag the cursor forward,
-        // and rewrite the jitter scale until ~49 legal successors fell
-        // into the backward-drop path. The single door buffers it as a
-        // challenger; the next legal frame kills it; nothing is learned
-        // from it.
-        let mut seg = segmenter(Some(2.0));
-        let mut kept = Vec::new();
-        let mut lost = Vec::new();
-        for i in 0..60 {
-            let t = f64::from(i) * 0.033;
-            let v = if i == 10 { t + 9.5 } else { t };
-            let step = admit(&mut seg, v);
-            assert!(step.cut.is_none(), "a blip commits no seam");
-            kept.extend(released(&step));
-            lost.extend(dropped(&step));
-        }
-        let tail = seg.finish();
-        kept.extend(released(&tail));
-        lost.extend(dropped(&tail));
-        assert_eq!(kept.len(), 59, "every legal frame survives: {kept:?}");
-        assert!(
-            kept.iter().all(|&t| t < 2.0),
-            "labels stay at content scale"
-        );
-        assert_close(&lost, &[10.0 * 0.033 + 9.5]);
-    }
-
-    #[test]
-    fn releases_a_plausible_sparse_tail_at_eof() {
-        // A keyframe-only decode of a legal long-GOP recording: keyframes
-        // 0,2,..,10 then 25 and 39.9 inside a declared 40s extent. The
-        // tail is content at a plausible position with nothing left to
-        // contradict it — released in place, not dropped as an
-        // unconfirmed challenger.
-        let mut seg = Segmenter::new(Some(40.0), FALLBACK_NOMINAL_GAP);
-        let values = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 25.0, 39.9];
-        let out = drain_releases(&mut seg, &values);
-        assert_eq!(out, values.to_vec(), "the whole legal file is content");
-    }
-
-    #[test]
-    fn commits_a_seam_on_a_confirmed_beyond_extent_jump() {
-        // A confirmed forward run beyond the extent prior cannot keep its
-        // labels: the position does not exist in the declared file, so
-        // the clock seams and content continues at the seal.
-        let mut seg = segmenter(Some(2.0));
-        for v in [0.0, 0.1, 0.2] {
-            admit(&mut seg, v);
-        }
-        assert!(released(&admit(&mut seg, 86_400.0)).is_empty(), "buffered");
-        assert!(released(&admit(&mut seg, 86_400.1)).is_empty(), "buffered");
-        let step = admit(&mut seg, 86_400.2);
-        let cut = step.cut.expect("beyond the extent prior: a seam");
-        assert!((cut.logical.0 - 0.3).abs() < 1e-9);
-        assert_close(&released(&step), &[0.3, 0.4, 0.5]);
-    }
-
-    #[test]
-    fn learns_the_forward_tolerance_from_released_gaps() {
-        let mut seg = segmenter(Some(100.0));
-        // Head learns an 8s cadence: tolerance becomes 2 × 8 = 16.
-        for v in [0.0, 8.0, 16.0] {
-            admit(&mut seg, v);
-        }
-        assert_eq!(
-            released(&admit(&mut seg, 31.0)),
-            vec![31.0],
-            "a 15s gap fits the learned tolerance"
-        );
-        assert!(
-            released(&admit(&mut seg, 100.0)).is_empty(),
-            "a 69s gap beyond the tolerance opens a challenger"
-        );
-    }
-
-    #[test]
-    fn teaches_keyframe_cadence_through_the_head() {
-        // A keyframe-only decode of a sparse stream: minute-scale gaps are
-        // its legal cadence. The head fences against the declared extent,
-        // not the flat floor, so the cadence confirms and then becomes its
-        // own precedent.
-        let mut seg = Segmenter::new(Some(500.0), FALLBACK_NOMINAL_GAP);
-        let out = drain_releases(&mut seg, &[0.0, 100.0, 200.0, 300.0, 400.0]);
-        assert_eq!(out, vec![0.0, 100.0, 200.0, 300.0, 400.0]);
-    }
-
-    #[test]
-    fn fences_the_head_against_a_far_future_jump() {
-        let mut seg = segmenter(Some(2.0));
-        assert!(released(&admit(&mut seg, 0.0)).is_empty());
-        assert!(
-            released(&admit(&mut seg, 86_400.0)).is_empty(),
-            "beyond the extent fence: a challenger, not a head frame"
-        );
-        let step = admit(&mut seg, 0.033);
-        assert_eq!(dropped(&step), vec![86_400.0], "the blip dies signaled");
-        assert_eq!(released(&admit(&mut seg, 0.066)), vec![0.0, 0.033, 0.066]);
-    }
-
-    #[test]
-    fn replaces_an_unconfirmed_head_with_its_confirmed_challenger() {
-        // The poisoned-head shape: the first packets dragged the declared
-        // origin a day forward, so the head reads ~0 and legal content
-        // rebases to -86398. The challenger confirms, the dead head is
-        // dropped with signals, and the first segment re-anchors at the
-        // stream head — content keeps sane labels, no verdict, no retry.
-        let mut seg = segmenter(Some(0.1));
-        admit(&mut seg, 0.0);
-        admit(&mut seg, 0.033);
-        assert!(released(&admit(&mut seg, -86_398.0)).is_empty());
-        assert!(released(&admit(&mut seg, -86_397.966)).is_empty());
-        let step = admit(&mut seg, -86_397.933);
-        assert_eq!(
-            dropped(&step),
-            vec![0.0, 0.033],
-            "the dead head is dropped with signals"
-        );
-        assert!(step.cut.is_none(), "no committed clock existed to seam");
-        assert_close(&released(&step), &[0.0, 0.034, 0.067]);
-    }
-
-    #[test]
-    fn anchors_an_opening_segment_within_preroll_identically() {
-        // Edit-list pre-roll: legitimate negative timestamps close to zero
-        // project identically — byte-for-byte what the container said.
-        let mut seg = segmenter(Some(4.0));
-        let out = drain_releases(&mut seg, &[-0.5, -0.4, -0.3, 0.0, 0.1]);
-        assert_eq!(out, vec![-0.5, -0.4, -0.3, 0.0, 0.1]);
-    }
-
-    #[test]
-    fn drops_an_unconfirmed_challenger_at_eof() {
-        // A corrupt pts on the very last frame has no successor to vouch
-        // for it: dropped with a signal, never released into a garbage
-        // label.
-        let mut seg = segmenter(Some(2.0));
-        for v in [0.0, 0.1, 0.2] {
-            admit(&mut seg, v);
-        }
-        admit(&mut seg, 86_400.0);
-        let step = seg.finish();
-        assert_eq!(dropped(&step), vec![86_400.0]);
-        assert!(step.released.is_empty());
-    }
-
-    #[test]
-    fn confirms_a_short_head_at_eof() {
-        // A stream shorter than one confirmation is content, not a
-        // fragment: nothing ever contradicted it.
-        let mut seg = segmenter(Some(1.0));
-        admit(&mut seg, 0.0);
-        admit(&mut seg, 0.1);
-        assert_eq!(released(&seg.finish()), vec![0.0, 0.1]);
-    }
-
-    #[test]
-    fn releases_a_lone_frame_at_eof() {
-        let mut seg = segmenter(Some(10.0));
-        admit(&mut seg, 5.0);
-        assert_eq!(released(&seg.finish()), vec![5.0]);
-    }
-
-    #[test]
-    fn keeps_the_logical_clock_monotone_across_seams() {
-        // Three clock domains, each internally sane: two seams, all
-        // content preserved, and the concatenation is non-decreasing.
-        let mut seg = segmenter(Some(3.0));
-        let mut values = Vec::new();
-        values.extend((0..10).map(|i| f64::from(i) * 0.033));
-        values.extend((0..10).map(|i| 43_200.0 + f64::from(i) * 0.033));
-        values.extend((0..10).map(|i| 20.0 + f64::from(i) * 0.033));
-        let out = drain_releases(&mut seg, &values);
-        assert_eq!(out.len(), 30, "every frame survives");
-        assert!(out.windows(2).all(|w| w[0] <= w[1]), "monotone: {out:?}");
-        assert!(out.iter().all(|&t| t < 2.0), "labels stay near content");
-    }
-
-    /// Drive one container timestamp through a [`FramePath`]; map the step
-    /// to `(sent, dropped, stop)` timestamps.
+    /// Drive one container timestamp through the path and expose sent/dropped times.
     fn path_admit(path: &mut FramePath, v: f64) -> (Vec<f32>, Vec<f32>, bool) {
         let step = path.admit(ContainerTs(v), ffmpeg::frame::Video::empty());
         step_view(step)

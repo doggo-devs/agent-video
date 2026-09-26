@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! ProcessState: the shell around the pure [`Chunker`] core — it consumes
-//! judged candidate frames, lets the chunker turn them into chunk/static
-//! events, and interprets those events against the effectful world: parallel
-//! chunk jobs on the rayon pool and incremental writes through the output
-//! session.
-//!
-//! The division of labor is deliberate: everything about *where frames go on
-//! the timeline* (chunk keying, sparse-chunk merging, static stretches,
-//! broken-timeline accounting) lives in [`super::chunker`] and is unit-tested
-//! there without a pool or a session; this module owns only the effects.
+//! Streaming process orchestration. Every sample advances the timeline and
+//! static detector; only dedup survivors enter scoring chunks. Worker queues
+//! bound in-flight images, and completed artifacts are written incrementally.
 
 use std::mem;
 use std::num::NonZeroUsize;
@@ -20,14 +13,15 @@ use image::GrayImage;
 use crate::config::Config;
 use crate::error::Result;
 use crate::event::EventSink;
-use crate::types::{Aspect, CandidateFrame, GridMeta, LayoutKind};
-use crate::{compose, layout};
+use crate::types::{Aspect, CandidateFrame, GridMeta, LayoutKind, Ts};
+use crate::{compose, dedup::Deduper, layout};
 
+use super::candidates::HashedFrame;
 use super::chunk::{GridResult, ProcessChunkEnv, process_chunk};
-use super::chunker::{Chunker, Event};
+use super::chunker::{Chunk, Chunker};
 use super::jobs::OrderedJobs;
 use super::output::OutputSession;
-use super::stretch::Stretch;
+use super::stretch::{Stretch, StretchDetector};
 
 /// Lower bound for an extraction batch.
 const MIN_EXTRACT_BATCH_FRAMES: usize = 32;
@@ -41,7 +35,7 @@ const MAX_EXTRACT_BATCH_FRAMES: usize = 240;
 /// masquerades as a coded, recoverable error.
 type ChunkOutcome = std::thread::Result<Result<GridResult>>;
 
-/// The effectful `process` orchestrator: judged frames in, grids and static
+/// The effectful `process` orchestrator: sampled frames in, grids and static
 /// entries out through the run's output session.
 pub struct ProcessState<'a> {
     cfg: &'a Config,
@@ -53,8 +47,12 @@ pub struct ProcessState<'a> {
     /// execute on a pool thread — a single-thread pool would deadlock.
     pool: &'a rayon::ThreadPool,
     env: ProcessChunkEnv,
-    /// The pure chunking core; this shell only interprets its events.
+    /// Groups only the frames admitted by dedup.
     chunker: Chunker,
+    deduper: Deduper,
+    stretches: StretchDetector,
+    last_ts: Option<Ts>,
+    duration: f32,
     /// Chunk jobs in flight: assigns chunk indexes, caps buffered chunks at
     /// `max_in_flight`, and hands results back in chunk order.
     jobs: OrderedJobs<ChunkOutcome>,
@@ -90,7 +88,15 @@ impl<'a> ProcessState<'a> {
                 hero_scene_diff: cfg.hero_scene_diff(),
                 max_heroes: cfg.max_heroes(),
             },
-            chunker: Chunker::new(cfg.chunk_seconds(), cfg.base_fps()),
+            chunker: Chunker::new(cfg.chunk_seconds()),
+            deduper: Deduper::new(cfg.hash_threshold(), cfg.dedup_window()),
+            stretches: StretchDetector::new(
+                cfg.chunk_seconds(),
+                cfg.hash_threshold(),
+                (2.0 / cfg.base_fps()).max(cfg.gap_threshold()),
+            ),
+            last_ts: None,
+            duration: 0.0,
             jobs: OrderedJobs::new(parallelism),
             grid_metas: Vec::new(),
             static_seq: 0,
@@ -105,17 +111,32 @@ impl<'a> ProcessState<'a> {
         self.env.aspect = aspect;
     }
 
-    /// Record one judged frame, interpreting whatever events it seals off.
-    /// Timeline placement lives in [`Chunker::push`]; its monotone-input
-    /// precondition is guaranteed by the decode pass's segmenter.
-    pub fn push_judged(&mut self, frame: CandidateFrame, kept: bool) -> Result<()> {
-        let events = self.chunker.push(frame, kept, self.capacity());
-        self.handle_events(events)
+    /// Observe a sample before independently selecting grid candidates.
+    pub fn push(&mut self, sample: HashedFrame) -> Result<()> {
+        let ts = sample.frame.ts;
+        assert!(
+            self.last_ts.is_none_or(|last| ts >= last),
+            "frames must arrive in non-decreasing timestamp order"
+        );
+        self.last_ts = Some(ts);
+        self.duration = self.duration.max(ts.get() + 1.0 / self.cfg.base_fps());
+        if let Some(stretch) = self.stretches.observe(&sample) {
+            self.emit_static(stretch)?;
+        }
+        if self.deduper.accepts(&sample.hash) {
+            let chunks = self.chunker.push(sample.frame, self.capacity());
+            self.handle_chunks(chunks)?;
+        }
+        Ok(())
     }
 
+    /// Flush trailing evidence and chunks, returning all metadata in time order.
     pub fn finish(mut self) -> Result<(f32, Vec<GridMeta>)> {
-        let events = self.chunker.finish(self.capacity());
-        self.handle_events(events)?;
+        if let Some(stretch) = self.stretches.finish() {
+            self.emit_static(stretch)?;
+        }
+        let chunks = self.chunker.finish(self.capacity());
+        self.handle_chunks(chunks)?;
         for outcome in self
             .jobs
             .finish()
@@ -124,13 +145,11 @@ impl<'a> ProcessState<'a> {
             self.emit_grid(worker_result(outcome)?)?;
         }
 
-        // Interleave static entries with grids by start time. Both lists are
-        // time-ascending; a static range starts inside its grid, so the
-        // stable sort keeps it right after that grid.
+        // Independent streams complete in different orders; ties retain grid-first order.
         let mut metas = mem::take(&mut self.grid_metas);
         metas.append(&mut self.static_metas);
         metas.sort_by(|a, b| a.time_range.start().total_cmp(&b.time_range.start()));
-        Ok((self.chunker.duration(), metas))
+        Ok((self.duration, metas))
     }
 
     /// Current grid capacity: how many carried frames fill one grid. Cheap
@@ -139,18 +158,14 @@ impl<'a> ProcessState<'a> {
         layout::grid_capacity(&self.env.spec, self.env.aspect)
     }
 
-    fn handle_events(&mut self, events: Vec<Event>) -> Result<()> {
-        for event in events {
-            match event {
-                Event::Chunk { frames, prev_tail } => self.spawn_chunk(frames, prev_tail)?,
-                Event::Static(stretch) => self.emit_static(stretch)?,
-            }
+    fn handle_chunks(&mut self, chunks: Vec<Chunk>) -> Result<()> {
+        for Chunk { frames, prev_tail } in chunks {
+            self.spawn_chunk(frames, prev_tail)?;
         }
         Ok(())
     }
 
-    /// Render and record one static-stretch entry: the last visually-distinct
-    /// frame stands in for the whole unchanged range.
+    /// Render the anchor of a continuous run over its observed time range.
     fn emit_static(&mut self, stretch: Stretch) -> Result<()> {
         let Stretch { range, rgb } = stretch;
         self.static_seq += 1;
@@ -232,8 +247,8 @@ mod tests {
     use super::*;
     use crate::config::{Overrides, StrategyOpts};
     use crate::event::Discard;
+    use crate::sample;
     use crate::types::{Detail, GridImage, GridMeta, Quality};
-    use crate::{dedup, sample};
     use image::{Rgb, RgbImage};
 
     /// Config with explicit 60s chunks at 1 fps and the high quality tier
@@ -288,15 +303,17 @@ mod tests {
             .expect("test pool builds")
     }
 
-    /// Judge synthetic frames through the real dedup machinery, exactly as
-    /// the candidate stream does in production.
-    fn judge(cfg: &Config, frames: &[(f32, u32)]) -> Vec<(CandidateFrame, bool)> {
+    /// Build the same fingerprints as the production candidate stream.
+    fn samples(cfg: &Config, frames: &[(f32, u32)]) -> Vec<HashedFrame> {
         let rgbs = frames
             .iter()
             .map(|&(ts, seed)| distinct_frame(ts, seed))
             .collect();
         let candidates = sample::candidate_frames_from_rgbs(rgbs, cfg.score_edge());
-        dedup::Deduper::new(cfg.hash_threshold(), cfg.dedup_window()).judge(candidates)
+        super::super::candidates::fingerprint(
+            candidates,
+            &image_hasher::HasherConfig::new().to_hasher(),
+        )
     }
 
     /// Drive a full push→finish cycle in JSON mode and return the grid
@@ -320,8 +337,8 @@ mod tests {
         let session = json_session();
         let parallelism = NonZeroUsize::new(parallelism).expect("test parallelism is nonzero");
         let mut state = ProcessState::new(cfg, pool, &session, parallelism, &Discard);
-        for (frame, kept) in judge(cfg, frames) {
-            state.push_judged(frame, kept).expect("push frame");
+        for sample in samples(cfg, frames) {
+            state.push(sample).expect("push frame");
         }
         let (_duration, grid_metas) = state.finish().expect("finish");
         grid_metas
@@ -412,8 +429,8 @@ mod tests {
         let session = json_session();
         let one = NonZeroUsize::new(1).expect("1 is nonzero");
         let mut state = ProcessState::new(&cfg, &pool, &session, one, &Discard);
-        for (frame, kept) in judge(&cfg, &frames) {
-            state.push_judged(frame, kept).expect("push frame");
+        for sample in samples(&cfg, &frames) {
+            state.push(sample).expect("push frame");
         }
         assert!(
             state.jobs.peak_buffered() <= 1,
@@ -430,7 +447,7 @@ mod tests {
         let cfg = base_config();
 
         // Two distinct frames, then 69 duplicates of the second (dedup drops
-        // them), then a distinct frame at 75s: a 74s static stretch.
+        // them), then a distinct frame at 75s: static evidence ends at 70s.
         let mut frames = vec![(0.0, 0), (1.0, 1)];
         frames.extend((2..=70).map(|t| (t as f32, 1)));
         frames.push((75.0, 2));
@@ -444,8 +461,8 @@ mod tests {
         assert_eq!(stat.layout, LayoutKind::Static);
         assert_eq!(
             (stat.time_range.start(), stat.time_range.end()),
-            (1.0, 75.0),
-            "stretch spans kept-frame gap"
+            (1.0, 70.0),
+            "a later change cannot extend the observed static range"
         );
         assert_eq!(stat.total_frames, 1, "one representative frame");
         assert!(
@@ -455,37 +472,120 @@ mod tests {
     }
 
     #[test]
-    fn closes_trailing_static_stretch_at_finish() {
+    fn preserves_separate_static_visits_with_dense_or_sparse_sampling() {
         let cfg = base_config();
-
-        // The video ends inside the static stretch: no following kept frame,
-        // so the last dropped duplicate bounds the range.
-        let mut frames = vec![(0.0, 0), (1.0, 1)];
-        frames.extend((2..=70).map(|t| (t as f32, 1)));
-
-        let metas = run(&cfg, 2, &frames);
-
-        assert_eq!(metas.len(), 2, "grid plus trailing static entry");
-        assert_eq!(metas[1].layout, LayoutKind::Static);
-        assert_eq!(
-            (metas[1].time_range.start(), metas[1].time_range.end()),
-            (1.0, 70.0)
-        );
+        for step in [1, 4] {
+            let frames: Vec<_> = (0..3)
+                .flat_map(|scene| {
+                    (0..=60)
+                        .step_by(step)
+                        .map(move |t| ((scene * (60 + step) + t) as f32, (scene % 2) as u32))
+                })
+                .collect();
+            let metas = run(&cfg, 2, &frames);
+            let ranges: Vec<_> = metas
+                .iter()
+                .filter(|m| m.layout == LayoutKind::Static)
+                .map(|m| (m.time_range.start(), m.time_range.end()))
+                .collect();
+            let expected: Vec<_> = (0..3)
+                .map(|scene| {
+                    let start = (scene * (60 + step)) as f32;
+                    (start, start + 60.0)
+                })
+                .collect();
+            assert_eq!(
+                ranges, expected,
+                "each A/B/A visit retains its own span, spacing={step}"
+            );
+            assert!(
+                metas
+                    .windows(2)
+                    .all(|pair| pair[0].time_range.start() <= pair[1].time_range.start())
+            );
+        }
     }
 
     #[test]
     fn sparse_sampling_gap_is_not_static() {
         let cfg = base_config();
 
-        // Big gaps between kept frames but zero dropped duplicates inside them
-        // (sparse keyframe sampling): no evidence of stillness, no static entry.
+        // Isolated, different scenes provide no continuous static evidence.
         let metas = run(&cfg, 2, &[(0.0, 0), (65.0, 1), (130.0, 2)]);
 
         assert_eq!(metas.len(), 1, "sparse frames merge into one grid");
         assert!(
             metas.iter().all(|m| m.layout != LayoutKind::Static),
-            "no static entries without dropped-duplicate evidence"
+            "no static entries without continuous similar observations"
         );
+    }
+
+    #[test]
+    fn recovers_static_evidence_after_revisiting_deduplicated_scenes() {
+        let cfg = base_config();
+        let frames: Vec<_> = (0..80)
+            .map(|t| (t as f32, u32::from(t != 0 && t != 2)))
+            .collect();
+        let metas = run(&cfg, 2, &frames);
+        let stretches: Vec<_> = metas
+            .iter()
+            .filter(|m| m.layout == LayoutKind::Static)
+            .collect();
+        assert_eq!(stretches.len(), 1);
+        let stretch = stretches[0];
+        assert_eq!(
+            (stretch.time_range.start(), stretch.time_range.end()),
+            (3.0, 79.0)
+        );
+
+        use base64::Engine as _;
+        let GridImage::Base64(encoded) = &stretch.image else {
+            panic!("JSON image expected")
+        };
+        let actual = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("valid image");
+        let expected = compose::render_single(&distinct_frame(3.0, 1).rgb, 3.0, cfg.jpeg_quality())
+            .expect("renders B");
+        assert_eq!(
+            actual, expected,
+            "the revisited B supplies the representative"
+        );
+    }
+
+    #[test]
+    fn rejects_continuous_scene_alternation_without_losing_duration() {
+        let cfg = base_config();
+        let pool = pool(1);
+        let session = json_session();
+        let mut state = ProcessState::new(&cfg, &pool, &session, NonZeroUsize::MIN, &Discard);
+        let frames: Vec<_> = (0..80).map(|t| (t as f32, t % 2)).collect();
+        for sample in samples(&cfg, &frames) {
+            state.push(sample).expect("push");
+        }
+        let (duration, metas) = state.finish().expect("finish");
+        assert_eq!(
+            duration, 80.0,
+            "dedup must not truncate the observed timeline"
+        );
+        assert_eq!(
+            metas.len(),
+            1,
+            "repeated transitions do not create per-flash output"
+        );
+        assert_ne!(metas[0].layout, LayoutKind::Static);
+    }
+
+    #[test]
+    #[should_panic(expected = "frames must arrive in non-decreasing timestamp order")]
+    fn rejects_timestamp_regression_even_when_dedup_would_drop_it() {
+        let cfg = base_config();
+        let pool = pool(1);
+        let session = json_session();
+        let mut state = ProcessState::new(&cfg, &pool, &session, NonZeroUsize::MIN, &Discard);
+        for sample in samples(&cfg, &[(10.0, 1), (5.0, 1)]) {
+            state.push(sample).expect("push");
+        }
     }
 
     #[test]

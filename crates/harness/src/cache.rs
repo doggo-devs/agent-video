@@ -18,8 +18,9 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use self::source::SourceId;
 use super::identity::ContentId;
+use crate::fetch::RipKey;
+use crate::transcribe::TranscriptId;
 
 /// Probe documents and transcripts older than this are dropped during sweeps.
 pub const PROBE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -36,13 +37,6 @@ const STALE_STAGING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Subtitle sidecar extensions living next to cached downloads.
 pub const SUBTITLE_EXTS: [&str; 3] = ["srt", "ass", "vtt"];
-
-/// Stable cache key for a source spelling: the canonical [`SourceId`]'s
-/// hash — the same identity the token registry keys offer sets on, so the
-/// two sides cannot disagree about which spellings share an entry.
-pub fn url_key(url: &str) -> String {
-    SourceId::from_spelling(url).cache_key()
-}
 
 /// Disk cache rooted at `paths.cache`; all methods create dirs lazily.
 #[derive(Debug, Clone)]
@@ -109,8 +103,7 @@ impl Cache {
     /// Publication is atomic (docs/shared-cache.md, Pattern 2a): the title
     /// is staged to a writer-unique `.part` and hard-linked into place, so
     /// readers never see a torn sidecar and a crash leaves only staging. A
-    /// blank title records nothing; a blank on-disk winner (a torn write
-    /// from releases before this scheme) is replaced. Without hard links
+    /// blank title records nothing. Without hard links
     /// (FAT, some network mounts) the publish falls back to a rename:
     /// still atomic, but last writer wins inside the race window.
     pub fn put_title(&self, fingerprint: &ContentId, title: &str) -> std::io::Result<()> {
@@ -129,10 +122,7 @@ impl Cache {
     }
 
     /// The recorded title for this content, refreshing its age clock;
-    /// `None` when nothing was recorded (local files, pre-title rips).
-    /// A blank sidecar — a legacy torn write — is not a title: it answers
-    /// `None` and its clock is left alone, so it ages out instead of
-    /// living forever as an unreadable winner.
+    /// `None` when absent, unreadable or blank. Invalid entries are not touched.
     pub fn get_title(&self, fingerprint: &ContentId) -> Option<String> {
         let p = self.title_path(fingerprint);
         let title = fs::read_to_string(&p).ok()?;
@@ -155,7 +145,11 @@ impl Cache {
     /// answer for another's, or a model upgrade — or a prompt/language
     /// change — keeps serving the old recipe's output indefinitely —
     /// every hit refreshes the age clock.
-    pub fn transcript_path(&self, fingerprint: &ContentId, transcript_id: &str) -> PathBuf {
+    pub fn transcript_path(
+        &self,
+        fingerprint: &ContentId,
+        transcript_id: &TranscriptId,
+    ) -> PathBuf {
         self.transcripts_dir
             .join(format!("{fingerprint}.{transcript_id}.srt"))
     }
@@ -165,7 +159,11 @@ impl Cache {
     /// derives from — needs no bump here: the sweep itself never expires
     /// a sidecar while a transcript for its content lives ([`Cache::evict`]),
     /// so no read path can reopen the sidecar-gone-transcript-alive window.
-    pub fn find_transcript(&self, fingerprint: &ContentId, transcript_id: &str) -> Option<PathBuf> {
+    pub fn find_transcript(
+        &self,
+        fingerprint: &ContentId,
+        transcript_id: &TranscriptId,
+    ) -> Option<PathBuf> {
         let p = self.transcript_path(fingerprint, transcript_id);
         if p.is_file() {
             touch(&p);
@@ -195,7 +193,7 @@ impl Cache {
     /// A hit also refreshes the key's subtitle sidecars, which grids read
     /// alongside the media; otherwise budget pressure would evict them from
     /// under a hot rip.
-    pub fn find_download(&self, key: &str) -> Option<PathBuf> {
+    pub fn find_download(&self, key: &RipKey) -> Option<PathBuf> {
         let entries = fs::read_dir(&self.downloads_dir).ok()?;
         let prefix = format!("{key}.");
         let (_, p) = entries
@@ -354,12 +352,7 @@ const TITLE_SUFFIX: &str = ".title";
 /// Install fully-staged `part` at `dest`, write-once. `link` is the
 /// hard-link primitive (injected so tests can model filesystems without
 /// one): it installs the complete staged bytes or fails because a winner
-/// already exists. A blank winner is a legacy torn write, not a title —
-/// it is dethroned and the publish contested once more; losing that
-/// second link means a rival published a real title meanwhile, and theirs
-/// serves the freeze as well as ours. Any other link error means the
-/// filesystem cannot hard-link at all and falls back to
-/// [`publish_by_rename`].
+/// already exists. Other link errors fall back to [`publish_by_rename`].
 fn publish_write_once(
     part: &Path,
     dest: &Path,
@@ -367,18 +360,7 @@ fn publish_write_once(
 ) -> std::io::Result<()> {
     match link(part, dest) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-            if fs::read_to_string(dest).is_ok_and(|t| t.trim().is_empty()) {
-                let _ = fs::remove_file(dest);
-                match link(part, dest) {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
-                    Err(_) => publish_by_rename(part, dest),
-                }
-            } else {
-                Ok(())
-            }
-        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
         Err(_) => publish_by_rename(part, dest),
     }
 }
@@ -387,11 +369,11 @@ fn publish_write_once(
 /// rename is still an atomic install of the complete staged bytes, so a
 /// reader never sees a torn sidecar — but rename replaces, so the
 /// write-once freeze weakens to last-writer-wins inside the racing
-/// window. An existing non-blank winner is deferred to first, exactly
+/// window. An existing winner is deferred to first, exactly
 /// like a lost link, keeping the weakening confined to concurrent racers
 /// (each holding a complete title that serves the freeze equally well).
 fn publish_by_rename(part: &Path, dest: &Path) -> std::io::Result<()> {
-    if fs::read_to_string(dest).is_ok_and(|t| !t.trim().is_empty()) {
+    if dest.try_exists()? {
         return Ok(());
     }
     fs::rename(part, dest)
@@ -470,17 +452,6 @@ mod tests {
     }
 
     #[test]
-    fn url_key_converges_spellings_of_one_source() {
-        let k = url_key("https://example.com/v.mp4");
-        assert_eq!(k, url_key("HTTPS://Example.COM/v.mp4"));
-        assert_ne!(
-            k,
-            url_key("https://example.com/V.mp4"),
-            "path case names a different resource"
-        );
-    }
-
-    #[test]
     fn probe_roundtrips_and_misses_cleanly() {
         let (cache, _dir) = cache(1024);
         assert!(
@@ -518,9 +489,12 @@ mod tests {
         let dir = cache.ensure_downloads_dir().expect("mkdir").to_path_buf();
         std::fs::write(dir.join("k1.mp4.part"), b"x").expect("write");
         std::fs::write(dir.join("k1.srt"), b"x").expect("write");
-        assert!(cache.find_download("k1").is_none());
+        assert!(cache.find_download(&RipKey::fixture("k1")).is_none());
         std::fs::write(dir.join("k1.mp4"), b"x").expect("write");
-        assert_eq!(cache.find_download("k1").expect("hit"), dir.join("k1.mp4"));
+        assert_eq!(
+            cache.find_download(&RipKey::fixture("k1")).expect("hit"),
+            dir.join("k1.mp4")
+        );
     }
 
     #[test]
@@ -531,7 +505,7 @@ mod tests {
         let (cache, _dir) = cache(1024);
         let dir = cache.ensure_downloads_dir().expect("mkdir").to_path_buf();
         std::fs::write(dir.join("k1.srt.promote"), b"x").expect("write");
-        assert!(cache.find_download("k1").is_none());
+        assert!(cache.find_download(&RipKey::fixture("k1")).is_none());
     }
 
     #[test]
@@ -551,9 +525,12 @@ mod tests {
             .and_then(|f| f.set_modified(SystemTime::now() - Duration::from_secs(3600)))
             .expect("age the superseded rip");
 
-        assert_eq!(cache.find_download("k1").expect("hit"), current);
         assert_eq!(
-            cache.find_download("k1").expect("hit"),
+            cache.find_download(&RipKey::fixture("k1")).expect("hit"),
+            current
+        );
+        assert_eq!(
+            cache.find_download(&RipKey::fixture("k1")).expect("hit"),
             current,
             "the winning touch keeps the winner winning"
         );
@@ -580,7 +557,7 @@ mod tests {
                 .expect("age the file");
         }
 
-        cache.find_download("k1").expect("hit");
+        cache.find_download(&RipKey::fixture("k1")).expect("hit");
 
         let mtime = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).expect("mtime");
         for p in [&media, &srt, &vtt] {
@@ -613,16 +590,16 @@ mod tests {
     #[test]
     fn transcripts_are_keyed_by_model() {
         let (cache, _dir) = cache(1024);
-        let p = cache.transcript_path(&ContentId::new("fp"), "medium");
+        let p = cache.transcript_path(&ContentId::new("fp"), &TranscriptId::fixture("medium"));
         std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
         std::fs::write(&p, b"cues").expect("write");
 
         assert_eq!(
-            cache.find_transcript(&ContentId::new("fp"), "medium"),
+            cache.find_transcript(&ContentId::new("fp"), &TranscriptId::fixture("medium")),
             Some(p)
         );
         assert_eq!(
-            cache.find_transcript(&ContentId::new("fp"), "large-v3"),
+            cache.find_transcript(&ContentId::new("fp"), &TranscriptId::fixture("large-v3")),
             None,
             "one model's transcript must not answer for another"
         );
@@ -698,7 +675,7 @@ mod tests {
         // sweep's listing and its unlink. The stale stat must not
         // authorize the deletion — the same veto downloads enjoy.
         let (cache, _dir) = cache(1024);
-        let p = cache.transcript_path(&ContentId::new("fp"), "m");
+        let p = cache.transcript_path(&ContentId::new("fp"), &TranscriptId::fixture("m"));
         std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
         std::fs::write(&p, b"cues").expect("write");
         let past = SystemTime::now() - PROBE_MAX_AGE - Duration::from_secs(60);
@@ -724,7 +701,7 @@ mod tests {
         let dir = cache.ensure_downloads_dir().expect("mkdir").to_path_buf();
         // The name a real writer would stage under, straight from the
         // grammar's constructor: the sweep must recognize its own inverse.
-        let staging = dir.join(naming::staging_dir_name("k"));
+        let staging = dir.join(naming::staging_dir_name(&RipKey::fixture("k")));
         std::fs::create_dir_all(&staging).expect("mkdir staging");
         std::fs::write(staging.join("k.mp4.part"), b"x").expect("write");
 
@@ -743,7 +720,7 @@ mod tests {
         // The names real writers stage under, straight from the grammar's
         // constructor: a direct download, a whisper transcript, a probe doc.
         let dl_part = naming::part_path(&dl.join("k.mp4"));
-        let srt = cache.transcript_path(&ContentId::new("fp"), "m");
+        let srt = cache.transcript_path(&ContentId::new("fp"), &TranscriptId::fixture("m"));
         std::fs::create_dir_all(srt.parent().expect("parent")).expect("mkdir");
         let srt_part = naming::part_path(&srt);
         std::fs::create_dir_all(&cache.probe_dir).expect("mkdir");
@@ -765,7 +742,7 @@ mod tests {
     #[test]
     fn spares_fresh_part_files_from_the_staleness_sweep() {
         let (cache, _dir) = cache(1024);
-        let srt = cache.transcript_path(&ContentId::new("fp"), "m");
+        let srt = cache.transcript_path(&ContentId::new("fp"), &TranscriptId::fixture("m"));
         std::fs::create_dir_all(srt.parent().expect("parent")).expect("mkdir");
         let part = naming::part_path(&srt);
         std::fs::write(&part, b"x").expect("write");
@@ -780,7 +757,7 @@ mod tests {
         let dl = cache.ensure_downloads_dir().expect("mkdir").to_path_buf();
         let media = dl.join("k.mp4");
         std::fs::write(&media, b"x").expect("write");
-        let srt = cache.transcript_path(&ContentId::new("fp"), "m");
+        let srt = cache.transcript_path(&ContentId::new("fp"), &TranscriptId::fixture("m"));
         std::fs::create_dir_all(srt.parent().expect("parent")).expect("mkdir");
         std::fs::write(&srt, b"cues").expect("write");
 
@@ -916,28 +893,6 @@ mod tests {
     }
 
     #[test]
-    fn rename_fallback_dethrones_a_blank_legacy_winner() {
-        // A blank winner is no winner on the fallback path either: the
-        // healing put must land instead of deferring to poison forever.
-        let (cache, _dir) = cache(1024);
-        fs::create_dir_all(&cache.probe_dir).expect("mkdir");
-        let dest = cache.title_path(&ContentId::new("fp"));
-        fs::write(&dest, "").expect("legacy poison");
-        let part = naming::part_path(&dest);
-        fs::write(&part, "Rust Ownership Explained").expect("stage");
-
-        publish_write_once(&part, &dest, |_, _| {
-            Err(std::io::Error::from(ErrorKind::Unsupported))
-        })
-        .expect("rename fallback publishes over poison");
-
-        assert_eq!(
-            cache.get_title(&ContentId::new("fp")).as_deref(),
-            Some("Rust Ownership Explained")
-        );
-    }
-
-    #[test]
     fn records_nothing_for_a_blank_title() {
         let (cache, _dir) = cache(1024);
         cache
@@ -951,55 +906,13 @@ mod tests {
     }
 
     #[test]
-    fn blank_legacy_title_answers_none_and_ages_out() {
-        // A pre-atomic-path cache may hold an empty sidecar. It must not
-        // answer as a title, and reading it must not refresh its clock:
-        // left alone, the age sweep retires it.
-        let (cache, _dir) = cache(1024);
-        std::fs::create_dir_all(&cache.probe_dir).expect("mkdir");
-        let poisoned = cache.probe_dir.join("fp.title");
-        std::fs::write(&poisoned, b"").expect("write");
-        let past = SystemTime::now() - PROBE_MAX_AGE - Duration::from_secs(60);
-        File::options()
-            .append(true)
-            .open(&poisoned)
-            .and_then(|f| f.set_modified(past))
-            .expect("age the sidecar");
-
-        assert_eq!(cache.get_title(&ContentId::new("fp")), None);
-
-        let removed = cache.evict(SystemTime::now());
-        assert_eq!(removed, vec![poisoned.clone()], "the read did not bump it");
-        assert!(!poisoned.exists(), "the poison self-retires");
-    }
-
-    #[test]
-    fn dethrones_a_blank_legacy_winner_on_put() {
-        // An empty winner is no winner: the next sighting replaces it
-        // instead of deferring to it forever.
-        let (cache, _dir) = cache(1024);
-        std::fs::create_dir_all(&cache.probe_dir).expect("mkdir");
-        std::fs::write(cache.probe_dir.join("fp.title"), b"").expect("write");
-
-        cache
-            .put_title(&ContentId::new("fp"), "Rust Ownership Explained")
-            .expect("put");
-
-        assert_eq!(
-            cache.get_title(&ContentId::new("fp")).as_deref(),
-            Some("Rust Ownership Explained"),
-            "the healing put wins over legacy poison"
-        );
-    }
-
-    #[test]
     fn sweep_spares_the_title_sidecar_of_a_living_transcript() {
         let (cache, _dir) = cache(1024);
         let fp = ContentId::new("fp");
         cache
             .put_title(&fp, "Rust Ownership Explained")
             .expect("put");
-        let srt = cache.transcript_path(&fp, "m-auto-abcd1234");
+        let srt = cache.transcript_path(&fp, &TranscriptId::fixture("m-auto-abcd1234"));
         std::fs::create_dir_all(srt.parent().expect("parent")).expect("mkdir");
         std::fs::write(&srt, b"cues").expect("write");
         // Age the sidecar past expiry while the transcript stays fresh: the
@@ -1030,7 +943,7 @@ mod tests {
         cache
             .put_title(&fp, "Rust Ownership Explained")
             .expect("put");
-        let srt = cache.transcript_path(&fp, "m-auto-abcd1234");
+        let srt = cache.transcript_path(&fp, &TranscriptId::fixture("m-auto-abcd1234"));
         std::fs::create_dir_all(srt.parent().expect("parent")).expect("mkdir");
         std::fs::write(&srt, b"cues").expect("write");
 

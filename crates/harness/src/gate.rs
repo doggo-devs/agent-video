@@ -17,18 +17,27 @@
 //! hand an unauthenticated boundary a way to pile up threads.
 
 use std::collections::HashSet;
+use std::hash::Hash;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// One admitted holder per key; waiters for a held key block until it
 /// frees. Distinct keys never contend.
-#[derive(Default)]
-pub struct KeyedGate {
-    held: Mutex<HashSet<String>>,
+pub struct KeyedGate<K: Eq + Hash> {
+    held: Mutex<HashSet<K>>,
     freed: Condvar,
 }
 
-impl KeyedGate {
+impl<K: Eq + Hash> Default for KeyedGate<K> {
+    fn default() -> Self {
+        Self {
+            held: Mutex::new(HashSet::new()),
+            freed: Condvar::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone> KeyedGate<K> {
     /// Hold `key` exclusively, waiting at most `bound` while it is held by
     /// someone else: `None` acquired nothing. The bound is the waiter's
     /// signature on its own account — a holder's legitimate work has no
@@ -37,10 +46,10 @@ impl KeyedGate {
     /// own bound and reports instead. The returned guard frees the key on
     /// drop — including an unwind, so a panicking holder wakes its waiters
     /// instead of wedging the key forever.
-    pub fn admit_within(&self, key: &str, bound: Duration) -> Option<KeyHold<'_>> {
+    pub fn admit_within(&self, key: K, bound: Duration) -> Option<KeyHold<'_, K>> {
         let deadline = Instant::now() + bound;
         let mut held = self.held.lock().expect("keyed gate poisoned");
-        while held.contains(key) {
+        while held.contains(&key) {
             let left = deadline.checked_duration_since(Instant::now())?;
             held = self
                 .freed
@@ -48,21 +57,18 @@ impl KeyedGate {
                 .expect("keyed gate poisoned")
                 .0;
         }
-        held.insert(key.to_string());
-        Some(KeyHold {
-            gate: self,
-            key: key.to_string(),
-        })
+        held.insert(key.clone());
+        Some(KeyHold { gate: self, key })
     }
 }
 
 /// Exclusive hold on one key; dropping it admits the next waiter.
-pub struct KeyHold<'a> {
-    gate: &'a KeyedGate,
-    key: String,
+pub struct KeyHold<'a, K: Eq + Hash> {
+    gate: &'a KeyedGate<K>,
+    key: K,
 }
 
-impl Drop for KeyHold<'_> {
+impl<K: Eq + Hash> Drop for KeyHold<'_, K> {
     fn drop(&mut self) {
         self.gate
             .held

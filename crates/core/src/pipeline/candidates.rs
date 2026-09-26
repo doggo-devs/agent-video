@@ -1,20 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The shared sampling front half of both pipelines: decoded frames in,
-//! judged candidates out.
-//!
-//! [`CandidateStream`] drains a frame source in bounded batches, derives
-//! per-frame scoring grayscales in parallel, and judges every frame against
-//! the perceptual deduper. `process` and `extract` both consume it, so the
-//! two subcommands select surviving frames with the same machinery and
-//! cannot drift apart — the property the tests below pin down.
+//! Bounded batches of sampled frames and their shared perceptual fingerprints.
+//! Fingerprints are computed in parallel; temporal consumers retain input order.
 
-use crate::dedup::Deduper;
+use image_hasher::{HasherConfig, ImageHash};
+use rayon::prelude::*;
+
 use crate::error::Result;
 use crate::sample::{self, RgbFrame};
 use crate::types::{Aspect, CandidateFrame};
 
-/// One judged frame: the candidate and whether dedup kept it.
-pub type Judged = (CandidateFrame, bool);
+/// A sampled frame with a fingerprint shared by dedup and static detection.
+pub struct HashedFrame {
+    /// Image and timestamp of this observation, including repeated content.
+    pub frame: CandidateFrame,
+    /// Perceptual fingerprint of the scoring grayscale.
+    pub hash: ImageHash,
+    /// Mean grayscale intensity; gradient hashes alone ignore uniform flashes.
+    pub mean_luma: f32,
+}
+
+/// Hash a bounded batch without reordering or filtering its observations.
+pub(super) fn fingerprint(
+    frames: Vec<CandidateFrame>,
+    hasher: &image_hasher::Hasher,
+) -> Vec<HashedFrame> {
+    frames
+        .into_par_iter()
+        .map(|frame| {
+            let hash = hasher.hash_image(frame.gray.as_ref());
+            let gray = frame.gray.as_raw();
+            let mean_luma =
+                gray.iter().map(|&v| u64::from(v)).sum::<u64>() as f32 / gray.len() as f32;
+            HashedFrame {
+                frame,
+                hash,
+                mean_luma,
+            }
+        })
+        .collect()
+}
 
 /// A pull source of decoded RGB frames.
 ///
@@ -41,33 +65,30 @@ impl RgbSource for sample::FrameStream<'_> {
 
 /// Streaming candidate producer over any [`RgbSource`].
 ///
-/// Batches bound memory to `batch_frames` decoded frames; the deduper's
-/// sliding window carries across batches, so verdicts are independent of the
-/// batch size (see `judges_identically_across_batch_sizes`).
+/// Batches bound image memory to `batch_frames`; their boundaries carry no
+/// temporal meaning for consumers.
 pub struct CandidateStream<'a, S> {
     source: S,
-    deduper: Deduper,
+    hasher: image_hasher::Hasher,
     batch_frames: usize,
     score_edge: u32,
-    /// Pool for the per-frame parallel work (grayscale, pHash) so `--threads`
+    /// Pool for the per-frame parallel work (grayscale, fingerprint) so `--threads`
     /// caps it too; `None` uses the global rayon pool (`extract` exposes no
     /// thread flag).
     pool: Option<&'a rayon::ThreadPool>,
 }
 
 impl<'a, S: RgbSource> CandidateStream<'a, S> {
-    /// Wire a frame source to the judging machinery: deduper, batch size
-    /// (floored at 1), scoring-grayscale edge, and optional worker pool.
+    /// Wire a source to bounded parallel grayscale and fingerprint computation.
     pub fn new(
         source: S,
-        deduper: Deduper,
         batch_frames: usize,
         score_edge: u32,
         pool: Option<&'a rayon::ThreadPool>,
     ) -> Self {
         Self {
             source,
-            deduper,
+            hasher: HasherConfig::new().to_hasher(),
             batch_frames: batch_frames.max(1),
             score_edge,
             pool,
@@ -79,9 +100,9 @@ impl<'a, S: RgbSource> CandidateStream<'a, S> {
         self.source.aspect()
     }
 
-    /// Pull the next batch of judged candidates, in timestamp order; `None`
+    /// Pull the next batch of fingerprinted samples, in timestamp order; `None`
     /// after a clean end of stream. The final batch may be short.
-    pub fn next_batch(&mut self) -> Result<Option<Vec<Judged>>> {
+    pub fn next_batch(&mut self) -> Result<Option<Vec<HashedFrame>>> {
         let mut rgbs = Vec::with_capacity(self.batch_frames);
         while rgbs.len() < self.batch_frames {
             match self.source.next_frame()? {
@@ -94,11 +115,12 @@ impl<'a, S: RgbSource> CandidateStream<'a, S> {
         }
 
         let score_edge = self.score_edge;
-        let deduper = &mut self.deduper;
-        let judge = move || deduper.judge(sample::candidate_frames_from_rgbs(rgbs, score_edge));
+        let hasher = &self.hasher;
+        let analyze =
+            move || fingerprint(sample::candidate_frames_from_rgbs(rgbs, score_edge), hasher);
         Ok(Some(match self.pool {
-            Some(pool) => pool.install(judge),
-            None => judge(),
+            Some(pool) => pool.install(analyze),
+            None => analyze(),
         }))
     }
 }
@@ -106,6 +128,7 @@ impl<'a, S: RgbSource> CandidateStream<'a, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dedup::Deduper;
     use image::{Rgb, RgbImage};
     use std::num::NonZeroUsize;
 
@@ -146,11 +169,15 @@ mod tests {
         let source = FakeSource {
             frames: mixed_frames().into_iter(),
         };
-        let deduper = Deduper::new(8, NonZeroUsize::new(4).expect("nonzero window"));
-        let mut stream = CandidateStream::new(source, deduper, batch_frames, 64, None);
+        let mut deduper = Deduper::new(8, NonZeroUsize::new(4).expect("nonzero window"));
+        let mut stream = CandidateStream::new(source, batch_frames, 64, None);
         let mut out = Vec::new();
         while let Some(batch) = stream.next_batch().expect("fake source never fails") {
-            out.extend(batch.into_iter().map(|(f, kept)| (f.ts.get(), kept)));
+            out.extend(
+                batch
+                    .into_iter()
+                    .map(|sample| (sample.frame.ts.get(), deduper.accepts(&sample.hash))),
+            );
         }
         out
     }
@@ -177,12 +204,38 @@ mod tests {
     }
 
     #[test]
+    fn preserves_static_evidence_across_batch_boundaries() {
+        use super::super::stretch::StretchDetector;
+        for batch_size in [1, 3, 60, 240] {
+            let frames: Vec<_> = (0..80)
+                .map(|t| frame(t as f32, u32::from(t != 0 && t != 2)))
+                .collect();
+            let source = FakeSource {
+                frames: frames.into_iter(),
+            };
+            let mut stream = CandidateStream::new(source, batch_size, 64, None);
+            let mut detector = StretchDetector::new(60.0, 8, 5.0);
+            let mut stretches = Vec::new();
+            while let Some(batch) = stream.next_batch().expect("batch") {
+                for sample in batch {
+                    stretches.extend(detector.observe(&sample));
+                }
+            }
+            stretches.extend(detector.finish());
+            let ranges: Vec<_> = stretches
+                .iter()
+                .map(|s| (s.range.start(), s.range.end()))
+                .collect();
+            assert_eq!(ranges, vec![(3.0, 79.0)], "batch size {batch_size}");
+        }
+    }
+
+    #[test]
     fn ends_cleanly_after_a_short_final_batch() {
         let source = FakeSource {
             frames: mixed_frames().into_iter(),
         };
-        let deduper = Deduper::new(8, NonZeroUsize::new(4).expect("nonzero window"));
-        let mut stream = CandidateStream::new(source, deduper, 4, 64, None);
+        let mut stream = CandidateStream::new(source, 4, 64, None);
 
         let sizes: Vec<usize> = std::iter::from_fn(|| {
             stream

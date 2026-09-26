@@ -186,16 +186,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_of_a_canonical_url_matches_the_verbatim_hash() {
-        // Compatibility pin: the cache used to hash the verbatim spelling,
-        // so a spelling that is already canonical must key exactly as
-        // before — existing shared-cache entries stay valid.
-        let url = "https://example.com/v.mp4";
-        let verbatim = hex(&Sha256::digest(url.as_bytes())[..16]);
-        assert_eq!(SourceId::from_spelling(url).cache_key(), verbatim);
-    }
-
-    #[test]
     fn urls_and_paths_never_share_an_identity() {
         assert_ne!(
             SourceId::from_spelling("https://example.com/v.mp4"),

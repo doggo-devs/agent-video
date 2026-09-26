@@ -257,9 +257,20 @@ mod tests {
         let pool = pool(2);
         let mut jobs = OrderedJobs::new(limit(4));
 
+        let mut starters = Vec::new();
         for _ in 0..4 {
-            jobs.spawn(&pool, |seq| seq * 10).expect("spawn");
+            let (start, wait) = mpsc::channel::<()>();
+            starters.push(start);
+            assert!(
+                jobs.spawn(&pool, move |seq| {
+                    let _ = wait.recv();
+                    seq * 10
+                })
+                .expect("spawn")
+                .is_empty()
+            );
         }
+        drop(starters);
         let delivered = jobs.finish().expect("finish");
 
         assert_eq!(delivered, vec![0, 10, 20, 30]);

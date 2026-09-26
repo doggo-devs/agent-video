@@ -11,15 +11,14 @@ mod support;
 use agent_video_core::config::Overrides;
 use agent_video_core::event::Discard;
 use agent_video_core::media::Stop;
-use agent_video_core::media::audio::{
-    AudioCeiling, AudioSamples, WHISPER_SAMPLE_RATE, decode_audio_16k_mono,
-};
+use agent_video_core::media::audio::{AudioChunk, AudioSamples, WHISPER_SAMPLE_RATE};
 use agent_video_core::media::decode::{FrameSource, SampleSpec};
 use agent_video_core::pipeline::{self, OutputSink, SubtitleSource, Window};
 use agent_video_core::probe;
 use agent_video_core::source::Source;
 use agent_video_core::types::{GridImage, TimeRange};
 use agent_video_core::wire;
+use std::num::NonZeroUsize;
 
 use std::path::Path;
 
@@ -32,10 +31,25 @@ const ROUNDING: f32 = 0.5;
 /// (or a grid and the file edge) may legitimately sit this far apart.
 const COVERAGE_SLACK: f32 = 2.0;
 
-/// A ceiling far above any fixture's duration: overflow tests pick their
-/// own tight cap; everything else must never trip this one.
-fn generous_cap() -> AudioCeiling {
-    AudioCeiling::from_seconds(60).expect("60s is a valid ceiling")
+fn audio_blocks(path: &Path, bound: usize) -> Vec<AudioChunk> {
+    let mut stream = AudioSamples::open(&source_of(path), &Stop::new())
+        .expect("audio opens")
+        .expect("audio track");
+    let mut blocks = Vec::new();
+    while let Some(chunk) = stream
+        .next_chunk(NonZeroUsize::new(bound).expect("positive bound"))
+        .expect("audio decodes")
+    {
+        assert!(chunk.samples.len() <= bound);
+        blocks.push(chunk);
+    }
+    assert!(
+        stream
+            .next_chunk(NonZeroUsize::new(bound).expect("positive bound"))
+            .expect("exhaustion is final")
+            .is_none()
+    );
+    blocks
 }
 
 macro_rules! require_fixture {
@@ -124,7 +138,7 @@ fn covers_full_duration_without_overlap() {
     let ranges: Vec<(f32, f32)> = meta
         .grids
         .iter()
-        .map(|g| support::parse_wire_range(&g.time_range))
+        .map(|g| (g.time_range.start(), g.time_range.end()))
         .collect();
     for (start, end) in &ranges {
         assert!(start <= end, "range {start}-{end} is ordered");
@@ -195,7 +209,7 @@ fn window_bounds_every_timestamp() {
     assert!(!meta.grids.is_empty(), "windowed run still produces grids");
     let inside = |ts: f32| (1.0 - ROUNDING..=4.0 + ROUNDING).contains(&ts);
     for grid in &meta.grids {
-        let (start, end) = support::parse_wire_range(&grid.time_range);
+        let (start, end) = (grid.time_range.start(), grid.time_range.end());
         assert!(
             inside(start) && inside(end),
             "grid range {}s-{}s falls inside the 1s-4s window",
@@ -318,7 +332,7 @@ fn survives_mid_stream_audio_param_change_in_process() {
     let last_end = meta
         .grids
         .iter()
-        .map(|g| support::parse_wire_range(&g.time_range).1)
+        .map(|g| g.time_range.end())
         .fold(0.0_f32, f32::max);
     assert!(
         last_end >= fx.duration - COVERAGE_SLACK,
@@ -333,22 +347,9 @@ fn reports_a_missing_audio_track_as_absence_not_failure() {
     // legitimate silent video (surveillance, screen capture) must decode
     // to "no audio here", never to a corrupt-input error.
     let fx = require_fixture!(support::fixtures::keyframe_poor(2.0));
-    let decoded = decode_audio_16k_mono(&source_of(&fx.media), &Stop::new(), generous_cap())
+    let decoded = AudioSamples::open(&source_of(&fx.media), &Stop::new())
         .expect("a video without an audio track is not a decode failure");
     assert!(decoded.is_none(), "absence is Ok(None), not an error");
-}
-
-#[test]
-fn rejects_audio_decoding_past_the_ceiling() {
-    // The finding's shape: a track longer than the caller's ceiling must
-    // fail with a typed error before materializing, never decode whole and
-    // never truncate silently. 6s of audio against a 1s cap pins the
-    // mechanism without synthesizing a hostile multi-hour file.
-    let fx = require_fixture!(support::fixtures::audio_param_change(6.0));
-    let cap = AudioCeiling::from_seconds(1).expect("1s is a valid ceiling");
-    let err = decode_audio_16k_mono(&source_of(&fx.media), &Stop::new(), cap)
-        .expect_err("6s of audio must overflow a 1s ceiling");
-    assert_eq!(err.code, agent_video_core::error::ErrorCode::InputTooLong);
 }
 
 #[test]
@@ -358,9 +359,8 @@ fn follows_mid_stream_sample_rate_change_in_audio_decode() {
     // 44100 -> 22050 Hz mid-stream change with AVERROR_INPUT_CHANGED and
     // discarded everything already decoded. Following the change means the
     // decode succeeds AND its output spans both segments, not just the first.
-    let samples = decode_audio_16k_mono(&source_of(&fx.media), &Stop::new(), generous_cap())
-        .expect("audio decode follows the mid-stream sample-rate change")
-        .expect("the fixture has an audio track");
+    let blocks = audio_blocks(&fx.media, 10_000);
+    let samples: Vec<_> = blocks.iter().flat_map(|b| b.samples.iter()).collect();
     let expected = fx.duration * WHISPER_SAMPLE_RATE as f32;
     assert!(
         samples.len() as f32 >= 0.9 * expected,
@@ -375,39 +375,149 @@ fn follows_mid_stream_sample_rate_change_in_audio_decode() {
 }
 
 #[test]
-fn collects_whole_track_under_a_generous_ceiling() {
-    // The streaming contract: pulling the track through small bounded
-    // fills must yield bit-identical samples to the capped whole-track
-    // decode — same pipeline, same carry-over handling, chunk seams
-    // invisible, and a generous ceiling changes nothing on legit input.
+fn bounds_audio_blocks_without_changing_samples_or_timing() {
     let fx = require_fixture!(support::fixtures::audio_param_change(6.0));
-    let whole = decode_audio_16k_mono(&source_of(&fx.media), &Stop::new(), generous_cap())
-        .expect("whole decode succeeds under a generous ceiling")
-        .expect("the fixture has an audio track");
+    let large = audio_blocks(&fx.media, 1_000_000);
+    let small = audio_blocks(&fx.media, 511);
+    let flatten = |blocks: Vec<AudioChunk>| -> Vec<_> {
+        blocks
+            .into_iter()
+            .flat_map(|b| {
+                b.samples
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(i, sample)| (b.start.advance(i), sample))
+            })
+            .collect()
+    };
+    assert_eq!(flatten(large), flatten(small));
+}
 
-    let mut stream = AudioSamples::open(&source_of(&fx.media), &Stop::new())
-        .expect("stream opens")
-        .expect("the fixture has an audio track");
-    let mut streamed = Vec::new();
-    let mut buf = Vec::new();
-    loop {
-        let more = stream.fill(&mut buf, 10_000).expect("fill succeeds");
-        streamed.append(&mut buf);
-        if !more {
-            break;
-        }
+#[test]
+fn preserves_delayed_audio_and_gaps_on_the_video_clock() {
+    for rate in [16_000, 44_100, 48_000] {
+        let fx = require_fixture!(support::fixtures::sparse_audio(rate));
+        let blocks = audio_blocks(&fx.media, 100_000);
+        assert_eq!(
+            blocks.len(),
+            2,
+            "only the actual audio runs are materialized"
+        );
+        assert_eq!(
+            (blocks[0].start.seconds(), blocks[0].end().seconds()),
+            (1.0, 2.0)
+        );
+        assert_eq!(
+            (blocks[1].start.seconds(), blocks[1].end().seconds()),
+            (3.0, 5.0)
+        );
+        assert!(blocks[0].samples.iter().all(|s| (*s - 0.25).abs() < 0.001));
+        assert!(blocks[1].samples.iter().all(|s| (*s - 0.75).abs() < 0.001));
+    }
+}
+
+#[test]
+fn keeps_audio_and_video_on_continuous_clocks_across_a_ts_reset() {
+    let fx = require_fixture!(support::fixtures::reset_av_clock(6.0));
+    let blocks = audio_blocks(&fx.media, 100_000);
+    let samples: usize = blocks.iter().map(|b| b.samples.len()).sum();
+    assert!(
+        (5.9..6.2).contains(&(samples as f64 / 16_000.0)),
+        "all speech survives: {samples}"
+    );
+    let audio_end = blocks.last().expect("audio").end().seconds();
+    let mut video = FrameSource::open(
+        &source_of(&fx.media),
+        SampleSpec::Fps {
+            fps: 120.0,
+            start: 0.0,
+            end: None,
+        },
+        48,
+        None,
+        &Discard,
+    )
+    .expect("video");
+    let mut video_end = 0.0;
+    while let Some(frame) = video.next_frame().expect("video decodes") {
+        video_end = f64::from(frame.ts.get()) + 1.0 / 30.0;
     }
     assert!(
-        !stream
-            .fill(&mut buf, 1)
-            .expect("post-exhaustion fill is fine"),
-        "exhaustion is final: later fills keep answering false"
+        (audio_end - video_end).abs() < 0.08,
+        "audio {audio_end}, video {video_end}"
     );
-    assert!(buf.is_empty(), "a drained stream appends nothing");
-    assert_eq!(
-        streamed, whole,
-        "streamed fills and the whole decode are the same samples"
-    );
+}
+
+#[test]
+fn confines_a_future_audio_timestamp_to_its_corrupt_frame() {
+    for packet in [0, 1, 2, 30, 165] {
+        let fx = require_fixture!(support::fixtures::corrupt_av_pts(
+            "audio-clock-blip",
+            4.0,
+            "PTS",
+            &format!("if(eq(N\\,{packet})\\,PTS+7776000000\\,PTS)")
+        ));
+        let blocks = audio_blocks(&fx.media, 100_000);
+        let samples: usize = blocks.iter().map(|b| b.samples.len()).sum();
+        assert!(
+            samples > 3 * 16_000,
+            "the legal audio tail survives: {samples}"
+        );
+        let end = blocks.last().expect("audio").end().seconds();
+        assert!(
+            (3.9..4.1).contains(&end),
+            "the corrupt timestamp never poisons the end: {end}"
+        );
+    }
+}
+
+#[test]
+fn recovers_the_video_origin_without_losing_delayed_audio() {
+    for poisoned in [1, 2, 65] {
+        let fx = require_fixture!(support::fixtures::corrupt_av_pts(
+            "audio-poisoned-video-head",
+            4.0,
+            &format!("if(lt(N\\,{poisoned})\\,PTS+7776000000\\,PTS)"),
+            "PTS"
+        ));
+        let blocks = audio_blocks(&fx.media, 100_000);
+        let start = blocks
+            .first()
+            .expect("audio survives the poisoned origin")
+            .start
+            .seconds();
+        let end = blocks.last().expect("audio").end().seconds();
+        // Short poisoned heads are dropped; long ones occupy their original duration.
+        assert!(
+            (0.40..0.50).contains(&start),
+            "the half-second delay survives: {start}"
+        );
+        assert!(
+            (3.9..4.1).contains(&end),
+            "the whole audio track survives: {end}"
+        );
+    }
+}
+
+#[test]
+fn lets_the_decoder_remove_aac_and_opus_priming_once() {
+    for codec in ["aac", "libopus"] {
+        let fx = require_fixture!(support::fixtures::primed_audio(codec));
+        let blocks = audio_blocks(&fx.media, 100_000);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "{codec}: PTS quantization must not fragment the track"
+        );
+        assert!(
+            blocks[0].start.seconds() <= 0.002,
+            "{codec}: first audible sample is at zero"
+        );
+        assert!(
+            (blocks[0].end().seconds() - 3.0).abs() <= 0.03,
+            "{codec}: decoder padding/trim"
+        );
+    }
 }
 
 #[test]
@@ -432,6 +542,15 @@ fn displays_rotated_and_mirrored_corners_in_their_declared_positions() {
     for (rotation, hflip, vflip, dimensions, corners) in cases {
         let fx = require_fixture!(support::fixtures::display_oriented(rotation, hflip, vflip));
         let case = format!("rotation={rotation}, hflip={hflip}, vflip={vflip}");
+        let input = agent_video_core::media::open_input(&source_of(&fx.media), &Stop::new(), &[])
+            .expect("probe input");
+        let summary = agent_video_core::media::summarize_input(&input, &source_of(&fx.media))
+            .expect("probe orientation");
+        assert_eq!(
+            (summary.width, summary.height),
+            (dimensions.0 * 2, dimensions.1 * 2),
+            "{case}"
+        );
         let mut frames = FrameSource::open(
             &source_of(&fx.media),
             SampleSpec::Keyframes,
@@ -467,6 +586,11 @@ fn displays_rotated_and_mirrored_corners_in_their_declared_positions() {
 #[test]
 fn rejects_unsupported_display_rotation_instead_of_returning_sideways_pixels() {
     let fx = require_fixture!(support::fixtures::display_oriented(45, false, false));
+    let input = agent_video_core::media::open_input(&source_of(&fx.media), &Stop::new(), &[])
+        .expect("probe input");
+    let error = agent_video_core::media::summarize_input(&input, &source_of(&fx.media))
+        .expect_err("probe rejects unsupported rotation");
+    assert_eq!(error.code, agent_video_core::error::ErrorCode::DecodeFailed);
     let error = FrameSource::open(
         &source_of(&fx.media),
         SampleSpec::Keyframes,
@@ -482,4 +606,67 @@ fn rejects_unsupported_display_rotation_instead_of_returning_sideways_pixels() {
         error.context().and_then(|c| c.input_path.as_deref()),
         Some(fx.media.as_path())
     );
+}
+
+#[test]
+fn renders_the_held_scene_after_revisits_and_brightness_flashes() {
+    use agent_video_core::types::LayoutKind;
+    for (uniform_flashes, expected_start) in [(false, 3.0), (true, 19.0)] {
+        let fx = require_fixture!(support::fixtures::revisited_static_scene(uniform_flashes));
+        let dir = support::fresh_output_dir(if uniform_flashes {
+            "flash-hold"
+        } else {
+            "revisit-hold"
+        });
+        let cfg = support::config(
+            512,
+            Overrides {
+                base_fps: Some(1.0),
+                ..Default::default()
+            },
+        );
+        pipeline::process(
+            &source_of(&fx.media),
+            OutputSink::Files(&dir),
+            &cfg,
+            pipeline::ProcessOpts {
+                threads: 1,
+                max_in_flight: pipeline::DEFAULT_IN_FLIGHT,
+                subs: SubtitleSource::Auto,
+                window: None,
+                stop: Stop::new(),
+                events: &Discard,
+            },
+        )
+        .expect("processes the 80-second fixture");
+        let meta = support::read_metadata(&dir);
+        let statics: Vec<_> = meta
+            .grids
+            .iter()
+            .filter(|g| g.layout == LayoutKind::Static)
+            .collect();
+        assert_eq!(
+            statics.len(),
+            1,
+            "short transitions must not emit static entries"
+        );
+        assert_eq!(
+            (statics[0].time_range.start(), statics[0].time_range.end()),
+            (expected_start, 79.0)
+        );
+        assert_eq!(meta.total_duration(), Some(80.0));
+        let GridImage::File(name) = &statics[0].image else {
+            panic!("file output expected")
+        };
+        let image = image::open(dir.join(name)).expect("static JPEG").to_rgb8();
+        let (width, height) = image.dimensions();
+        let left = image.get_pixel(width / 4, 3 * height / 4).0[0];
+        let right = image.get_pixel(3 * width / 4, 3 * height / 4).0[0];
+        assert!(left > 200, "B is bright on the left, got {left}");
+        if uniform_flashes {
+            assert!(right > 200, "held white frame, got {right}");
+        } else {
+            assert!(right < 60, "B is dark on the right, got {right}");
+        }
+    }
 }

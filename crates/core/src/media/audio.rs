@@ -1,348 +1,381 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Audio decoding for transcription: any input's best audio stream to
-//! 16 kHz mono f32 PCM (what whisper.cpp consumes), in-process via
-//! libswresample. [`AudioSamples`] is a pull stream — the caller decides
-//! how much decoded audio is resident at once, so a consumer that
-//! processes as it pulls holds hours of audio in bounded memory.
+//! Pull-based audio decoding to timed, continuous blocks of 16 kHz mono PCM.
+//! Gaps carry no samples; every block retains its position on the video clock.
 
-use ffmpeg_next as ffmpeg;
+use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 
 use ffmpeg::software::resampling;
 use ffmpeg::util::channel_layout::ChannelLayout;
 use ffmpeg::util::format::sample::{Sample, Type};
 use ffmpeg::util::frame;
+use ffmpeg_next as ffmpeg;
 
-use super::{ErrorBudget, InterruptibleInput, Recv, Stop, classify_receive, open_input};
-use crate::error::{Error, ErrorCode, Result};
+use super::clock::{ContainerTs, LogicalTs, PREROLL_ALLOWANCE, SegStep, Segmenter};
+use super::{ErrorBudget, InterruptibleInput, Recv, Stop, Timeline, classify_receive, open_input};
+use crate::error::Result;
 use crate::source::Source;
 
-/// The sample rate whisper.cpp expects.
+/// Sample rate of decoded audio and both transcription routes.
 pub const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
-/// Hard upper bound on any whole-track ceiling: 24 hours. Past it no
-/// caller policy is sane (24 h × 16 kHz × 4 B ≈ 5.5 GB resident), and the
-/// bound keeps `samples() + 1` arithmetic overflow-free on usize.
-const MAX_CEILING_SECONDS: u32 = 24 * 3600;
+/// Position on the media clock, measured in 16 kHz samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SamplePos(i64);
 
-/// A validated ceiling on whole-track PCM materialization, in seconds of
-/// 16 kHz audio.
-///
-/// [`AudioSamples::collect`] — the only whole-track entry point — demands
-/// one, so "decode the entire track into memory" is inexpressible without
-/// a bound: a hostile file claiming hundreds of hours of DTX/silence audio
-/// fails with a typed error instead of decoding into a multi-GB `Vec`.
-#[derive(Debug, Clone, Copy)]
-pub struct AudioCeiling {
-    seconds: u32,
-}
+impl SamplePos {
+    /// Construct a position in 16 kHz samples, including negative pre-roll.
+    pub const fn from_samples(samples: i64) -> Self {
+        Self(samples)
+    }
 
-impl AudioCeiling {
-    /// Build a ceiling of `secs` seconds. Rejects 0 and anything past the
-    /// 24-hour hard cap with [`ErrorCode::InvalidConfig`]: both describe a
-    /// misconfigured caller, never a property of the input.
-    pub fn from_seconds(secs: u32) -> Result<AudioCeiling> {
-        if secs == 0 || secs > MAX_CEILING_SECONDS {
-            return Err(Error::new(
-                ErrorCode::InvalidConfig,
-                format!(
-                    "invalid audio ceiling: {secs}s (must be 1..={MAX_CEILING_SECONDS} seconds)"
-                ),
-            ));
+    /// Position in seconds relative to the video's start.
+    pub fn seconds(self) -> f64 {
+        self.0 as f64 / f64::from(WHISPER_SAMPLE_RATE)
+    }
+
+    /// Advance by a sample count without wrapping the media clock.
+    pub fn advance(self, samples: usize) -> Self {
+        Self(
+            self.0
+                .saturating_add(i64::try_from(samples).unwrap_or(i64::MAX)),
+        )
+    }
+
+    /// Nonnegative sample distance from an earlier position, saturated to `usize`.
+    pub fn samples_since(self, earlier: Self) -> usize {
+        usize::try_from(self.0.saturating_sub(earlier.0).max(0)).unwrap_or(usize::MAX)
+    }
+
+    fn from_seconds(seconds: f64) -> std::result::Result<Self, ffmpeg::Error> {
+        let samples = (seconds * f64::from(WHISPER_SAMPLE_RATE)).round();
+        if !samples.is_finite() || samples < i64::MIN as f64 || samples >= i64::MAX as f64 {
+            return Err(ffmpeg::Error::InvalidData);
         }
-        Ok(AudioCeiling { seconds: secs })
-    }
-
-    /// The ceiling in 16 kHz samples.
-    pub fn samples(&self) -> usize {
-        self.seconds as usize * WHISPER_SAMPLE_RATE as usize
+        Ok(Self(samples as i64))
     }
 }
 
-/// Decode `source`'s best audio stream to 16 kHz mono f32 samples, whole,
-/// bounded by `cap`.
-///
-/// The convenience form of [`AudioSamples`] for callers that need the
-/// entire track in memory (VAD wants random access). `Ok(None)` when the
-/// container carries no audio stream at all: absence is a fact about the
-/// input, not a decode failure, and the caller decides what "nothing to
-/// transcribe" means. Errors are reserved for a container that cannot be
-/// opened, a decode that breaks mid-stream, or a track that decodes past
-/// `cap` ([`AudioSamples::collect`]). `stop` bounds every blocking read on
-/// a stalled source; see [`super::open_input`].
-pub fn decode_audio_16k_mono(
-    source: &Source,
-    stop: &Stop,
-    cap: AudioCeiling,
-) -> Result<Option<Vec<f32>>> {
-    let Some(mut stream) = AudioSamples::open(source, stop)? else {
-        return Ok(None);
-    };
-    Ok(Some(stream.collect(cap)?))
+/// A continuous run of PCM at its original media position. Emitted blocks
+/// are nonempty, nonnegative and nonoverlapping; gaps are not materialized.
+#[derive(Debug)]
+pub struct AudioChunk {
+    /// Position of the first sample on the source clock.
+    pub start: SamplePos,
+    /// Consecutive 16 kHz mono samples, with no timeline gaps inside.
+    pub samples: Vec<f32>,
 }
 
-/// A pull stream of 16 kHz mono f32 samples from one audio track.
-///
-/// Owns the demux → decode → resample pipeline; [`Self::fill`] advances it
-/// on demand. Per-packet failures are absorbed by an `ErrorBudget`, so
-/// only a permanently broken stream surfaces as an error.
+impl AudioChunk {
+    /// Exclusive end on the media clock.
+    pub fn end(&self) -> SamplePos {
+        self.start.advance(self.samples.len())
+    }
+}
+
+/// A pull stream owning demux, decode and resampling. Memory is bounded by
+/// the requested block size plus bounded clock confirmation and resampler carry.
 pub struct AudioSamples {
     ictx: InterruptibleInput,
     stream_index: usize,
     decoder: ffmpeg::decoder::Audio,
     sink: MonoSink,
-    /// Reused demux buffer.
+    clock: Segmenter<frame::Audio>,
+    timeline: Timeline,
+    time_base: f64,
+    fallback_start: f64,
     packet: ffmpeg::Packet,
-    /// Reused decode buffer.
-    frame: frame::Audio,
     budget: ErrorBudget,
     stage: Stage,
+    ready: VecDeque<AudioChunk>,
+    decoded_end: Option<SamplePos>,
+    dropped_frames: usize,
 }
 
-/// Where the pipeline stands; stages only move forward.
 enum Stage {
-    /// Packets still flow from the demuxer.
     Demux,
-    /// Demux EOF seen: the decoder's lookahead and the resampler's
-    /// carry-over still owe samples.
     Flush,
-    /// Everything delivered; [`AudioSamples::fill`] keeps answering
-    /// "no more".
     Done,
 }
 
 impl AudioSamples {
-    /// Open `source`'s best audio stream as a sample stream. `Ok(None)`
-    /// when the container has no audio stream at all — absence is the
-    /// input's shape, not a decode failure. `stop` bounds every blocking
-    /// read on a stalled source; see [`super::open_input`].
-    pub fn open(source: &Source, stop: &Stop) -> Result<Option<AudioSamples>> {
+    /// Open the best audio stream; `None` means the source has no audio.
+    /// Blocking reads observe `stop`. Positions share the video's origin.
+    pub fn open(source: &Source, stop: &Stop) -> Result<Option<Self>> {
         let ictx = open_input(source, stop, &[])?;
         let Some(stream) = ictx.streams().best(ffmpeg::media::Type::Audio) else {
             return Ok(None);
         };
         let stream_index = stream.index();
-
+        let tb = stream.time_base();
+        let time_base = f64::from(tb);
+        let mut timeline = Timeline::from_input(&ictx);
+        let start = stream.start_time();
+        if start != ffmpeg::ffi::AV_NOPTS_VALUE
+            && timeline.seconds(start, time_base) < PREROLL_ALLOWANCE
+        {
+            timeline = super::decode::head_timeline(source, stop, start as f64 * time_base)?;
+        }
+        let fallback_start = if start == ffmpeg::ffi::AV_NOPTS_VALUE {
+            0.0
+        } else {
+            timeline.seconds(start, time_base)
+        };
         let ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| super::decode_error("opening audio decoder", e))?;
-        let mut decoder = ctx
-            .decoder()
+        let mut decoder = ctx.decoder();
+        // Decoder-side priming removal adjusts frame PTS in this time base.
+        decoder.set_packet_time_base(tb);
+        let decoder = decoder
             .audio()
             .map_err(|e| super::decode_error("opening audio decoder", e))?;
-
-        // Decoders may leave the layout unset; the resampler needs one.
-        if decoder.channel_layout().is_empty() {
-            decoder.set_channel_layout(ChannelLayout::default(decoder.channels() as i32));
-        }
-
-        let sink = MonoSink::new(decoder.format(), decoder.channel_layout(), decoder.rate())
-            .map_err(|e| super::decode_error("configuring audio resampler", e))?;
-
-        Ok(Some(AudioSamples {
+        let duration = super::duration_seconds(&ictx, source).ok();
+        Ok(Some(Self {
             ictx,
             stream_index,
             decoder,
-            sink,
+            timeline,
+            time_base,
+            fallback_start,
+            clock: Segmenter::new(duration, 0.02),
+            sink: MonoSink {
+                time_base,
+                run: None,
+                published_end: SamplePos(0),
+            },
             packet: ffmpeg::Packet::empty(),
-            frame: frame::Audio::empty(),
             budget: ErrorBudget::new("decoding audio packets"),
             stage: Stage::Demux,
+            ready: VecDeque::new(),
+            decoded_end: None,
+            dropped_frames: 0,
         }))
     }
 
-    /// Decode the remainder of the track into one `Vec`, failing once the
-    /// decoded audio passes `cap` with [`ErrorCode::InputTooLong`].
-    ///
-    /// The only whole-track entry point. Overflow is an error, never a
-    /// silent truncation: a partial transcript masquerading as complete
-    /// would misreport the input. Peak memory on overflow is `cap` plus
-    /// [`Self::fill`]'s one-packet overshoot — asking for one sample past
-    /// the ceiling is enough to prove the track exceeds it.
-    pub fn collect(&mut self, cap: AudioCeiling) -> Result<Vec<f32>> {
-        let mut samples = Vec::new();
-        self.fill(&mut samples, cap.samples() + 1)?;
-        if samples.len() > cap.samples() {
-            return Err(Error::new(
-                ErrorCode::InputTooLong,
-                format!(
-                    "audio track decodes past the {}-second whole-track ceiling \
-                     ({} samples at 16 kHz)",
-                    cap.seconds,
-                    cap.samples()
-                ),
-            ));
-        }
-        Ok(samples)
-    }
-
-    /// Append decoded samples to `out` until `out.len() >= min_samples` or
-    /// the track ends. Returns whether more samples may still arrive;
-    /// `false` is final — further calls keep answering `false` without
-    /// touching `out`. `out` may overshoot `min_samples` by the delivery
-    /// granularity (one packet's worth of resampled audio), never by more.
-    pub fn fill(&mut self, out: &mut Vec<f32>, min_samples: usize) -> Result<bool> {
-        while out.len() < min_samples {
-            if !self.step(out)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Advance the pipeline by one increment: one demuxed packet, or the
-    /// end-of-stream flush. `false` means exhausted.
-    fn step(&mut self, out: &mut Vec<f32>) -> Result<bool> {
-        match self.stage {
-            Stage::Demux => {
-                match self.ictx.read_packet(&mut self.packet) {
-                    Ok(()) if self.packet.stream() != self.stream_index => {}
-                    Ok(()) => match self.decoder.send_packet(&self.packet) {
-                        Ok(()) => self.receive_frames(out)?,
-                        Err(e) => self.budget.fail(e)?,
-                    },
-                    Err(ffmpeg::Error::Eof) => {
-                        // The EOF flush is the decoder's last squeeze:
-                        // lookahead frames surface only now, so a refused
-                        // flush spends error budget instead of silently
-                        // dropping the tail.
-                        if let Err(e) = self.decoder.send_eof() {
-                            self.budget.fail(e)?;
-                        }
-                        self.stage = Stage::Flush;
-                    }
-                    // Unlike `PacketIter` (which retries read errors
-                    // unbudgeted, forever), a failed read spends budget, so
-                    // a permanently failing input trips the breaker instead
-                    // of spinning.
-                    Err(e) => self.budget.fail(e)?,
-                }
-                Ok(true)
-            }
-            Stage::Flush => {
-                self.receive_frames(out)?;
-                self.sink
-                    .drain(out)
-                    .map_err(|e| super::decode_error("flushing audio resampler", e))?;
-                self.stage = Stage::Done;
-                Ok(true)
-            }
-            Stage::Done => Ok(false),
-        }
-    }
-
-    /// Move every frame the decoder currently holds through the sink.
-    fn receive_frames(&mut self, out: &mut Vec<f32>) -> Result<()> {
+    /// Pull at most `max_samples` contiguous samples. Stops at a time gap
+    /// even when the block is smaller than requested. `None` is final.
+    pub fn next_chunk(&mut self, max_samples: NonZeroUsize) -> Result<Option<AudioChunk>> {
+        let mut result: Option<AudioChunk> = None;
         loop {
-            match classify_receive(self.decoder.receive_frame(&mut self.frame)) {
-                Recv::Frame => match self.sink.push(&mut self.frame, out) {
-                    Ok(()) => self.budget.ok(),
-                    Err(e) => self.budget.fail(e)?,
-                },
-                Recv::Drained => return Ok(()),
-                // A hard receive error is charged, never mistaken for
-                // "drained": a decoder that fails every receive trips the
-                // budget instead of silently truncating the audio tail.
-                Recv::Broken(e) => {
-                    self.budget.fail(e)?;
+            while self.ready.is_empty() && !matches!(self.stage, Stage::Done) {
+                self.step()?;
+            }
+            let Some(front) = self.ready.front() else {
+                break;
+            };
+            if result.as_ref().is_some_and(|out| out.end() != front.start) {
+                break;
+            }
+            let mut chunk = self.ready.pop_front().expect("front exists");
+            let out = result.get_or_insert_with(|| AudioChunk {
+                start: chunk.start,
+                samples: Vec::new(),
+            });
+            let take = chunk
+                .samples
+                .len()
+                .min(max_samples.get() - out.samples.len());
+            if take < chunk.samples.len() {
+                let rest = chunk.samples.split_off(take);
+                self.ready.push_front(AudioChunk {
+                    start: chunk.start.advance(take),
+                    samples: rest,
+                });
+            }
+            out.samples.extend(chunk.samples);
+            if out.samples.len() == max_samples.get() {
+                break;
+            }
+        }
+        if let Some(chunk) = &result {
+            self.decoded_end = Some(chunk.end());
+        }
+        Ok(result)
+    }
+
+    /// End of the last delivered audio block, before any VAD filtering.
+    /// `None` means no presentable samples were decoded.
+    pub fn decoded_end(&self) -> Option<SamplePos> {
+        self.decoded_end
+    }
+
+    /// Decoded frames discarded because their timestamps could not be confirmed.
+    pub fn dropped_frames(&self) -> usize {
+        self.dropped_frames
+    }
+
+    fn step(&mut self) -> Result<()> {
+        let mut frame = frame::Audio::empty();
+        match classify_receive(self.decoder.receive_frame(&mut frame)) {
+            Recv::Frame => {
+                if frame.rate() == 0 || frame.samples() == 0 {
+                    self.budget.fail(ffmpeg::Error::InvalidData)?;
                     return Ok(());
                 }
+                let at = frame.pts().or(frame.timestamp()).map_or_else(
+                    || self.clock.next_timestamp().unwrap_or(self.fallback_start),
+                    |pts| self.timeline.seconds(pts, self.time_base),
+                );
+                let step = self.clock.admit(ContainerTs(at), frame);
+                self.place(step)?;
+                return Ok(());
             }
+            Recv::Broken(e) => self.budget.fail(e)?,
+            Recv::Drained => {}
         }
-    }
-}
-
-/// Streaming converter to 16 kHz mono f32 that follows mid-stream input
-/// parameter changes.
-///
-/// A decoder's header parameters are a prediction, not a contract: HE-AAC
-/// SBR doubles the rate after the first frame, DASH splices can change the
-/// layout, and a decoder recovering from bitstream corruption may emit a
-/// frame with nonsense parameters. A fixed swresample context answers all
-/// of those with `AVERROR_INPUT_CHANGED` and would kill the stream; this
-/// sink instead reconfigures for coherent changes and reports garbage
-/// frames as per-frame errors the caller's `ErrorBudget` can absorb.
-struct MonoSink {
-    ctx: resampling::Context,
-    format: Sample,
-    layout: ChannelLayout,
-    rate: u32,
-}
-
-impl MonoSink {
-    fn new(
-        format: Sample,
-        layout: ChannelLayout,
-        rate: u32,
-    ) -> std::result::Result<Self, ffmpeg::Error> {
-        let ctx = resampling::Context::get(
-            format,
-            layout,
-            rate,
-            Sample::F32(Type::Packed),
-            ChannelLayout::MONO,
-            WHISPER_SAMPLE_RATE,
-        )?;
-        Ok(MonoSink {
-            ctx,
-            format,
-            layout,
-            rate,
-        })
-    }
-
-    /// Feed one decoded frame. `Err` marks this frame as unusable (decoder
-    /// garbage after corruption) — the stream itself may continue.
-    fn push(
-        &mut self,
-        frame: &mut frame::Audio,
-        samples: &mut Vec<f32>,
-    ) -> std::result::Result<(), ffmpeg::Error> {
-        if frame.channel_layout().is_empty() {
-            frame.set_channel_layout(ChannelLayout::default(frame.channels() as i32));
+        match self.stage {
+            Stage::Demux => match self.ictx.read_packet(&mut self.packet) {
+                Ok(()) if self.packet.stream() != self.stream_index => {}
+                Ok(()) => {
+                    if let Err(e) = self.decoder.send_packet(&self.packet) {
+                        self.budget.fail(e)?;
+                    }
+                }
+                Err(ffmpeg::Error::Eof) => {
+                    if let Err(e) = self.decoder.send_eof() {
+                        self.budget.fail(e)?;
+                    }
+                    self.stage = Stage::Flush;
+                }
+                Err(e) => self.budget.fail(e)?,
+            },
+            Stage::Flush => {
+                let step = self.clock.finish();
+                self.place(step)?;
+                self.sink
+                    .drain(&mut self.ready)
+                    .map_err(|e| super::decode_error("flushing audio resampler", e))?;
+                self.stage = Stage::Done;
+            }
+            Stage::Done => {}
         }
-        let params = (frame.format(), frame.channel_layout().bits(), frame.rate());
-        if params != (self.format, self.layout.bits(), self.rate) {
-            // Coherent parameters reconfigure; incoherent ones (a 17-channel
-            // frame out of a stereo stream) fail context creation and are
-            // charged to the caller's error budget.
-            let next = MonoSink::new(frame.format(), frame.channel_layout(), frame.rate())?;
-            self.drain(samples)?;
-            *self = next;
-        }
-        let capacity = scaled_capacity(frame.samples(), self.rate);
-        let mut out = frame::Audio::new(Sample::F32(Type::Packed), capacity, ChannelLayout::MONO);
-        self.ctx.run(frame, &mut out)?;
-        append_samples(&out, samples);
         Ok(())
     }
 
-    /// Drain the resampler's internal carry-over into `samples`.
-    fn drain(&mut self, samples: &mut Vec<f32>) -> std::result::Result<(), ffmpeg::Error> {
+    fn place(&mut self, step: SegStep<frame::Audio>) -> Result<()> {
+        self.dropped_frames += step.dropped.len();
+        for (at, mut frame) in step.released {
+            match self.sink.push(&mut frame, at, &mut self.ready) {
+                Ok(()) => self.budget.ok(),
+                Err(e) => self.budget.fail(e)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+struct Run {
+    ctx: resampling::Context,
+    input_end: f64,
+    output_pos: SamplePos,
+}
+
+struct MonoSink {
+    time_base: f64,
+    run: Option<Run>,
+    published_end: SamplePos,
+}
+
+impl MonoSink {
+    fn push(
+        &mut self,
+        frame: &mut frame::Audio,
+        at: LogicalTs,
+        ready: &mut VecDeque<AudioChunk>,
+    ) -> std::result::Result<(), ffmpeg::Error> {
+        if frame.rate() == 0 || frame.samples() == 0 {
+            return Err(ffmpeg::Error::InvalidData);
+        }
+        if frame.channel_layout().is_empty() {
+            frame.set_channel_layout(ChannelLayout::default(frame.channels() as i32));
+        }
+        let at = at.0;
+        let expected = self.run.as_ref().map_or(at, |run| run.input_end);
+        let position = SamplePos::from_seconds(at)?;
+        // Container PTS rounding must not split a continuous sample clock.
+        let tolerance = self.time_base.abs() + 1.0 / f64::from(frame.rate());
+        let continuous = self.run.is_some() && (at - expected).abs() <= tolerance;
+        let params = resampling::context::Definition {
+            format: frame.format(),
+            channel_layout: frame.channel_layout(),
+            rate: frame.rate(),
+        };
+        if !continuous
+            || self
+                .run
+                .as_ref()
+                .is_none_or(|run| *run.ctx.input() != params)
+        {
+            let ctx = resampling::Context::get(
+                params.format,
+                params.channel_layout,
+                params.rate,
+                Sample::F32(Type::Packed),
+                ChannelLayout::MONO,
+                WHISPER_SAMPLE_RATE,
+            )?;
+            self.drain(ready)?;
+            let output_pos = if continuous {
+                self.run.as_ref().expect("continuous run").output_pos
+            } else {
+                position
+            };
+            self.run = Some(Run {
+                ctx,
+                input_end: expected,
+                output_pos,
+            });
+        }
+        let run = self.run.as_mut().expect("resampler configured");
+        let capacity = (frame.samples() as u64 * u64::from(WHISPER_SAMPLE_RATE))
+            .div_ceil(u64::from(frame.rate())) as usize
+            + 256;
+        let mut output =
+            frame::Audio::new(Sample::F32(Type::Packed), capacity, ChannelLayout::MONO);
+        run.ctx.run(frame, &mut output)?;
+        run.input_end = if continuous { expected } else { at }
+            + frame.samples() as f64 / f64::from(frame.rate());
+        Self::publish(run, &mut self.published_end, &output, ready);
+        Ok(())
+    }
+
+    fn drain(
+        &mut self,
+        ready: &mut VecDeque<AudioChunk>,
+    ) -> std::result::Result<(), ffmpeg::Error> {
+        let Some(run) = self.run.as_mut() else {
+            return Ok(());
+        };
         loop {
-            let mut out = frame::Audio::new(Sample::F32(Type::Packed), 4096, ChannelLayout::MONO);
-            let delay = self.ctx.flush(&mut out)?;
-            append_samples(&out, samples);
-            if delay.is_none() || out.samples() == 0 {
+            let mut output =
+                frame::Audio::new(Sample::F32(Type::Packed), 4096, ChannelLayout::MONO);
+            let delay = run.ctx.flush(&mut output)?;
+            Self::publish(run, &mut self.published_end, &output, ready);
+            if delay.is_none() || output.samples() == 0 {
                 return Ok(());
             }
         }
     }
-}
 
-/// Output-frame capacity for `n` input samples at `in_rate`, with headroom
-/// for resampler carry-over.
-fn scaled_capacity(n: usize, in_rate: u32) -> usize {
-    let scaled = (n as u64 * u64::from(WHISPER_SAMPLE_RATE)).div_ceil(u64::from(in_rate.max(1)));
-    scaled as usize + 256
-}
-
-/// Append the valid samples of a packed mono f32 frame.
-fn append_samples(out: &frame::Audio, samples: &mut Vec<f32>) {
-    let n = out.samples();
-    if n == 0 {
-        return;
+    fn publish(
+        run: &mut Run,
+        end: &mut SamplePos,
+        output: &frame::Audio,
+        ready: &mut VecDeque<AudioChunk>,
+    ) {
+        let start = run.output_pos;
+        run.output_pos = start.advance(output.samples());
+        let skip = end.0.saturating_sub(start.0).max(0) as u64;
+        if skip >= output.samples() as u64 {
+            return;
+        }
+        let chunk = AudioChunk {
+            start: start.advance(skip as usize),
+            samples: output.plane::<f32>(0)[skip as usize..output.samples()].to_vec(),
+        };
+        *end = chunk.end();
+        ready.push_back(chunk);
     }
-    // Packed mono: one plane, one sample per frame slot.
-    samples.extend_from_slice(&out.plane::<f32>(0)[..n]);
 }
 
 #[cfg(test)]
@@ -350,20 +383,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn audio_ceiling_rejects_zero_and_beyond_the_hard_cap() {
-        assert_eq!(
-            AudioCeiling::from_seconds(0)
-                .expect_err("zero seconds is not a ceiling")
-                .code,
-            ErrorCode::InvalidConfig
-        );
-        assert_eq!(
-            AudioCeiling::from_seconds(MAX_CEILING_SECONDS + 1)
-                .expect_err("past the 24h hard cap")
-                .code,
-            ErrorCode::InvalidConfig
-        );
-        let cap = AudioCeiling::from_seconds(MAX_CEILING_SECONDS).expect("the cap itself is legal");
-        assert_eq!(cap.samples(), 24 * 3600 * 16_000);
+    fn trims_preroll_and_overlap() {
+        let mut sink = MonoSink {
+            time_base: 1.0 / 16_000.0,
+            run: None,
+            published_end: SamplePos(0),
+        };
+        let mut chunks = VecDeque::new();
+        for (at, n, value) in [(-0.5, 16_000, 1.0), (0.25, 16_000, 2.0), (1.25, 8_000, 3.0)] {
+            let mut audio = frame::Audio::new(Sample::F32(Type::Packed), n, ChannelLayout::MONO);
+            audio.set_rate(16_000);
+            audio.plane_mut::<f32>(0).fill(value);
+            sink.push(&mut audio, LogicalTs(at), &mut chunks)
+                .expect("coherent audio frame");
+        }
+        sink.drain(&mut chunks).expect("resampler tail");
+        let samples: Vec<_> = chunks
+            .into_iter()
+            .flat_map(|chunk| {
+                chunk
+                    .samples
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(i, sample)| (chunk.start.advance(i), sample))
+            })
+            .collect();
+        assert_eq!(samples.len(), 28_000);
+        for (i, (position, sample)) in samples.into_iter().enumerate() {
+            assert_eq!(position, SamplePos::from_samples(i as i64));
+            assert_eq!(
+                sample,
+                if i < 8_000 {
+                    1.0
+                } else if i < 20_000 {
+                    2.0
+                } else {
+                    3.0
+                }
+            );
+        }
     }
 }

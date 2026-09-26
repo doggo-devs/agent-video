@@ -125,7 +125,7 @@ pub struct ServerDeps {
     /// transcript recipe: the cache check and the whisper run share one
     /// critical section, so concurrent requests for the same transcript
     /// run the model once and the rest adopt the cached result.
-    pub transcriptions: KeyedGate,
+    pub transcriptions: KeyedGate<(crate::identity::ContentId, crate::transcribe::TranscriptId)>,
     /// Per-waiter bound on `transcriptions` admission: how long a rival
     /// call may wait for an in-flight transcription of the same content
     /// before answering "in flight — call again" instead of pinning its

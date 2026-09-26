@@ -6,8 +6,7 @@
 //! types from the self-spawned child's stdout — one definition, so a field
 //! rename is a compile error in the consumer instead of a runtime parse
 //! failure. Rich pipeline types convert *into* this module at the output
-//! boundary ([`Grid::new`]) and are never reconstructed from it: wire
-//! shapes are plain data with no invariants to bypass.
+//! boundary ([`Grid::new`]); deserialization validates range invariants.
 
 use serde::{Deserialize, Serialize};
 
@@ -156,7 +155,8 @@ pub struct Grid {
     #[serde(flatten)]
     pub image: GridImage,
     /// `"MM:SS-MM:SS"` (`"H:MM:SS"` past an hour).
-    pub time_range: String,
+    #[serde(with = "grid_range")]
+    pub time_range: TimeRange,
     /// Number of frames composed onto the grid.
     pub total_frames: usize,
     /// Hero frames; uniform grids carry none. Always serialized — an empty
@@ -180,7 +180,7 @@ impl Grid {
     pub fn new(meta: GridMeta, subtitles: GridSubtitles) -> Self {
         Grid {
             image: meta.image,
-            time_range: meta.time_range.to_string(),
+            time_range: meta.time_range,
             total_frames: meta.total_frames,
             key_frames: meta.key_frames,
             layout: meta.layout,
@@ -189,6 +189,35 @@ impl Grid {
                 GridSubtitles::NoSource | GridSubtitles::NoCueInRange => None,
             },
         }
+    }
+}
+
+/// Preserve the clock-string wire format while validating decoded bounds.
+mod grid_range {
+    use super::*;
+
+    pub fn serialize<S: serde::Serializer>(
+        range: &TimeRange,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(range)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<TimeRange, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let range = text.split_once('-').and_then(|(start, end)| {
+            TimeRange::new(
+                crate::types::parse_clock(start)?,
+                crate::types::parse_clock(end)?,
+            )
+        });
+        range.ok_or_else(|| {
+            serde::de::Error::custom(
+                "time_range must have finite, non-negative, ordered START-END bounds",
+            )
+        })
     }
 }
 
@@ -246,7 +275,10 @@ mod tests {
         assert_eq!(back.grids.len(), 1);
         let grid = &back.grids[0];
         assert!(matches!(&grid.image, GridImage::Base64(b) if b == "QUJD"));
-        assert_eq!(grid.time_range, "00:00-01:30");
+        assert_eq!(
+            (grid.time_range.start(), grid.time_range.end()),
+            (0.0, 90.0)
+        );
         assert_eq!(grid.key_frames[0].timestamp, "00:10");
         assert_eq!(grid.layout, LayoutKind::Uniform);
         assert_eq!(grid.subtitles.as_deref(), Some("00:01 hi"));
@@ -312,6 +344,44 @@ mod tests {
         // and `base64` is not representable.
         let json = r#"{"time_range": "00:00-01:30", "total_frames": 1, "layout": "UNIFORM"}"#;
         assert!(serde_json::from_str::<Grid>(json).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_grid_time_ranges() {
+        for range in [
+            "garbage",
+            "01:30-00:00",
+            "NaN-01:00",
+            "00:00-inf",
+            "-1-10",
+            "00:00-01:00-extra",
+        ] {
+            let mut json =
+                serde_json::to_value(grid(GridImage::File("g.jpg".into()))).expect("grid");
+            json["time_range"] = serde_json::Value::String(range.into());
+            assert!(serde_json::from_value::<Grid>(json).is_err(), "{range}");
+        }
+    }
+
+    #[test]
+    fn reads_grid_clocks_including_single_frame_ranges() {
+        for (text, start, end) in [
+            ("00:10-00:10", 10.0, 10.0),
+            ("1:02:03-1:03:04", 3723.0, 3784.0),
+        ] {
+            let mut json =
+                serde_json::to_value(grid(GridImage::File("g.jpg".into()))).expect("grid");
+            json["time_range"] = serde_json::Value::String(text.into());
+            let grid: Grid = serde_json::from_value(json).expect("valid clocks");
+            assert_eq!(
+                (grid.time_range.start(), grid.time_range.end()),
+                (start, end)
+            );
+            assert_eq!(
+                serde_json::to_value(grid).expect("grid")["time_range"],
+                text
+            );
+        }
     }
 
     /// Byte-for-byte pin of a `process` document — the compatibility proof

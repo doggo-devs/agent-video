@@ -73,7 +73,7 @@ pub struct Offer {
 
 /// Where a download lands: `cache` = disposable analysis copy under the LRU
 /// cache; `keep` = user-owned file in the keep directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Dest {
     Cache,
     Keep,
