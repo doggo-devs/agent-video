@@ -7,7 +7,9 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pin the image for its FFmpeg 8 packages instead of depending on when
+    # ubuntu-latest moves off 24.04 and its FFmpeg 6.1 packages.
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -21,7 +23,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev pkg-config \
             ffmpeg
+      - name: Report FFmpeg versions
+        run: |
+          ffmpeg -version
+          pkg-config --modversion libavcodec libavformat libavutil libswscale libswresample
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-26.04-ffmpeg-8
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - name: Check documentation links

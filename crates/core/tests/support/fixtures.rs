@@ -123,7 +123,8 @@ pub fn sparse_audio(rate: u32) -> Option<Fixture> {
     })
 }
 
-/// Continuous lossy audio exercising decoder skip-samples and resampler delay.
+/// Three seconds of lossy audio with smooth tone markers centered at 0.25s
+/// and 2.75s, exercising decoder skip-samples and resampler delay.
 pub fn primed_audio(codec: &str) -> Option<Fixture> {
     require_ffmpeg()?;
     let rate = if codec == "aac" { "44100" } else { "48000" };
@@ -140,11 +141,17 @@ pub fn primed_audio(codec: &str) -> Option<Fixture> {
         "-f",
         "lavfi",
         "-i",
-        &format!("sine=frequency=440:sample_rate={rate}:duration=3"),
+        &format!(
+            "aevalsrc=0.5*sin(2*PI*1000*t)*(exp(-pow((t-0.25)/0.01\\,2))+exp(-pow((t-2.75)/0.01\\,2))):s={rate}:d=3"
+        ),
         "-c:v",
         "libx264",
         "-c:a",
         codec,
+        // Preserve the requested source clock, including encoder pre-roll.
+        // Automatic muxer timestamp shifts are not what this fixture tests.
+        "-avoid_negative_ts",
+        "disabled",
         filename,
     ]);
     let dir = cached("primed-audio", &args, &[filename], |scratch| {

@@ -500,7 +500,7 @@ fn recovers_the_video_origin_without_losing_delayed_audio() {
 }
 
 #[test]
-fn lets_the_decoder_remove_aac_and_opus_priming_once() {
+fn preserves_aac_and_opus_samples_and_marker_positions() {
     for codec in ["aac", "libopus"] {
         let fx = require_fixture!(support::fixtures::primed_audio(codec));
         let blocks = audio_blocks(&fx.media, 100_000);
@@ -509,14 +509,53 @@ fn lets_the_decoder_remove_aac_and_opus_priming_once() {
             1,
             "{codec}: PTS quantization must not fragment the track"
         );
+        let block = &blocks[0];
+        // Let the codec/container declare its padding rather than assuming
+        // that every encoder produces exactly three seconds of decoded PCM.
+        // The CLI is an independent path through decode and resampling: our
+        // clock/sink must neither trim those samples again nor append any.
+        let reference = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&fx.media)
+            .args([
+                "-map", "0:a:0", "-ar", "16000", "-ac", "1", "-f", "f32le", "pipe:1",
+            ])
+            .output()
+            .expect("decode reference PCM");
         assert!(
-            blocks[0].start.seconds() <= 0.002,
-            "{codec}: first audible sample is at zero"
+            reference.status.success(),
+            "{codec}: reference decode failed: {}",
+            String::from_utf8_lossy(&reference.stderr)
         );
-        assert!(
-            (blocks[0].end().seconds() - 3.0).abs() <= 0.03,
-            "{codec}: decoder padding/trim"
+        assert_eq!(reference.stdout.len() % size_of::<f32>(), 0);
+        assert_eq!(
+            block.samples.len(),
+            reference.stdout.len() / size_of::<f32>(),
+            "{codec}: preserve the reference decoder's sample count"
         );
+
+        // Energy centroids locate actual sound, not just the chunk's label.
+        // Smooth symmetric markers avoid a codec-dependent silence threshold.
+        // 2ms allows container millisecond rounding and lossy encoding while
+        // remaining smaller than an extra Opus pre-skip (~6.5ms) or AAC frame.
+        for expected in [0.25, 2.75] {
+            let mut energy = 0.0;
+            let mut moment = 0.0;
+            for (i, sample) in block.samples.iter().enumerate() {
+                let at = block.start.advance(i).seconds();
+                if (at - expected).abs() < 0.1 {
+                    let weight = f64::from(*sample).powi(2);
+                    energy += weight;
+                    moment += at * weight;
+                }
+            }
+            assert!(energy > 1.0, "{codec}: missing tone marker at {expected}s");
+            let actual = moment / energy;
+            assert!(
+                (actual - expected).abs() <= 0.002,
+                "{codec}: tone marker at {actual:.6}s, expected {expected}s"
+            );
+        }
     }
 }
 
