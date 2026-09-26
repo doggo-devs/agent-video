@@ -99,10 +99,11 @@ pub fn sparse_audio(rate: u32) -> Option<Fixture> {
         "-f",
         "lavfi",
         "-i",
-        &format!("aevalsrc='if(lt(t,2),0.25,0.75)':s={rate}:d=4"),
+        &format!("aevalsrc='if(lt(t,1),0.25,0.75)':s={rate}:d=3"),
         "-af",
+        // Create the gap directly: aselect is a no-op in FFmpeg 8.0.1.
         &format!(
-            "asetnsamples=n={}:p=0,aselect='lt(t,1)+gte(t,2)',asetpts=PTS+1/TB",
+            "asetnsamples=n={}:p=0,asetpts='PTS+(1+gte(T,1))/TB'",
             rate / 100
         ),
         "-c:v",
@@ -137,7 +138,9 @@ pub fn primed_audio(codec: &str) -> Option<Fixture> {
         "-f",
         "lavfi",
         "-i",
-        "color=c=blue:s=64x48:r=1:d=3",
+        // Supply enough video frames for probing to establish its own origin;
+        // a three-frame video can inherit Opus's negative stream start time.
+        "color=c=blue:s=64x48:r=30:d=3",
         "-f",
         "lavfi",
         "-i",
