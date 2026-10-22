@@ -24,20 +24,17 @@ The default build links the system FFmpeg libraries dynamically, so the host
 needs a matching FFmpeg installed at runtime.
 
 For a self-contained release binary with **zero runtime dependencies**, build
-FFmpeg from source and link it statically (adds static dav1d for software AV1):
+FFmpeg from source and link it, dav1d (software AV1) and musl statically into
+one static-pie:
 
 ```bash
 ./scripts/build-static.sh
-# requires: git, nasm, meson, ninja, pkg-config, a C toolchain
+# requires: podman or docker; binary at target/static/agent-video
 ```
 
-The static binary still links glibc. For a single-file artifact with no dynamic
-deps, build against musl (needs `musl-tools` + `rustup target add
-x86_64-unknown-linux-musl`):
-
-```bash
-TARGET=x86_64-unknown-linux-musl ./scripts/build-static.sh
-```
+The build runs in an Alpine container, whose musl-native toolchain is what lets
+a fully static binary stay position-independent (and so keep ASLR). It targets
+the host's architecture and loads on any Linux of that architecture.
 
 The static build has **no TLS backend**: `https://` inputs to `process`/
 `extract` fail with `PROTOCOL_UNSUPPORTED`. This is deliberate — URL sources
