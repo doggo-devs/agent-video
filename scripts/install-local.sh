@@ -34,7 +34,7 @@ INSTALL_YTDLP="${AV_YTDLP:-}"             # yes|no|"" (ask)
 BIN_DIR="${AV_BIN_DIR:-$HOME/.local/bin}"
 BUILD_MODE="${AV_BUILD:-dynamic}"          # dynamic|static
 REUSE_BINARY=""                            # --binary <path>: skip build
-DO_BUILD=1                                 # --no-build: reuse target/release
+DO_BUILD=1                                 # --no-build: reuse the last build
 DO_INTEGRATE="${AV_INTEGRATE:-}"           # yes|no|"" (ask): skill + MCP wiring
 
 usage() {
@@ -50,8 +50,10 @@ Usage: scripts/install-local.sh [options]
       --asr[=yes|no]        Install local ASR weights (default: ask / no).
       --yt-dlp[=yes|no]     Install/verify yt-dlp for site URLs.
       --bin-dir <dir>       Install directory (default: ~/.local/bin).
-      --static | --dynamic  FFmpeg linkage (default: dynamic).
-      --no-build            Reuse an existing target/release/agent-video.
+      --static | --dynamic  FFmpeg linkage (default: dynamic). Static is a
+                            fully static Linux binary built in a container
+                            (podman or docker).
+      --no-build            Reuse the existing build for the chosen linkage.
       --binary <path>       Install this prebuilt local binary (no build).
       --integrate[=yes|no]  Copy the skill + register the `video` MCP server
                             into detected agents (pi/Claude/Codex/Cursor),
@@ -120,6 +122,13 @@ config_file() {
 }
 
 # ── resolve choices ──────────────────────────────────────────────────────────
+case "$BUILD_MODE" in
+  static)
+    [ "$OS" = Linux ] || die "--static builds a Linux binary; use --dynamic on $OS"
+    BUILT_BIN="$ROOT/target/static/agent-video" ;;
+  *) BUILT_BIN="$ROOT/target/release/agent-video" ;;
+esac
+
 bold "agent-video local installer  (${OS}/${ARCH}, build: ${BUILD_MODE})"
 echo
 
@@ -171,7 +180,7 @@ if [ -n "$REUSE_BINARY" ]; then
   [ -x "$REUSE_BINARY" ] || die "not an executable: $REUSE_BINARY"
   BIN_SRC="$REUSE_BINARY"
 elif [ "$DO_BUILD" = 0 ]; then
-  BIN_SRC="$ROOT/target/release/agent-video"
+  BIN_SRC="$BUILT_BIN"
   [ -x "$BIN_SRC" ] || die "no prebuilt binary at $BIN_SRC — drop --no-build to build it"
 else
   command -v cargo >/dev/null 2>&1 || die "cargo not found — install the Rust toolchain (https://rustup.rs)"
@@ -181,7 +190,7 @@ else
   else
     ( cd "$ROOT" && cargo build --release -p agent-video )
   fi
-  BIN_SRC="$ROOT/target/release/agent-video"
+  BIN_SRC="$BUILT_BIN"
   [ -x "$BIN_SRC" ] || die "build reported success but $BIN_SRC is missing"
 fi
 

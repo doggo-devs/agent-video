@@ -1,0 +1,13 @@
+# Builder image for the fully static release binary; scripts/build-static.sh
+# builds and runs it, scripts/static/build.sh runs inside it.
+#
+# Alpine because its gcc is musl-native: `-static-pie` resolves to musl's own
+# self-relocating rcrt1.o, so the binary keeps ASLR without a dynamic loader,
+# and the whole binary carries exactly one libc.
+FROM docker.io/library/rust:1-alpine
+
+# clang-libclang: bindgen (ffmpeg-sys) loads libclang at build time.
+# llvm-libunwind-static: std links `-lunwind` once Rust's bundled copy is off.
+RUN apk add --no-cache \
+      bash build-base clang-libclang git linux-headers llvm-libunwind-static \
+      meson nasm perl pkgconf

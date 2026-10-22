@@ -1,0 +1,13 @@
+#!/bin/sh
+# RUSTC_WRAPPER that links host artifacts (build scripts) dynamically.
+#
+# Rust's musl host defaults to crt-static, and a static build script cannot
+# dlopen() — which bindgen needs to load libclang. With `cargo --target`, host
+# artifacts are the only rustc invocations without a --target flag, so those
+# get crt-static turned off; target artifacts pass through untouched.
+rustc="$1"
+shift
+for arg in "$@"; do
+  case "$arg" in --target | --target=*) exec "$rustc" "$@" ;; esac
+done
+exec "$rustc" "$@" -C target-feature=-crt-static

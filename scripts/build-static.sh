@@ -1,139 +1,36 @@
 #!/usr/bin/env bash
-# Build a fully static, zero-dependency agent-video.
+# Build the fully static, zero-dependency agent-video: FFmpeg, dav1d and musl
+# all linked into one static-pie that loads on any Linux of the host's
+# architecture. The work runs inside an Alpine builder image
+# (scripts/static/Containerfile) whose musl-native gcc makes static-pie link
+# correctly; the result lands at target/static/agent-video.
 #
-# Built without `local-asr`, so transcription here is the API route only.
-# The prebuilt onnxruntime the local recognizer links is glibc-built and
-# incompatible with musl: a static musl binary segfaults inside musl's
-# allocator while loading any model — reproduced in a plain C program with no
-# Rust involved, so it is upstream's constraint rather than this build's.
-# Zero dynamic dependencies is the point of this variant; carrying a
-# recognizer that crashes is not a trade worth making.
-#
-# FFmpeg is compiled and linked statically. One capability needs a lib it does
-# not bundle: software AV1 (libdav1d). This builds it as a static lib, exposes
-# it via pkg-config, then builds with `static-ffmpeg` so FFmpeg's configure
-# picks up --enable-libdav1d. No hwaccel (--disable-autodetect) and no TLS
-# backend: URL downloads happen in the harness (rustls), FFmpeg only opens
-# local files.
-#
-# Requirements: git, nasm, meson, ninja, pkg-config, a C toolchain.
-# For a musl target, also musl-tools + the rustup target.
+# Requirements: podman or docker.
 #
 # Environment knobs:
-#   DAV1D_VERSION      dav1d git tag                     (default: 1.5.3)
-#   DEPS_PREFIX        static-lib install prefix
-#                      (default: target/static-deps-<libc>)
-#   TARGET             Rust target triple. A *-musl triple cross-builds the C
-#                      deps + Rust against musl for a no-dynamic-deps binary;
-#                      unset = host glibc target.
-#   FFMPEG_TARGET_CPU  -march baseline for distributable builds (e.g.
-#                      x86-64-v3), overriding ffmpeg-sys-next's -march=native.
+#   CONTAINER          runtime to use     (default: podman, else docker)
+#   DAV1D_VERSION      forwarded to scripts/static/build.sh
+#   FFMPEG_TARGET_CPU  forwarded to scripts/static/build.sh
+# Extra arguments are passed through to `cargo build`.
 set -euo pipefail
 
-DAV1D_VERSION="${DAV1D_VERSION:-1.5.3}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGET="${TARGET:-}"
-JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+IMAGE="agent-video-static-builder"
 
-# --- musl toolchain wiring ---------------------------------------------------
-# A *-musl target builds the C deps + Rust against musl: CC=musl-gcc for the C
-# side, the linker var for the Rust side. `link-self-contained=no` (set below)
-# reuses that same distro musl instead of Rust's bundled copy — one libc for the
-# whole binary.
-LIBC="gnu"
-if [[ "$TARGET" == *musl* ]]; then
-  LIBC="musl"
-  export CC="${CC:-musl-gcc}"
-  # cc reads CC_<triple> (lowercase); cargo reads CARGO_TARGET_<TRIPLE>_*.
-  triple_lower="${TARGET//-/_}"
-  triple_upper="$(echo "$triple_lower" | tr '[:lower:]' '[:upper:]')"
-  export "CC_${triple_lower}=${CC}"
-  export "CARGO_TARGET_${triple_upper}_LINKER=${CC}"
-fi
+runtime="${CONTAINER:-$(command -v podman || command -v docker || true)}"
+[ -n "$runtime" ] || { echo "error: needs podman or docker" >&2; exit 1; }
 
-PREFIX="${DEPS_PREFIX:-$ROOT/target/static-deps-$LIBC}"
+echo ">> preparing builder image $IMAGE"
+"$runtime" build -q -t "$IMAGE" -f "$ROOT/scripts/static/Containerfile" \
+  "$ROOT/scripts/static" >/dev/null
 
-# --- 1. Build dav1d as a static library (skip if already present) ------------
-if [ -f "$PREFIX/lib/libdav1d.a" ]; then
-  echo ">> reusing dav1d static lib at $PREFIX/lib/libdav1d.a"
-else
-  echo ">> building dav1d $DAV1D_VERSION (static, $LIBC) into $PREFIX"
-  work="$(mktemp -d)"
-  trap 'rm -rf "$work"' EXIT
-  git clone --depth 1 --branch "$DAV1D_VERSION" \
-    https://code.videolan.org/videolan/dav1d.git "$work/src"
-  meson setup "$work/build" "$work/src" \
-    --prefix="$PREFIX" \
-    --libdir=lib \
-    --default-library=static \
-    --buildtype=release \
-    -Denable_tools=false \
-    -Denable_tests=false
-  ninja -C "$work/build"
-  ninja -C "$work/build" install
-  rm -rf "$work"
-  trap - EXIT
-fi
+# Run as the invoking user so everything written under target/ stays theirs.
+case "$(basename "$runtime")" in
+  podman) user_args=(--userns=keep-id) ;;
+  *) user_args=(--user "$(id -u):$(id -g)") ;;
+esac
 
-# --- 2. Point FFmpeg's configure (via pkg-config) at the static deps ---------
-export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-export PKG_CONFIG_ALL_STATIC=1
-
-# --- 3. Optionally pin the FFmpeg C baseline for distributable artifacts ------
-# ffmpeg-sys-next hard-codes `-march=native` for host builds. A later -march on
-# the compiler line wins, so a thin CC wrapper that appends the desired baseline
-# neutralizes it without patching the crate. The wrapper also carries any
-# musl-gcc CC set above.
-#
-# Both names have to move. The `cc` crate resolves the compiler from
-# `CC_<triple>` first and only falls back to `CC`, so a cross build that
-# exported the triple-specific name above would keep using it and never see
-# the wrapper: the baseline would be announced here and absent from the
-# object files.
-#
-# The wrapper keeps the real compiler's filename, in a directory of its own.
-# FFmpeg's configure splits a compiler name into cross-prefix and tool and
-# re-joins them as `${prefix}gcc`, so a wrapper named anything else is looked
-# up under a name that does not exist: `ffmpeg-cc-wrapper` becomes
-# `ffmpeg-cc-gcc`, and configure fails outright. `musl-gcc` survives that
-# round trip because its own name already has the shape.
-if [ -n "${FFMPEG_TARGET_CPU:-}" ]; then
-  real_cc="$(command -v "${CC:-cc}")" \
-    || { echo "error: no C compiler on PATH (${CC:-cc})" >&2; exit 1; }
-  shim_dir="$ROOT/target/ffmpeg-cc-shim"
-  mkdir -p "$shim_dir"
-  wrapper="$shim_dir/$(basename "$real_cc")"
-  cat > "$wrapper" <<EOF
-#!/bin/sh
-exec $real_cc "\$@" -march=$FFMPEG_TARGET_CPU -mtune=generic
-EOF
-  chmod +x "$wrapper"
-  export PATH="$shim_dir:$PATH"
-  export CC="$wrapper"
-  [ -n "$TARGET" ] && export "CC_${TARGET//-/_}=$wrapper"
-  echo ">> pinning FFmpeg C baseline to -march=$FFMPEG_TARGET_CPU (via $real_cc)"
-fi
-
-# --- 4. musl link flags ------------------------------------------------------
-# Env RUSTFLAGS replaces .cargo/config.toml's cfg rustflags wholesale, so a musl
-# build must restate both: link-self-contained=no (reuse the distro musl) and
-# the CPU baseline. The baseline is restated only on x86_64, where the gcc
-# -march value (x86-64-v3) doubles as a valid rustc target-cpu; aarch64 -march
-# values like armv8-a are not rustc CPU names, and rustc's default `generic`
-# already is the armv8-a baseline.
-if [[ "$TARGET" == *musl* ]]; then
-  triple_upper="$(echo "${TARGET//-/_}" | tr '[:lower:]' '[:upper:]')"
-  musl_rustflags="-C link-self-contained=no"
-  if [[ -n "${FFMPEG_TARGET_CPU:-}" && "$TARGET" == x86_64* ]]; then
-    musl_rustflags="$musl_rustflags -C target-cpu=$FFMPEG_TARGET_CPU"
-  fi
-  export "CARGO_TARGET_${triple_upper}_RUSTFLAGS=$musl_rustflags"
-fi
-
-# --- 5. Build ----------------------------------------------------------------
-target_args=()
-[ -n "$TARGET" ] && target_args=(--target "$TARGET")
-features="--no-default-features --features static-ffmpeg"
-echo ">> cargo build --release -p agent-video $features ${target_args[*]}"
-# shellcheck disable=SC2086 # $features is two flag pairs, not one word.
-exec cargo build --release -p agent-video $features "${target_args[@]}" "$@"
+exec "$runtime" run --rm "${user_args[@]}" \
+  -v "$ROOT:/src" -w /src \
+  -e HOME=/tmp -e DAV1D_VERSION -e FFMPEG_TARGET_CPU \
+  "$IMAGE" scripts/static/build.sh "$@"

@@ -11,9 +11,11 @@ jobs:
   build:
     name: ${{ matrix.target }} (${{ matrix.variant }})
     runs-on: ${{ matrix.os }}
-    # Linux builds run in a Debian 13 (trixie) container so the binary links
-    # against trixie's glibc rather than the newer one on the GitHub runner,
-    # keeping it loadable on any distro at least as recent.
+    # Dynamic Linux builds run in a Debian 13 (trixie) container so the binary
+    # links against trixie's glibc rather than the newer one on the GitHub
+    # runner, keeping it loadable on any distro at least as recent. Static
+    # builds run on the bare runner: build-static.sh brings its own Alpine
+    # builder image.
     container: ${{ matrix.container }}
     strategy:
       fail-fast: false
@@ -33,10 +35,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
             variant: dynamic
           # fully-static musl: FFmpeg + dav1d + libc all linked in — a single
-          # file with no dynamic dependencies, loadable on any Linux.
+          # static-pie with no dynamic dependencies, loadable on any Linux.
           # Software AV1 via bundled dav1d, no hwaccel.
           - os: ubuntu-latest
-            container: rust:1-trixie
+            container: ""
             target: x86_64-unknown-linux-musl
             variant: static
             ffmpeg_cpu: x86-64-v3
@@ -48,7 +50,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             variant: dynamic
           - os: ubuntu-24.04-arm
-            container: rust:1-trixie
+            container: ""
             target: aarch64-unknown-linux-musl
             variant: static
             ffmpeg_cpu: armv8-a
@@ -77,20 +79,11 @@ jobs:
           [ "v$crate" = "$GITHUB_REF_NAME" ] || {
             echo "tag $GITHUB_REF_NAME != crate version $crate" >&2; exit 1; }
 
+      # Static builds get their toolchain from the builder image instead.
       - uses: dtolnay/rust-toolchain@stable
+        if: matrix.variant == 'dynamic'
 
       # --- FFmpeg / build-tool provisioning -----------------------------------
-      - name: Install build deps (Linux, static)
-        if: runner.os == 'Linux' && matrix.variant == 'static'
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential nasm meson ninja-build pkg-config git perl
-      - name: Install musl toolchain + rustup target (Linux, musl)
-        if: contains(matrix.target, 'musl')
-        run: |
-          apt-get install -y --no-install-recommends musl-tools
-          rustup target add ${{ matrix.target }}
       - name: Install build deps (Linux, dynamic)
         if: runner.os == 'Linux' && matrix.variant == 'dynamic'
         run: |
@@ -107,18 +100,17 @@ jobs:
           "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
 
       - uses: Swatinem/rust-cache@v2
+        if: matrix.variant == 'dynamic'
         with:
           key: ${{ matrix.target }}-${{ matrix.variant }}
 
       # --- Build --------------------------------------------------------------
-      # Static builds route through build-static.sh; a musl target sets TARGET
-      # so the C deps compile against musl and cargo cross-builds, landing the
-      # binary under target/<triple>/release instead of target/release.
+      # Static builds route through build-static.sh, which builds for the
+      # runner's own architecture and lands the binary at target/static.
       - name: Build (static)
         if: matrix.variant == 'static'
         env:
           FFMPEG_TARGET_CPU: ${{ matrix.ffmpeg_cpu }}
-          TARGET: ${{ contains(matrix.target, 'musl') && matrix.target || '' }}
         run: ./scripts/build-static.sh
       - name: Build (dynamic, Linux)
         if: matrix.variant == 'dynamic' && runner.os == 'Linux'
@@ -134,15 +126,14 @@ jobs:
         if: matrix.variant == 'dynamic' && runner.os == 'Windows'
         run: cargo build --release
 
-      # Resolve the release output dir: native (dynamic gnu) builds land in
-      # target/release; a musl build passes --target and lands in
-      # target/<triple>/release.
+      # Resolve the release output dir: dynamic builds land in target/release,
+      # static ones in target/static.
       - name: Resolve output dir
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          if [[ "${{ matrix.target }}" == *musl* ]]; then
-            echo "OUT_DIR=target/${{ matrix.target }}/release" >> "$GITHUB_ENV"
+          if [ "${{ matrix.variant }}" = static ]; then
+            echo "OUT_DIR=target/static" >> "$GITHUB_ENV"
           else
             echo "OUT_DIR=target/release" >> "$GITHUB_ENV"
           fi
