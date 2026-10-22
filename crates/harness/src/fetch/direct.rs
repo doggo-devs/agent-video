@@ -172,7 +172,7 @@ impl<T: Transport> Transport for StallGuard<T> {
             let slice = self.tick.min(idle_left).min(ceiling_left);
             let slice_timeout = NextTimeout {
                 after: UreqDuration::Exact(slice),
-                reason: timeout.reason,
+                ..timeout
             };
             match self.inner.await_input(slice_timeout) {
                 Ok(made_progress) => return Ok(made_progress),
@@ -795,6 +795,7 @@ mod tests {
         NextTimeout {
             after: UreqDuration::NotHappening,
             reason: ureq::Timeout::RecvBody,
+            ..NextTimeout::default()
         }
     }
 

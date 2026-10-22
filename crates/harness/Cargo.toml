@@ -28,14 +28,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 toml = "1"
-dirs = "6"
+dirs = "7"
 sha2 = "0.11"
 ureq = "3"
 # Statically linked by default: the build script fetches a prebuilt
 # `-static-lib` archive, so no onnxruntime is required on the host and the
 # binary carries no new dynamic dependency.
-sherpa-onnx = { version = "1.13.5", optional = true }
-rmcp = { version = "2", default-features = false, features = [
+sherpa-onnx = { version = "1.13.8", optional = true }
+rmcp = { version = "3", default-features = false, features = [
     "server",
     "transport-io",
 ] }

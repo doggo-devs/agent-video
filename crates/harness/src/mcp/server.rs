@@ -11,8 +11,8 @@ use std::time::SystemTime;
 
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Implementation, ListToolsResult, PaginatedRequestParams,
-    ProgressNotificationParam, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
+    PaginatedRequestParams, ProgressNotificationParam, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler};
@@ -37,15 +37,10 @@ impl VideoServer {
 }
 
 impl ServerHandler for VideoServer {
-    fn get_info(&self) -> ServerInfo {
-        // The rmcp model types are `#[non_exhaustive]`; build by mutation.
-        let mut server_info = Implementation::default();
-        server_info.name = "agent-video".to_string();
-        server_info.version = env!("CARGO_PKG_VERSION").to_string();
-        let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info.server_info = server_info;
-        info
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
+            Implementation::new("agent-video", env!("CARGO_PKG_VERSION")),
+        )
     }
 
     async fn list_tools(
@@ -67,7 +62,7 @@ impl ServerHandler for VideoServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let handler: Handler = match request.name.as_ref() {
             "video" => handle_video_call,
             "video_confirm" => handle_confirm_call,
@@ -75,7 +70,8 @@ impl ServerHandler for VideoServer {
                 return Ok(failed(&crate::fault::Fault::bad_input(format!(
                     "unknown tool \"{other}\"; this server exposes \"video\" and \
                      \"video_confirm\""
-                ))));
+                )))
+                .into());
             }
         };
         let args = request.arguments.unwrap_or_default();
@@ -107,6 +103,7 @@ impl ServerHandler for VideoServer {
         let deps = Arc::clone(&self.deps);
         tokio::task::spawn_blocking(move || handler(&args, &deps, &notify))
             .await
+            .map(CallToolResponse::from)
             .map_err(|e| McpError::internal_error(format!("handler task failed: {e}"), None))
     }
 }
