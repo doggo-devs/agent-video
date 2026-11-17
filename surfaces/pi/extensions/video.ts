@@ -28,7 +28,7 @@ import {
 
 const require = createRequire(import.meta.url);
 
-const RELEASES_URL = "https://github.com/durvia/agent-video/releases";
+const RELEASES_URL = "https://github.com/doggo-devs/agent-video/releases";
 
 function resolveBinary(): string {
 	const override = process.env["AGENT_VIDEO_BIN"];

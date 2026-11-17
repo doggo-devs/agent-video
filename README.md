@@ -49,7 +49,7 @@ Binary resolution order is `$AGENT_VIDEO_BIN`, then the platform package — no
 
 Release tarballs for every platform (dynamic without a suffix, `-static` for
 the self-contained variant) are attached to each tag at
-<https://github.com/durvia/agent-video/releases>. The static Linux build is a
+<https://github.com/doggo-devs/agent-video/releases>. The static Linux build is a
 single file with no dynamic dependencies; the dynamic builds are GPU-capable
 and expect a matching system FFmpeg.
 

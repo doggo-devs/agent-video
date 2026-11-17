@@ -15,7 +15,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/durvia/agent-video.git",
+    "url": "git+https://github.com/doggo-devs/agent-video.git",
     "directory": "packages/harness"
   }
 }

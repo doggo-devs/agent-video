@@ -6,7 +6,7 @@ members = ["crates/core", "crates/harness", "crates/cli"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/durvia/agent-video"
+repository = "https://github.com/doggo-devs/agent-video"
 
 # Versions shared by more than one member live here so they cannot drift
 # crate-by-crate; single-user dependencies stay in their member manifest.

@@ -16,7 +16,7 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 
-const RELEASES_URL = "https://github.com/durvia/agent-video/releases";
+const RELEASES_URL = "https://github.com/doggo-devs/agent-video/releases";
 const PLATFORM_KEY = `${process.platform}-${process.arch}`;
 
 function resolveBinary() {

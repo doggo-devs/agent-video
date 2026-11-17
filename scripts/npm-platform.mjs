@@ -50,7 +50,7 @@ writeFileSync(
       license: "Apache-2.0",
       repository: {
         type: "git",
-        url: "git+https://github.com/durvia/agent-video.git",
+        url: "git+https://github.com/doggo-devs/agent-video.git",
       },
       preferUnplugged: true,
       os: [spec.os],
@@ -66,7 +66,7 @@ writeFileSync(
   `# @agent-video/${platform}\n\n` +
     `Prebuilt \`agent-video\` core binary for ${spec.os} ${spec.cpu}. ` +
     "Installed automatically as an optional dependency of " +
-    "[@agent-video/harness](https://github.com/durvia/agent-video); " +
+    "[@agent-video/harness](https://github.com/doggo-devs/agent-video); " +
     "not meant to be installed directly.\n",
 );
 
