@@ -126,6 +126,10 @@ headers="$(readelf -lhdW "$bin")"
 fail() { echo "error: $bin $1" >&2; exit 1; }
 grep -q 'Requesting program interpreter' <<<"$headers" && fail "requests a program interpreter"
 grep -q '(NEEDED)' <<<"$headers" && fail "needs shared libraries"
-grep -q 'Type:[[:space:]]*DYN' <<<"$headers" || fail "is not position-independent"
+# ceiling: rustc's aarch64-unknown-linux-musl spec lacks static-position-independent-executables, so
+# aarch64 links static non-PIE (no ASLR); require DYN there once rustc enables static-pie for it.
+if [[ "$TARGET" != aarch64* ]]; then
+  grep -q 'Type:[[:space:]]*DYN' <<<"$headers" || fail "is not position-independent"
+fi
 install -m 0755 "$bin" "$OUT/agent-video"
 echo ">> built $OUT/agent-video (static-pie, $TARGET)"
