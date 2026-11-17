@@ -94,11 +94,21 @@ jobs:
       - name: Install FFmpeg (macOS)
         if: runner.os == 'macOS'
         run: brew install ffmpeg pkg-config
-      - name: Install FFmpeg (Windows, vcpkg)
+      # Prebuilt by ffmpeg-windows.yml: vcpkg from source costs ~27 min and
+      # tag runs never share an actions/cache entry.
+      - name: Install FFmpeg (Windows, prebuilt)
         if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FFMPEG_WIN_TAG: deps-ffmpeg-win64-1
+          FFMPEG_WIN_SHA256: 3a9a44d65b0016ea44c6ef3c0c2a34f19f8f29e1979f9e76bd07a389a66e1e31
         run: |
-          vcpkg install ffmpeg[avcodec,avformat,swscale]:x64-windows
-          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          gh release download $env:FFMPEG_WIN_TAG -p ffmpeg-win64.zip -R $env:GITHUB_REPOSITORY
+          $sha = (Get-FileHash ffmpeg-win64.zip -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne $env:FFMPEG_WIN_SHA256) { throw "ffmpeg-win64.zip sha256 $sha != pinned $env:FFMPEG_WIN_SHA256" }
+          Expand-Archive ffmpeg-win64.zip -DestinationPath "$env:RUNNER_TEMP\ffmpeg"
+          "FFMPEG_DIR=$env:RUNNER_TEMP\ffmpeg" >> $env:GITHUB_ENV
 
       - uses: Swatinem/rust-cache@v2
         if: matrix.variant == 'dynamic'
@@ -154,7 +164,8 @@ jobs:
           $stage = "stage/agent-video"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item target/release/agent-video.exe $stage
-          Copy-Item "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\*.dll" $stage
+          # bin/ also carries vcpkg's pkgconf-8.dll, which the exe never loads.
+          Get-ChildItem "$env:FFMPEG_DIR\bin\*.dll" -Exclude pkgconf* | Copy-Item -Destination $stage
           Compress-Archive -Path "$stage/*" `
             -DestinationPath "agent-video-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
 
