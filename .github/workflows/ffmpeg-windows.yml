@@ -1,0 +1,73 @@
+name: ffmpeg-windows
+
+# Builds the trimmed FFmpeg the Windows release links against, once, and
+# publishes it as a release asset of this repo. vcpkg compiles FFmpeg from
+# source (~27 min) and the release workflow runs on fresh tags, which never see
+# each other's actions/cache entries, so release.yml downloads this prebuilt
+# package instead. Third-party Windows builds (BtbN, gyan) bundle every codec
+# and would more than double the win32-x64 npm package.
+#
+# Run it by hand when FFmpeg should move, then pin the printed tag and sha256
+# in release.yml (FFMPEG_WIN_TAG / FFMPEG_WIN_SHA256).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish under, e.g. deps-ffmpeg-win64-1"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only the libraries ffmpeg-next is built with (codec, format,
+      # software-scaling, software-resampling); avutil comes with core.
+      - name: Build FFmpeg (vcpkg)
+        run: vcpkg install "ffmpeg[core,avcodec,avformat,swresample,swscale]:x64-windows"
+
+      # The FFMPEG_DIR layout ffmpeg-sys-next expects: include/, lib/*.lib,
+      # plus bin/*.dll for packaging next to the exe.
+      - name: Package
+        shell: pwsh
+        run: |
+          $src = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          $pkg = "ffmpeg-win64"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item -Recurse "$src\include", "$src\lib", "$src\bin" $pkg
+          Remove-Item -Recurse -Force "$pkg\lib\pkgconfig" -ErrorAction SilentlyContinue
+          vcpkg list ffmpeg | Out-File -Encoding utf8 "$pkg\VERSION.txt"
+          Compress-Archive -Path "$pkg\*" -DestinationPath "$pkg.zip"
+          $sha = (Get-FileHash "$pkg.zip" -Algorithm SHA256).Hash.ToLower()
+          "$sha  $pkg.zip" | Out-File -Encoding ascii "$pkg.zip.sha256"
+          Get-Content "$pkg\VERSION.txt"
+          Get-ChildItem "$pkg\bin"
+          "sha256: $sha"
+
+      # Prove the package is enough before publishing it: link the release
+      # build against it and start the exe with only the bundled DLLs.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Smoke build
+        shell: pwsh
+        run: |
+          Expand-Archive ffmpeg-win64.zip -DestinationPath "$env:RUNNER_TEMP\ffmpeg"
+          $env:FFMPEG_DIR = "$env:RUNNER_TEMP\ffmpeg"
+          Remove-Item Env:VCPKG_ROOT -ErrorAction SilentlyContinue
+          cargo build --release
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" target/release
+          ./target/release/agent-video.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ inputs.tag }}" ffmpeg-win64.zip ffmpeg-win64.zip.sha256
+          --prerelease --latest=false --target "${{ github.sha }}"
+          --title "${{ inputs.tag }}"
+          --notes "Trimmed FFmpeg for the Windows release build (FFMPEG_DIR layout). See .github/workflows/ffmpeg-windows.yml."
