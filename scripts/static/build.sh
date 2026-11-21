@@ -31,8 +31,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="$ROOT/target/static"
 PREFIX="$OUT/deps"
 TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-triple_lower="${TARGET//-/_}"
-triple_upper="$(echo "$triple_lower" | tr '[:lower:]' '[:upper:]')"
+triple_upper="$(echo "${TARGET//-/_}" | tr '[:lower:]' '[:upper:]')"
 
 # The image is discarded after each run; keep the crate cache with the build.
 export CARGO_HOME="$OUT/cargo"
@@ -65,32 +64,14 @@ export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PAT
 export PKG_CONFIG_ALL_STATIC=1
 
 # --- 3. Optionally pin the FFmpeg C baseline for distributable artifacts ------
-# ffmpeg-sys-next hard-codes `-march=native` for host builds. A later -march on
-# the compiler line wins, so a thin CC wrapper that appends the desired baseline
-# neutralizes it without patching the crate.
-#
-# Both names have to move. The `cc` crate resolves the compiler from
-# `CC_<triple>` first and only falls back to `CC`, so exporting only one would
-# let the baseline be announced here and stay absent from the object files.
-#
-# The wrapper keeps the real compiler's filename, in a directory of its own.
-# FFmpeg's configure splits a compiler name into cross-prefix and tool and
-# re-joins them as `${prefix}gcc`, so a wrapper named anything else is looked
-# up under a name that does not exist.
+# ffmpeg-sys-next passes `-march=native -mtune=native` to FFmpeg's configure
+# for host builds unless FFMPEG_MARCH / FFMPEG_MTUNE say otherwise. Native
+# would bake the runner's ISA (AVX-512 on GitHub's x86 runners) into plain C
+# code that has no runtime CPU check. Configure ignores $CC, so no compiler
+# wrapper can reach it.
 if [ -n "${FFMPEG_TARGET_CPU:-}" ]; then
-  real_cc="$(command -v cc)"
-  shim_dir="$OUT/cc-shim"
-  mkdir -p "$shim_dir"
-  wrapper="$shim_dir/$(basename "$real_cc")"
-  cat > "$wrapper" <<EOF
-#!/bin/sh
-exec $real_cc "\$@" -march=$FFMPEG_TARGET_CPU -mtune=generic
-EOF
-  chmod +x "$wrapper"
-  export PATH="$shim_dir:$PATH"
-  export CC="$wrapper"
-  export "CC_${triple_lower}=$wrapper"
-  echo ">> pinning FFmpeg C baseline to -march=$FFMPEG_TARGET_CPU (via $real_cc)"
+  export FFMPEG_MARCH="$FFMPEG_TARGET_CPU" FFMPEG_MTUNE=generic
+  echo ">> pinning FFmpeg C baseline to -march=$FFMPEG_TARGET_CPU"
 fi
 
 # --- 4. Link flags -----------------------------------------------------------
