@@ -16,18 +16,12 @@ workspace = true
 # declaration. Off by default — a library consumer gets a clap-free core;
 # the CLI crate turns it on.
 clap = ["dep:clap"]
-# Zero-dependency release build: compile FFmpeg from source and link it
-# statically. `build-lib-dav1d` adds `--enable-libdav1d` (software AV1); the
-# static lib must be on PKG_CONFIG_PATH at build time — see
-# scripts/build-static.sh. No TLS backend: URL downloads happen in the harness
-# (rustls), so FFmpeg only ever opens local files; a direct `https://` input
-# fails with PROTOCOL_UNSUPPORTED. Day-to-day builds link the system FFmpeg
-# via pkg-config instead (fast).
-static-ffmpeg = [
-    "ffmpeg-next/build",
-    "ffmpeg-next/static",
-    "ffmpeg-next/build-lib-dav1d",
-]
+# Zero-dependency release build: link a static FFmpeg (with dav1d for
+# software AV1) found through pkg-config, as scripts/build-static.sh builds it.
+# No TLS backend: URL downloads happen in the harness (rustls), so FFmpeg only
+# ever opens local files; a direct `https://` input fails with
+# PROTOCOL_UNSUPPORTED. Day-to-day builds link the system FFmpeg dynamically.
+static-ffmpeg = ["ffmpeg-next/static"]
 
 [dependencies]
 ffmpeg-next = { version = "9", default-features = false, features = [

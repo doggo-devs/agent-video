@@ -8,8 +8,7 @@ rustflags = ["-C", "target-cpu=x86-64-v3"]
 
 # The release/distribution build: FFmpeg + dav1d + musl in one static-pie,
 # zero runtime dependencies. Use `./scripts/build-static.sh` — it runs in an
-# Alpine container that builds static dav1d and puts it on PKG_CONFIG_PATH,
-# which the `static-ffmpeg` feature needs for `--enable-libdav1d` (software
-# AV1). Running the feature bare (no deps on PKG_CONFIG_PATH) makes FFmpeg's
-# configure fail. Plain `cargo build --release` still links the system FFmpeg
-# dynamically for fast iteration.
+# Alpine container that builds static dav1d and FFmpeg and puts them on
+# PKG_CONFIG_PATH, where the `static-ffmpeg` feature links them from. Plain
+# `cargo build --release` still links the system FFmpeg dynamically for fast
+# iteration.

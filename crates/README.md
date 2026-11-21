@@ -32,6 +32,9 @@ one static-pie:
 # requires: podman or docker; binary at target/static/agent-video
 ```
 
+The first run builds dav1d and FFmpeg into `target/static/deps`; later runs
+reuse them until a version or `FFMPEG_TARGET_CPU` changes.
+
 The build runs in an Alpine container, whose musl-native toolchain is what lets
 a fully static binary stay position-independent (and so keep ASLR). It targets
 the host's architecture and loads on any Linux of that architecture.

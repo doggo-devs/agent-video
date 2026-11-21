@@ -10,6 +10,7 @@
 # Environment knobs:
 #   CONTAINER          runtime to use     (default: podman, else docker)
 #   DAV1D_VERSION      forwarded to scripts/static/build.sh
+#   FFMPEG_VERSION     forwarded to scripts/static/build.sh
 #   FFMPEG_TARGET_CPU  forwarded to scripts/static/build.sh
 # Extra arguments are passed through to `cargo build`.
 set -euo pipefail
@@ -32,5 +33,5 @@ esac
 
 exec "$runtime" run --rm "${user_args[@]}" \
   -v "$ROOT:/src" -w /src \
-  -e HOME=/tmp -e DAV1D_VERSION -e FFMPEG_TARGET_CPU \
+  -e HOME=/tmp -e DAV1D_VERSION -e FFMPEG_VERSION -e FFMPEG_TARGET_CPU \
   "$IMAGE" scripts/static/build.sh "$@"
