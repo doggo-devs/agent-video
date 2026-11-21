@@ -43,6 +43,7 @@ jobs:
             variant: static
             ffmpeg_cpu: x86-64-v3
             smoke_cpu: Haswell-noTSX
+            deps_sha256: 171b9fd073906d93bd3d574a5902840babb7958c03d9b187c32659300164b658
             npm_platform: linux-x64
 
           # --- Linux aarch64 (native arm runner, no cross-compile) --------
@@ -56,6 +57,7 @@ jobs:
             variant: static
             ffmpeg_cpu: armv8-a
             smoke_cpu: cortex-a72
+            deps_sha256: f181e5a067f605754e2a7ea4ceba7bb02aa15013e600e7d55cf718a5955f4c71
             npm_platform: linux-arm64
 
           # --- macOS aarch64 (dynamic; requires `brew install ffmpeg`). ----
@@ -111,6 +113,19 @@ jobs:
           if ($sha -ne $env:FFMPEG_WIN_SHA256) { throw "ffmpeg-win64.zip sha256 $sha != pinned $env:FFMPEG_WIN_SHA256" }
           Expand-Archive ffmpeg-win64.zip -DestinationPath "$env:RUNNER_TEMP\ffmpeg"
           "FFMPEG_DIR=$env:RUNNER_TEMP\ffmpeg" >> $env:GITHUB_ENV
+
+      # Prebuilt by ffmpeg-musl.yml: dav1d + FFmpeg are most of a static build.
+      - name: Fetch static deps (prebuilt)
+        if: matrix.variant == 'static'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATIC_DEPS_TAG: deps-ffmpeg-musl-1
+        run: |
+          pkg="ffmpeg-musl-$(uname -m).tar.gz"
+          gh release download "$STATIC_DEPS_TAG" -p "$pkg" -R "$GITHUB_REPOSITORY"
+          echo "${{ matrix.deps_sha256 }}  $pkg" | sha256sum -c
+          mkdir -p target/static
+          tar -C target/static -xzf "$pkg"
 
       # --- Build --------------------------------------------------------------
       # No rust-cache: entries a tag run saves are invisible to the next tag.
