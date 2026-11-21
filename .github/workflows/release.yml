@@ -112,12 +112,8 @@ jobs:
           Expand-Archive ffmpeg-win64.zip -DestinationPath "$env:RUNNER_TEMP\ffmpeg"
           "FFMPEG_DIR=$env:RUNNER_TEMP\ffmpeg" >> $env:GITHUB_ENV
 
-      - uses: Swatinem/rust-cache@v2
-        if: matrix.variant == 'dynamic'
-        with:
-          key: ${{ matrix.target }}-${{ matrix.variant }}
-
       # --- Build --------------------------------------------------------------
+      # No rust-cache: entries a tag run saves are invisible to the next tag.
       # Static builds route through build-static.sh, which builds for the
       # runner's own architecture and lands the binary at target/static.
       - name: Build (static)
