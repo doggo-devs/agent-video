@@ -42,6 +42,7 @@ jobs:
             target: x86_64-unknown-linux-musl
             variant: static
             ffmpeg_cpu: x86-64-v3
+            smoke_cpu: Haswell-noTSX
             npm_platform: linux-x64
 
           # --- Linux aarch64 (native arm runner, no cross-compile) --------
@@ -54,6 +55,7 @@ jobs:
             target: aarch64-unknown-linux-musl
             variant: static
             ffmpeg_cpu: armv8-a
+            smoke_cpu: cortex-a72
             npm_platform: linux-arm64
 
           # --- macOS aarch64 (dynamic; requires `brew install ffmpeg`). ----
@@ -123,6 +125,17 @@ jobs:
         env:
           FFMPEG_TARGET_CPU: ${{ matrix.ffmpeg_cpu }}
         run: ./scripts/build-static.sh
+      # Decode on an emulated CPU at the claimed baseline: instructions leaked
+      # from the runner's newer ISA (AVX-512, SVE) SIGILL here, not on users.
+      - name: Smoke (static, baseline CPU)
+        if: matrix.variant == 'static'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user ffmpeg
+          ffmpeg -loglevel error -f lavfi -i testsrc2=s=640x360:r=25:d=3 \
+            -c:v libx264 -pix_fmt yuv420p "$RUNNER_TEMP/smoke.mp4"
+          "qemu-$(uname -m)" -cpu ${{ matrix.smoke_cpu }} target/static/agent-video \
+            process "$RUNNER_TEMP/smoke.mp4" -o "$RUNNER_TEMP/smoke-out"
       - name: Build (dynamic, Linux)
         if: matrix.variant == 'dynamic' && runner.os == 'Linux'
         env:
