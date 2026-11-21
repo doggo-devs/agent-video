@@ -125,17 +125,12 @@ jobs:
         env:
           FFMPEG_TARGET_CPU: ${{ matrix.ffmpeg_cpu }}
         run: ./scripts/build-static.sh
-      # Decode on an emulated CPU at the claimed baseline: instructions leaked
-      # from the runner's newer ISA (AVX-512, SVE) SIGILL here, not on users.
       - name: Smoke (static, baseline CPU)
         if: matrix.variant == 'static'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-user ffmpeg
-          ffmpeg -loglevel error -f lavfi -i testsrc2=s=640x360:r=25:d=3 \
-            -c:v libx264 -pix_fmt yuv420p "$RUNNER_TEMP/smoke.mp4"
-          "qemu-$(uname -m)" -cpu ${{ matrix.smoke_cpu }} target/static/agent-video \
-            process "$RUNNER_TEMP/smoke.mp4" -o "$RUNNER_TEMP/smoke-out"
+          ./scripts/smoke-static.sh ${{ matrix.smoke_cpu }}
       - name: Build (dynamic, Linux)
         if: matrix.variant == 'dynamic' && runner.os == 'Linux'
         env:

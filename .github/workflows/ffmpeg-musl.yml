@@ -1,0 +1,82 @@
+name: ffmpeg-musl
+
+# Builds the static dav1d + FFmpeg prefix the static Linux releases link
+# against, once per arch, and publishes it as release assets of this repo.
+# Compiling them is most of a static build, and the release workflow runs on
+# fresh tags, which never see each other's actions/cache entries, so
+# release.yml drops this prebuilt prefix into target/static/deps instead.
+#
+# Run it by hand when DAV1D_VERSION / FFMPEG_VERSION (scripts/static/build.sh)
+# or a CPU baseline moves, then pin the tag and the printed sha256s in
+# release.yml (STATIC_DEPS_TAG / deps_sha256). The prefix carries a STAMP;
+# build.sh rebuilds instead of reusing one that does not match.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish under, e.g. deps-ffmpeg-musl-1"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # Baselines must match release.yml's static entries.
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+            ffmpeg_cpu: x86-64-v3
+            smoke_cpu: Haswell-noTSX
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            ffmpeg_cpu: armv8-a
+            smoke_cpu: cortex-a72
+    steps:
+      - uses: actions/checkout@v4
+
+      # A full static build: the prefix comes out of it, and the binary linked
+      # against it proves the prefix is enough before publishing.
+      - name: Build
+        env:
+          FFMPEG_TARGET_CPU: ${{ matrix.ffmpeg_cpu }}
+        run: ./scripts/build-static.sh
+      - name: Smoke (baseline CPU)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user ffmpeg
+          ./scripts/smoke-static.sh ${{ matrix.smoke_cpu }}
+
+      - name: Package
+        run: |
+          pkg="ffmpeg-musl-${{ matrix.arch }}.tar.gz"
+          tar -C target/static -czf "$pkg" deps
+          sha256sum "$pkg" | tee "$pkg.sha256"
+          cat target/static/deps/STAMP
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-musl-${{ matrix.arch }}
+          path: ffmpeg-musl-*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ inputs.tag }}" ffmpeg-musl-*
+          -R "$GITHUB_REPOSITORY"
+          --prerelease --latest=false --target "${{ github.sha }}"
+          --title "${{ inputs.tag }}"
+          --notes "Static dav1d + FFmpeg prefixes for the static Linux release builds (target/static/deps). See .github/workflows/ffmpeg-musl.yml."
