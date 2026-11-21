@@ -1,6 +1,6 @@
 {
   "name": "@agent-video/cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Turn a video into VLM-readable grid images — CLI and MCP server",
   "type": "module",
   "bin": {

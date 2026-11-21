@@ -1,6 +1,6 @@
 {
   "name": "agent-video",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Watch a video (local path or URL): `want` picks the view — grids of timestamped frames (default), the spoken transcript, or probe metadata alone. `from`/`until` window any of them. Local files render on the spot; a URL answers with download options to confirm first.",
   "homepage": "https://github.com/doggo-devs/agent-video",
   "repository": "https://github.com/doggo-devs/agent-video",

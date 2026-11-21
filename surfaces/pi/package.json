@@ -1,6 +1,6 @@
 {
   "name": "@agent-video/pi",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Watch a video (local path or URL): `want` picks the view — grids of timestamped frames (default), the spoken transcript, or probe metadata alone. `from`/`until` window any of them. Local files render on the spot; a URL answers with download options to confirm first.",
   "license": "Apache-2.0",
   "repository": {
@@ -9,7 +9,7 @@
     "directory": "surfaces/pi"
   },
   "dependencies": {
-    "@agent-video/cli": "0.1.0"
+    "@agent-video/cli": "0.1.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
